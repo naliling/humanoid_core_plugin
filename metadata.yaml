@@ -1,6 +1,18 @@
-name: humanoid_core
+name: astrbot_plugin_humanoid_core
 display_name: 人形化伴侣核心插件
-desc: 集成动态精力、人格驱动的日程生成（灵活粒度）、真实天气与生理周期的轻量化伴侣插件
+short_desc: 拟真生活与自然状态引擎
+desc: |
+  集成动态精力、人格驱动的日程生成（灵活粒度）、
+  真实天气与生理周期的轻量化伴侣插件。
+  支持查看日程、重置日程等指令。
 version: 1.9.3
 author: 娜莉灵
+repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+tags:
+  - 拟真
+  - 生活模拟
+  - 人格驱动
