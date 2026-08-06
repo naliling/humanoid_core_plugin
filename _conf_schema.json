@@ -1,0 +1,63 @@
+{
+    "max_energy": {
+        "description": "【生理】精力上限值 (默认 100)",
+        "type": "float",
+        "default": 100.0
+    },
+    "enable_cycle": {
+        "description": "【生理】是否开启生理周期模拟",
+        "type": "bool",
+        "default": true
+    },
+    "cycle_length": {
+        "description": "【生理】生理周期总天数 (默认 28 天)",
+        "type": "int",
+        "default": 28
+    },
+    "use_llm_schedule": {
+        "description": "【日程】是否启用大模型每日自动生成全新动态日程。关闭后使用内置备用模板（基于日期轮换）。",
+        "type": "bool",
+        "default": true
+    },
+    "schedule_provider_name": {
+        "description": "【日程】指定生成日程的模型/Provider 名称（如 gpt-4o、gemini-2.5-flash 等），留空则使用当前默认模型。",
+        "type": "string",
+        "default": ""
+    },
+    "schedule_prompt_extra": {
+        "description": "【日程】大模型生成日程时的额外偏好指导语 (如: 喜欢户外运动/偏爱宅家)。",
+        "type": "string",
+        "default": "偏向普通的日常居家、工作与休闲生活，作息正常"
+    },
+    "character_personality": {
+        "description": "【人格设定】选择角色人格，模型将按此生成符合人设的日程",
+        "type": "string",
+        "_special": "select_persona",
+        "default": ""
+    },
+    "admin_qq": {
+        "description": "【权限】管理员QQ列表（数组），仅管理员可使用重置日程等管理指令",
+        "type": "list",
+        "default": []
+    },
+    "weather_enabled": {
+        "description": "【天气】是否启用 OpenWeather 真实天气",
+        "type": "bool",
+        "default": true
+    },
+    "weather_api_key": {
+        "description": "【天气】OpenWeather API Key (请填入 32 位密钥)",
+        "type": "string",
+        "default": ""
+    },
+    "weather_location": {
+        "description": "【天气】目标城市 (英文格式，如 Zelenogradsk,RU)",
+        "type": "string",
+        "default": "Zelenogradsk,RU"
+    },
+    "weather_refresh_minutes": {
+        "description": "【天气】天气刷新间隔分钟数 (默认 60)",
+        "type": "int",
+        "default": 60
+    }
+}

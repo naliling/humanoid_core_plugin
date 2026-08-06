@@ -1,0 +1,6 @@
+name: humanoid_core
+display_name: 人形化伴侣核心插件
+desc: 集成动态精力、人格驱动的日程生成（灵活粒度）、真实天气与生理周期的轻量化伴侣插件
+version: 1.9.3
+author: 娜莉灵
+astrbot_version: ">=4.0.0"
