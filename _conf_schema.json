@@ -63,6 +63,6 @@
     "inject_activity_context": {
         "description": "【聊天干预】是否将当前日程活动/位置注入提示词。关闭后，AI不会时刻强调自己在做什么（如'正在上班'），仅保留精力与情绪微调，聊天更自然。",
         "type": "bool",
-        "default": false
+        "default": true
     }
 }
