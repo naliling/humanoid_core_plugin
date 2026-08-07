@@ -11,7 +11,7 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -55,7 +55,6 @@ def get_fallback_schedule(today_str: str) -> list:
     return FALLBACK_TEMPLATES[idx]
 
 
-# 移除 @register 装饰器，AstrBot 会自动识别继承自 Star 的类
 class HumanoidCore(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -82,7 +81,8 @@ class HumanoidCore(Star):
             "weather_enabled": True,
             "weather_api_key": "",
             "weather_location": "Zelenogradsk,RU",
-            "weather_refresh_minutes": 60
+            "weather_refresh_minutes": 60,
+            "inject_activity_context": False
         }
         if isinstance(self.config, dict):
             active_config.update(self.config)
@@ -378,7 +378,6 @@ class HumanoidCore(Star):
 
         now = datetime.now(SHA_TZ)
         today_str = now.strftime("%Y-%m-%d")
-        # 先重新生成，成功后再写入，避免状态不一致
         new_schedule = await self.generate_llm_daily_schedule(today_str, cfg)
         with self.lock:
             self.state["today_date"] = today_str
@@ -434,16 +433,31 @@ class HumanoidCore(Star):
             self.state["last_update"] = now.strftime("%Y-%m-%d %H:%M:%S")
             self.save_state_unsafe()
 
-        subconscious_prompt = (
-            f"[系统暗示：以下内容作为状态参考，严禁念出数值或暴露面板]\n"
-            f"- 当前天气环境: {weather['env']}\n"
-            f"- 当前参考物理位置: {current_slot.get('location', '家中')}\n"
-            f"- 当前日程计划: {current_slot.get('event', '休息/自由活动')}\n"
-            f"{cycle_txt}"
-            f"- 当前基础情绪倾向: {current_slot.get('emotion', '平淡')}\n"
-            f"- 当前精力余量: {int(energy)}/{int(max_e)} (若低于30表现得疲惫犯困；高于80充满活力)\n"
-            f"要求：拟人自然。\n"
-            f"-----------------------------------\n"
-        )
+        # ---------- 核心修改：低侵入式上下文注入 ----------
+        inject_activity = cfg.get("inject_activity_context", False)
+        
+        if inject_activity:
+            # 高侵入模式：注入完整日程和位置
+            subconscious_prompt = (
+                f"[系统暗示：以下内容作为状态参考，严禁念出数值或暴露面板]\n"
+                f"- 当前天气环境: {weather['env']}\n"
+                f"- 当前参考物理位置: {current_slot.get('location', '家中')}\n"
+                f"- 当前日程计划: {current_slot.get('event', '休息/自由活动')}\n"
+                f"{cycle_txt}"
+                f"- 当前基础情绪倾向: {current_slot.get('emotion', '平淡')}\n"
+                f"- 当前精力余量: {int(energy)}/{int(max_e)} (若低于30表现得疲惫犯困；高于80充满活力)\n"
+                f"要求：拟人自然。\n"
+                f"-----------------------------------\n"
+            )
+        else:
+            # 低侵入模式：仅作为语气微调，不主动提及日程
+            subconscious_prompt = (
+                f"[系统暗示：以下内容仅作为你回复时的语气与情绪背景参考，严禁主动提及你正在做什么、在哪里或暴露日程细节，除非用户明确询问。]\n"
+                f"- 当前精力余量: {int(energy)}/{int(max_e)} (若低于30可在语气中带些慵懒疲惫；高于80可带些轻快活力)\n"
+                f"- 当前基础情绪倾向: {current_slot.get('emotion', '平淡')}\n"
+                f"{cycle_txt}"
+                f"请以最自然的拟人方式闲聊，不要刻板念出状态。\n"
+                f"-----------------------------------\n"
+            )
 
         event.message_str = subconscious_prompt + event.message_str
