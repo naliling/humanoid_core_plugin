@@ -5,7 +5,8 @@ desc: |
   集成动态精力、人格驱动的日程生成（灵活粒度）、
   真实天气与生理周期的轻量化伴侣插件。
   支持查看日程、重置日程等指令。
-version: 1.9.3
+  v2.0.0 新增“低侵入模式”，可关闭日程活动注入，让聊天更自然。
+version: 2.0.0
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"
