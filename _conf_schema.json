@@ -27,7 +27,7 @@
     "schedule_prompt_extra": {
         "description": "【日程】大模型生成日程时的额外偏好指导语 (如: 喜欢户外运动/偏爱宅家)。",
         "type": "string",
-        "default": "偏向普通的日常居家、工作与休闲生活，作息正常"
+        "default": "工作学习与休息放松结合，日常节奏灵活自然，不刻意限定时段。"
     },
     "character_personality": {
         "description": "【人格设定】选择角色人格，模型将按此生成符合人设的日程",
@@ -61,8 +61,8 @@
         "default": 60
     },
     "inject_activity_context": {
-        "description": "【聊天干预】是否将当前日程活动/位置注入提示词。关闭后，AI不会时刻强调自己在做什么（如'正在上班'），仅保留精力与情绪微调，聊天更自然。",
+        "description": "【聊天模式】是否让AI主动提及天气、位置和日程活动。\n关闭后，AI不会主动说这些，仅靠精力和情绪微调语气，聊天更自然。\n（天气依然会后台获取，用户问到时仍可回答）",
         "type": "bool",
         "default": false
     }
-}
+    }
