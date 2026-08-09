@@ -1,12 +1,11 @@
 name: astrbot_plugin_humanoid_core
 display_name: 人形化伴侣核心插件
-short_desc: 拟真生活与自然状态引擎
+short_desc: 拟真生活状态引擎（动态日程/精力/天气/生理周期）
 desc: |
   集成动态精力、人格驱动的日程生成（灵活粒度）、
-  真实天气与生理周期的轻量化伴侣插件。
+  真实天气与生理周期的拟真伴侣插件。
   支持查看日程、重置日程等指令。
-  v2.0.0 新增“低侵入模式”，可关闭日程活动注入，让聊天更自然。
-version: 2.0.1
+version: 2.0.5
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"
