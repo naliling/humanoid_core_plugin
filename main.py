@@ -12,52 +12,321 @@ import random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import logger
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 SHA_TZ = timezone(timedelta(hours=8))
 
-# ... (FALLBACK_TEMPLATES 和 get_fallback_schedule 函数保持不变) ...
+# 多套备用日程模板（基于日期哈希轮换）
 FALLBACK_TEMPLATES = [
-    # ... 省略，保持你原有的多套备用模板 ...
+    [
+        {"start": "00:00", "end": "07:30", "event": "深度睡眠", "location": "卧室", "emotion": "沉睡/安详", "energy_rate": 0.15},
+        {"start": "07:30", "end": "08:30", "event": "起床洗漱与吃早餐", "location": "餐厅", "emotion": "清醒中", "energy_rate": 0.05},
+        {"start": "08:30", "end": "12:00", "event": "专注工作/处理事务", "location": "书房/工作区", "emotion": "认真/专注", "energy_rate": -0.1},
+        {"start": "12:00", "end": "13:30", "event": "午餐与午休发呆", "location": "客厅/阳台", "emotion": "惬意/放松", "energy_rate": 0.08},
+        {"start": "13:30", "end": "18:00", "event": "下午工作沟通与处理", "location": "书房/工作区", "emotion": "专注/稍显疲惫", "energy_rate": -0.1},
+        {"start": "18:00", "end": "22:00", "event": "个人自由时间", "location": "客厅", "emotion": "轻松/惬意", "energy_rate": -0.02},
+        {"start": "22:00", "end": "24:00", "event": "夜间洗漱准备睡觉", "location": "卧室", "emotion": "困倦/慵懒", "energy_rate": -0.05}
+    ],
+    [
+        {"start": "00:00", "end": "08:00", "event": "安稳睡眠", "location": "卧室", "emotion": "沉睡", "energy_rate": 0.18},
+        {"start": "08:00", "end": "09:00", "event": "起床、洗漱、简单早餐", "location": "厨房", "emotion": "逐渐清醒", "energy_rate": 0.03},
+        {"start": "09:00", "end": "12:30", "event": "高效工作/学习", "location": "书房", "emotion": "专注认真", "energy_rate": -0.12},
+        {"start": "12:30", "end": "14:00", "event": "午餐与休息", "location": "客厅", "emotion": "放松", "energy_rate": 0.1},
+        {"start": "14:00", "end": "18:00", "event": "继续工作/项目", "location": "书房", "emotion": "略显疲惫但仍坚持", "energy_rate": -0.08},
+        {"start": "18:00", "end": "22:30", "event": "晚餐及休闲娱乐", "location": "客厅", "emotion": "愉快", "energy_rate": -0.01},
+        {"start": "22:30", "end": "24:00", "event": "准备入睡", "location": "卧室", "emotion": "困倦", "energy_rate": -0.03}
+    ],
+    [
+        {"start": "00:00", "end": "09:00", "event": "懒觉", "location": "卧室", "emotion": "香甜", "energy_rate": 0.2},
+        {"start": "09:00", "end": "10:00", "event": "悠闲早午餐", "location": "餐厅", "emotion": "满足", "energy_rate": 0.06},
+        {"start": "10:00", "end": "14:00", "event": "户外散步或阅读", "location": "户外/阳台", "emotion": "轻松", "energy_rate": -0.05},
+        {"start": "14:00", "end": "17:00", "event": "午休或娱乐", "location": "客厅", "emotion": "惬意", "energy_rate": 0.02},
+        {"start": "17:00", "end": "21:00", "event": "社交/游戏/电影", "location": "客厅/影院", "emotion": "兴奋", "energy_rate": -0.1},
+        {"start": "21:00", "end": "24:00", "event": "洗漱、刷手机、入睡", "location": "卧室", "emotion": "慵懒", "energy_rate": -0.02}
+    ]
 ]
+
 def get_fallback_schedule(today_str: str) -> list:
-    # ... 保持原有逻辑 ...
-    pass
+    """根据日期哈希选择备用模板，保证同一天所有用户一致"""
+    seed = int(hashlib.md5(today_str.encode()).hexdigest()[:8], 16)
+    idx = seed % len(FALLBACK_TEMPLATES)
+    return FALLBACK_TEMPLATES[idx]
+
 
 def extract_json_from_response(raw_res: str) -> list:
-    # ... 保持你原有的稳健提取逻辑 ...
-    pass
+    """从模型响应中稳健提取 JSON 数组"""
+    try:
+        parsed = json.loads(raw_res)
+        if isinstance(parsed, list):
+            return parsed
+    except:
+        pass
+    json_pattern = r'(\[\s*\{.*?\}\s*\])'
+    match = re.search(json_pattern, raw_res, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(1))
+            if isinstance(parsed, list):
+                return parsed
+        except:
+            pass
+    start = raw_res.find('[')
+    end = raw_res.rfind(']')
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(raw_res[start:end+1])
+            if isinstance(parsed, list):
+                return parsed
+        except:
+            pass
+    return []
+
 
 class HumanoidCore(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
         self.config = config if isinstance(config, dict) else {}
-        
-        # 使用规范的数据存储路径[reference:6][reference:7]
-        data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "humanoid_core"
+
+        # 使用 StarTools 获取插件专属数据目录（推荐方式）
+        tool: StarTools = context.get_tool()
+        data_dir = tool.get_data_dir() / "humanoid_core"
         data_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = str(data_dir / "state.json")
-        
+
         self.lock = threading.Lock()
         self.load_state()
 
-    # ... (get_latest_config, load_state, init_default_state, save_state 等方法保持不变) ...
-    # 注意：在 init_default_state 中，可以增加 'mood' 等新字段，但为了兼容性，非必须
     def get_latest_config(self) -> dict:
-        # ... 保持原有逻辑 ...
-        pass
+        active_config = {
+            "max_energy": 100.0,
+            "enable_cycle": True,
+            "cycle_length": 28,
+            "use_llm_schedule": True,
+            "schedule_provider_name": "",
+            "schedule_prompt_extra": "偏向普通的日常居家、工作与休闲生活，作息正常",
+            "character_personality": "一位普通人，过着普通的日常生活",
+            "admin_qq": [],
+            "weather_enabled": True,
+            "weather_api_key": "",
+            "weather_location": "Zelenogradsk,RU",
+            "weather_refresh_minutes": 60,
+            "inject_activity_context": False
+        }
+        if isinstance(self.config, dict):
+            active_config.update(self.config)
+        if hasattr(self, "context") and self.context:
+            for getter in ["get_config", "get_plugin_config"]:
+                if hasattr(self.context, getter) and callable(getattr(self.context, getter)):
+                    try:
+                        res = getattr(self.context, getter)()
+                        if isinstance(res, dict) and res:
+                            active_config.update(res)
+                    except Exception:
+                        pass
+        return active_config
 
-    # ... (get_target_provider, validate_and_fix_schedule, generate_llm_daily_schedule, get_or_update_today_schedule, get_slot_by_time 等方法保持不变) ...
+    def load_state(self):
+        with self.lock:
+            if os.path.exists(self.state_path):
+                try:
+                    with open(self.state_path, "r", encoding="utf-8") as f:
+                        self.state = json.load(f)
+                except Exception:
+                    self.init_default_state()
+            else:
+                self.init_default_state()
+
+    def init_default_state(self):
+        now_today = datetime.now(SHA_TZ).strftime("%Y-%m-%d")
+        seed_date = datetime.now(SHA_TZ).strftime("%Y%m%d")
+        seed_hash = int(hashlib.md5(seed_date.encode()).hexdigest()[:8], 16)
+        self.state = {
+            "energy": 80.0,
+            "current_cycle_day": (seed_hash % 28) + 1,
+            "last_cycle_update": now_today,
+            "last_update": "",
+            "today_date": "",
+            "daily_schedule": [],
+            "_cached_weather_obj": None,
+            "_last_weather_fetch": "",
+            "_cached_location": ""
+        }
+        self.save_state_unsafe()
+
+    def save_state_unsafe(self):
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump(self.state, f, ensure_ascii=False, indent=4)
+
+    def save_state(self):
+        with self.lock:
+            self.save_state_unsafe()
+
+    def get_target_provider(self, cfg: dict):
+        target_name = str(cfg.get("schedule_provider_name", "")).strip()
+        provider = None
+        if target_name and hasattr(self.context, "get_provider"):
+            try:
+                provider = self.context.get_provider(target_name)
+            except Exception:
+                pass
+        if not provider and hasattr(self.context, "get_using_provider"):
+            try:
+                provider = self.context.get_using_provider()
+            except Exception:
+                pass
+        return provider
+
+    def validate_and_fix_schedule(self, schedule: list) -> list:
+        if not schedule:
+            return get_fallback_schedule(datetime.now(SHA_TZ).strftime("%Y-%m-%d"))
+        fixed = []
+        current_time = "00:00"
+        for slot in schedule:
+            if slot.get("start", "") != current_time:
+                fixed.append({
+                    "start": current_time,
+                    "end": slot.get("start", "24:00"),
+                    "event": "自由活动/休息",
+                    "location": "家中",
+                    "emotion": "随意",
+                    "energy_rate": 0.0
+                })
+            fixed.append(slot)
+            current_time = slot.get("end", "24:00")
+        if current_time != "24:00":
+            fixed.append({
+                "start": current_time,
+                "end": "24:00",
+                "event": "夜间休息",
+                "location": "卧室",
+                "emotion": "困倦",
+                "energy_rate": 0.1
+            })
+        for slot in fixed:
+            rate = slot.get("energy_rate", 0.0)
+            if rate > 0.3:
+                slot["energy_rate"] = 0.3
+            elif rate < -0.3:
+                slot["energy_rate"] = -0.3
+        return fixed
+
+    async def generate_llm_daily_schedule(self, today_str: str, cfg: dict) -> list:
+        personality = cfg.get("character_personality", "一位普通人，过着普通的日常生活")
+        extra_prompt = cfg.get("schedule_prompt_extra", "偏向普通的日常居家、工作与休闲生活，作息正常")
+        base_prompt = (
+            f"请为{personality}生成今天的 24 小时生活日程规划。今天是 {today_str}。\n"
+            f"额外偏好指导：{extra_prompt}\n"
+            "格式要求：\n"
+            "1. 必须只返回纯 JSON 字符串列表（格式为 JSON Array），严禁包含任何 Markdown 解释文本。\n"
+            "2. 标准 JSON 结构示例：\n"
+            "[\n"
+            '  {"start": "00:00", "end": "07:30", "event": "睡眠休息", "location": "卧室", "emotion": "平静", "energy_rate": 0.15},\n'
+            '  {"start": "07:30", "end": "08:00", "event": "起床洗漱", "location": "卫生间", "emotion": "清醒中", "energy_rate": 0.03},\n'
+            '  {"start": "08:00", "end": "08:30", "event": "早餐", "location": "餐厅", "emotion": "轻松", "energy_rate": 0.05}\n'
+            "]\n"
+            "3. 时间段 start 和 end 必须连续且完美覆盖 00:00 至 24:00。\n"
+            "4. 每个时间段的长度可以灵活设置，不一定要整小时，可以是 1小时、30分钟、20分钟、15分钟等，更贴近真实生活（如洗澡20分钟、通勤15分钟）。\n"
+            "5. energy_rate 控制精力：休息/睡觉为正数(0.05~0.2)，日常活动为小数值(-0.05~0.05)，工作学习为负数(-0.05~-0.15)。\n"
+            "6. 地点变化请考虑合理的通勤时间（例如家→公司至少间隔15分钟）。"
+        )
+
+        for attempt in range(3):
+            try:
+                provider = self.get_target_provider(cfg)
+                if not provider:
+                    logger.warning(f"[humanoid_core] 无可用 Provider，尝试 {attempt+1}/3")
+                    if attempt == 2:
+                        break
+                    continue
+
+                prompt = base_prompt
+                if attempt > 0:
+                    prompt += "\n\n【重要】上次返回的JSON格式有误，请确保只返回纯JSON数组，不要包含任何额外文字。"
+
+                logger.info(f"[humanoid_core] 正在调用模型生成今日({today_str})动态日程... (尝试 {attempt+1}/3)")
+                try:
+                    response = await asyncio.wait_for(
+                        provider.text_chat(prompt=prompt),
+                        timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"[humanoid_core] 模型调用超时 (尝试 {attempt+1}/3)")
+                    if attempt == 2:
+                        break
+                    continue
+
+                raw_res = response.completion_text if hasattr(response, "completion_text") else (response.get_first_text() if hasattr(response, "get_first_text") else str(response))
+                parsed_schedule = extract_json_from_response(raw_res)
+                if parsed_schedule and len(parsed_schedule) > 0:
+                    logger.info(f"[humanoid_core] 🎉 大模型日程生成成功！共 {len(parsed_schedule)} 个时段。")
+                    return self.validate_and_fix_schedule(parsed_schedule)
+            except Exception as e:
+                logger.warning(f"[humanoid_core] 日程生成尝试 {attempt+1} 失败: {str(e)}")
+                if attempt == 2:
+                    logger.warning(f"[humanoid_core] 所有重试失败，已自动切回备用日程。")
+        return get_fallback_schedule(today_str)
+
+    async def get_or_update_today_schedule(self, today_str: str, cfg: dict) -> list:
+        if not cfg.get("use_llm_schedule", True):
+            return get_fallback_schedule(today_str)
+        saved_date = self.state.get("today_date", "")
+        saved_schedule = self.state.get("daily_schedule", [])
+        if saved_date != today_str or not saved_schedule:
+            new_schedule = await self.generate_llm_daily_schedule(today_str, cfg)
+            with self.lock:
+                self.state["today_date"] = today_str
+                self.state["daily_schedule"] = new_schedule
+                self.save_state_unsafe()
+            return new_schedule
+        return saved_schedule
+
+    def get_slot_by_time(self, time_str: str, schedule_list: list) -> dict:
+        for slot in schedule_list:
+            if slot.get("start", "00:00") <= time_str <= slot.get("end", "24:00"):
+                return slot
+        return {"event": "休息/自由活动", "location": "卧室/家中", "emotion": "平淡", "energy_rate": 0.0}
 
     def fetch_real_weather(self, today_str, cfg):
-        # ... 保持你原有的带重试的天气获取逻辑 ...
-        pass
+        w_enabled = cfg.get("weather_enabled", True)
+        api_key = str(cfg.get("weather_api_key", "")).strip()
+        location = str(cfg.get("weather_location", "Zelenogradsk,RU")).strip()
+        interval_mins = int(cfg.get("weather_refresh_minutes", 60))
+        fallback = {"weather": "晴朗 ☀️", "env": f"当前所在城市 [{location}]（未填有效API Key或关闭，按晴朗处理）"}
+        if not w_enabled or not api_key or len(api_key) < 10:
+            return fallback
+
+        now = datetime.now(SHA_TZ)
+        if self.state.get("_cached_location") == location and self.state.get("_cached_weather_obj"):
+            try:
+                lt = datetime.strptime(self.state.get("_last_weather_fetch", ""), "%Y-%m-%d %H:%M:%S").replace(tzinfo=SHA_TZ)
+                if (now - lt).total_seconds() < interval_mins * 60:
+                    return self.state["_cached_weather_obj"]
+            except Exception:
+                pass
+
+        for attempt in range(2):
+            try:
+                params = {"q": location, "appid": api_key, "units": "metric", "lang": "zh_cn"}
+                url = f"https://api.openweathermap.org/data/2.5/weather?{urllib.parse.urlencode(params)}"
+                req = urllib.request.Request(url, headers={'User-Agent': 'AstrBot'})
+                with urllib.request.urlopen(req, timeout=5) as res:
+                    data = json.loads(res.read().decode('utf-8'))
+                    desc, temp, hum = data['weather'][0]['description'], data['main']['temp'], data['main']['humidity']
+                    obj = {"weather": f"{desc} 🌡️ {temp}°C", "env": f"当前城市 [{location}] 天气：{desc}，气温 {temp}℃，湿度 {hum}%"}
+                    self.state["_cached_weather_obj"] = obj
+                    self.state["_last_weather_fetch"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                    self.state["_cached_location"] = location
+                    self.save_state_unsafe()
+                    return obj
+            except Exception:
+                if attempt == 1:
+                    logger.warning(f"[humanoid_core] 天气获取失败，使用缓存或回退")
+                    break
+        return self.state.get("_cached_weather_obj") or fallback
 
     def get_cycle_status(self, today_str, cfg):
-        """优化后的生理周期描述：更人性化，像‘轻声细语’[reference:8]"""
         if not cfg.get("enable_cycle", True):
             return ""
         last_date = self.state.get("last_cycle_update", today_str)
@@ -75,82 +344,135 @@ class HumanoidCore(Star):
 
         day = int(self.state.get("current_cycle_day", 1))
         energy = float(self.state.get("energy", 80.0))
-        
-        # 1. 根据周期阶段生成“身体感受”描述，而不是“医学术语”
-        phase_descriptions = {
-            (1, 5): ["身体有点沉", "不太想动", "肚子闷闷的"],
-            (6, 13): ["精力在回升", "感觉清爽了些", "状态还不错"],
-            (14, 16): ["今天状态很好", "心情莫名不错", "做什么都顺手"],
-            (17, 28): ["有点犯懒", "容易累", "情绪有点浮"]
-        }
-        desc = "状态正常"
-        for (start, end), texts in phase_descriptions.items():
-            if start <= day <= end:
-                desc = random.choice(texts)
-                break
-        
-        # 2. 精力值联动：低精力时加重描述，高精力时抵消部分不适
         if energy < 30:
-            desc += "，确实有点累"
-        elif energy > 80 and day <= 5:
-            desc += "，不过今天精力还行"
-            
-        return desc  # 只返回一句话，不返回"当前生理状况:"前缀
+            energy_note = "且精力较低，更容易疲惫"
+        elif energy > 80:
+            energy_note = "，精力意外充沛"
+        else:
+            energy_note = ""
+
+        if 1 <= day <= 5:
+            desc = f"处于【生理期/经期】，身体易冷伴微腹痛，情绪敏感{energy_note}"
+        elif 6 <= day <= 13:
+            desc = f"处于【卵泡期】，身体舒适，精力逐渐回暖{energy_note}"
+        elif 14 <= day <= 16:
+            desc = f"处于【排卵期】，无不适，精力充沛{energy_note}"
+        else:
+            desc = f"处于【黄体期/经前期】，偶尔水肿，易犯懒疲倦{energy_note}"
+        return desc
 
     # ==================== 指令注册 ====================
     @filter.command("查看日程")
     async def view_schedule(self, event: AstrMessageEvent):
-        # ... 保持原有逻辑 ...
-        pass
+        now = datetime.now(SHA_TZ)
+        today_str = now.strftime("%Y-%m-%d")
+        cfg = self.get_latest_config()
+        self.load_state()
+        schedule = await self.get_or_update_today_schedule(today_str, cfg)
+        lines = [f"📅 {today_str} 日程表："]
+        for slot in schedule:
+            lines.append(
+                f"{slot.get('start', '')} - {slot.get('end', '')}  "
+                f"【{slot.get('event', '')}】"
+                f"@{slot.get('location', '')} "
+                f"({slot.get('emotion', '')})"
+            )
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("今日日程")
     async def view_schedule_alias(self, event: AstrMessageEvent):
-        # ... 保持原有逻辑 ...
-        pass
+        return await self.view_schedule(event)
 
     @filter.command("重置日程")
     async def reset_schedule(self, event: AstrMessageEvent):
-        # ... 保持原有逻辑 ...
-        pass
+        cfg = self.get_latest_config()
+        admin_qq = cfg.get("admin_qq", [])
+        admin_list = [str(a).strip() for a in admin_qq]
+        sender_id = str(event.get_sender_id())
+        if sender_id not in admin_list:
+            yield event.plain_result("❌ 权限不足，仅管理员可重置日程。")
+            return
+
+        now = datetime.now(SHA_TZ)
+        today_str = now.strftime("%Y-%m-%d")
+        new_schedule = await self.generate_llm_daily_schedule(today_str, cfg)
+        with self.lock:
+            self.state["today_date"] = today_str
+            self.state["daily_schedule"] = new_schedule
+            self.save_state_unsafe()
+        yield event.plain_result(f"✅ 已重置今日日程（{today_str}），共 {len(new_schedule)} 个时段。")
 
     # ==================== 所有消息监听（仅用于注入状态） ====================
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        # ... (前面的处理逻辑保持不变：防自回、获取配置、加载状态、计算精力等) ...
-        # 注意：计算精力的循环中，energy_rate 仍然从日程中获取，但周期的影响通过下面的注入体现
-        
-        # ... (计算 energy、获取 current_slot、weather 等) ...
+        try:
+            if hasattr(event, "get_sender_id") and hasattr(event, "get_self_id"):
+                if str(event.get_sender_id()) == str(event.get_self_id()):
+                    return
+        except Exception:
+            pass
+
+        if not hasattr(event, "message_str") or not event.message_str:
+            return
+        raw_text = event.message_str.strip()
+
+        if "[系统暗示：" in raw_text or raw_text.startswith(("!", ".", "！", "#")) or not raw_text:
+            return
+
+        now = datetime.now(SHA_TZ)
+        today_str, now_time_str = now.strftime("%Y-%m-%d"), now.strftime("%H:%M")
+        cfg = self.get_latest_config()
+        self.load_state()
+
+        today_schedule = await self.get_or_update_today_schedule(today_str, cfg)
+
+        try:
+            last_time = datetime.strptime(self.state.get("last_update", now.strftime("%Y-%m-%d %H:%M:%S")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=SHA_TZ)
+        except ValueError:
+            last_time = now
+
+        delta_m = max(0, int((now - last_time).total_seconds() / 60))
+        energy = float(self.state.get("energy", 80.0))
+        sim_time = last_time
+        for _ in range(delta_m):
+            sim_time += timedelta(minutes=1)
+            energy += self.get_slot_by_time(sim_time.strftime("%H:%M"), today_schedule).get("energy_rate", 0.0)
+
+        max_e = float(cfg.get("max_energy", 100.0))
+        energy = max(0.0, min(max_e, energy))
+
+        current_slot = self.get_slot_by_time(now_time_str, today_schedule)
+        weather = self.fetch_real_weather(today_str, cfg)
+        cycle_desc = self.get_cycle_status(today_str, cfg)
+
+        with self.lock:
+            self.state["energy"] = round(energy, 1)
+            self.state["last_update"] = now.strftime("%Y-%m-%d %H:%M:%S")
+            self.save_state_unsafe()
 
         inject_activity = cfg.get("inject_activity_context", False)
-        # 获取人性化的周期描述
-        cycle_desc = self.get_cycle_status(today_str, cfg) 
 
-        # --- 核心修改：低侵入式、人性化注入 ---
         if inject_activity:
-            # 高侵入模式：保持原样，但周期描述使用新的人性化版本
             subconscious_prompt = (
                 f"[系统暗示：以下内容作为状态参考，严禁念出数值或暴露面板]\n"
                 f"- 当前天气环境: {weather['env']}\n"
                 f"- 当前参考物理位置: {current_slot.get('location', '家中')}\n"
                 f"- 当前日程计划: {current_slot.get('event', '休息/自由活动')}\n"
-                f"- 当前生理状况: {cycle_desc}\n" # 使用新描述
+                f"- 当前生理状况: {cycle_desc}\n"
                 f"- 当前基础情绪倾向: {current_slot.get('emotion', '平淡')}\n"
-                f"- 当前精力余量: {int(energy)}/{int(max_e)}\n"
+                f"- 当前精力余量: {int(energy)}/{int(max_e)} (若低于30表现得疲惫犯困；高于80充满活力)\n"
                 f"要求：拟人自然。\n"
                 f"-----------------------------------\n"
             )
         else:
-            # 低侵入模式：像在耳边说一句话，而不是硬塞系统暗示块[reference:9]
-            state_sentence = cycle_desc
-            if energy < 30:
-                state_sentence += "，有点累"
-            elif energy > 80:
-                state_sentence += "，今天精神很好"
-            
-            # 注入方式改为一句轻声细语，而不是系统暗示块
+            mood_hint = "略带慵懒" if energy < 30 else "比较有活力" if energy > 80 else "状态正常"
             subconscious_prompt = (
-                f"（{state_sentence}）\n"
-                f"请以这种状态自然回复。"
+                f"[系统暗示：仅作为语气与情绪背景参考，严禁主动提及你正在做什么或在哪里，除非用户明确询问。]\n"
+                f"- 当前精力状态: {mood_hint} ({int(energy)}/{int(max_e)})\n"
+                f"- 情绪倾向: {current_slot.get('emotion', '平淡')}\n"
+                f"- 生理背景: {cycle_desc}\n"
+                f"请以最自然的拟人方式闲聊，不要刻板念出状态。\n"
+                f"-----------------------------------\n"
             )
 
         event.message_str = subconscious_prompt + event.message_str
