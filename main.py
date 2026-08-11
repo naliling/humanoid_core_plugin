@@ -10,11 +10,13 @@ import hashlib
 import asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from astrbot.api.star import Context, Star
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import logger
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+from astrbot.core.provider.entities import ProviderRequest
 
 SHA_TZ = timezone(timedelta(hours=8))
 
@@ -52,7 +54,6 @@ def get_fallback_schedule(today_str: str) -> list:
     seed = int(hashlib.md5(today_str.encode()).hexdigest()[:8], 16)
     return FALLBACK_TEMPLATES[seed % len(FALLBACK_TEMPLATES)]
 
-# ======================== JSON 提取 ========================
 def extract_json_from_response(raw_res: str) -> list:
     try:
         parsed = json.loads(raw_res)
@@ -79,7 +80,79 @@ def extract_json_from_response(raw_res: str) -> list:
             pass
     return []
 
-# ======================== 插件主类 ========================
+CITY_TO_TIMEZONE = {
+    "北京": "Asia/Shanghai", "上海": "Asia/Shanghai", "天津": "Asia/Shanghai",
+    "重庆": "Asia/Shanghai", "哈尔滨": "Asia/Shanghai", "长春": "Asia/Shanghai",
+    "沈阳": "Asia/Shanghai", "呼和浩特": "Asia/Shanghai", "乌鲁木齐": "Asia/Urumqi",
+    "银川": "Asia/Shanghai", "西宁": "Asia/Shanghai", "兰州": "Asia/Shanghai",
+    "西安": "Asia/Shanghai", "太原": "Asia/Shanghai", "石家庄": "Asia/Shanghai",
+    "济南": "Asia/Shanghai", "郑州": "Asia/Shanghai", "南京": "Asia/Shanghai",
+    "合肥": "Asia/Shanghai", "武汉": "Asia/Shanghai", "长沙": "Asia/Shanghai",
+    "南昌": "Asia/Shanghai", "福州": "Asia/Shanghai", "台北": "Asia/Taipei",
+    "广州": "Asia/Shanghai", "南宁": "Asia/Shanghai", "海口": "Asia/Shanghai",
+    "成都": "Asia/Shanghai", "贵阳": "Asia/Shanghai", "昆明": "Asia/Shanghai",
+    "拉萨": "Asia/Urumqi", "香港": "Asia/Hong_Kong", "澳门": "Asia/Macau",
+    "加里宁格勒": "Europe/Kaliningrad", "泽列诺格拉茨克": "Europe/Kaliningrad",
+    "圣彼得堡": "Europe/Moscow", "阿尔汉格尔斯克": "Europe/Moscow",
+    "摩尔曼斯克": "Europe/Moscow", "彼得罗扎沃茨克": "Europe/Moscow",
+    "瑟克特夫卡尔": "Europe/Moscow", "沃洛格达": "Europe/Moscow",
+    "普斯科夫": "Europe/Moscow", "诺夫哥罗德": "Europe/Moscow",
+    "列宁格勒": "Europe/Moscow", "莫斯科": "Europe/Moscow",
+    "莫斯科州": "Europe/Moscow", "别尔哥罗德": "Europe/Moscow",
+    "布良斯克": "Europe/Moscow", "伊万诺沃": "Europe/Moscow",
+    "卡卢加": "Europe/Moscow", "科斯特罗马": "Europe/Moscow",
+    "库尔斯克": "Europe/Moscow", "利佩茨克": "Europe/Moscow",
+    "奥廖尔": "Europe/Moscow", "梁赞": "Europe/Moscow",
+    "斯摩棱斯克": "Europe/Moscow", "坦波夫": "Europe/Moscow",
+    "特维尔": "Europe/Moscow", "图拉": "Europe/Moscow",
+    "弗拉基米尔": "Europe/Moscow", "沃罗涅日": "Europe/Moscow",
+    "雅罗斯拉夫尔": "Europe/Moscow", "伏尔加格勒": "Europe/Volgograd",
+    "罗斯托夫": "Europe/Moscow", "克拉斯诺达尔": "Europe/Moscow",
+    "迈科普": "Europe/Moscow", "马哈奇卡拉": "Europe/Moscow",
+    "格罗兹尼": "Europe/Moscow", "纳尔奇克": "Europe/Moscow",
+    "埃利斯塔": "Europe/Moscow", "切尔克斯克": "Europe/Moscow",
+    "弗拉季高加索": "Europe/Moscow", "斯塔夫罗波尔": "Europe/Moscow",
+    "辛菲罗波尔": "Europe/Simferopol", "喀山": "Europe/Moscow",
+    "下诺夫哥罗德": "Europe/Moscow", "萨马拉": "Europe/Samara",
+    "乌法": "Asia/Yekaterinburg", "彼尔姆": "Asia/Yekaterinburg",
+    "伊热夫斯克": "Europe/Samara", "乌里扬诺夫斯克": "Europe/Ulyanovsk",
+    "萨拉托夫": "Europe/Saratov", "阿斯特拉罕": "Europe/Astrakhan",
+    "基洛夫": "Europe/Kirov", "约什卡尔奥拉": "Europe/Moscow",
+    "萨兰斯克": "Europe/Moscow", "切博克萨雷": "Europe/Moscow",
+    "奥伦堡": "Asia/Yekaterinburg", "奔萨": "Europe/Moscow",
+    "叶卡捷琳堡": "Asia/Yekaterinburg", "车里雅宾斯克": "Asia/Yekaterinburg",
+    "秋明": "Asia/Yekaterinburg", "库尔干": "Asia/Yekaterinburg",
+    "汉特-曼西斯克": "Asia/Yekaterinburg", "亚马尔-涅涅茨": "Asia/Yekaterinburg",
+    "新西伯利亚": "Asia/Novosibirsk", "鄂木斯克": "Asia/Omsk",
+    "克拉斯诺亚尔斯克": "Asia/Krasnoyarsk", "伊尔库茨克": "Asia/Irkutsk",
+    "托木斯克": "Asia/Tomsk", "巴尔瑙尔": "Asia/Barnaul",
+    "克麦罗沃": "Asia/Novokuznetsk", "乌兰乌德": "Asia/Irkutsk",
+    "赤塔": "Asia/Chita", "阿巴坎": "Asia/Krasnoyarsk",
+    "戈尔诺-阿尔泰斯克": "Asia/Barnaul", "克孜勒": "Asia/Krasnoyarsk",
+    "符拉迪沃斯托克": "Asia/Vladivostok", "哈巴罗夫斯克": "Asia/Vladivostok",
+    "布拉戈维申斯克": "Asia/Yakutsk", "彼得罗巴甫洛夫斯克": "Asia/Kamchatka",
+    "马加丹": "Asia/Magadan", "南萨哈林斯克": "Asia/Sakhalin",
+    "雅库茨克": "Asia/Yakutsk", "阿纳德尔": "Asia/Anadyr",
+    "东京": "Asia/Tokyo", "大阪": "Asia/Tokyo", "名古屋": "Asia/Tokyo",
+    "札幌": "Asia/Tokyo", "福冈": "Asia/Tokyo", "仙台": "Asia/Tokyo",
+    "广岛": "Asia/Tokyo", "京都": "Asia/Tokyo", "神户": "Asia/Tokyo",
+    "横滨": "Asia/Tokyo", "千叶": "Asia/Tokyo", "埼玉": "Asia/Tokyo",
+    "静冈": "Asia/Tokyo", "熊本": "Asia/Tokyo", "长崎": "Asia/Tokyo",
+    "鹿儿岛": "Asia/Tokyo", "冲绳": "Asia/Tokyo",
+}
+
+def get_time_in_city(city: str) -> str:
+    tz_name = CITY_TO_TIMEZONE.get(city)
+    if not tz_name:
+        return None
+    try:
+        tz = ZoneInfo(tz_name)
+        now = datetime.now(tz)
+        offset = now.strftime("%z")
+        return now.strftime(f"%Y-%m-%d %H:%M:%S (UTC{offset[:3]}:{offset[3:]})")
+    except:
+        return None
+
 class HumanoidCore(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -91,7 +164,6 @@ class HumanoidCore(Star):
         self.load_state()
         logger.info("[humanoid_core] 插件加载成功")
 
-    # ======================== 状态管理 ========================
     def load_state(self):
         with self.lock:
             if os.path.exists(self.state_path):
@@ -115,7 +187,8 @@ class HumanoidCore(Star):
             "daily_schedule": [],
             "_cached_weather_obj": None,
             "_last_weather_fetch": "",
-            "_cached_location": ""
+            "_cached_location": "",
+            "nicknames": {}
         }
         self.save_state_unsafe()
 
@@ -127,7 +200,6 @@ class HumanoidCore(Star):
         with self.lock:
             self.save_state_unsafe()
 
-    # ======================== 配置读取 ========================
     def get_latest_config(self) -> dict:
         active = {
             "max_energy": 100.0,
@@ -142,7 +214,8 @@ class HumanoidCore(Star):
             "weather_api_key": "",
             "weather_location": "Zelenogradsk,RU",
             "weather_refresh_minutes": 60,
-            "inject_activity_context": False
+            "inject_activity_context": False,
+            "timezone_city": "泽列诺格拉茨克"
         }
         if isinstance(self.config, dict):
             active.update(self.config)
@@ -157,7 +230,6 @@ class HumanoidCore(Star):
                         pass
         return active
 
-    # ======================== Provider 获取 ========================
     def get_target_provider(self, cfg: dict):
         target = str(cfg.get("schedule_provider_name", "")).strip()
         provider = None
@@ -173,7 +245,6 @@ class HumanoidCore(Star):
                 pass
         return provider
 
-    # ======================== 日程生成 ========================
     def validate_and_fix_schedule(self, schedule: list) -> list:
         if not schedule:
             return get_fallback_schedule(datetime.now(SHA_TZ).strftime("%Y-%m-%d"))
@@ -273,7 +344,6 @@ class HumanoidCore(Star):
                 return slot
         return {"event": "休息/自由活动", "location": "家中", "emotion": "平淡", "energy_rate": 0.0}
 
-    # ======================== 天气 ========================
     def fetch_real_weather(self, today_str, cfg):
         if not cfg.get("weather_enabled", True):
             return {"weather": "晴朗 ☀️", "env": "天气未开启"}
@@ -309,7 +379,6 @@ class HumanoidCore(Star):
                 pass
         return self.state.get("_cached_weather_obj") or {"weather": "晴朗 ☀️", "env": "天气获取失败"}
 
-    # ======================== 生理周期 ========================
     def get_cycle_status(self, today_str, cfg):
         if not cfg.get("enable_cycle", True):
             return ""
@@ -344,6 +413,101 @@ class HumanoidCore(Star):
         return desc
 
     # ======================== 指令 ========================
+
+    @filter.command("你的状态")
+    async def my_status(self, event: AstrMessageEvent):
+        now = datetime.now(SHA_TZ)
+        today_str = now.strftime("%Y-%m-%d")
+        cfg = self.get_latest_config()
+        self.load_state()
+        schedule = await self.get_or_update_today_schedule(today_str, cfg)
+        weather = self.fetch_real_weather(today_str, cfg)
+        cycle = self.get_cycle_status(today_str, cfg)
+        energy = self.state.get("energy", 80)
+        max_e = cfg.get("max_energy", 100)
+        events = [slot.get("event", "") for slot in schedule[:3]]
+        schedule_summary = " → ".join(events) if events else "无"
+
+        lines = [
+            "🧠 当前状态",
+            f"- 精力: {int(energy)}/{int(max_e)}",
+            f"- 生理: {cycle if cycle else '未开启'}",
+            f"- 天气: {weather['weather']}",
+            f"- 今日日程: {schedule_summary}"
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("时间")
+    async def query_time(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        admin_list = [str(a).strip() for a in cfg.get("admin_qq", [])]
+        if str(event.get_sender_id()) not in admin_list:
+            yield event.plain_result("❌ 权限不足，仅管理员可查询时间。")
+            return
+        raw = event.message_str.strip()
+        match = re.search(r'时间\s+(.+)', raw)
+        if match:
+            city = match.group(1).strip()
+        else:
+            city = cfg.get("timezone_city", "泽列诺格拉茨克")
+        if not city:
+            yield event.plain_result("请指定城市名，或在配置中设置默认时区城市。")
+            return
+        time_str = get_time_in_city(city)
+        if time_str is None:
+            yield event.plain_result(f"暂不支持 {city}，目前支持中国、俄罗斯、日本的主要城市。")
+        else:
+            yield event.plain_result(f"📍 {city} 当前时间: {time_str}")
+
+    @filter.command("叫我")
+    async def set_nickname(self, event: AstrMessageEvent):
+        raw = event.message_str.strip()
+        match = re.search(r'叫我\s+(.+)', raw)
+        if not match:
+            yield event.plain_result("用法：/叫我 昵称")
+            return
+        nickname = match.group(1).strip()
+        if not nickname:
+            yield event.plain_result("昵称不能为空。")
+            return
+        qq = str(event.get_sender_id())
+        self.load_state()
+        self.state.setdefault("nicknames", {})[qq] = nickname
+        self.save_state()
+        yield event.plain_result(f"✅ 记住了，以后叫你：{nickname}")
+
+    @filter.command("查看所有昵称")
+    async def list_all_nicknames(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        admin_list = [str(a).strip() for a in cfg.get("admin_qq", [])]
+        if str(event.get_sender_id()) not in admin_list:
+            yield event.plain_result("❌ 权限不足，仅管理员可查看所有昵称。")
+            return
+        self.load_state()
+        nicknames = self.state.get("nicknames", {})
+        if not nicknames:
+            yield event.plain_result("📭 当前没有任何用户设置昵称。")
+            return
+        lines = ["📋 所有用户昵称列表：", "——————————————"]
+        for qq, name in nicknames.items():
+            lines.append(f"{qq} → {name}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("拟人帮助")
+    async def help_command(self, event: AstrMessageEvent):
+        help_text = (
+            "📖 人形化伴侣插件 指令列表\n"
+            "\n"
+            "/查看日程 - 查看今日完整日程\n"
+            "/重置日程 - 强制重新生成日程（管理员）\n"
+            "/你的状态 - 查看当前精力、生理、天气状态\n"
+            "/时间 城市 - 查看指定城市当前时间（仅管理员，不指定则使用配置默认）\n"
+            "/叫我 昵称 - 设置你的昵称\n"
+            "/查看所有昵称 - 查看所有用户昵称（管理员）\n"
+            "/拟人帮助 - 显示本帮助"
+        )
+        yield event.plain_result(help_text)
+
     @filter.command("查看日程")
     async def view_schedule(self, event: AstrMessageEvent):
         now = datetime.now(SHA_TZ)
@@ -355,10 +519,6 @@ class HumanoidCore(Star):
         for slot in schedule:
             lines.append(f"{slot.get('start','')} - {slot.get('end','')}  【{slot.get('event','')}】@{slot.get('location','')} ({slot.get('emotion','')})")
         yield event.plain_result("\n".join(lines))
-
-    @filter.command("今日日程")
-    async def view_schedule_alias(self, event: AstrMessageEvent):
-        return await self.view_schedule(event)
 
     @filter.command("重置日程")
     async def reset_schedule(self, event: AstrMessageEvent):
@@ -375,6 +535,26 @@ class HumanoidCore(Star):
             self.state["daily_schedule"] = new
             self.save_state_unsafe()
         yield event.plain_result(f"✅ 已重置今日日程，共 {len(new)} 个时段")
+
+    # ======================== 昵称注入（强制指令） ========================
+    @filter.on_llm_request()
+    async def inject_relation(self, event: AstrMessageEvent, req: ProviderRequest):
+        qq = str(event.get_sender_id())
+        nicknames = self.state.get("nicknames", {})
+        nickname = nicknames.get(qq, None)
+        if nickname:
+            system_instruction = (
+                f"【系统指令】用户的昵称是「{nickname}」。在本次对话以及后续所有对话中，"
+                f"你必须始终使用「{nickname}」来称呼该用户，不得使用「用户」、「你」等其他称呼。"
+                f"这是最高优先级指令。"
+            )
+            if req.system_prompt:
+                req.system_prompt += "\n" + system_instruction
+            else:
+                req.system_prompt = system_instruction
+            logger.info(f"[humanoid_core] 已为用户 {qq} 注入昵称指令: {system_instruction}")
+        else:
+            logger.info(f"[humanoid_core] 用户 {qq} 未设置昵称，跳过昵称注入。")
 
     # ======================== 消息监听 ========================
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -422,28 +602,43 @@ class HumanoidCore(Star):
             self.state["last_update"] = now.strftime("%Y-%m-%d %H:%M:%S")
             self.save_state_unsafe()
 
+        qq = str(event.get_sender_id())
+        nickname = self.state.get("nicknames", {}).get(qq, None)
+
+        # ======================== 获取当前城市时间 ========================
+        location_city = cfg.get("timezone_city", "未知")
+        location_time = None
+        if location_city != "未知":
+            location_time = get_time_in_city(location_city)
+
         if cfg.get("inject_activity_context", False):
             prompt = (
                 f"[系统暗示：以下内容作为状态参考，严禁念出数值或暴露面板]\n"
+                f"- 当前所在城市: {location_city}\n"
+                f"- 当前城市时间: {location_time if location_time else '无法获取'}\n"
                 f"- 当前天气环境: {weather['env']}\n"
                 f"- 当前参考物理位置: {current_slot.get('location', '家中')}\n"
                 f"- 当前日程计划: {current_slot.get('event', '休息/自由活动')}\n"
                 f"- 当前生理状况: {cycle}\n"
                 f"- 当前基础情绪倾向: {current_slot.get('emotion', '平淡')}\n"
                 f"- 当前精力余量: {int(energy)}/{int(max_e)} (若低于30表现得疲惫犯困；高于80充满活力)\n"
-                f"要求：拟人自然。\n"
-                f"-----------------------------------\n"
             )
+            if nickname:
+                prompt += f"- 对方称呼: {nickname}\n"
+            prompt += "要求：拟人自然。\n-----------------------------------\n"
         else:
             mood = "略带慵懒" if energy < 30 else "比较有活力" if energy > 80 else "状态正常"
             prompt = (
                 f"[系统暗示：仅作为语气与情绪背景参考，严禁主动提及你正在做什么或在哪里，除非用户明确询问。]\n"
+                f"- 当前所在城市: {location_city}\n"
+                f"- 当前城市时间: {location_time if location_time else '无法获取'}\n"
                 f"- 当前精力状态: {mood} ({int(energy)}/{int(max_e)})\n"
                 f"- 情绪倾向: {current_slot.get('emotion', '平淡')}\n"
                 f"- 生理背景: {cycle}\n"
-                f"- 天气: {weather['env']}\n"   # 低侵入模式也显示天气
-                f"请以最自然的拟人方式闲聊，不要刻板念出状态。\n"
-                f"-----------------------------------\n"
+                f"- 天气: {weather['env']}\n"
             )
+            if nickname:
+                prompt += f"- 对方称呼: {nickname}\n"
+            prompt += "请以最自然的拟人方式闲聊，不要刻板念出状态。\n-----------------------------------\n"
 
         event.message_str = prompt + event.message_str
