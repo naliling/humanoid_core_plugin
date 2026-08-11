@@ -8,6 +8,7 @@ import urllib.error
 import re
 import hashlib
 import asyncio
+import random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -80,7 +81,9 @@ def extract_json_from_response(raw_res: str) -> list:
             pass
     return []
 
+# ======================== 城市映射表（已扩展至中日俄主要城市） ========================
 CITY_TO_TIMEZONE = {
+    # ===== 中国（直辖市 + 地级市 + 港澳台） =====
     "北京": "Asia/Shanghai", "上海": "Asia/Shanghai", "天津": "Asia/Shanghai",
     "重庆": "Asia/Shanghai", "哈尔滨": "Asia/Shanghai", "长春": "Asia/Shanghai",
     "沈阳": "Asia/Shanghai", "呼和浩特": "Asia/Shanghai", "乌鲁木齐": "Asia/Urumqi",
@@ -92,6 +95,134 @@ CITY_TO_TIMEZONE = {
     "广州": "Asia/Shanghai", "南宁": "Asia/Shanghai", "海口": "Asia/Shanghai",
     "成都": "Asia/Shanghai", "贵阳": "Asia/Shanghai", "昆明": "Asia/Shanghai",
     "拉萨": "Asia/Urumqi", "香港": "Asia/Hong_Kong", "澳门": "Asia/Macau",
+    # 河北
+    "唐山": "Asia/Shanghai", "秦皇岛": "Asia/Shanghai", "邯郸": "Asia/Shanghai",
+    "邢台": "Asia/Shanghai", "保定": "Asia/Shanghai", "张家口": "Asia/Shanghai",
+    "承德": "Asia/Shanghai", "沧州": "Asia/Shanghai", "廊坊": "Asia/Shanghai",
+    "衡水": "Asia/Shanghai",
+    # 山西
+    "大同": "Asia/Shanghai", "朔州": "Asia/Shanghai", "忻州": "Asia/Shanghai",
+    "阳泉": "Asia/Shanghai", "吕梁": "Asia/Shanghai", "晋中": "Asia/Shanghai",
+    "长治": "Asia/Shanghai", "晋城": "Asia/Shanghai", "临汾": "Asia/Shanghai",
+    "运城": "Asia/Shanghai",
+    # 内蒙古
+    "包头": "Asia/Shanghai", "乌海": "Asia/Shanghai", "赤峰": "Asia/Shanghai",
+    "通辽": "Asia/Shanghai", "鄂尔多斯": "Asia/Shanghai", "呼伦贝尔": "Asia/Shanghai",
+    "巴彦淖尔": "Asia/Shanghai", "乌兰察布": "Asia/Shanghai",
+    # 辽宁
+    "大连": "Asia/Shanghai", "鞍山": "Asia/Shanghai", "抚顺": "Asia/Shanghai",
+    "本溪": "Asia/Shanghai", "丹东": "Asia/Shanghai", "锦州": "Asia/Shanghai",
+    "营口": "Asia/Shanghai", "阜新": "Asia/Shanghai", "辽阳": "Asia/Shanghai",
+    "盘锦": "Asia/Shanghai", "铁岭": "Asia/Shanghai", "朝阳": "Asia/Shanghai",
+    "葫芦岛": "Asia/Shanghai",
+    # 吉林
+    "吉林": "Asia/Shanghai", "四平": "Asia/Shanghai", "辽源": "Asia/Shanghai",
+    "通化": "Asia/Shanghai", "白山": "Asia/Shanghai", "松原": "Asia/Shanghai",
+    "白城": "Asia/Shanghai",
+    # 黑龙江
+    "齐齐哈尔": "Asia/Shanghai", "鸡西": "Asia/Shanghai", "鹤岗": "Asia/Shanghai",
+    "双鸭山": "Asia/Shanghai", "大庆": "Asia/Shanghai", "伊春": "Asia/Shanghai",
+    "佳木斯": "Asia/Shanghai", "七台河": "Asia/Shanghai", "牡丹江": "Asia/Shanghai",
+    "黑河": "Asia/Shanghai", "绥化": "Asia/Shanghai",
+    # 江苏
+    "无锡": "Asia/Shanghai", "徐州": "Asia/Shanghai", "常州": "Asia/Shanghai",
+    "苏州": "Asia/Shanghai", "南通": "Asia/Shanghai", "连云港": "Asia/Shanghai",
+    "淮安": "Asia/Shanghai", "盐城": "Asia/Shanghai", "扬州": "Asia/Shanghai",
+    "镇江": "Asia/Shanghai", "泰州": "Asia/Shanghai", "宿迁": "Asia/Shanghai",
+    # 浙江
+    "杭州": "Asia/Shanghai", "宁波": "Asia/Shanghai", "温州": "Asia/Shanghai",
+    "嘉兴": "Asia/Shanghai", "湖州": "Asia/Shanghai", "绍兴": "Asia/Shanghai",
+    "金华": "Asia/Shanghai", "衢州": "Asia/Shanghai", "舟山": "Asia/Shanghai",
+    "台州": "Asia/Shanghai", "丽水": "Asia/Shanghai",
+    # 安徽
+    "芜湖": "Asia/Shanghai", "蚌埠": "Asia/Shanghai", "淮南": "Asia/Shanghai",
+    "马鞍山": "Asia/Shanghai", "淮北": "Asia/Shanghai", "铜陵": "Asia/Shanghai",
+    "安庆": "Asia/Shanghai", "黄山": "Asia/Shanghai", "滁州": "Asia/Shanghai",
+    "阜阳": "Asia/Shanghai", "宿州": "Asia/Shanghai", "六安": "Asia/Shanghai",
+    "亳州": "Asia/Shanghai", "池州": "Asia/Shanghai", "宣城": "Asia/Shanghai",
+    # 福建
+    "厦门": "Asia/Shanghai", "莆田": "Asia/Shanghai", "三明": "Asia/Shanghai",
+    "泉州": "Asia/Shanghai", "漳州": "Asia/Shanghai", "南平": "Asia/Shanghai",
+    "龙岩": "Asia/Shanghai", "宁德": "Asia/Shanghai",
+    # 江西
+    "景德镇": "Asia/Shanghai", "萍乡": "Asia/Shanghai", "九江": "Asia/Shanghai",
+    "新余": "Asia/Shanghai", "鹰潭": "Asia/Shanghai", "赣州": "Asia/Shanghai",
+    "吉安": "Asia/Shanghai", "宜春": "Asia/Shanghai", "抚州": "Asia/Shanghai",
+    "上饶": "Asia/Shanghai",
+    # 山东
+    "青岛": "Asia/Shanghai", "淄博": "Asia/Shanghai", "枣庄": "Asia/Shanghai",
+    "东营": "Asia/Shanghai", "烟台": "Asia/Shanghai", "潍坊": "Asia/Shanghai",
+    "济宁": "Asia/Shanghai", "泰安": "Asia/Shanghai", "威海": "Asia/Shanghai",
+    "日照": "Asia/Shanghai", "临沂": "Asia/Shanghai", "德州": "Asia/Shanghai",
+    "聊城": "Asia/Shanghai", "滨州": "Asia/Shanghai", "菏泽": "Asia/Shanghai",
+    # 河南
+    "开封": "Asia/Shanghai", "洛阳": "Asia/Shanghai", "平顶山": "Asia/Shanghai",
+    "安阳": "Asia/Shanghai", "鹤壁": "Asia/Shanghai", "新乡": "Asia/Shanghai",
+    "焦作": "Asia/Shanghai", "濮阳": "Asia/Shanghai", "许昌": "Asia/Shanghai",
+    "漯河": "Asia/Shanghai", "三门峡": "Asia/Shanghai", "南阳": "Asia/Shanghai",
+    "商丘": "Asia/Shanghai", "信阳": "Asia/Shanghai", "周口": "Asia/Shanghai",
+    "驻马店": "Asia/Shanghai",
+    # 湖北
+    "黄石": "Asia/Shanghai", "十堰": "Asia/Shanghai", "宜昌": "Asia/Shanghai",
+    "襄阳": "Asia/Shanghai", "鄂州": "Asia/Shanghai", "荆门": "Asia/Shanghai",
+    "孝感": "Asia/Shanghai", "荆州": "Asia/Shanghai", "黄冈": "Asia/Shanghai",
+    "咸宁": "Asia/Shanghai", "随州": "Asia/Shanghai",
+    # 湖南
+    "株洲": "Asia/Shanghai", "湘潭": "Asia/Shanghai", "衡阳": "Asia/Shanghai",
+    "邵阳": "Asia/Shanghai", "岳阳": "Asia/Shanghai", "常德": "Asia/Shanghai",
+    "张家界": "Asia/Shanghai", "益阳": "Asia/Shanghai", "郴州": "Asia/Shanghai",
+    "永州": "Asia/Shanghai", "怀化": "Asia/Shanghai", "娄底": "Asia/Shanghai",
+    # 广东
+    "韶关": "Asia/Shanghai", "深圳": "Asia/Shanghai", "珠海": "Asia/Shanghai",
+    "汕头": "Asia/Shanghai", "佛山": "Asia/Shanghai", "江门": "Asia/Shanghai",
+    "湛江": "Asia/Shanghai", "茂名": "Asia/Shanghai", "肇庆": "Asia/Shanghai",
+    "惠州": "Asia/Shanghai", "梅州": "Asia/Shanghai", "汕尾": "Asia/Shanghai",
+    "河源": "Asia/Shanghai", "阳江": "Asia/Shanghai", "清远": "Asia/Shanghai",
+    "东莞": "Asia/Shanghai", "中山": "Asia/Shanghai", "潮州": "Asia/Shanghai",
+    "揭阳": "Asia/Shanghai", "云浮": "Asia/Shanghai",
+    # 广西
+    "柳州": "Asia/Shanghai", "桂林": "Asia/Shanghai", "梧州": "Asia/Shanghai",
+    "北海": "Asia/Shanghai", "防城港": "Asia/Shanghai", "钦州": "Asia/Shanghai",
+    "贵港": "Asia/Shanghai", "玉林": "Asia/Shanghai", "百色": "Asia/Shanghai",
+    "贺州": "Asia/Shanghai", "河池": "Asia/Shanghai", "来宾": "Asia/Shanghai",
+    "崇左": "Asia/Shanghai",
+    # 海南
+    "三亚": "Asia/Shanghai", "三沙": "Asia/Shanghai", "儋州": "Asia/Shanghai",
+    # 四川
+    "自贡": "Asia/Shanghai", "攀枝花": "Asia/Shanghai", "泸州": "Asia/Shanghai",
+    "德阳": "Asia/Shanghai", "绵阳": "Asia/Shanghai", "广元": "Asia/Shanghai",
+    "遂宁": "Asia/Shanghai", "内江": "Asia/Shanghai", "乐山": "Asia/Shanghai",
+    "南充": "Asia/Shanghai", "眉山": "Asia/Shanghai", "宜宾": "Asia/Shanghai",
+    "广安": "Asia/Shanghai", "达州": "Asia/Shanghai", "雅安": "Asia/Shanghai",
+    "巴中": "Asia/Shanghai", "资阳": "Asia/Shanghai",
+    # 贵州
+    "六盘水": "Asia/Shanghai", "遵义": "Asia/Shanghai", "安顺": "Asia/Shanghai",
+    "毕节": "Asia/Shanghai", "铜仁": "Asia/Shanghai",
+    # 云南
+    "曲靖": "Asia/Shanghai", "玉溪": "Asia/Shanghai", "保山": "Asia/Shanghai",
+    "昭通": "Asia/Shanghai", "丽江": "Asia/Shanghai", "普洱": "Asia/Shanghai",
+    "临沧": "Asia/Shanghai",
+    # 西藏
+    "日喀则": "Asia/Shanghai", "昌都": "Asia/Shanghai", "林芝": "Asia/Shanghai",
+    "山南": "Asia/Shanghai", "那曲": "Asia/Shanghai",
+    # 陕西
+    "铜川": "Asia/Shanghai", "宝鸡": "Asia/Shanghai", "咸阳": "Asia/Shanghai",
+    "渭南": "Asia/Shanghai", "延安": "Asia/Shanghai", "汉中": "Asia/Shanghai",
+    "榆林": "Asia/Shanghai", "安康": "Asia/Shanghai", "商洛": "Asia/Shanghai",
+    # 甘肃
+    "嘉峪关": "Asia/Shanghai", "金昌": "Asia/Shanghai", "白银": "Asia/Shanghai",
+    "天水": "Asia/Shanghai", "武威": "Asia/Shanghai", "张掖": "Asia/Shanghai",
+    "平凉": "Asia/Shanghai", "酒泉": "Asia/Shanghai", "庆阳": "Asia/Shanghai",
+    "定西": "Asia/Shanghai", "陇南": "Asia/Shanghai",
+    # 青海
+    "海东": "Asia/Shanghai",
+    # 宁夏
+    "石嘴山": "Asia/Shanghai", "吴忠": "Asia/Shanghai", "固原": "Asia/Shanghai",
+    "中卫": "Asia/Shanghai",
+    # 新疆
+    "克拉玛依": "Asia/Shanghai", "吐鲁番": "Asia/Shanghai", "哈密": "Asia/Shanghai",
+
+    # ===== 俄罗斯（85个联邦主体行政中心） =====
     "加里宁格勒": "Europe/Kaliningrad", "泽列诺格拉茨克": "Europe/Kaliningrad",
     "圣彼得堡": "Europe/Moscow", "阿尔汉格尔斯克": "Europe/Moscow",
     "摩尔曼斯克": "Europe/Moscow", "彼得罗扎沃茨克": "Europe/Moscow",
@@ -133,12 +264,28 @@ CITY_TO_TIMEZONE = {
     "布拉戈维申斯克": "Asia/Yakutsk", "彼得罗巴甫洛夫斯克": "Asia/Kamchatka",
     "马加丹": "Asia/Magadan", "南萨哈林斯克": "Asia/Sakhalin",
     "雅库茨克": "Asia/Yakutsk", "阿纳德尔": "Asia/Anadyr",
+    # 额外俄罗斯主要城市
+    "索契": "Europe/Moscow",
+
+    # ===== 日本（都道府县厅所在地 + 政令指定都市） =====
     "东京": "Asia/Tokyo", "大阪": "Asia/Tokyo", "名古屋": "Asia/Tokyo",
     "札幌": "Asia/Tokyo", "福冈": "Asia/Tokyo", "仙台": "Asia/Tokyo",
     "广岛": "Asia/Tokyo", "京都": "Asia/Tokyo", "神户": "Asia/Tokyo",
     "横滨": "Asia/Tokyo", "千叶": "Asia/Tokyo", "埼玉": "Asia/Tokyo",
     "静冈": "Asia/Tokyo", "熊本": "Asia/Tokyo", "长崎": "Asia/Tokyo",
     "鹿儿岛": "Asia/Tokyo", "冲绳": "Asia/Tokyo",
+    "青森": "Asia/Tokyo", "盛冈": "Asia/Tokyo", "秋田": "Asia/Tokyo",
+    "山形": "Asia/Tokyo", "福岛": "Asia/Tokyo", "水户": "Asia/Tokyo",
+    "宇都宫": "Asia/Tokyo", "前桥": "Asia/Tokyo", "新潟": "Asia/Tokyo",
+    "甲府": "Asia/Tokyo", "长野": "Asia/Tokyo", "岐阜": "Asia/Tokyo",
+    "津": "Asia/Tokyo", "金泽": "Asia/Tokyo", "福井": "Asia/Tokyo",
+    "大津": "Asia/Tokyo", "奈良": "Asia/Tokyo", "和歌山": "Asia/Tokyo",
+    "鸟取": "Asia/Tokyo", "松江": "Asia/Tokyo", "冈山": "Asia/Tokyo",
+    "山口": "Asia/Tokyo", "德岛": "Asia/Tokyo", "高松": "Asia/Tokyo",
+    "松山": "Asia/Tokyo", "高知": "Asia/Tokyo", "佐贺": "Asia/Tokyo",
+    "大分": "Asia/Tokyo", "宫崎": "Asia/Tokyo", "那霸": "Asia/Tokyo",
+    "川崎": "Asia/Tokyo", "北九州": "Asia/Tokyo", "堺": "Asia/Tokyo",
+    "相模原": "Asia/Tokyo", "滨松": "Asia/Tokyo",
 }
 
 def get_time_in_city(city: str) -> str:
@@ -188,7 +335,8 @@ class HumanoidCore(Star):
             "_cached_weather_obj": None,
             "_last_weather_fetch": "",
             "_cached_location": "",
-            "nicknames": {}
+            "nicknames": {},
+            "_energy_noise_date": ""  # 用于每日随机波动
         }
         self.save_state_unsafe()
 
@@ -205,19 +353,28 @@ class HumanoidCore(Star):
             "max_energy": 100.0,
             "enable_cycle": True,
             "cycle_length": 28,
+            "energy_decay_rate": "1.0",
+            "cycle_description_style": "default",
             "use_llm_schedule": True,
             "schedule_provider_name": "",
             "schedule_prompt_extra": "偏向普通的日常居家、工作与休闲生活，作息正常",
+            "schedule_time_granularity": "flexible",
             "character_personality": "一位普通人，过着普通的日常生活",
             "admin_qq": [],
             "weather_enabled": True,
             "weather_api_key": "",
             "weather_location": "Zelenogradsk,RU",
             "weather_refresh_minutes": 60,
-            "inject_activity_context": False,
+            "inject_activity_context": "low",
+            "environment_mode": "both",
+            "show_city_time_in_low_intrusion": True,
             "timezone_city": "泽列诺格拉茨克"
         }
         if isinstance(self.config, dict):
+            # 兼容旧版 inject_activity_context (bool → string)
+            val = self.config.get("inject_activity_context")
+            if isinstance(val, bool):
+                self.config["inject_activity_context"] = "low" if val else "mood_only"
             active.update(self.config)
         if hasattr(self, "context") and self.context:
             for getter in ["get_config", "get_plugin_config"]:
@@ -282,10 +439,18 @@ class HumanoidCore(Star):
     async def generate_llm_daily_schedule(self, today_str: str, cfg: dict) -> list:
         personality = cfg.get("character_personality", "一位普通人")
         extra = cfg.get("schedule_prompt_extra", "")
+        granularity = cfg.get("schedule_time_granularity", "flexible")
+        granularity_hint = ""
+        if granularity == "hourly":
+            granularity_hint = "请按整小时划分时间段（如 00:00-08:00-09:00...），不要出现30分钟或45分钟等非整点时间。"
+        elif granularity == "30min":
+            granularity_hint = "请按半小时划分时间段（如 00:00-00:30-01:00...）。"
+        else:
+            granularity_hint = "时间粒度可以灵活，可以是1小时、30分钟、20分钟、15分钟等。"
         prompt = (
             f"请为{personality}生成今天的 24 小时生活日程规划。今天是 {today_str}。\n"
             f"额外偏好指导：{extra}\n"
-            "格式要求：\n"
+            f"格式要求：\n"
             "1. 必须只返回纯 JSON 字符串列表（格式为 JSON Array），严禁包含任何 Markdown 解释文本。\n"
             "2. 标准 JSON 结构示例：\n"
             "[\n"
@@ -293,7 +458,7 @@ class HumanoidCore(Star):
             '  {"start": "07:30", "end": "08:00", "event": "起床洗漱", "location": "卫生间", "emotion": "清醒中", "energy_rate": 0.03}\n'
             "]\n"
             "3. 时间段必须连续覆盖 00:00 至 24:00。\n"
-            "4. 粒度可灵活（30分钟、20分钟等）。\n"
+            f"4. {granularity_hint}\n"
             "5. energy_rate：休息为正(0.05~0.2)，工作为负(-0.05~-0.15)。\n"
             "6. 地点变化考虑通勤时间。"
         )
@@ -394,8 +559,9 @@ class HumanoidCore(Star):
                         self.save_state_unsafe()
             except:
                 pass
-        day = self.state.get("current_cycle_day", 1)
+        day = int(self.state.get("current_cycle_day", 1))
         energy = self.state.get("energy", 80.0)
+        style = cfg.get("cycle_description_style", "default")
         if energy < 30:
             note = "，精力较低"
         elif energy > 80:
@@ -403,14 +569,56 @@ class HumanoidCore(Star):
         else:
             note = ""
         if 1 <= day <= 5:
-            desc = f"处于【生理期/经期】，身体易冷伴微腹痛，情绪敏感{note}"
+            phase = "生理期/经期"
+            desc_full = f"处于【{phase}】，身体易冷伴微腹痛，疲惫情绪敏感{note}"
+            desc_simple = f"经期（第{day}天）"
         elif 6 <= day <= 13:
-            desc = f"处于【卵泡期】，身体舒适，精力回暖{note}"
+            phase = "卵泡期"
+            desc_full = f"处于【{phase}】，身体舒适，精力回暖{note}"
+            desc_simple = f"卵泡期（第{day}天）"
         elif 14 <= day <= 16:
-            desc = f"处于【排卵期】，无不适，精力充沛{note}"
+            phase = "排卵期"
+            desc_full = f"处于【{phase}】，无不适，精力充沛{note}"
+            desc_simple = f"排卵期（第{day}天）"
         else:
-            desc = f"处于【黄体期/经前期】，偶尔水肿，易犯懒疲倦{note}"
-        return desc
+            phase = "黄体期/经前期"
+            desc_full = f"处于【{phase}】，偶尔水肿，易犯懒疲倦{note}"
+            desc_simple = f"黄体期（第{day}天）"
+        if style == "simple":
+            return desc_simple
+        return desc_full
+
+    # ======================== 精力相关辅助方法 ========================
+    def get_energy_description(self, energy: float) -> str:
+        """根据精力值返回拟人化语气描述"""
+        if energy >= 90:
+            return "精力充沛，语气轻快，话比较多"
+        elif energy >= 70:
+            return "状态良好，语气正常，偶尔主动"
+        elif energy >= 40:
+            return "状态一般，语气平和，不太想动"
+        elif energy >= 20:
+            return "有点累，语气偏慵懒，不想说太多"
+        else:
+            return "很疲惫，语气低落，只想安静待着"
+
+    def apply_energy_inertia(self, energy: float, rate: float) -> float:
+        """应用精力惯性修正：低精力时恢复慢，高精力时消耗快"""
+        if energy < 30:
+            inertia = 0.7
+        elif energy > 80:
+            inertia = 1.3
+        else:
+            inertia = 1.0
+        return rate * inertia
+
+    def apply_afternoon_slump(self, energy: float) -> float:
+        """午后节律：13:00~15:00 精力自然下降 5%"""
+        now = datetime.now(SHA_TZ)
+        hour = now.hour
+        if 13 <= hour <= 15:
+            return energy * 0.95
+        return energy
 
     # ======================== 指令 ========================
 
@@ -427,10 +635,11 @@ class HumanoidCore(Star):
         max_e = cfg.get("max_energy", 100)
         events = [slot.get("event", "") for slot in schedule[:3]]
         schedule_summary = " → ".join(events) if events else "无"
+        energy_desc = self.get_energy_description(energy)
 
         lines = [
             "🧠 当前状态",
-            f"- 精力: {int(energy)}/{int(max_e)}",
+            f"- 精力: {int(energy)}/{int(max_e)} ({energy_desc})",
             f"- 生理: {cycle if cycle else '未开启'}",
             f"- 天气: {weather['weather']}",
             f"- 今日日程: {schedule_summary}"
@@ -500,6 +709,7 @@ class HumanoidCore(Star):
             "\n"
             "/查看日程 - 查看今日完整日程\n"
             "/重置日程 - 强制重新生成日程（管理员）\n"
+            "/重置状态 - 重置精力与生理周期（管理员）\n"
             "/你的状态 - 查看当前精力、生理、天气状态\n"
             "/时间 城市 - 查看指定城市当前时间（仅管理员，不指定则使用配置默认）\n"
             "/叫我 昵称 - 设置你的昵称\n"
@@ -536,7 +746,31 @@ class HumanoidCore(Star):
             self.save_state_unsafe()
         yield event.plain_result(f"✅ 已重置今日日程，共 {len(new)} 个时段")
 
-    # ======================== 昵称注入（强制指令） ========================
+    @filter.command("重置状态")
+    async def reset_state(self, event: AstrMessageEvent):
+        """重置精力与生理周期（保留昵称、日程等数据）"""
+        cfg = self.get_latest_config()
+        admin_list = [str(a).strip() for a in cfg.get("admin_qq", [])]
+        if str(event.get_sender_id()) not in admin_list:
+            yield event.plain_result("❌ 权限不足，仅管理员可重置状态。")
+            return
+
+        with self.lock:
+            # 重置精力
+            self.state["energy"] = 80.0
+            # 重置生理周期（基于当前日期重新计算）
+            now_today = datetime.now(SHA_TZ).strftime("%Y-%m-%d")
+            seed_date = datetime.now(SHA_TZ).strftime("%Y%m%d")
+            seed_hash = int(hashlib.md5(seed_date.encode()).hexdigest()[:8], 16)
+            self.state["current_cycle_day"] = (seed_hash % 28) + 1
+            self.state["last_cycle_update"] = now_today
+            # 重置每日波动标记，让明天重新生成噪声
+            self.state["_energy_noise_date"] = ""
+            self.save_state_unsafe()
+
+        yield event.plain_result("✅ 已重置状态：精力恢复至 80，生理周期已重新计算。")
+
+    # ======================== 昵称注入 ========================
     @filter.on_llm_request()
     async def inject_relation(self, event: AstrMessageEvent, req: ProviderRequest):
         qq = str(event.get_sender_id())
@@ -559,6 +793,22 @@ class HumanoidCore(Star):
     # ======================== 消息监听 ========================
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
+        # 环境感知：判断消息类型
+        cfg = self.get_latest_config()
+        env_mode = cfg.get("environment_mode", "both")
+        if env_mode == "private":
+            try:
+                if hasattr(event, "is_group") and event.is_group():
+                    return
+            except:
+                pass
+        elif env_mode == "group":
+            try:
+                if hasattr(event, "is_private") and event.is_private():
+                    return
+            except:
+                pass
+
         try:
             if hasattr(event, "get_sender_id") and hasattr(event, "get_self_id"):
                 if str(event.get_sender_id()) == str(event.get_self_id()):
@@ -574,10 +824,17 @@ class HumanoidCore(Star):
         now = datetime.now(SHA_TZ)
         today_str = now.strftime("%Y-%m-%d")
         now_time = now.strftime("%H:%M")
-        cfg = self.get_latest_config()
         self.load_state()
 
         schedule = await self.get_or_update_today_schedule(today_str, cfg)
+
+        # 处理每日随机波动（仅每天首次计算时应用）
+        noise_date = self.state.get("_energy_noise_date", "")
+        if noise_date != today_str:
+            noise = random.uniform(0.98, 1.02)
+            self.state["energy"] = self.state.get("energy", 80.0) * noise
+            self.state["_energy_noise_date"] = today_str
+            self.save_state()
 
         try:
             last_time = datetime.strptime(self.state.get("last_update", now.strftime("%Y-%m-%d %H:%M:%S")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=SHA_TZ)
@@ -587,11 +844,18 @@ class HumanoidCore(Star):
         delta_m = max(0, int((now - last_time).total_seconds() / 60))
         energy = self.state.get("energy", 80.0)
         sim = last_time
+        decay_rate = float(cfg.get("energy_decay_rate", "1.0"))
         for _ in range(delta_m):
             sim += timedelta(minutes=1)
-            energy += self.get_slot_by_time(sim.strftime("%H:%M"), schedule).get("energy_rate", 0.0)
+            rate = self.get_slot_by_time(sim.strftime("%H:%M"), schedule).get("energy_rate", 0.0)
+            # 应用精力惯性
+            rate = self.apply_energy_inertia(energy, rate)
+            energy += rate * decay_rate
         max_e = float(cfg.get("max_energy", 100.0))
         energy = max(0.0, min(max_e, energy))
+
+        # 应用午后节律
+        energy = self.apply_afternoon_slump(energy)
 
         current_slot = self.get_slot_by_time(now_time, schedule)
         weather = self.fetch_real_weather(today_str, cfg)
@@ -605,13 +869,16 @@ class HumanoidCore(Star):
         qq = str(event.get_sender_id())
         nickname = self.state.get("nicknames", {}).get(qq, None)
 
-        # ======================== 获取当前城市时间 ========================
         location_city = cfg.get("timezone_city", "未知")
         location_time = None
         if location_city != "未知":
             location_time = get_time_in_city(location_city)
 
-        if cfg.get("inject_activity_context", False):
+        # 聊天模式
+        chat_mode = cfg.get("inject_activity_context", "low")
+        energy_desc = self.get_energy_description(energy)
+
+        if chat_mode == "full":
             prompt = (
                 f"[系统暗示：以下内容作为状态参考，严禁念出数值或暴露面板]\n"
                 f"- 当前所在城市: {location_city}\n"
@@ -621,22 +888,31 @@ class HumanoidCore(Star):
                 f"- 当前日程计划: {current_slot.get('event', '休息/自由活动')}\n"
                 f"- 当前生理状况: {cycle}\n"
                 f"- 当前基础情绪倾向: {current_slot.get('emotion', '平淡')}\n"
-                f"- 当前精力余量: {int(energy)}/{int(max_e)} (若低于30表现得疲惫犯困；高于80充满活力)\n"
+                f"- 当前精力状态: {energy_desc} ({int(energy)}/{int(max_e)})\n"
             )
             if nickname:
                 prompt += f"- 对方称呼: {nickname}\n"
             prompt += "要求：拟人自然。\n-----------------------------------\n"
-        else:
-            mood = "略带慵懒" if energy < 30 else "比较有活力" if energy > 80 else "状态正常"
+        elif chat_mode == "mood_only":
+            prompt = (
+                f"[系统暗示：仅作为语气与情绪背景参考]\n"
+                f"- 当前精力状态: {energy_desc}\n"
+                f"- 情绪倾向: {current_slot.get('emotion', '平淡')}\n"
+            )
+            if nickname:
+                prompt += f"- 对方称呼: {nickname}\n"
+            prompt += "请以最自然的拟人方式闲聊。\n-----------------------------------\n"
+        else:  # low
             prompt = (
                 f"[系统暗示：仅作为语气与情绪背景参考，严禁主动提及你正在做什么或在哪里，除非用户明确询问。]\n"
                 f"- 当前所在城市: {location_city}\n"
-                f"- 当前城市时间: {location_time if location_time else '无法获取'}\n"
-                f"- 当前精力状态: {mood} ({int(energy)}/{int(max_e)})\n"
+                f"- 当前精力状态: {energy_desc} ({int(energy)}/{int(max_e)})\n"
                 f"- 情绪倾向: {current_slot.get('emotion', '平淡')}\n"
                 f"- 生理背景: {cycle}\n"
-                f"- 天气: {weather['env']}\n"
             )
+            if cfg.get("show_city_time_in_low_intrusion", True):
+                prompt += f"- 当前城市时间: {location_time if location_time else '无法获取'}\n"
+            prompt += f"- 天气: {weather['env']}\n"
             if nickname:
                 prompt += f"- 对方称呼: {nickname}\n"
             prompt += "请以最自然的拟人方式闲聊，不要刻板念出状态。\n-----------------------------------\n"
