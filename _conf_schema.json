@@ -34,8 +34,9 @@
     "schedule_provider_name": {
         "description": "【日程】指定生成日程的模型 Provider（下拉选择已配置的 Provider）",
         "type": "string",
-        "_special": "select_provider",
-        "default": ""
+        "_special": "select_provider"
+        "default": "",
+        
     },
     "schedule_prompt_extra": {
         "description": "【日程】大模型生成日程时的额外偏好指导语 (如: 喜欢户外运动/偏爱宅家)。",
@@ -51,7 +52,6 @@
     "character_personality": {
         "description": "【人格设定】选择角色人格，模型将按此生成符合人设的日程",
         "type": "string",
-        "_special": "select_persona",
         "default": ""
     },
     "admin_qq": {
@@ -90,6 +90,11 @@
         "type": "string",
         "default": "both",
         "options": ["both", "private", "group"]
+    },
+    "enable_chat_awareness": {
+        "description": "【聊天感知】开启后，AI能感知自己是在群聊还是私聊中与你对话",
+        "type": "bool",
+        "default": true
     },
     "show_city_time_in_low_intrusion": {
         "description": "【低侵入】低侵入模式下是否显示当前城市时间",
