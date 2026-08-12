@@ -1,5 +1,5 @@
 name: astrbot_plugin_humanoid_core
-display_name: 人形化伴侣核心插件
+display_name: 人形化伴侣插件
 short_desc: 日程/天气/生理/精力拟人化/环境感知/昵称/重置状态
 desc: |
   🧠 拟真生活引擎，让人工智能拥有"身体"和"生活感"。
