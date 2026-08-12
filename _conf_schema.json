@@ -34,9 +34,8 @@
     "schedule_provider_name": {
         "description": "【日程】指定生成日程的模型 Provider（下拉选择已配置的 Provider）",
         "type": "string",
-        "_special": "select_provider"
-        "default": "",
-        
+        "_special": "select_provider",
+        "default": ""
     },
     "schedule_prompt_extra": {
         "description": "【日程】大模型生成日程时的额外偏好指导语 (如: 喜欢户外运动/偏爱宅家)。",
