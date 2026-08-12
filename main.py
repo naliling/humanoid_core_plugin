@@ -588,7 +588,7 @@ class HumanoidCore(Star):
             return desc_simple
         return desc_full
 
-    # ======================== 精力相关辅助方法 ========================
+    # ======================== 精力相关辅助方法（已修改） ========================
     def get_energy_description(self, energy: float) -> str:
         """根据精力值返回拟人化语气描述"""
         if energy >= 90:
@@ -603,21 +603,15 @@ class HumanoidCore(Star):
             return "很疲惫，语气低落，只想安静待着"
 
     def apply_energy_inertia(self, energy: float, rate: float) -> float:
-        """应用精力惯性修正：低精力时恢复慢，高精力时消耗快"""
-        if energy < 30:
-            inertia = 0.7
-        elif energy > 80:
-            inertia = 1.3
-        else:
-            inertia = 1.0
-        return rate * inertia
+        """【修改】完全取消惯性，恢复与消耗按原始速率执行"""
+        return rate
 
     def apply_afternoon_slump(self, energy: float) -> float:
-        """午后节律：13:00~15:00 精力自然下降 5%"""
+        """【修改】削弱午后节律，从 -5% 改为 -2%"""
         now = datetime.now(SHA_TZ)
         hour = now.hour
         if 13 <= hour <= 15:
-            return energy * 0.95
+            return energy * 0.98   # 只降 2%
         return energy
 
     # ======================== 指令 ========================
@@ -648,11 +642,8 @@ class HumanoidCore(Star):
 
     @filter.command("时间")
     async def query_time(self, event: AstrMessageEvent):
+        """查询城市当前时间（所有用户可用）"""
         cfg = self.get_latest_config()
-        admin_list = [str(a).strip() for a in cfg.get("admin_qq", [])]
-        if str(event.get_sender_id()) not in admin_list:
-            yield event.plain_result("❌ 权限不足，仅管理员可查询时间。")
-            return
         raw = event.message_str.strip()
         match = re.search(r'时间\s+(.+)', raw)
         if match:
@@ -711,7 +702,7 @@ class HumanoidCore(Star):
             "/重置日程 - 强制重新生成日程（管理员）\n"
             "/重置状态 - 重置精力与生理周期（管理员）\n"
             "/你的状态 - 查看当前精力、生理、天气状态\n"
-            "/时间 城市 - 查看指定城市当前时间（仅管理员，不指定则使用配置默认）\n"
+            "/时间 城市 - 查看指定城市当前时间（所有用户可用）\n"
             "/叫我 昵称 - 设置你的昵称\n"
             "/查看所有昵称 - 查看所有用户昵称（管理员）\n"
             "/拟人帮助 - 显示本帮助"
@@ -828,11 +819,15 @@ class HumanoidCore(Star):
 
         schedule = await self.get_or_update_today_schedule(today_str, cfg)
 
-        # 处理每日随机波动（仅每天首次计算时应用）
+        # ====================== 【修改】每日随机波动 + 保底恢复 ======================
         noise_date = self.state.get("_energy_noise_date", "")
         if noise_date != today_str:
             noise = random.uniform(0.98, 1.02)
-            self.state["energy"] = self.state.get("energy", 80.0) * noise
+            new_energy = self.state.get("energy", 80.0) * noise
+            # 保底恢复：如果精力低于 30，强制恢复到 30
+            if new_energy < 30.0:
+                new_energy = 30.0
+            self.state["energy"] = new_energy
             self.state["_energy_noise_date"] = today_str
             self.save_state()
 
@@ -848,13 +843,13 @@ class HumanoidCore(Star):
         for _ in range(delta_m):
             sim += timedelta(minutes=1)
             rate = self.get_slot_by_time(sim.strftime("%H:%M"), schedule).get("energy_rate", 0.0)
-            # 应用精力惯性
+            # 应用精力惯性（已取消，直接使用原始速率）
             rate = self.apply_energy_inertia(energy, rate)
             energy += rate * decay_rate
         max_e = float(cfg.get("max_energy", 100.0))
         energy = max(0.0, min(max_e, energy))
 
-        # 应用午后节律
+        # 应用午后节律（已削弱至 -2%）
         energy = self.apply_afternoon_slump(energy)
 
         current_slot = self.get_slot_by_time(now_time, schedule)
