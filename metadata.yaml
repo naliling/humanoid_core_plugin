@@ -27,7 +27,7 @@ desc: |
   /拟人帮助 – 列出所有指令
 
   轻量、无额外依赖，开箱即用。
-version: 2.3.0
+version: 2.3.1
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"
