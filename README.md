@@ -1,4 +1,4 @@
-# Humanoid Core - 拟真生活状态引擎 (v2.4.3)
+# Humanoid Core - 拟真生活状态引擎 (v2.4.4)
 
 **一句话概括**：让人工智能拥有"身体"、"生活感"、"情绪"和"场景意识"的中轻量插件。
 
@@ -261,7 +261,8 @@ A：攻击性只影响语气倾向（如讽刺、冷淡、愤怒），但不会�
 
 ## 版本历史
 
-- **v2.4.3** (当前)：新增 `mood_affection_override`、`mood_affection_delta_cap`，降低 `mood_sensitivity` 至28，新增 `/批量好感度` 指令
+- **v2.4.4** (当前)：新增 `mood_affection_override`、`mood_affection_delta_cap`，降低 `mood_sensitivity` 至28，新增 `/批量好感度` 指令
+- **v2.4.3**：被自动更新做局了 插件配置没上传到
 - **v2.4.2**：修正配置默认值，`_apply_mood_decay` 加锁
 - **v2.4.1**：补全情绪指令
 - **v2.4.0**：新增情绪系统
