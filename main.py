@@ -4,6 +4,7 @@ import asyncio
 import random
 import re
 import hashlib
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -45,6 +46,91 @@ FALLBACK_TEMPLATES = [
         {"start": "21:00", "end": "24:00", "event": "洗漱、刷手机、入睡", "location": "卧室", "emotion": "慵懒", "energy_rate": -0.02}
     ]
 ]
+
+# ======================== 情绪映射表 ========================
+def _round_to_bucket(value: float) -> float:
+    buckets = [0.0, 12.5, 25.0, 37.5, 50.0]
+    for b in buckets:
+        if value <= b:
+            return b
+    return 50.0
+
+def _get_affection_rank(affection: float) -> int:
+    if affection < 12.5: return 0
+    elif affection < 37.5: return 25
+    elif affection < 62.5: return 50
+    elif affection < 87.5: return 75
+    else: return 100
+
+AFFECTION_MAP = {
+    0: {
+        (50.0, 0.0): "痴迷(病态)", (50.0, 12.5): "纠缠(偏执)", (50.0, 25.0): "憎恨(爱转恨)",
+        (50.0, 37.5): "毁灭性恨", (50.0, 50.0): "同归于尽",
+        (37.5, 0.0): "依赖(绝望)", (37.5, 12.5): "烦躁", (37.5, 25.0): "厌恶",
+        (37.5, 37.5): "仇恨", (37.5, 50.0): "残暴",
+        (25.0, 0.0): "冷淡", (25.0, 12.5): "无聊", (25.0, 25.0): "轻蔑",
+        (25.0, 37.5): "蔑视", (25.0, 50.0): "冷酷",
+        (12.5, 0.0): "回避", (12.5, 12.5): "疏离", (12.5, 25.0): "嫌弃",
+        (12.5, 37.5): "恶心", (12.5, 50.0): "憎恶",
+        (0.0, 0.0): "无视", (0.0, 12.5): "不存在", (0.0, 25.0): "否定",
+        (0.0, 37.5): "驱逐", (0.0, 50.0): "湮灭",
+    },
+    25: {
+        (50.0, 0.0): "执着", (50.0, 12.5): "猜疑", (50.0, 25.0): "嫉妒",
+        (50.0, 37.5): "报复欲", (50.0, 50.0): "毁灭欲",
+        (37.5, 0.0): "渴求(卑微)", (37.5, 12.5): "试探(不安)", (37.5, 25.0): "敌意",
+        (37.5, 37.5): "愤怒", (37.5, 50.0): "仇恨",
+        (25.0, 0.0): "普通", (25.0, 12.5): "不耐烦", (25.0, 25.0): "竞争",
+        (25.0, 37.5): "攻击性玩笑", (25.0, 50.0): "讽刺",
+        (12.5, 0.0): "礼貌", (12.5, 12.5): "无聊", (12.5, 25.0): "烦躁",
+        (12.5, 37.5): "厌恶", (12.5, 50.0): "憎恨",
+        (0.0, 0.0): "冷漠", (0.0, 12.5): "沉默", (0.0, 25.0): "回避",
+        (0.0, 37.5): "拒绝", (0.0, 50.0): "驱赶",
+    },
+    50: {
+        (50.0, 0.0): "迷恋", (50.0, 12.5): "占有", (50.0, 25.0): "嫉妒",
+        (50.0, 37.5): "施虐倾向", (50.0, 50.0): "毁灭性爱",
+        (37.5, 0.0): "依恋", (37.5, 12.5): "激情", (37.5, 25.0): "纠缠",
+        (37.5, 37.5): "报复", (37.5, 50.0): "仇恨",
+        (25.0, 0.0): "喜欢", (25.0, 12.5): "渴望", (25.0, 25.0): "竞争",
+        (25.0, 37.5): "愤怒", (25.0, 50.0): "残暴",
+        (12.5, 0.0): "好感", (12.5, 12.5): "无聊", (12.5, 25.0): "烦躁",
+        (12.5, 37.5): "厌恶", (12.5, 50.0): "憎恨",
+        (0.0, 0.0): "冷漠", (0.0, 12.5): "疏离", (0.0, 25.0): "轻蔑",
+        (0.0, 37.5): "蔑视", (0.0, 50.0): "冷酷",
+    },
+    75: {
+        (50.0, 0.0): "痴迷", (50.0, 12.5): "占有欲", (50.0, 25.0): "吃醋",
+        (50.0, 37.5): "霸道", (50.0, 50.0): "毁灭占有",
+        (37.5, 0.0): "依恋甜", (37.5, 12.5): "热情", (37.5, 25.0): "撒娇纠缠",
+        (37.5, 37.5): "管教欲", (37.5, 50.0): "因爱生恨",
+        (25.0, 0.0): "欣赏", (25.0, 12.5): "心动", (25.0, 25.0): "争宠",
+        (25.0, 37.5): "着急", (25.0, 50.0): "暴躁后悔",
+        (12.5, 0.0): "友善", (12.5, 12.5): "小无聊", (12.5, 25.0): "小烦躁",
+        (12.5, 37.5): "恼火", (12.5, 50.0): "气话哄好",
+        (0.0, 0.0): "平淡", (0.0, 12.5): "安静", (0.0, 25.0): "冷一下",
+        (0.0, 37.5): "生闷气", (0.0, 50.0): "冷战",
+    },
+    100: {
+        (50.0, 0.0): "崇拜", (50.0, 12.5): "完全占有", (50.0, 25.0): "吃醋失控",
+        (50.0, 37.5): "施虐play", (50.0, 50.0): "共依存",
+        (37.5, 0.0): "离不开", (37.5, 12.5): "热情似火", (37.5, 25.0): "黏人烦",
+        (37.5, 37.5): "调教欲", (37.5, 50.0): "相爱相杀",
+        (25.0, 0.0): "溺爱", (25.0, 12.5): "渴望融合", (25.0, 25.0): "撒娇争夺",
+        (25.0, 37.5): "炸毛", (25.0, 50.0): "虐恋",
+        (12.5, 0.0): "安心", (12.5, 12.5): "小撒娇", (12.5, 25.0): "小赌气",
+        (12.5, 37.5): "假生气", (12.5, 50.0): "闹别扭",
+        (0.0, 0.0): "平静幸福", (0.0, 12.5): "沉默有爱", (0.0, 25.0): "闷气心软",
+        (0.0, 37.5): "委屈", (0.0, 50.0): "冷战等你哄",
+    },
+}
+
+def get_mood_label(affection: float, libido: float, aggression: float) -> str:
+    rank = _get_affection_rank(affection)
+    lib_bucket = _round_to_bucket(libido)
+    agg_bucket = _round_to_bucket(aggression)
+    table = AFFECTION_MAP.get(rank, {})
+    return table.get((lib_bucket, agg_bucket), "普通")
 
 # ======================== 工具函数 ========================
 def get_fallback_schedule(today_str: str) -> list:
@@ -88,9 +174,8 @@ def extract_json_from_response(raw_res: str) -> list:
             pass
     return []
 
-# ======================== 城市 ⇄ 时区映射表（完整版，覆盖中日俄主要城市） ========================
+# ======================== 城市 ⇄ 时区映射表 ========================
 CITY_TO_TIMEZONE = {
-    # ---- 中国（直辖市 + 所有省会/首府 + 主要地级市） ----
     "北京": "Asia/Shanghai", "上海": "Asia/Shanghai", "天津": "Asia/Shanghai", "重庆": "Asia/Shanghai",
     "石家庄": "Asia/Shanghai", "唐山": "Asia/Shanghai", "秦皇岛": "Asia/Shanghai", "邯郸": "Asia/Shanghai",
     "邢台": "Asia/Shanghai", "保定": "Asia/Shanghai", "张家口": "Asia/Shanghai", "承德": "Asia/Shanghai",
@@ -178,8 +263,6 @@ CITY_TO_TIMEZONE = {
     "香港": "Asia/Hong_Kong", "澳门": "Asia/Macau",
     "台北": "Asia/Taipei", "高雄": "Asia/Taipei", "台中": "Asia/Taipei", "台南": "Asia/Taipei",
     "基隆": "Asia/Taipei", "新竹": "Asia/Taipei", "嘉义": "Asia/Taipei",
-
-    # ---- 俄罗斯（主要城市/联邦主体行政中心） ----
     "加里宁格勒": "Europe/Kaliningrad", "泽列诺格拉茨克": "Europe/Kaliningrad",
     "圣彼得堡": "Europe/Moscow", "莫斯科": "Europe/Moscow", "莫斯科州": "Europe/Moscow",
     "阿尔汉格尔斯克": "Europe/Moscow", "摩尔曼斯克": "Europe/Moscow", "彼得罗扎沃茨克": "Europe/Moscow",
@@ -210,8 +293,6 @@ CITY_TO_TIMEZONE = {
     "布拉戈维申斯克": "Asia/Yakutsk", "彼得罗巴甫洛夫斯克": "Asia/Kamchatka",
     "马加丹": "Asia/Magadan", "南萨哈林斯克": "Asia/Sakhalin", "雅库茨克": "Asia/Yakutsk",
     "阿纳德尔": "Asia/Anadyr", "索契": "Europe/Moscow",
-
-    # ---- 日本（主要城市） ----
     "东京": "Asia/Tokyo", "大阪": "Asia/Tokyo", "名古屋": "Asia/Tokyo", "札幌": "Asia/Tokyo",
     "福冈": "Asia/Tokyo", "京都": "Asia/Tokyo", "神户": "Asia/Tokyo", "横滨": "Asia/Tokyo",
     "千叶": "Asia/Tokyo", "埼玉": "Asia/Tokyo", "广岛": "Asia/Tokyo", "仙台": "Asia/Tokyo",
@@ -241,11 +322,11 @@ def get_time_in_city(city: str):
 class HumanoidCore(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
-        self.config = config          # 修复1：保存传入的配置
+        self.config = config
         self._config_cache = None
         self._config_version = 0
         self.reload_config(config)
-        
+
         data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "humanoid_core"
         data_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = str(data_dir / "state.json")
@@ -287,9 +368,16 @@ class HumanoidCore(Star):
             "environment_mode": "both",
             "show_city_time_in_low_intrusion": True,
             "timezone_city": "广州",
-            "enable_chat_awareness": True
+            "enable_chat_awareness": True,
+            "mood_enabled": True,
+            "mood_sensitivity": 28,
+            "mood_decay_hours": 2.0,
+            "mood_initial_affection": 46,
+            "mood_initial_libido": 24,
+            "mood_initial_aggression": 28,
+            "mood_affection_override": [],
+            "mood_affection_delta_cap": 3
         }
-        # 应用本地配置（修复：只使用 self.config，不额外从 context 获取）
         if isinstance(self.config, dict):
             defaults.update(self.config)
         defaults.update(overrides)
@@ -324,7 +412,9 @@ class HumanoidCore(Star):
             "_last_weather_fetch": "",
             "_cached_location": "",
             "nicknames": {},
-            "_energy_noise_date": ""
+            "_energy_noise_date": "",
+            "moods": {},
+            "_mood_decay_last_run": 0.0
         }
         self.save_state_unsafe()
 
@@ -336,7 +426,6 @@ class HumanoidCore(Star):
         async with self.lock:
             self.save_state_unsafe()
 
-    # ========== 时区核心方法 ==========
     def _get_plugin_tz(self, cfg: dict = None):
         if cfg is None:
             cfg = self.get_latest_config()
@@ -349,7 +438,6 @@ class HumanoidCore(Star):
     def _get_plugin_now(self, cfg: dict = None):
         return datetime.now(self._get_plugin_tz(cfg))
 
-    # ========== 精力计算（分段聚合） ==========
     def _compute_energy_delta(self, start_time: datetime, end_time: datetime, schedule: list, decay_rate: float) -> float:
         if start_time >= end_time:
             return 0.0
@@ -392,19 +480,17 @@ class HumanoidCore(Star):
             delta += rate * decay_rate * minutes
         return delta
 
-    # ========== 状态更新（异步，加锁保护） ==========
     async def _get_current_context(self, update_energy=True):
         cfg = self.get_latest_config()
         now = self._get_plugin_now(cfg)
         today_str = now.strftime("%Y-%m-%d")
         now_time = now.strftime("%H:%M")
-        
+
         schedule = await self.get_or_update_today_schedule(today_str, cfg)
         weather = await self.fetch_real_weather(today_str, cfg)
         cycle = await self.get_cycle_status(today_str, cfg)
-        
+
         if update_energy:
-            # 每日随机噪声（加锁）
             async with self.lock:
                 noise_date = self.state.get("_energy_noise_date", "")
                 if noise_date != today_str:
@@ -414,16 +500,14 @@ class HumanoidCore(Star):
                         new_energy = 30.0
                     self.state["energy"] = new_energy
                     self.state["_energy_noise_date"] = today_str
-                    # 先不保存，后面统一存
-            
-            # 计算时间差
+
             last_time_str = self.state.get("last_update", now.strftime("%Y-%m-%d %H:%M:%S"))
             try:
                 last_time = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
                 last_time = last_time.replace(tzinfo=now.tzinfo)
             except:
                 last_time = now
-            
+
             if last_time < now:
                 decay_rate = self._safe_float(cfg.get("energy_decay_rate", "1.0"), 1.0)
                 delta = self._compute_energy_delta(last_time, now, schedule, decay_rate)
@@ -434,12 +518,11 @@ class HumanoidCore(Star):
                     energy *= 0.98
                 if energy < 30.0:
                     energy = 30.0
-                # 加锁更新 state
                 async with self.lock:
                     self.state["energy"] = round(energy, 1)
                     self.state["last_update"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                    self.save_state_unsafe()   # 已持有锁，直接保存
-        
+                    self.save_state_unsafe()
+
         energy = self.state.get("energy", 80.0)
         max_e = float(cfg.get("max_energy", 100.0))
         current_slot = self.get_slot_by_time(now_time, schedule)
@@ -447,7 +530,7 @@ class HumanoidCore(Star):
         location_time, weekday_ignore = get_time_in_city(location_city)
         weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
         weekday = weekday_names[now.weekday()]
-        
+
         return {
             "energy": energy,
             "max_e": max_e,
@@ -468,7 +551,6 @@ class HumanoidCore(Star):
         except:
             return default
 
-    # ========== 天气获取 ==========
     async def fetch_real_weather(self, today_str, cfg):
         if not cfg.get("weather_enabled", True):
             return {"weather": "晴朗 ☀️", "env": "天气未开启"}
@@ -507,7 +589,6 @@ class HumanoidCore(Star):
                 logger.warning(f"[humanoid_core] 天气请求失败: {e}")
         return self.state.get("_cached_weather_obj") or {"weather": "晴朗 ☀️", "env": "天气获取失败"}
 
-    # ========== 其他辅助方法 ==========
     def get_target_provider(self, cfg: dict):
         target = str(cfg.get("schedule_provider_name", "")).strip()
         provider = None
@@ -703,7 +784,7 @@ class HumanoidCore(Star):
         chat_mode = cfg.get("inject_activity_context", "low")
         energy_desc = self.get_energy_description(ctx["energy"])
         max_e = ctx["max_e"]
-        
+
         if chat_mode == "full":
             prompt = (
                 f"[系统暗示：以下内容作为状态参考，严禁念出数值或暴露面板]\n"
@@ -724,7 +805,7 @@ class HumanoidCore(Star):
                 f"- 当前精力状态: {energy_desc}\n"
                 f"- 情绪倾向: {ctx['current_slot'].get('emotion', '平淡')}\n"
             )
-        else:  # low
+        else:
             prompt = (
                 f"[系统暗示：仅作为语气与情绪背景参考，严禁主动提及你正在做什么或在哪里，除非用户明确询问。]\n"
                 f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
@@ -736,9 +817,174 @@ class HumanoidCore(Star):
             if cfg.get("show_city_time_in_low_intrusion", True):
                 prompt += f"- 当前城市时间: {ctx['location_time'] if ctx['location_time'] else '无法获取'}\n"
             prompt += f"- 天气: {ctx['weather']['env']}\n"
-        
+
         prompt += "\n请以最自然的拟人方式闲聊，不要刻板念出状态。\n-----------------------------------\n"
         return prompt
+
+    # ======================== 情绪方法 ========================
+    def _get_user_mood(self, qq: str) -> dict:
+        if "moods" not in self.state:
+            self.state["moods"] = {}
+        if qq not in self.state["moods"]:
+            cfg = self.get_latest_config()
+            # 检查覆盖配置
+            override_list = cfg.get("mood_affection_override", [])
+            override_val = None
+            for item in override_list:
+                if isinstance(item, str) and ":" in item:
+                    qq_part, val_part = item.split(":", 1)
+                    if qq_part.strip() == qq:
+                        try:
+                            override_val = float(val_part.strip())
+                        except:
+                            pass
+                        break
+            affection = float(cfg.get("mood_initial_affection", 46))
+            if override_val is not None:
+                affection = min(100.0, max(0.0, override_val))
+            self.state["moods"][qq] = {
+                "affection": affection,
+                "libido": float(cfg.get("mood_initial_libido", 24)),
+                "aggression": float(cfg.get("mood_initial_aggression", 28)),
+                "base_affection": affection,
+                "base_libido": float(cfg.get("mood_initial_libido", 24)),
+                "base_aggression": float(cfg.get("mood_initial_aggression", 28)),
+                "last_interaction": 0.0,
+                "turn_count": 0
+            }
+            self.save_state_unsafe()
+        return self.state["moods"][qq]
+
+    def _save_user_mood(self, qq: str, data: dict):
+        if "moods" not in self.state:
+            self.state["moods"] = {}
+        self.state["moods"][qq] = data
+        self.save_state_unsafe()
+
+    async def _apply_mood_decay(self, cfg: dict):
+        async with self.lock:
+            now = time.time()
+            last_run = self.state.get("_mood_decay_last_run", now)
+            elapsed_hours = (now - last_run) / 3600.0
+            if elapsed_hours < 0.1:
+                return
+            duration = float(cfg.get("mood_decay_hours", 2.0))
+            if duration <= 0:
+                duration = 0.5
+
+            moods = self.state.get("moods", {})
+            updated = False
+            for qq, data in moods.items():
+                for key, base_key in [("affection", "base_affection"), ("libido", "base_libido"), ("aggression", "base_aggression")]:
+                    base = data.get(base_key, 25)
+                    current = data.get(key, 25)
+                    deviation = current - base
+                    if abs(deviation) < 0.001:
+                        continue
+                    if elapsed_hours >= duration:
+                        delta = -deviation
+                    else:
+                        ratio = elapsed_hours / duration
+                        delta = -deviation * (ratio ** 2)
+                    new_val = current + delta
+                    if key == "affection":
+                        new_val = max(0.0, min(100.0, new_val))
+                    else:
+                        new_val = max(0.0, min(50.0, new_val))
+                    if abs(new_val - current) > 0.0001:
+                        data[key] = new_val
+                        updated = True
+            if updated:
+                self.state["moods"] = moods
+            self.state["_mood_decay_last_run"] = now
+            if updated:
+                self.save_state_unsafe()
+
+    async def _update_mood_by_message(self, event: AstrMessageEvent, qq: str, cfg: dict):
+        user_msg = event.message_str.strip() if hasattr(event, "message_str") else ""
+        if not user_msg:
+            return
+        mood_data = self._get_user_mood(qq)
+        now = time.time()
+        if mood_data.get("last_interaction", 0) == 0:
+            mood_data["last_interaction"] = now
+            mood_data["turn_count"] = 1
+            self._save_user_mood(qq, mood_data)
+            return
+
+        prompt = (
+            f"用户说：{user_msg}\n"
+            f"当前情绪状态：好感度 {mood_data['affection']:.1f}/100，亲近欲 {mood_data['libido']:.1f}/50，攻击性 {mood_data['aggression']:.1f}/50\n"
+            "请分析这句话会让AI对用户的情绪产生什么变化。只返回JSON：{\"affection_delta\": 数值(-5~5), \"libido_delta\": 数值(-5~5), \"aggression_delta\": 数值(-5~5)}"
+        )
+
+        try:
+            provider = self.get_target_provider(cfg)
+            if not provider:
+                return
+            response = await asyncio.wait_for(provider.text_chat(prompt=prompt), timeout=10.0)
+            raw = response.completion_text if hasattr(response, "completion_text") else str(response)
+            match = re.search(r'\{[^{}]*\}', raw)
+            if not match:
+                return
+            delta = json.loads(match.group())
+            sensitivity = cfg.get("mood_sensitivity", 28) / 100.0
+            delta_cap = cfg.get("mood_affection_delta_cap", 3)
+
+            aff_delta = delta.get("affection_delta", 0) * sensitivity
+            lib_delta = delta.get("libido_delta", 0) * sensitivity
+            agg_delta = delta.get("aggression_delta", 0) * sensitivity
+
+            # 限制单次变化幅度
+            aff_delta = max(-delta_cap, min(delta_cap, aff_delta))
+            lib_delta = max(-delta_cap, min(delta_cap, lib_delta))
+            agg_delta = max(-delta_cap, min(delta_cap, agg_delta))
+
+            energy = self.state.get("energy", 80)
+            if energy > 70:
+                if aff_delta > 0: aff_delta *= 1.3
+                else: aff_delta *= 0.7
+                if lib_delta > 0: lib_delta *= 1.3
+                else: lib_delta *= 0.7
+                if agg_delta > 0: agg_delta *= 1.3
+                else: agg_delta *= 0.7
+            elif energy < 40:
+                aff_delta *= 0.5
+                lib_delta *= 0.5
+                agg_delta *= 0.5
+
+            cycle_day = self.state.get("current_cycle_day", 1)
+            if 1 <= cycle_day <= 5:
+                if aff_delta > 0: aff_delta *= 0.5
+                else: aff_delta *= 1.5
+                if lib_delta > 0: lib_delta *= 0.5
+                else: lib_delta *= 1.5
+                if agg_delta > 0: agg_delta *= 0.8
+                else: agg_delta *= 1.5
+            elif 14 <= cycle_day <= 16:
+                if aff_delta > 0: aff_delta *= 1.4
+                else: aff_delta *= 0.6
+                if lib_delta > 0: lib_delta *= 1.4
+                else: lib_delta *= 0.6
+                if agg_delta > 0: agg_delta *= 1.2
+                else: agg_delta *= 0.8
+
+            mood_data["affection"] = max(0.0, min(100.0, mood_data["affection"] + aff_delta))
+            mood_data["libido"] = max(0.0, min(50.0, mood_data["libido"] + lib_delta))
+            mood_data["aggression"] = max(0.0, min(50.0, mood_data["aggression"] + agg_delta))
+
+            turn = mood_data.get("turn_count", 1)
+            base_coef = 1.0 if turn <= 10 else 0.2
+            mood_data["base_affection"] = max(0.0, min(100.0, mood_data["base_affection"] + aff_delta * base_coef * 0.5))
+            mood_data["base_libido"] = max(0.0, min(50.0, mood_data["base_libido"] + lib_delta * base_coef * 0.5))
+            mood_data["base_aggression"] = max(0.0, min(50.0, mood_data["base_aggression"] + agg_delta * base_coef * 0.5))
+
+            mood_data["turn_count"] = turn + 1
+            mood_data["last_interaction"] = now
+            self._save_user_mood(qq, mood_data)
+
+        except Exception as e:
+            logger.warning(f"[humanoid_core] 情绪更新失败: {e}")
 
     # ======================== 指令 ========================
     @filter.command("你的状态")
@@ -756,7 +1002,141 @@ class HumanoidCore(Star):
             f"- 今日日程: {schedule_summary}",
             f"- 今日是：{ctx['today_str']} 星期{ctx['weekday']}"
         ]
+        if cfg.get("mood_enabled", True):
+            qq = str(event.get_sender_id())
+            await self._apply_mood_decay(cfg)
+            mood = self._get_user_mood(qq)
+            label = get_mood_label(mood["affection"], mood["libido"], mood["aggression"])
+            lines.append(f"- 情绪: {label} (好感度 {mood['affection']:.1f})")
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("好感度")
+    async def cmd_mood_status(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        if not cfg.get("mood_enabled", True):
+            yield event.plain_result("情绪系统未开启。")
+            return
+        qq = str(event.get_sender_id())
+        await self._apply_mood_decay(cfg)
+        data = self._get_user_mood(qq)
+        label = get_mood_label(data["affection"], data["libido"], data["aggression"])
+        msg = (
+            f"〖情绪档案〗\n"
+            f"好感度：{data['affection']:.1f}/100\n"
+            f"亲近欲：{data['libido']:.1f}/50（基线 {data['base_libido']:.1f}）\n"
+            f"攻击性：{data['aggression']:.1f}/50（基线 {data['base_aggression']:.1f}）\n"
+            f"当前标签：{label}"
+        )
+        yield event.plain_result(msg)
+
+    @filter.command("情绪详情")
+    async def cmd_mood_detail(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        if not cfg.get("mood_enabled", True):
+            yield event.plain_result("情绪系统未开启。")
+            return
+        qq = str(event.get_sender_id())
+        await self._apply_mood_decay(cfg)
+        data = self._get_user_mood(qq)
+        label = get_mood_label(data["affection"], data["libido"], data["aggression"])
+        msg = (
+            f"〖情绪详细档案〗\n"
+            f"好感度：{data['affection']:.1f}/100（基线 {data['base_affection']:.1f}）\n"
+            f"亲近欲：{data['libido']:.1f}/50（基线 {data['base_libido']:.1f}）\n"
+            f"攻击性：{data['aggression']:.1f}/50（基线 {data['base_aggression']:.1f}）\n"
+            f"当前标签：{label}\n"
+            f"交互轮次：{data.get('turn_count', 0)}"
+        )
+        yield event.plain_result(msg)
+
+    @filter.command("重置情绪")
+    async def cmd_reset_mood(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        admin_list = [str(a).strip() for a in cfg.get("admin_qq", [])]
+        if str(event.get_sender_id()) not in admin_list:
+            yield event.plain_result("❌ 权限不足，仅管理员可重置情绪。")
+            return
+        qq = str(event.get_sender_id())
+        mood_data = self._get_user_mood(qq)
+        mood_data["affection"] = float(cfg.get("mood_initial_affection", 46))
+        mood_data["libido"] = float(cfg.get("mood_initial_libido", 24))
+        mood_data["aggression"] = float(cfg.get("mood_initial_aggression", 28))
+        mood_data["base_affection"] = float(cfg.get("mood_initial_affection", 46))
+        mood_data["base_libido"] = float(cfg.get("mood_initial_libido", 24))
+        mood_data["base_aggression"] = float(cfg.get("mood_initial_aggression", 28))
+        mood_data["turn_count"] = 0
+        mood_data["last_interaction"] = 0
+        self._save_user_mood(qq, mood_data)
+        yield event.plain_result("✅ 已重置情绪至初始值。")
+
+    @filter.command("设置好感度")
+    async def cmd_set_affection(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        admin_list = [str(a).strip() for a in cfg.get("admin_qq", [])]
+        if str(event.get_sender_id()) not in admin_list:
+            yield event.plain_result("❌ 权限不足。")
+            return
+        raw = event.message_str.strip()
+        match = re.search(r'设置好感度\s+(\d+(?:\.\d+)?)', raw)
+        if not match:
+            yield event.plain_result("用法：/设置好感度 数值 (0-100)")
+            return
+        val = float(match.group(1))
+        if val < 0 or val > 100:
+            yield event.plain_result("数值必须在 0-100 之间。")
+            return
+        qq = str(event.get_sender_id())
+        mood_data = self._get_user_mood(qq)
+        mood_data["affection"] = val
+        mood_data["base_affection"] = val
+        self._save_user_mood(qq, mood_data)
+        yield event.plain_result(f"✅ 好感度已设为 {val}")
+
+    @filter.command("批量好感度")
+    async def cmd_batch_affection(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        admin_list = [str(a).strip() for a in cfg.get("admin_qq", [])]
+        if str(event.get_sender_id()) not in admin_list:
+            yield event.plain_result("❌ 权限不足，仅管理员可批量导入好感度。")
+            return
+        raw = event.message_str.strip()
+        data = raw.replace("批量好感度", "").strip()
+        if not data:
+            yield event.plain_result("用法：/批量好感度 QQ号:数值, QQ号:数值 或 JSON 数组")
+            return
+        parsed = []
+        # 尝试 JSON
+        try:
+            arr = json.loads(data)
+            if isinstance(arr, list):
+                for item in arr:
+                    if isinstance(item, dict) and "qq" in item and "value" in item:
+                        parsed.append((str(item["qq"]), float(item["value"])))
+        except:
+            pass
+        # 尝试 QQ:数值 格式
+        if not parsed:
+            for part in re.split(r'[,，\s]+', data):
+                if ":" in part:
+                    parts = part.split(":", 1)
+                    if len(parts) == 2:
+                        try:
+                            parsed.append((parts[0].strip(), float(parts[1].strip())))
+                        except:
+                            pass
+        if not parsed:
+            yield event.plain_result("格式错误，请使用：/批量好感度 QQ号:数值, QQ号:数值")
+            return
+        success = 0
+        for qq, val in parsed:
+            if val < 0 or val > 100:
+                continue
+            mood_data = self._get_user_mood(qq)
+            mood_data["affection"] = val
+            mood_data["base_affection"] = val
+            self._save_user_mood(qq, mood_data)
+            success += 1
+        yield event.plain_result(f"✅ 已批量设置 {success} 个用户的好感度。")
 
     @filter.command("时间")
     async def query_time(self, event: AstrMessageEvent):
@@ -820,10 +1200,15 @@ class HumanoidCore(Star):
             "/查看日程 - 查看今日完整日程\n"
             "/重置日程 - 强制重新生成日程（管理员）\n"
             "/重置状态 - 重置精力与生理周期（管理员）\n"
-            "/你的状态 - 查看当前精力、生理、天气状态\n"
+            "/你的状态 - 查看当前精力、生理、天气、情绪状态\n"
             "/时间 城市 - 查看指定城市当前时间（所有用户可用）\n"
             "/叫我 昵称 - 设置你的昵称\n"
             "/查看所有昵称 - 查看所有用户昵称（管理员）\n"
+            "/好感度 - 查看情绪档案（好感度/亲近欲/攻击性）\n"
+            "/情绪详情 - 查看详细情绪档案（含基线、轮次）\n"
+            "/重置情绪 - 重置情绪至初始值（管理员）\n"
+            "/设置好感度 数值 - 手动设置好感度（管理员）\n"
+            "/批量好感度 QQ:数值,QQ:数值 - 批量导入好感度（管理员）\n"
             "/拟人帮助 - 显示本帮助"
         )
         yield event.plain_result(help_text)
@@ -879,7 +1264,7 @@ class HumanoidCore(Star):
         cfg = self.get_latest_config()
         ctx = await self._get_current_context(update_energy=False)
         context_prompt = self._build_context_prompt(ctx, cfg)
-        
+
         enable_chat_awareness = cfg.get("enable_chat_awareness", True)
         if enable_chat_awareness:
             group_id = getattr(event, 'group_id', None)
@@ -890,12 +1275,12 @@ class HumanoidCore(Star):
             else:
                 chat_env_note = "【环境感知】当前你在私聊中与用户一对一对话，回复时语气可以更亲密、自然一些。\n"
             context_prompt = chat_env_note + context_prompt
-        
+
         if req.system_prompt:
             req.system_prompt += "\n" + context_prompt
         else:
             req.system_prompt = context_prompt
-        
+
         qq = str(event.get_sender_id())
         async with self.lock:
             nicknames = self.state.get("nicknames", {})
@@ -907,6 +1292,20 @@ class HumanoidCore(Star):
                 f"这是最高优先级指令。"
             )
             req.system_prompt += "\n" + system_instruction
+
+        if cfg.get("mood_enabled", True):
+            await self._apply_mood_decay(cfg)
+            mood_data = self._get_user_mood(qq)
+            label = get_mood_label(mood_data["affection"], mood_data["libido"], mood_data["aggression"])
+            mood_prompt = (
+                f"〖当前情绪数值〗\n"
+                f"亲近欲：{mood_data['libido']:.1f}/50（亲近/给予温暖的欲望）\n"
+                f"攻击性：{mood_data['aggression']:.1f}/50（推开/伤害的冲动）\n"
+                f"好感度：{mood_data['affection']:.1f}/100\n"
+                f"参考标签：对用户「{label}」\n"
+                "（请根据上述数值和你在人设中定义的「情绪驱动规则」来演绎角色，不要提及数值。）"
+            )
+            req.system_prompt += "\n\n" + mood_prompt
 
     # ======================== 消息监听 ========================
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -932,13 +1331,16 @@ class HumanoidCore(Star):
                     return
         except:
             pass
-        
+
         if not hasattr(event, "message_str") or not event.message_str:
             return
         raw = event.message_str.strip()
-        # 过滤命令前缀（包括 /），避免命令被消息监听重复处理
         if raw.startswith(("/", "!", ".", "！", "#")) or not raw:
             return
 
-        # 仅更新状态
         await self._get_current_context(update_energy=True)
+
+        if cfg.get("mood_enabled", True):
+            qq = str(event.get_sender_id())
+            await self._apply_mood_decay(cfg)
+            await self._update_mood_by_message(event, qq, cfg)
