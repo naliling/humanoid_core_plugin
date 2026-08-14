@@ -63,65 +63,40 @@ def _get_affection_rank(affection: float) -> int:
     else: return 100
 
 AFFECTION_MAP = {
-    0: {
-        (50.0, 0.0): "痴迷(病态)", (50.0, 12.5): "纠缠(偏执)", (50.0, 25.0): "憎恨(爱转恨)",
-        (50.0, 37.5): "毁灭性恨", (50.0, 50.0): "同归于尽",
-        (37.5, 0.0): "依赖(绝望)", (37.5, 12.5): "烦躁", (37.5, 25.0): "厌恶",
-        (37.5, 37.5): "仇恨", (37.5, 50.0): "残暴",
-        (25.0, 0.0): "冷淡", (25.0, 12.5): "无聊", (25.0, 25.0): "轻蔑",
-        (25.0, 37.5): "蔑视", (25.0, 50.0): "冷酷",
-        (12.5, 0.0): "回避", (12.5, 12.5): "疏离", (12.5, 25.0): "嫌弃",
-        (12.5, 37.5): "恶心", (12.5, 50.0): "憎恶",
-        (0.0, 0.0): "无视", (0.0, 12.5): "不存在", (0.0, 25.0): "否定",
-        (0.0, 37.5): "驱逐", (0.0, 50.0): "湮灭",
+    0: {  # 好感度 0~12.5
+        (50.0, 0.0): "漠然", (50.0, 12.5): "疏远", (50.0, 25.0): "防范", (50.0, 37.5): "戒备", (50.0, 50.0): "敌视",
+        (37.5, 0.0): "冷淡", (37.5, 12.5): "避让", (37.5, 25.0): "嫌弃", (37.5, 37.5): "恼火", (37.5, 50.0): "厌恶",
+        (25.0, 0.0): "客气", (25.0, 12.5): "距离", (25.0, 25.0): "隔阂", (25.0, 37.5): "抵触", (25.0, 50.0): "反感",
+        (12.5, 0.0): "礼貌", (12.5, 12.5): "陌生", (12.5, 25.0): "谨慎", (12.5, 37.5): "不安", (12.5, 50.0): "警惕",
+        (0.0, 0.0): "无视", (0.0, 12.5): "透明", (0.0, 25.0): "无视", (0.0, 37.5): "排斥", (0.0, 50.0): "驱逐",
     },
-    25: {
-        (50.0, 0.0): "执着", (50.0, 12.5): "猜疑", (50.0, 25.0): "嫉妒",
-        (50.0, 37.5): "报复欲", (50.0, 50.0): "毁灭欲",
-        (37.5, 0.0): "渴求(卑微)", (37.5, 12.5): "试探(不安)", (37.5, 25.0): "敌意",
-        (37.5, 37.5): "愤怒", (37.5, 50.0): "仇恨",
-        (25.0, 0.0): "普通", (25.0, 12.5): "不耐烦", (25.0, 25.0): "竞争",
-        (25.0, 37.5): "攻击性玩笑", (25.0, 50.0): "讽刺",
-        (12.5, 0.0): "礼貌", (12.5, 12.5): "无聊", (12.5, 25.0): "烦躁",
-        (12.5, 37.5): "厌恶", (12.5, 50.0): "憎恨",
-        (0.0, 0.0): "冷漠", (0.0, 12.5): "沉默", (0.0, 25.0): "回避",
-        (0.0, 37.5): "拒绝", (0.0, 50.0): "驱赶",
+    25: {  # 好感度 12.5~37.5
+        (50.0, 0.0): "留意", (50.0, 12.5): "好奇", (50.0, 25.0): "琢磨", (50.0, 37.5): "在意", (50.0, 50.0): "纠结",
+        (37.5, 0.0): "平淡", (37.5, 12.5): "观察", (37.5, 25.0): "试探", (37.5, 37.5): "较劲", (37.5, 50.0): "不服",
+        (25.0, 0.0): "普通", (25.0, 12.5): "随意", (25.0, 25.0): "平常", (25.0, 37.5): "别扭", (25.0, 50.0): "嘴硬",
+        (12.5, 0.0): "温和", (12.5, 12.5): "淡然", (12.5, 25.0): "淡然", (12.5, 37.5): "淡漠", (12.5, 50.0): "冷漠",
+        (0.0, 0.0): "漠视", (0.0, 12.5): "无视", (0.0, 25.0): "回避", (0.0, 37.5): "回避", (0.0, 50.0): "抗拒",
     },
-    50: {
-        (50.0, 0.0): "迷恋", (50.0, 12.5): "占有", (50.0, 25.0): "嫉妒",
-        (50.0, 37.5): "施虐倾向", (50.0, 50.0): "毁灭性爱",
-        (37.5, 0.0): "依恋", (37.5, 12.5): "激情", (37.5, 25.0): "纠缠",
-        (37.5, 37.5): "报复", (37.5, 50.0): "仇恨",
-        (25.0, 0.0): "喜欢", (25.0, 12.5): "渴望", (25.0, 25.0): "竞争",
-        (25.0, 37.5): "愤怒", (25.0, 50.0): "残暴",
-        (12.5, 0.0): "好感", (12.5, 12.5): "无聊", (12.5, 25.0): "烦躁",
-        (12.5, 37.5): "厌恶", (12.5, 50.0): "憎恨",
-        (0.0, 0.0): "冷漠", (0.0, 12.5): "疏离", (0.0, 25.0): "轻蔑",
-        (0.0, 37.5): "蔑视", (0.0, 50.0): "冷酷",
+    50: {  # 好感度 37.5~62.5
+        (50.0, 0.0): "友好", (50.0, 12.5): "亲近", (50.0, 25.0): "在意", (50.0, 37.5): "吃醋", (50.0, 50.0): "闹腾",
+        (37.5, 0.0): "好感", (37.5, 12.5): "喜欢", (37.5, 25.0): "欣赏", (37.5, 37.5): "调皮", (37.5, 50.0): "炸毛",
+        (25.0, 0.0): "舒适", (25.0, 12.5): "放松", (25.0, 25.0): "自然", (25.0, 37.5): "较真", (25.0, 50.0): "倔强",
+        (12.5, 0.0): "友善", (12.5, 12.5): "温和", (12.5, 25.0): "随性", (12.5, 37.5): "任性", (12.5, 50.0): "不讲理",
+        (0.0, 0.0): "中立", (0.0, 12.5): "平静", (0.0, 25.0): "游离", (0.0, 37.5): "冷落", (0.0, 50.0): "疏离",
     },
-    75: {
-        (50.0, 0.0): "痴迷", (50.0, 12.5): "占有欲", (50.0, 25.0): "吃醋",
-        (50.0, 37.5): "霸道", (50.0, 50.0): "毁灭占有",
-        (37.5, 0.0): "依恋甜", (37.5, 12.5): "热情", (37.5, 25.0): "撒娇纠缠",
-        (37.5, 37.5): "管教欲", (37.5, 50.0): "因爱生恨",
-        (25.0, 0.0): "欣赏", (25.0, 12.5): "心动", (25.0, 25.0): "争宠",
-        (25.0, 37.5): "着急", (25.0, 50.0): "暴躁后悔",
-        (12.5, 0.0): "友善", (12.5, 12.5): "小无聊", (12.5, 25.0): "小烦躁",
-        (12.5, 37.5): "恼火", (12.5, 50.0): "气话哄好",
-        (0.0, 0.0): "平淡", (0.0, 12.5): "安静", (0.0, 25.0): "冷一下",
-        (0.0, 37.5): "生闷气", (0.0, 50.0): "冷战",
+    75: {  # 好感度 62.5~87.5
+        (50.0, 0.0): "亲密", (50.0, 12.5): "依恋", (50.0, 25.0): "吃醋", (50.0, 37.5): "撒娇", (50.0, 50.0): "闹别扭",
+        (37.5, 0.0): "温暖", (37.5, 12.5): "热情", (37.5, 25.0): "宠溺", (37.5, 37.5): "黏人", (37.5, 50.0): "使性子",
+        (25.0, 0.0): "欣赏", (25.0, 12.5): "心动", (25.0, 25.0): "喜欢", (25.0, 37.5): "拉扯", (25.0, 50.0): "较劲",
+        (12.5, 0.0): "随意", (12.5, 12.5): "自在", (12.5, 25.0): "惬意", (12.5, 37.5): "烦闷", (12.5, 50.0): "闹心",
+        (0.0, 0.0): "安静", (0.0, 12.5): "沉默", (0.0, 25.0): "独处", (0.0, 37.5): "冷淡", (0.0, 50.0): "冷处理",
     },
-    100: {
-        (50.0, 0.0): "崇拜", (50.0, 12.5): "完全占有", (50.0, 25.0): "吃醋失控",
-        (50.0, 37.5): "施虐play", (50.0, 50.0): "共依存",
-        (37.5, 0.0): "离不开", (37.5, 12.5): "热情似火", (37.5, 25.0): "黏人烦",
-        (37.5, 37.5): "调教欲", (37.5, 50.0): "相爱相杀",
-        (25.0, 0.0): "溺爱", (25.0, 12.5): "渴望融合", (25.0, 25.0): "撒娇争夺",
-        (25.0, 37.5): "炸毛", (25.0, 50.0): "虐恋",
-        (12.5, 0.0): "安心", (12.5, 12.5): "小撒娇", (12.5, 25.0): "小赌气",
-        (12.5, 37.5): "假生气", (12.5, 50.0): "闹别扭",
-        (0.0, 0.0): "平静幸福", (0.0, 12.5): "沉默有爱", (0.0, 25.0): "闷气心软",
-        (0.0, 37.5): "委屈", (0.0, 50.0): "冷战等你哄",
+    100: {  # 好感度 87.5~100
+        (50.0, 0.0): "信赖", (50.0, 12.5): "依恋", (50.0, 25.0): "痴迷", (50.0, 37.5): "占有", (50.0, 50.0): "共依存",
+        (37.5, 0.0): "眷恋", (37.5, 12.5): "深爱", (37.5, 25.0): "宠溺", (37.5, 37.5): "痴缠", (37.5, 50.0): "虐恋",
+        (25.0, 0.0): "温柔", (25.0, 12.5): "呵护", (25.0, 25.0): "娇惯", (25.0, 37.5): "吃醋", (25.0, 50.0): "心疼",
+        (12.5, 0.0): "安稳", (12.5, 12.5): "恬静", (12.5, 25.0): "安心", (12.5, 37.5): "委屈", (12.5, 50.0): "赌气",
+        (0.0, 0.0): "默契", (0.0, 12.5): "平和", (0.0, 25.0): "淡然", (0.0, 37.5): "难过", (0.0, 50.0): "失落",
     },
 }
 
@@ -333,7 +308,124 @@ class HumanoidCore(Star):
         self.lock = asyncio.Lock()
         self.load_state()
         self.http_session = None
+        self._persona_switch_task = None
         logger.info("[humanoid_core] 插件加载成功")
+        self._start_persona_auto_switch()
+
+    def _start_persona_auto_switch(self):
+        if self._persona_switch_task is None or self._persona_switch_task.done():
+            self._persona_switch_task = asyncio.create_task(self._persona_auto_switch_loop())
+            logger.info("[humanoid_core] 人格自动切换后台任务已启动")
+
+    async def _persona_auto_switch_loop(self):
+        cfg = self.get_latest_config()
+        while True:
+            try:
+                await self._check_and_recover_expired_personas(cfg)
+
+                if not cfg.get("persona_enabled", False):
+                    await asyncio.sleep(60)
+                    cfg = self.get_latest_config()
+                    continue
+                mode = cfg.get("persona_switch_mode", "manual")
+                if mode == "manual":
+                    await asyncio.sleep(60)
+                    cfg = self.get_latest_config()
+                    continue
+
+                now = self._get_plugin_now(cfg)
+                if mode == "daily":
+                    next_run = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    if now >= next_run:
+                        next_run += timedelta(days=1)
+                    wait_seconds = (next_run - now).total_seconds()
+                    await asyncio.sleep(wait_seconds)
+                    await self._apply_global_persona_switch(cfg)
+                elif mode == "hourly":
+                    next_run = now.replace(minute=0, second=0, microsecond=0)
+                    if now >= next_run:
+                        next_run += timedelta(hours=1)
+                    wait_seconds = (next_run - now).total_seconds()
+                    await asyncio.sleep(wait_seconds)
+                    await self._apply_global_persona_switch(cfg)
+                elif mode == "custom":
+                    custom_time = cfg.get("persona_switch_custom_time", "08:00")
+                    try:
+                        target_hour, target_minute = map(int, custom_time.split(":"))
+                        if not (0 <= target_hour <= 23 and 0 <= target_minute <= 59):
+                            raise ValueError
+                    except:
+                        target_hour, target_minute = 8, 0
+                    next_run = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+                    if now >= next_run:
+                        next_run += timedelta(days=1)
+                    wait_seconds = (next_run - now).total_seconds()
+                    await asyncio.sleep(wait_seconds)
+                    await self._apply_global_persona_switch(cfg)
+                else:
+                    await asyncio.sleep(60)
+                cfg = self.get_latest_config()
+            except Exception as e:
+                logger.error(f"[humanoid_core] 人格自动切换循环异常: {e}")
+                await asyncio.sleep(60)
+
+    async def _check_and_recover_expired_personas(self, cfg: dict):
+        if not cfg.get("persona_auto_recover_enabled", True):
+            return
+        now = self._get_plugin_now(cfg)
+        expiry_dict = self.state.get("user_persona_expiry", {})
+        default_name = cfg.get("persona_default_name", "")
+        if not default_name:
+            return
+        to_recover = []
+        for qq, expiry_str in expiry_dict.items():
+            try:
+                expiry = datetime.fromisoformat(expiry_str)
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=now.tzinfo)
+                if now >= expiry:
+                    to_recover.append(qq)
+            except:
+                continue
+        if not to_recover:
+            return
+        async with self.lock:
+            user_persona = self.state.get("user_persona", {})
+            for qq in to_recover:
+                if user_persona.get(qq) == cfg.get("persona_switch_name", ""):
+                    user_persona[qq] = default_name
+                self.state.get("user_persona_expiry", {}).pop(qq, None)
+            self.state["user_persona"] = user_persona
+            self.save_state_unsafe()
+            logger.info(f"[humanoid_core] 已恢复 {len(to_recover)} 个用户的人格为默认")
+
+    async def _apply_global_persona_switch(self, cfg: dict):
+        try:
+            default_name = cfg.get("persona_default_name", "")
+            switch_name = cfg.get("persona_switch_name", "")
+            if not default_name or not switch_name:
+                return
+            new_default = switch_name
+            new_switch = default_name
+            default_desc = cfg.get("persona_default_description", "")
+            switch_desc = cfg.get("persona_switch_description", "")
+            cfg["persona_default_name"] = new_default
+            cfg["persona_switch_name"] = new_switch
+            cfg["persona_default_description"] = switch_desc
+            cfg["persona_switch_description"] = default_desc
+
+            async with self.lock:
+                user_personas = self.state.get("user_persona", {})
+                for qq, pname in list(user_personas.items()):
+                    if pname == default_name:
+                        user_personas[qq] = new_default
+                    elif pname == switch_name:
+                        user_personas[qq] = new_switch
+                self.state["user_persona"] = user_personas
+                self.save_state_unsafe()
+            logger.info(f"[humanoid_core] 全局人格自动切换: {default_name} ↔ {switch_name}")
+        except Exception as e:
+            logger.error(f"[humanoid_core] 全局人格切换失败: {e}")
 
     async def _ensure_session(self):
         if self.http_session is None or self.http_session.closed:
@@ -376,7 +468,22 @@ class HumanoidCore(Star):
             "mood_initial_libido": 24,
             "mood_initial_aggression": 28,
             "mood_affection_override": [],
-            "mood_affection_delta_cap": 3
+            "mood_affection_delta_cap": 3,
+            "mood_log_enabled": True,
+            "mood_log_max_entries": 30,
+            "mood_log_threshold_affection": 15,
+            "mood_log_threshold_libido": 12,
+            "mood_log_threshold_aggression": 12,
+            "persona_enabled": False,
+            "persona_default_name": "",
+            "persona_default_description": "",
+            "persona_switch_name": "",
+            "persona_switch_description": "",
+            "persona_switch_mode": "manual",
+            "persona_switch_custom_time": "08:00",
+            "persona_reset_mood_on_switch": False,
+            "persona_auto_recover_enabled": True,
+            "mood_update_timeout": 30.0
         }
         if isinstance(self.config, dict):
             defaults.update(self.config)
@@ -414,7 +521,11 @@ class HumanoidCore(Star):
             "nicknames": {},
             "_energy_noise_date": "",
             "moods": {},
-            "_mood_decay_last_run": 0.0
+            "_mood_decay_last_run": 0.0,
+            "mood_logs": {},
+            "user_persona": {},
+            "global_persona_index": 0,
+            "user_persona_expiry": {}
         }
         self.save_state_unsafe()
 
@@ -827,7 +938,6 @@ class HumanoidCore(Star):
             self.state["moods"] = {}
         if qq not in self.state["moods"]:
             cfg = self.get_latest_config()
-            # 检查覆盖配置
             override_list = cfg.get("mood_affection_override", [])
             override_val = None
             for item in override_list:
@@ -918,73 +1028,190 @@ class HumanoidCore(Star):
             "请分析这句话会让AI对用户的情绪产生什么变化。只返回JSON：{\"affection_delta\": 数值(-5~5), \"libido_delta\": 数值(-5~5), \"aggression_delta\": 数值(-5~5)}"
         )
 
-        try:
-            provider = self.get_target_provider(cfg)
-            if not provider:
+        for attempt in range(2):
+            try:
+                provider = self.get_target_provider(cfg)
+                if not provider:
+                    return
+                timeout = cfg.get("mood_update_timeout", 30.0)
+                response = await asyncio.wait_for(provider.text_chat(prompt=prompt), timeout=timeout)
+                raw = response.completion_text if hasattr(response, "completion_text") else str(response)
+                match = re.search(r'\{[^{}]*\}', raw)
+                if not match:
+                    logger.warning(f"[humanoid_core] 情绪更新: 未匹配到JSON，原始响应: {raw[:100]}")
+                    continue
+                delta = json.loads(match.group())
+                sensitivity = cfg.get("mood_sensitivity", 28) / 100.0
+                delta_cap = cfg.get("mood_affection_delta_cap", 3)
+
+                aff_delta = delta.get("affection_delta", 0) * sensitivity
+                lib_delta = delta.get("libido_delta", 0) * sensitivity
+                agg_delta = delta.get("aggression_delta", 0) * sensitivity
+
+                aff_delta = max(-delta_cap, min(delta_cap, aff_delta))
+                lib_delta = max(-delta_cap, min(delta_cap, lib_delta))
+                agg_delta = max(-delta_cap, min(delta_cap, agg_delta))
+
+                energy = self.state.get("energy", 80)
+                if energy > 70:
+                    if aff_delta > 0: aff_delta *= 1.3
+                    else: aff_delta *= 0.7
+                    if lib_delta > 0: lib_delta *= 1.3
+                    else: lib_delta *= 0.7
+                    if agg_delta > 0: agg_delta *= 1.3
+                    else: agg_delta *= 0.7
+                elif energy < 40:
+                    aff_delta *= 0.5
+                    lib_delta *= 0.5
+                    agg_delta *= 0.5
+
+                cycle_day = self.state.get("current_cycle_day", 1)
+                if 1 <= cycle_day <= 5:
+                    if aff_delta > 0: aff_delta *= 0.5
+                    else: aff_delta *= 1.5
+                    if lib_delta > 0: lib_delta *= 0.5
+                    else: lib_delta *= 1.5
+                    if agg_delta > 0: agg_delta *= 0.8
+                    else: agg_delta *= 1.5
+                elif 14 <= cycle_day <= 16:
+                    if aff_delta > 0: aff_delta *= 1.4
+                    else: aff_delta *= 0.6
+                    if lib_delta > 0: lib_delta *= 1.4
+                    else: lib_delta *= 0.6
+                    if agg_delta > 0: agg_delta *= 1.2
+                    else: agg_delta *= 0.8
+
+                old_affection = mood_data["affection"]
+                old_libido = mood_data["libido"]
+                old_aggression = mood_data["aggression"]
+
+                mood_data["affection"] = max(0.0, min(100.0, mood_data["affection"] + aff_delta))
+                mood_data["libido"] = max(0.0, min(50.0, mood_data["libido"] + lib_delta))
+                mood_data["aggression"] = max(0.0, min(50.0, mood_data["aggression"] + agg_delta))
+
+                turn = mood_data.get("turn_count", 1)
+                base_coef = 1.0 if turn <= 10 else 0.2
+                mood_data["base_affection"] = max(0.0, min(100.0, mood_data["base_affection"] + aff_delta * base_coef * 0.5))
+                mood_data["base_libido"] = max(0.0, min(50.0, mood_data["base_libido"] + lib_delta * base_coef * 0.5))
+                mood_data["base_aggression"] = max(0.0, min(50.0, mood_data["base_aggression"] + agg_delta * base_coef * 0.5))
+
+                mood_data["turn_count"] = turn + 1
+                mood_data["last_interaction"] = now
+
+                self._log_mood_event(qq, old_affection, old_libido, old_aggression,
+                                     mood_data["affection"], mood_data["libido"], mood_data["aggression"], cfg)
+
+                self._save_user_mood(qq, mood_data)
                 return
-            response = await asyncio.wait_for(provider.text_chat(prompt=prompt), timeout=10.0)
-            raw = response.completion_text if hasattr(response, "completion_text") else str(response)
-            match = re.search(r'\{[^{}]*\}', raw)
-            if not match:
-                return
-            delta = json.loads(match.group())
-            sensitivity = cfg.get("mood_sensitivity", 28) / 100.0
-            delta_cap = cfg.get("mood_affection_delta_cap", 3)
 
-            aff_delta = delta.get("affection_delta", 0) * sensitivity
-            lib_delta = delta.get("libido_delta", 0) * sensitivity
-            agg_delta = delta.get("aggression_delta", 0) * sensitivity
+            except asyncio.TimeoutError:
+                if attempt == 1:
+                    logger.warning(f"[humanoid_core] 情绪更新超时，已重试2次，超时时间 {timeout}秒")
+                    return
+            except Exception as e:
+                import traceback
+                if attempt == 1:
+                    logger.warning(f"[humanoid_core] 情绪更新失败: {e}\n{traceback.format_exc()}")
+                    return
 
-            # 限制单次变化幅度
-            aff_delta = max(-delta_cap, min(delta_cap, aff_delta))
-            lib_delta = max(-delta_cap, min(delta_cap, lib_delta))
-            agg_delta = max(-delta_cap, min(delta_cap, agg_delta))
+    def _log_mood_event(self, qq: str, old_aff, old_lib, old_agg, new_aff, new_lib, new_agg, cfg: dict):
+        if not cfg.get("mood_log_enabled", True):
+            return
+        thresh_aff = cfg.get("mood_log_threshold_affection", 15)
+        thresh_lib = cfg.get("mood_log_threshold_libido", 12)
+        thresh_agg = cfg.get("mood_log_threshold_aggression", 12)
 
-            energy = self.state.get("energy", 80)
-            if energy > 70:
-                if aff_delta > 0: aff_delta *= 1.3
-                else: aff_delta *= 0.7
-                if lib_delta > 0: lib_delta *= 1.3
-                else: lib_delta *= 0.7
-                if agg_delta > 0: agg_delta *= 1.3
-                else: agg_delta *= 0.7
-            elif energy < 40:
-                aff_delta *= 0.5
-                lib_delta *= 0.5
-                agg_delta *= 0.5
+        aff_delta = new_aff - old_aff
+        lib_delta = new_lib - old_lib
+        agg_delta = new_agg - old_agg
 
-            cycle_day = self.state.get("current_cycle_day", 1)
-            if 1 <= cycle_day <= 5:
-                if aff_delta > 0: aff_delta *= 0.5
-                else: aff_delta *= 1.5
-                if lib_delta > 0: lib_delta *= 0.5
-                else: lib_delta *= 1.5
-                if agg_delta > 0: agg_delta *= 0.8
-                else: agg_delta *= 1.5
-            elif 14 <= cycle_day <= 16:
-                if aff_delta > 0: aff_delta *= 1.4
-                else: aff_delta *= 0.6
-                if lib_delta > 0: lib_delta *= 1.4
-                else: lib_delta *= 0.6
-                if agg_delta > 0: agg_delta *= 1.2
-                else: agg_delta *= 0.8
+        events = []
+        if abs(aff_delta) >= thresh_aff:
+            events.append(f"好感度{'上升' if aff_delta > 0 else '下降'}至 {new_aff:.1f}")
+        if abs(lib_delta) >= thresh_lib:
+            events.append(f"亲近欲{'上升' if lib_delta > 0 else '下降'}至 {new_lib:.1f}")
+        if abs(agg_delta) >= thresh_agg:
+            events.append(f"攻击性{'上升' if agg_delta > 0 else '下降'}至 {new_agg:.1f}")
 
-            mood_data["affection"] = max(0.0, min(100.0, mood_data["affection"] + aff_delta))
-            mood_data["libido"] = max(0.0, min(50.0, mood_data["libido"] + lib_delta))
-            mood_data["aggression"] = max(0.0, min(50.0, mood_data["aggression"] + agg_delta))
+        if not events:
+            return
 
-            turn = mood_data.get("turn_count", 1)
-            base_coef = 1.0 if turn <= 10 else 0.2
-            mood_data["base_affection"] = max(0.0, min(100.0, mood_data["base_affection"] + aff_delta * base_coef * 0.5))
-            mood_data["base_libido"] = max(0.0, min(50.0, mood_data["base_libido"] + lib_delta * base_coef * 0.5))
-            mood_data["base_aggression"] = max(0.0, min(50.0, mood_data["base_aggression"] + agg_delta * base_coef * 0.5))
+        if "mood_logs" not in self.state:
+            self.state["mood_logs"] = {}
+        if qq not in self.state["mood_logs"]:
+            self.state["mood_logs"][qq] = []
+        max_entries = cfg.get("mood_log_max_entries", 30)
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.state["mood_logs"][qq].append({
+            "time": now_str,
+            "event": "，".join(events),
+            "affection": round(new_aff, 1),
+            "libido": round(new_lib, 1),
+            "aggression": round(new_agg, 1)
+        })
+        if len(self.state["mood_logs"][qq]) > max_entries:
+            self.state["mood_logs"][qq] = self.state["mood_logs"][qq][-max_entries:]
+        self.save_state_unsafe()
 
-            mood_data["turn_count"] = turn + 1
-            mood_data["last_interaction"] = now
+    # ======================== 多人格方法 ========================
+    def _get_user_persona(self, qq: str, cfg: dict) -> dict:
+        if not cfg.get("persona_enabled", False):
+            return None
+        user_persona = self.state.get("user_persona", {})
+        current_name = user_persona.get(qq)
+        if not current_name:
+            current_name = cfg.get("persona_default_name", "")
+            current_desc = cfg.get("persona_default_description", "")
+        else:
+            if current_name == cfg.get("persona_default_name"):
+                current_desc = cfg.get("persona_default_description", "")
+            elif current_name == cfg.get("persona_switch_name"):
+                current_desc = cfg.get("persona_switch_description", "")
+            else:
+                current_name = cfg.get("persona_default_name", "")
+                current_desc = cfg.get("persona_default_description", "")
+        if not current_name:
+            return None
+        return {
+            "name": current_name,
+            "description": current_desc
+        }
+
+    def _get_available_personas(self, cfg: dict) -> list:
+        personas = []
+        if cfg.get("persona_default_name"):
+            personas.append({
+                "name": cfg["persona_default_name"],
+                "description": cfg.get("persona_default_description", "")
+            })
+        if cfg.get("persona_switch_name"):
+            personas.append({
+                "name": cfg["persona_switch_name"],
+                "description": cfg.get("persona_switch_description", "")
+            })
+        return personas
+
+    async def _switch_persona(self, qq: str, cfg: dict, expire_time: datetime = None):
+        switch_name = cfg.get("persona_switch_name", "")
+        if not switch_name:
+            return
+        if "user_persona" not in self.state:
+            self.state["user_persona"] = {}
+        self.state["user_persona"][qq] = switch_name
+        if expire_time:
+            self.state.setdefault("user_persona_expiry", {})[qq] = expire_time.isoformat()
+        else:
+            self.state.get("user_persona_expiry", {}).pop(qq, None)
+        if cfg.get("persona_reset_mood_on_switch", False):
+            mood_data = self._get_user_mood(qq)
+            mood_data["affection"] = cfg.get("mood_initial_affection", 46)
+            mood_data["libido"] = cfg.get("mood_initial_libido", 24)
+            mood_data["aggression"] = cfg.get("mood_initial_aggression", 28)
+            mood_data["base_affection"] = cfg.get("mood_initial_affection", 46)
+            mood_data["base_libido"] = cfg.get("mood_initial_libido", 24)
+            mood_data["base_aggression"] = cfg.get("mood_initial_aggression", 28)
             self._save_user_mood(qq, mood_data)
-
-        except Exception as e:
-            logger.warning(f"[humanoid_core] 情绪更新失败: {e}")
+        self.save_state_unsafe()
 
     # ======================== 指令 ========================
     @filter.command("你的状态")
@@ -1008,6 +1235,11 @@ class HumanoidCore(Star):
             mood = self._get_user_mood(qq)
             label = get_mood_label(mood["affection"], mood["libido"], mood["aggression"])
             lines.append(f"- 情绪: {label} (好感度 {mood['affection']:.1f})")
+        if cfg.get("persona_enabled", False):
+            qq = str(event.get_sender_id())
+            persona = self._get_user_persona(qq, cfg)
+            if persona:
+                lines.append(f"- 人格: {persona.get('name', '未知')}")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("好感度")
@@ -1049,6 +1281,23 @@ class HumanoidCore(Star):
         )
         yield event.plain_result(msg)
 
+    @filter.command("情绪日志")
+    async def cmd_mood_log(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        if not cfg.get("mood_log_enabled", True):
+            yield event.plain_result("❌ 情绪日志未启用。")
+            return
+        qq = str(event.get_sender_id())
+        logs = self.state.get("mood_logs", {}).get(qq, [])
+        if not logs:
+            yield event.plain_result("📭 暂无情绪波动记录。")
+            return
+        recent = logs[-10:]
+        lines = ["📋 情绪波动记录（最近10条）：", "——————————————"]
+        for entry in recent:
+            lines.append(f"{entry['time']} | {entry['event']}")
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("重置情绪")
     async def cmd_reset_mood(self, event: AstrMessageEvent):
         cfg = self.get_latest_config()
@@ -1058,16 +1307,19 @@ class HumanoidCore(Star):
             return
         qq = str(event.get_sender_id())
         mood_data = self._get_user_mood(qq)
-        mood_data["affection"] = float(cfg.get("mood_initial_affection", 46))
-        mood_data["libido"] = float(cfg.get("mood_initial_libido", 24))
-        mood_data["aggression"] = float(cfg.get("mood_initial_aggression", 28))
-        mood_data["base_affection"] = float(cfg.get("mood_initial_affection", 46))
-        mood_data["base_libido"] = float(cfg.get("mood_initial_libido", 24))
-        mood_data["base_aggression"] = float(cfg.get("mood_initial_aggression", 28))
+        affection = float(cfg.get("mood_initial_affection", 46))
+        libido = float(cfg.get("mood_initial_libido", 24))
+        aggression = float(cfg.get("mood_initial_aggression", 28))
+        mood_data["affection"] = affection
+        mood_data["libido"] = libido
+        mood_data["aggression"] = aggression
+        mood_data["base_affection"] = affection
+        mood_data["base_libido"] = libido
+        mood_data["base_aggression"] = aggression
         mood_data["turn_count"] = 0
         mood_data["last_interaction"] = 0
         self._save_user_mood(qq, mood_data)
-        yield event.plain_result("✅ 已重置情绪至初始值。")
+        yield event.plain_result(f"✅ 已重置情绪至初始值（好感度 {affection}）。")
 
     @filter.command("设置好感度")
     async def cmd_set_affection(self, event: AstrMessageEvent):
@@ -1105,7 +1357,6 @@ class HumanoidCore(Star):
             yield event.plain_result("用法：/批量好感度 QQ号:数值, QQ号:数值 或 JSON 数组")
             return
         parsed = []
-        # 尝试 JSON
         try:
             arr = json.loads(data)
             if isinstance(arr, list):
@@ -1114,7 +1365,6 @@ class HumanoidCore(Star):
                         parsed.append((str(item["qq"]), float(item["value"])))
         except:
             pass
-        # 尝试 QQ:数值 格式
         if not parsed:
             for part in re.split(r'[,，\s]+', data):
                 if ":" in part:
@@ -1137,6 +1387,118 @@ class HumanoidCore(Star):
             self._save_user_mood(qq, mood_data)
             success += 1
         yield event.plain_result(f"✅ 已批量设置 {success} 个用户的好感度。")
+
+    @filter.command("切换人格")
+    async def cmd_switch_persona(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        if not cfg.get("persona_enabled", False):
+            yield event.plain_result("❌ 多人格系统未启用，请在配置中开启 `persona_enabled`。")
+            return
+        qq = str(event.get_sender_id())
+        raw = event.message_str.strip()
+        cmd_part = "切换人格"
+        rest = raw[len(cmd_part):].strip()
+        if not rest:
+            yield event.plain_result("用法：/切换人格 人格名 [时间] （时间如 2h、30m、18:00）")
+            return
+        parts = rest.split()
+        target_name = parts[0]
+        personas = self._get_available_personas(cfg)
+        target_persona = next((p for p in personas if p["name"] == target_name), None)
+        if not target_persona:
+            yield event.plain_result(f"❌ 不存在名为「{target_name}」的人格，可用的有：{', '.join([p['name'] for p in personas])}")
+            return
+        default_name = cfg.get("persona_default_name", "")
+        expire_time = None
+        if len(parts) > 1:
+            time_arg = parts[1]
+            now = self._get_plugin_now(cfg)
+            if time_arg.endswith("h") or time_arg.endswith("H"):
+                try:
+                    hours = float(time_arg[:-1])
+                    expire_time = now + timedelta(hours=hours)
+                except:
+                    yield event.plain_result("❌ 时间格式错误，示例：2h 或 18:00")
+                    return
+            elif time_arg.endswith("m") or time_arg.endswith("M"):
+                try:
+                    minutes = float(time_arg[:-1])
+                    expire_time = now + timedelta(minutes=minutes)
+                except:
+                    yield event.plain_result("❌ 时间格式错误，示例：30m 或 18:00")
+                    return
+            elif ":" in time_arg:
+                try:
+                    hour, minute = map(int, time_arg.split(":"))
+                    target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    if target_time <= now:
+                        target_time += timedelta(days=1)
+                    expire_time = target_time
+                except:
+                    yield event.plain_result("❌ 时间格式错误，示例：18:00")
+                    return
+            else:
+                yield event.plain_result("❌ 无法识别时间参数，请使用如 2h、30m 或 18:00")
+                return
+        await self._switch_persona(qq, cfg, expire_time)
+        if expire_time:
+            time_str = expire_time.strftime("%Y-%m-%d %H:%M")
+            yield event.plain_result(f"✅ 已切换至人格「{target_name}」，将于 {time_str} 自动恢复为「{default_name}」")
+        else:
+            yield event.plain_result(f"✅ 已永久切换至人格「{target_name}」")
+
+    @filter.command("查看人格")
+    async def cmd_view_persona(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        if not cfg.get("persona_enabled", False):
+            yield event.plain_result("❌ 多人格系统未启用。")
+            return
+        qq = str(event.get_sender_id())
+        current_persona = self._get_user_persona(qq, cfg)
+        current_name = current_persona.get("name", "未设置") if current_persona else "未设置"
+        personas = self._get_available_personas(cfg)
+        lines = [f"📋 当前人格：{current_name}", "", "可用人格列表："]
+        for p in personas:
+            name = p.get("name", "未命名")
+            desc = p.get("description", "无描述")
+            marker = "✅" if name == current_name else "  "
+            lines.append(f"{marker} {name}：{desc}")
+        if not personas:
+            lines.append("（未配置任何人格，请在配置中填写 persona_default_name 和 persona_switch_name）")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("人格详情")
+    async def cmd_persona_detail(self, event: AstrMessageEvent):
+        cfg = self.get_latest_config()
+        if not cfg.get("persona_enabled", False):
+            yield event.plain_result("❌ 多人格系统未启用。")
+            return
+        raw = event.message_str.strip()
+        match = re.search(r'人格详情\s*(.+)', raw)
+        if match:
+            name = match.group(1).strip()
+        else:
+            qq = str(event.get_sender_id())
+            persona = self._get_user_persona(qq, cfg)
+            name = persona.get("name", "") if persona else ""
+        if not name:
+            yield event.plain_result("请指定人格名称，或先切换到一个已存在的人格。")
+            return
+        personas = self._get_available_personas(cfg)
+        target = None
+        for p in personas:
+            if p.get("name") == name:
+                target = p
+                break
+        if not target:
+            yield event.plain_result(f"❌ 不存在名为「{name}」的人格。")
+            return
+        msg = (
+            f"〖人格详情〗\n"
+            f"名称：{target.get('name', '未命名')}\n"
+            f"描述：{target.get('description', '无')}"
+        )
+        yield event.plain_result(msg)
 
     @filter.command("时间")
     async def query_time(self, event: AstrMessageEvent):
@@ -1200,15 +1562,19 @@ class HumanoidCore(Star):
             "/查看日程 - 查看今日完整日程\n"
             "/重置日程 - 强制重新生成日程（管理员）\n"
             "/重置状态 - 重置精力与生理周期（管理员）\n"
-            "/你的状态 - 查看当前精力、生理、天气、情绪状态\n"
+            "/你的状态 - 查看当前精力、生理、天气、情绪、人格状态\n"
             "/时间 城市 - 查看指定城市当前时间（所有用户可用）\n"
             "/叫我 昵称 - 设置你的昵称\n"
             "/查看所有昵称 - 查看所有用户昵称（管理员）\n"
             "/好感度 - 查看情绪档案（好感度/亲近欲/攻击性）\n"
             "/情绪详情 - 查看详细情绪档案（含基线、轮次）\n"
+            "/情绪日志 - 查看情绪波动记录\n"
             "/重置情绪 - 重置情绪至初始值（管理员）\n"
             "/设置好感度 数值 - 手动设置好感度（管理员）\n"
             "/批量好感度 QQ:数值,QQ:数值 - 批量导入好感度（管理员）\n"
+            "/切换人格 人格名 [时间] - 切换到指定人格，可带时间（2h/30m/18:00）自动恢复\n"
+            "/查看人格 - 查看当前人格和可用人格列表\n"
+            "/人格详情 [名称] - 查看人格详细设定\n"
             "/拟人帮助 - 显示本帮助"
         )
         yield event.plain_result(help_text)
@@ -1343,4 +1709,4 @@ class HumanoidCore(Star):
         if cfg.get("mood_enabled", True):
             qq = str(event.get_sender_id())
             await self._apply_mood_decay(cfg)
-            await self._update_mood_by_message(event, qq, cfg)
+            asyncio.create_task(self._update_mood_by_message(event, qq, cfg))
