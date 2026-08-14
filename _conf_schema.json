@@ -51,7 +51,24 @@
     "character_personality": {
         "description": "【人格设定】选择角色人格，模型将按此生成符合人设的日程",
         "type": "string",
-        "default": ""
+        "default": "普通人",
+        "options": [
+            "普通人",
+            "工作狂",
+            "懒散宅家",
+            "温柔体贴",
+            "傲娇别扭",
+            "冷静理性",
+            "活泼开朗",
+            "文艺青年",
+            "成熟稳重",
+            "天真烂漫",
+            "腹黑",
+            "高冷",
+            "元气少女",
+            "知性姐姐",
+            "邻家哥哥"
+        ]
     },
     "admin_qq": {
         "description": "【权限】管理员QQ列表（数组），仅管理员可使用重置日程等管理指令",
@@ -144,5 +161,81 @@
         "description": "【情绪】单次好感度变化上限 (1-10)，数值越低变化越平缓",
         "type": "int",
         "default": 3
+    },
+    "mood_log_enabled": {
+        "description": "【情绪日志】是否启用情绪波动事件记录",
+        "type": "bool",
+        "default": true
+    },
+    "mood_log_max_entries": {
+        "description": "【情绪日志】每个用户最多保留的事件记录条数",
+        "type": "int",
+        "default": 30
+    },
+    "mood_log_threshold_affection": {
+        "description": "【情绪日志】好感度变化多少时触发记录",
+        "type": "int",
+        "default": 15
+    },
+    "mood_log_threshold_libido": {
+        "description": "【情绪日志】亲近欲变化多少时触发记录",
+        "type": "int",
+        "default": 12
+    },
+    "mood_log_threshold_aggression": {
+        "description": "【情绪日志】攻击性变化多少时触发记录",
+        "type": "int",
+        "default": 12
+    },
+    "persona_enabled": {
+        "description": "【多人格】是否启用多人格系统",
+        "type": "bool",
+        "default": false
+    },
+    "persona_default_name": {
+        "description": "【多人格】默认人格名称",
+        "type": "string",
+        "default": ""
+    },
+    "persona_default_description": {
+        "description": "【多人格】默认人格描述",
+        "type": "string",
+        "default": ""
+    },
+    "persona_switch_name": {
+        "description": "【多人格】要切换的目标人格名称",
+        "type": "string",
+        "default": ""
+    },
+    "persona_switch_description": {
+        "description": "【多人格】目标人格描述",
+        "type": "string",
+        "default": ""
+    },
+    "persona_switch_mode": {
+        "description": "【多人格】切换模式：manual=手动，daily=每天0点，hourly=每小时，custom=自定义时间",
+        "type": "string",
+        "default": "manual",
+        "options": ["manual", "daily", "hourly", "custom"]
+    },
+    "persona_switch_custom_time": {
+        "description": "【多人格】自定义切换时间（仅当 switch_mode=custom 时生效），格式 HH:MM，如 08:00",
+        "type": "string",
+        "default": "08:00"
+    },
+    "persona_reset_mood_on_switch": {
+        "description": "【多人格】切换人格时是否重置情绪值",
+        "type": "bool",
+        "default": false
+    },
+    "persona_auto_recover_enabled": {
+        "description": "【多人格】是否允许临时切换后自动恢复（关闭后忽略到期时间）",
+        "type": "bool",
+        "default": true
+    },
+    "mood_update_timeout": {
+        "description": "【情绪】单次情绪更新请求超时时间（秒），数值越大越不容易超时",
+        "type": "float",
+        "default": 30.0
     }
-    }
+}
