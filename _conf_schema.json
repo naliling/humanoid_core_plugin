@@ -27,9 +27,9 @@
         "options": ["default", "simple"]
     },
     "use_llm_schedule": {
-        "description": "【日程】是否启用大模型每日自动生成全新动态日程。关闭后使用内置备用模板（基于日期轮换）。",
+        "description": "【日程】是否启用大模型每日自动生成全新动态日程。建议在配置好 schedule_provider_name（或全局 provider）后启用。默认建议关闭以避免未配置 Provider 时异常。",
         "type": "bool",
-        "default": true
+        "default": false
     },
     "schedule_provider_name": {
         "description": "【日程】指定生成日程的模型 Provider（下拉选择已配置的 Provider）",
@@ -71,14 +71,14 @@
         ]
     },
     "admin_qq": {
-        "description": "【权限】管理员QQ列表（数组），仅管理员可使用重置日程等管理指令",
+        "description": "【权限】管理员QQ列表（数组），仅管理员可使用重置日程等管理指令。支持字符串或数组，字符串可使用逗号分隔多个 QQ。",
         "type": "list",
         "default": []
     },
     "weather_enabled": {
-        "description": "【天气】是否启用 OpenWeather 真实天气",
+        "description": "【天气】是否启用 OpenWeather 真实天气。建议在填入 weather_api_key 后再启用；默认关闭以避免未配置 API Key 时频繁请求失败。",
         "type": "bool",
-        "default": true
+        "default": false
     },
     "weather_api_key": {
         "description": "【天气】OpenWeather API Key (请填入 32 位密钥)",
