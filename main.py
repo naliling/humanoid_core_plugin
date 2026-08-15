@@ -444,7 +444,7 @@ class HumanoidCore(Star):
             "max_energy": 100.0,
             "enable_cycle": True,
             "cycle_length": 28,
-            "energy_decay_rate": "1.0",
+            "energy_decay_rate": "0.5",   # 修改默认值为0.5
             "cycle_description_style": "default",
             "use_llm_schedule": True,
             "schedule_provider_name": "",
@@ -549,6 +549,7 @@ class HumanoidCore(Star):
     def _get_plugin_now(self, cfg: dict = None):
         return datetime.now(self._get_plugin_tz(cfg))
 
+    # ======================== 修改后的 _compute_energy_delta ========================
     def _compute_energy_delta(self, start_time: datetime, end_time: datetime, schedule: list, decay_rate: float) -> float:
         if start_time >= end_time:
             return 0.0
@@ -569,6 +570,24 @@ class HumanoidCore(Star):
                 continue
         sorted_times = sorted(boundaries)
         delta = 0.0
+        consumption_discount = 0.7   # 消耗打7折
+
+        # 获取当前周期日，用于周期系数
+        cycle_day = self.state.get("current_cycle_day", 1)
+        # 定义周期影响系数（经期消耗1.3倍，卵泡期0.8倍等）
+        if 1 <= cycle_day <= 5:          # 经期
+            cycle_factor = 1.3
+        elif 6 <= cycle_day <= 12:       # 卵泡期
+            cycle_factor = 0.8
+        elif 13 <= cycle_day <= 15:      # 排卵期
+            cycle_factor = 1.0
+        elif 16 <= cycle_day <= 21:      # 黄体早期
+            cycle_factor = 1.1
+        elif 22 <= cycle_day <= 26:      # 黄体晚期
+            cycle_factor = 1.2
+        else:                            # 经前期 (27~28)
+            cycle_factor = 1.15
+
         for i in range(len(sorted_times)-1):
             seg_start = sorted_times[i]
             seg_end = sorted_times[i+1]
@@ -588,9 +607,16 @@ class HumanoidCore(Star):
                 except:
                     continue
             minutes = (seg_end - seg_start).total_seconds() / 60
-            delta += rate * decay_rate * minutes
+            if rate < 0:
+                # 消耗部分：基础打折 × 周期系数
+                effective_rate = rate * consumption_discount * cycle_factor
+            else:
+                # 恢复部分不变
+                effective_rate = rate
+            delta += effective_rate * decay_rate * minutes
         return delta
 
+    # ======================== 修改后的 _get_current_context ========================
     async def _get_current_context(self, update_energy=True):
         cfg = self.get_latest_config()
         now = self._get_plugin_now(cfg)
@@ -602,16 +628,8 @@ class HumanoidCore(Star):
         cycle = await self.get_cycle_status(today_str, cfg)
 
         if update_energy:
-            async with self.lock:
-                noise_date = self.state.get("_energy_noise_date", "")
-                if noise_date != today_str:
-                    noise = random.uniform(0.98, 1.02)
-                    new_energy = self.state.get("energy", 80.0) * noise
-                    if new_energy < 30.0:
-                        new_energy = 30.0
-                    self.state["energy"] = new_energy
-                    self.state["_energy_noise_date"] = today_str
-
+            now = self._get_plugin_now(cfg)
+            today_str = now.strftime("%Y-%m-%d")
             last_time_str = self.state.get("last_update", now.strftime("%Y-%m-%d %H:%M:%S"))
             try:
                 last_time = datetime.strptime(last_time_str, "%Y-%m-%d %H:%M:%S")
@@ -619,6 +637,19 @@ class HumanoidCore(Star):
             except:
                 last_time = now
 
+            # 若跨天，重置精力并调整 last_time 为当天 00:00
+            if last_time.date() < now.date():
+                new_energy = 80.0 * random.uniform(0.95, 1.05)
+                max_e = float(cfg.get("max_energy", 100.0))
+                new_energy = max(5.0, min(max_e, new_energy))   # 保底改为5
+                async with self.lock:
+                    self.state["energy"] = round(new_energy, 1)
+                    self.state["last_update"] = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+                    self.state["_energy_noise_date"] = today_str
+                    self.save_state_unsafe()
+                last_time = datetime.strptime(self.state["last_update"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=now.tzinfo)
+
+            # 同一天或已重置，计算从 last_time 到现在的增量
             if last_time < now:
                 decay_rate = self._safe_float(cfg.get("energy_decay_rate", "1.0"), 1.0)
                 delta = self._compute_energy_delta(last_time, now, schedule, decay_rate)
@@ -627,8 +658,8 @@ class HumanoidCore(Star):
                 energy = max(0.0, min(max_e, energy))
                 if 13 <= now.hour <= 15:
                     energy *= 0.98
-                if energy < 30.0:
-                    energy = 30.0
+                if energy < 5.0:        # 保底改为5
+                    energy = 5.0
                 async with self.lock:
                     self.state["energy"] = round(energy, 1)
                     self.state["last_update"] = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -825,6 +856,7 @@ class HumanoidCore(Star):
                 return slot
         return {"event": "休息/自由活动", "location": "家中", "emotion": "平淡", "energy_rate": 0.0}
 
+    # ======================== 修改后的 get_cycle_status ========================
     async def get_cycle_status(self, today_str, cfg):
         if not cfg.get("enable_cycle", True):
             return ""
@@ -843,28 +875,40 @@ class HumanoidCore(Star):
             day = int(self.state.get("current_cycle_day", 1))
         energy = self.state.get("energy", 80.0)
         style = cfg.get("cycle_description_style", "default")
-        if energy < 30:
-            note = "，精力较低"
+        if energy < 10:
+            note = "，精力很低"
+        elif energy < 30:
+            note = "，精力偏低"
         elif energy > 80:
             note = "，精力充沛"
         else:
             note = ""
+
         if 1 <= day <= 5:
-            phase = "生理期/经期"
-            desc_full = f"处于【{phase}】，身体易冷伴微腹痛，疲惫情绪敏感{note}"
+            phase = "经期"
+            desc_full = f"处于【{phase}】，身体能量消耗较大，宜放慢节奏{note}"
             desc_simple = f"经期（第{day}天）"
-        elif 6 <= day <= 13:
+        elif 6 <= day <= 12:
             phase = "卵泡期"
-            desc_full = f"处于【{phase}】，身体舒适，精力回暖{note}"
+            desc_full = f"处于【{phase}】，能量水平逐步回升{note}"
             desc_simple = f"卵泡期（第{day}天）"
-        elif 14 <= day <= 16:
+        elif 13 <= day <= 15:
             phase = "排卵期"
-            desc_full = f"处于【{phase}】，无不适，精力充沛{note}"
+            desc_full = f"处于【{phase}】，能量储备相对充足{note}"
             desc_simple = f"排卵期（第{day}天）"
-        else:
-            phase = "黄体期/经前期"
-            desc_full = f"处于【{phase}】，偶尔水肿，易犯懒疲倦{note}"
-            desc_simple = f"黄体期（第{day}天）"
+        elif 16 <= day <= 21:
+            phase = "黄体早期"
+            desc_full = f"处于【{phase}】，能量开始趋于平稳{note}"
+            desc_simple = f"黄体早期（第{day}天）"
+        elif 22 <= day <= 26:
+            phase = "黄体晚期"
+            desc_full = f"处于【{phase}】，能量水平逐渐回落{note}"
+            desc_simple = f"黄体晚期（第{day}天）"
+        else:  # 27~28
+            phase = "经前期"
+            desc_full = f"处于【{phase}】，能量状态略有波动{note}"
+            desc_simple = f"经前期（第{day}天）"
+
         if style == "simple":
             return desc_simple
         return desc_full
