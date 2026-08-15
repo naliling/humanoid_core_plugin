@@ -17,7 +17,7 @@
     "energy_decay_rate": {
         "description": "【生理】精力变化速度倍率（下拉选择）",
         "type": "string",
-        "default": "1.0",
+        "default": "0.5",
         "options": ["0.5", "1.0", "2.0", "3.0"]
     },
     "cycle_description_style": {
@@ -237,5 +237,5 @@
         "description": "【情绪】单次情绪更新请求超时时间（秒），数值越大越不容易超时",
         "type": "float",
         "default": 30.0
-    }
+    },
 }
