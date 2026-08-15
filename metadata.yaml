@@ -15,7 +15,7 @@ desc: |
   - 支持中日俄主要城市时间查询
 
   指令和配置见 README.md。
-version: 2.6.2
+version: 2.6.3
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"
