@@ -27,9 +27,9 @@
         "options": ["default", "simple"]
     },
     "use_llm_schedule": {
-        "description": "【日程】是否启用大模型每日自动生成全新动态日程。建议在配置好 schedule_provider_name（或全局 provider）后启用。默认建议关闭以避免未配置 Provider 时异常。",
+        "description": "【日程】是否启用大模型每日自动生成全新动态日程。关闭后使用内置备用模板（基于日期轮换）。",
         "type": "bool",
-        "default": false
+        "default": true
     },
     "schedule_provider_name": {
         "description": "【日程】指定生成日程的模型 Provider（下拉选择已配置的 Provider）",
@@ -40,18 +40,18 @@
     "schedule_prompt_extra": {
         "description": "【日程】大模型生成日程时的额外偏好指导语 (如: 喜欢户外运动/偏爱宅家)。",
         "type": "string",
-        "default": "工作学习与休息放松结合，日常节奏灵活自然，不刻意限定时段。"
+        "default": "休闲日常，愉快的生活。"
     },
     "schedule_time_granularity": {
-        "description": "【日程】生成粒度（下拉选择：flexible=灵活，hourly=整点，30min=半小时）",
+        "description": "【日程】生成粒度（下拉选择：flexible=灵活，5min=5分钟，10min=10分钟，15min=15分钟，20min=20分钟，30min=半小时，hourly=整点）",
         "type": "string",
-        "default": "flexible",
-        "options": ["flexible", "hourly", "30min"]
+        "default": "15min",
+        "options": ["flexible", "5min", "10min", "15min", "20min", "30min", "hourly"]
     },
     "character_personality": {
         "description": "【人格设定】选择角色人格，模型将按此生成符合人设的日程",
         "type": "string",
-        "default": "普通人",
+        "default": "温柔体贴",
         "options": [
             "普通人",
             "工作狂",
@@ -71,14 +71,14 @@
         ]
     },
     "admin_qq": {
-        "description": "【权限】管理员QQ列表（数组），仅管理员可使用重置日程等管理指令。支持字符串或数组，字符串可使用逗号分隔多个 QQ。",
+        "description": "【权限】管理员QQ列表（数组），仅管理员可使用重置日程等管理指令",
         "type": "list",
         "default": []
     },
     "weather_enabled": {
-        "description": "【天气】是否启用 OpenWeather 真实天气。建议在填入 weather_api_key 后再启用；默认关闭以避免未配置 API Key 时频繁请求失败。",
+        "description": "【天气】是否启用 OpenWeather 真实天气",
         "type": "bool",
-        "default": false
+        "default": true
     },
     "weather_api_key": {
         "description": "【天气】OpenWeather API Key (请填入 32 位密钥)",
@@ -88,7 +88,7 @@
     "weather_location": {
         "description": "【天气】目标城市 (英文格式，如 Zelenogradsk,RU)",
         "type": "string",
-        "default": "Zelenogradsk,RU"
+        "default": "Heyuan,CN"
     },
     "weather_refresh_minutes": {
         "description": "【天气】天气刷新间隔分钟数 (默认 60)",
@@ -153,7 +153,7 @@
         "default": 28
     },
     "mood_affection_override": {
-        "description": "【情绪】指定QQ号的初始好感度覆盖（列表格式：QQ号:数值，如 123456:100，多个用英文逗号分隔）",
+        "description": "【情绪】指定QQ号的初始好感度覆盖（格式：QQ号:数值，如 123456:100，多个用英文逗号分隔）",
         "type": "list",
         "default": []
     },
@@ -236,6 +236,61 @@
     "mood_update_timeout": {
         "description": "【情绪】单次情绪更新请求超时时间（秒），数值越大越不容易超时",
         "type": "float",
-        "default": 30.0
+        "default": 120
+    },
+    "mood_tag_enabled": {
+        "description": "【心情标签】是否启用可读的心情标签（如“疲惫但开心”）",
+        "type": "bool",
+        "default": true
+    },
+    "mood_tag_use_llm": {
+        "description": "【心情标签】是否使用 LLM 生成心情标签（否则使用规则）",
+        "type": "bool",
+        "default": false
+    },
+    "social_energy_enabled": {
+        "description": "【社交能量】是否开启社交能量（影响回复热情）",
+        "type": "bool",
+        "default": true
+    },
+    "social_energy_consumption_per_msg": {
+        "description": "【社交能量】每条消息消耗的社交能量值 (0.5~3.0)",
+        "type": "float",
+        "default": 1.0
+    },
+    "social_energy_recovery_per_minute": {
+        "description": "【社交能量】每分钟恢复的社交能量值 (0.05~0.5)",
+        "type": "float",
+        "default": 0.2
+    },
+    "social_energy_reset_hour": {
+        "description": "【社交能量】每天重置社交能量的小时 (0-23)，设为 -1 则不重置",
+        "type": "int",
+        "default": 0
+    },
+    "night_mode_enabled": {
+        "description": "【夜间模式】是否开启夜间睡眠模式",
+        "type": "bool",
+        "default": true
+    },
+    "night_start_hour": {
+        "description": "【夜间模式】夜间开始小时 (0-23)",
+        "type": "int",
+        "default": 23
+    },
+    "night_end_hour": {
+        "description": "【夜间模式】夜间结束小时 (0-23)",
+        "type": "int",
+        "default": 6
+    },
+    "night_mode_force_sleep": {
+        "description": "【夜间模式】是否强制回复睡眠提示（否则仅缩短回复）",
+        "type": "bool",
+        "default": false
+    },
+    "debug_mode": {
+        "description": "【调试】是否启用调试模式（输出详细日志，包括LLM请求/响应、情绪计算过程等）",
+        "type": "bool",
+        "default": false
     }
 }
