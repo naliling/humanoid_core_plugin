@@ -63,35 +63,35 @@ def _get_affection_rank(affection: float) -> int:
     else: return 100
 
 AFFECTION_MAP = {
-    0: {  # 好感度 0~12.5
+    0: {
         (50.0, 0.0): "漠然", (50.0, 12.5): "疏远", (50.0, 25.0): "防范", (50.0, 37.5): "戒备", (50.0, 50.0): "敌视",
         (37.5, 0.0): "冷淡", (37.5, 12.5): "避让", (37.5, 25.0): "嫌弃", (37.5, 37.5): "恼火", (37.5, 50.0): "厌恶",
         (25.0, 0.0): "客气", (25.0, 12.5): "距离", (25.0, 25.0): "隔阂", (25.0, 37.5): "抵触", (25.0, 50.0): "反感",
         (12.5, 0.0): "礼貌", (12.5, 12.5): "陌生", (12.5, 25.0): "谨慎", (12.5, 37.5): "不安", (12.5, 50.0): "警惕",
         (0.0, 0.0): "无视", (0.0, 12.5): "透明", (0.0, 25.0): "无视", (0.0, 37.5): "排斥", (0.0, 50.0): "驱逐",
     },
-    25: {  # 好感度 12.5~37.5
+    25: {
         (50.0, 0.0): "留意", (50.0, 12.5): "好奇", (50.0, 25.0): "琢磨", (50.0, 37.5): "在意", (50.0, 50.0): "纠结",
         (37.5, 0.0): "平淡", (37.5, 12.5): "观察", (37.5, 25.0): "试探", (37.5, 37.5): "较劲", (37.5, 50.0): "不服",
         (25.0, 0.0): "普通", (25.0, 12.5): "随意", (25.0, 25.0): "平常", (25.0, 37.5): "别扭", (25.0, 50.0): "嘴硬",
         (12.5, 0.0): "温和", (12.5, 12.5): "淡然", (12.5, 25.0): "淡然", (12.5, 37.5): "淡漠", (12.5, 50.0): "冷漠",
         (0.0, 0.0): "漠视", (0.0, 12.5): "无视", (0.0, 25.0): "回避", (0.0, 37.5): "回避", (0.0, 50.0): "抗拒",
     },
-    50: {  # 好感度 37.5~62.5
+    50: {
         (50.0, 0.0): "友好", (50.0, 12.5): "亲近", (50.0, 25.0): "在意", (50.0, 37.5): "吃醋", (50.0, 50.0): "闹腾",
         (37.5, 0.0): "好感", (37.5, 12.5): "喜欢", (37.5, 25.0): "欣赏", (37.5, 37.5): "调皮", (37.5, 50.0): "炸毛",
         (25.0, 0.0): "舒适", (25.0, 12.5): "放松", (25.0, 25.0): "自然", (25.0, 37.5): "较真", (25.0, 50.0): "倔强",
         (12.5, 0.0): "友善", (12.5, 12.5): "温和", (12.5, 25.0): "随性", (12.5, 37.5): "任性", (12.5, 50.0): "不讲理",
         (0.0, 0.0): "中立", (0.0, 12.5): "平静", (0.0, 25.0): "游离", (0.0, 37.5): "冷落", (0.0, 50.0): "疏离",
     },
-    75: {  # 好感度 62.5~87.5
+    75: {
         (50.0, 0.0): "亲密", (50.0, 12.5): "依恋", (50.0, 25.0): "吃醋", (50.0, 37.5): "撒娇", (50.0, 50.0): "闹别扭",
         (37.5, 0.0): "温暖", (37.5, 12.5): "热情", (37.5, 25.0): "宠溺", (37.5, 37.5): "黏人", (37.5, 50.0): "使性子",
         (25.0, 0.0): "欣赏", (25.0, 12.5): "心动", (25.0, 25.0): "喜欢", (25.0, 37.5): "拉扯", (25.0, 50.0): "较劲",
         (12.5, 0.0): "随意", (12.5, 12.5): "自在", (12.5, 25.0): "惬意", (12.5, 37.5): "烦闷", (12.5, 50.0): "闹心",
         (0.0, 0.0): "安静", (0.0, 12.5): "沉默", (0.0, 25.0): "独处", (0.0, 37.5): "冷淡", (0.0, 50.0): "冷处理",
     },
-    100: {  # 好感度 87.5~100
+    100: {
         (50.0, 0.0): "信赖", (50.0, 12.5): "依恋", (50.0, 25.0): "痴迷", (50.0, 37.5): "占有", (50.0, 50.0): "共依存",
         (37.5, 0.0): "眷恋", (37.5, 12.5): "深爱", (37.5, 25.0): "宠溺", (37.5, 37.5): "痴缠", (37.5, 50.0): "虐恋",
         (25.0, 0.0): "温柔", (25.0, 12.5): "呵护", (25.0, 25.0): "娇惯", (25.0, 37.5): "吃醋", (25.0, 50.0): "心疼",
@@ -308,10 +308,34 @@ class HumanoidCore(Star):
         self.lock = asyncio.Lock()
         self.load_state()
         self.http_session = None
+        self._stop_event = asyncio.Event()
         self._persona_switch_task = None
+        self._social_energy_task = None
         logger.info("[humanoid_core] 插件加载成功")
         self._start_persona_auto_switch()
+        self._start_social_energy_recovery()
 
+    # ---------- 生命周期 ----------
+    async def cleanup(self):
+        self._stop_event.set()
+        if self._persona_switch_task and not self._persona_switch_task.done():
+            try:
+                await asyncio.wait_for(self._persona_switch_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self._persona_switch_task.cancel()
+        if self._social_energy_task and not self._social_energy_task.done():
+            try:
+                await asyncio.wait_for(self._social_energy_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self._social_energy_task.cancel()
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+        logger.info("[humanoid_core] 已清理资源")
+
+    def __del__(self):
+        pass
+
+    # ---------- 人格自动切换 ----------
     def _start_persona_auto_switch(self):
         if self._persona_switch_task is None or self._persona_switch_task.done():
             self._persona_switch_task = asyncio.create_task(self._persona_auto_switch_loop())
@@ -319,10 +343,9 @@ class HumanoidCore(Star):
 
     async def _persona_auto_switch_loop(self):
         cfg = self.get_latest_config()
-        while True:
+        while not self._stop_event.is_set():
             try:
                 await self._check_and_recover_expired_personas(cfg)
-
                 if not cfg.get("persona_enabled", False):
                     await asyncio.sleep(60)
                     cfg = self.get_latest_config()
@@ -332,7 +355,6 @@ class HumanoidCore(Star):
                     await asyncio.sleep(60)
                     cfg = self.get_latest_config()
                     continue
-
                 now = self._get_plugin_now(cfg)
                 if mode == "daily":
                     next_run = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -368,6 +390,7 @@ class HumanoidCore(Star):
             except Exception as e:
                 logger.error(f"[humanoid_core] 人格自动切换循环异常: {e}")
                 await asyncio.sleep(60)
+        logger.info("[humanoid_core] 人格自动切换任务已停止")
 
     async def _check_and_recover_expired_personas(self, cfg: dict):
         if not cfg.get("persona_auto_recover_enabled", True):
@@ -413,7 +436,6 @@ class HumanoidCore(Star):
             cfg["persona_switch_name"] = new_switch
             cfg["persona_default_description"] = switch_desc
             cfg["persona_switch_description"] = default_desc
-
             async with self.lock:
                 user_personas = self.state.get("user_persona", {})
                 for qq, pname in list(user_personas.items()):
@@ -427,6 +449,39 @@ class HumanoidCore(Star):
         except Exception as e:
             logger.error(f"[humanoid_core] 全局人格切换失败: {e}")
 
+    # ---------- 社交能量恢复任务 ----------
+    def _start_social_energy_recovery(self):
+        if self._social_energy_task is None or self._social_energy_task.done():
+            self._social_energy_task = asyncio.create_task(self._social_energy_recovery_loop())
+            logger.info("[humanoid_core] 社交能量恢复任务已启动")
+
+    async def _social_energy_recovery_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                cfg = self.get_latest_config()
+                if cfg.get("social_energy_enabled", True):
+                    recovery = cfg.get("social_energy_recovery_per_minute", 0.2)
+                    async with self.lock:
+                        se = self.state.get("social_energy", 100.0)
+                        se = min(100.0, se + recovery)
+                        self.state["social_energy"] = se
+
+                        reset_hour = cfg.get("social_energy_reset_hour", 0)
+                        if reset_hour >= 0:
+                            now = self._get_plugin_now(cfg)
+                            today = now.strftime("%Y-%m-%d")
+                            last_reset = self.state.get("_last_social_energy_reset_date", "")
+                            if last_reset != today and now.hour >= reset_hour:
+                                self.state["social_energy"] = 100.0
+                                self.state["_last_social_energy_reset_date"] = today
+                        self.save_state_unsafe()
+                await asyncio.sleep(60)
+            except Exception as e:
+                logger.error(f"[humanoid_core] 社交能量恢复异常: {e}")
+                await asyncio.sleep(60)
+        logger.info("[humanoid_core] 社交能量恢复任务已停止")
+
+    # ---------- 基础方法 ----------
     async def _ensure_session(self):
         if self.http_session is None or self.http_session.closed:
             self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
@@ -438,13 +493,14 @@ class HumanoidCore(Star):
         else:
             self._config_cache = self._merge_config({})
         self._config_version += 1
+        logger.info("[humanoid_core] 配置已重载")
 
     def _merge_config(self, overrides: dict) -> dict:
         defaults = {
             "max_energy": 100.0,
             "enable_cycle": True,
             "cycle_length": 28,
-            "energy_decay_rate": "0.5",   # 修改默认值为0.5
+            "energy_decay_rate": "0.5",
             "cycle_description_style": "default",
             "use_llm_schedule": True,
             "schedule_provider_name": "",
@@ -483,7 +539,18 @@ class HumanoidCore(Star):
             "persona_switch_custom_time": "08:00",
             "persona_reset_mood_on_switch": False,
             "persona_auto_recover_enabled": True,
-            "mood_update_timeout": 30.0
+            "mood_update_timeout": 30.0,
+            "mood_tag_enabled": True,
+            "mood_tag_use_llm": False,
+            "social_energy_enabled": True,
+            "social_energy_consumption_per_msg": 1.0,
+            "social_energy_recovery_per_minute": 0.2,
+            "social_energy_reset_hour": 0,
+            "night_mode_enabled": True,
+            "night_start_hour": 23,
+            "night_end_hour": 7,
+            "night_mode_force_sleep": False,
+            "debug_mode": False,
         }
         if isinstance(self.config, dict):
             defaults.update(self.config)
@@ -500,6 +567,12 @@ class HumanoidCore(Star):
             try:
                 with open(self.state_path, 'r', encoding='utf-8') as f:
                     self.state = json.load(f)
+                if "social_energy" not in self.state:
+                    self.state["social_energy"] = 100.0
+                if "mood_tags" not in self.state:
+                    self.state["mood_tags"] = {}
+                if "_last_social_energy_reset_date" not in self.state:
+                    self.state["_last_social_energy_reset_date"] = ""
             except Exception:
                 self.init_default_state()
         else:
@@ -525,7 +598,10 @@ class HumanoidCore(Star):
             "mood_logs": {},
             "user_persona": {},
             "global_persona_index": 0,
-            "user_persona_expiry": {}
+            "user_persona_expiry": {},
+            "social_energy": 100.0,
+            "mood_tags": {},
+            "_last_social_energy_reset_date": "",
         }
         self.save_state_unsafe()
 
@@ -549,7 +625,7 @@ class HumanoidCore(Star):
     def _get_plugin_now(self, cfg: dict = None):
         return datetime.now(self._get_plugin_tz(cfg))
 
-    # ======================== 修改后的 _compute_energy_delta ========================
+    # ======================== 精力计算（优化版） ========================
     def _compute_energy_delta(self, start_time: datetime, end_time: datetime, schedule: list, decay_rate: float) -> float:
         if start_time >= end_time:
             return 0.0
@@ -570,22 +646,19 @@ class HumanoidCore(Star):
                 continue
         sorted_times = sorted(boundaries)
         delta = 0.0
-        consumption_discount = 0.7   # 消耗打7折
-
-        # 获取当前周期日，用于周期系数
+        consumption_discount = 0.7
         cycle_day = self.state.get("current_cycle_day", 1)
-        # 定义周期影响系数（经期消耗1.3倍，卵泡期0.8倍等）
-        if 1 <= cycle_day <= 5:          # 经期
+        if 1 <= cycle_day <= 5:
             cycle_factor = 1.3
-        elif 6 <= cycle_day <= 12:       # 卵泡期
+        elif 6 <= cycle_day <= 12:
             cycle_factor = 0.8
-        elif 13 <= cycle_day <= 15:      # 排卵期
+        elif 13 <= cycle_day <= 15:
             cycle_factor = 1.0
-        elif 16 <= cycle_day <= 21:      # 黄体早期
+        elif 16 <= cycle_day <= 21:
             cycle_factor = 1.1
-        elif 22 <= cycle_day <= 26:      # 黄体晚期
+        elif 22 <= cycle_day <= 26:
             cycle_factor = 1.2
-        else:                            # 经前期 (27~28)
+        else:
             cycle_factor = 1.15
 
         for i in range(len(sorted_times)-1):
@@ -608,15 +681,18 @@ class HumanoidCore(Star):
                     continue
             minutes = (seg_end - seg_start).total_seconds() / 60
             if rate < 0:
-                # 消耗部分：基础打折 × 周期系数
                 effective_rate = rate * consumption_discount * cycle_factor
             else:
-                # 恢复部分不变
                 effective_rate = rate
             delta += effective_rate * decay_rate * minutes
+
+        # 调试日志
+        cfg = self.get_latest_config()
+        if cfg.get("debug_mode", False):
+            logger.debug(f"[humanoid_core] 精力计算: 时段 {start_time} - {end_time}, 总变化 {delta:.2f}")
         return delta
 
-    # ======================== 修改后的 _get_current_context ========================
+    # ======================== 上下文获取 ========================
     async def _get_current_context(self, update_energy=True):
         cfg = self.get_latest_config()
         now = self._get_plugin_now(cfg)
@@ -637,11 +713,10 @@ class HumanoidCore(Star):
             except:
                 last_time = now
 
-            # 若跨天，重置精力并调整 last_time 为当天 00:00
             if last_time.date() < now.date():
                 new_energy = 80.0 * random.uniform(0.95, 1.05)
                 max_e = float(cfg.get("max_energy", 100.0))
-                new_energy = max(5.0, min(max_e, new_energy))   # 保底改为5
+                new_energy = max(5.0, min(max_e, new_energy))
                 async with self.lock:
                     self.state["energy"] = round(new_energy, 1)
                     self.state["last_update"] = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
@@ -649,7 +724,6 @@ class HumanoidCore(Star):
                     self.save_state_unsafe()
                 last_time = datetime.strptime(self.state["last_update"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=now.tzinfo)
 
-            # 同一天或已重置，计算从 last_time 到现在的增量
             if last_time < now:
                 decay_rate = self._safe_float(cfg.get("energy_decay_rate", "1.0"), 1.0)
                 delta = self._compute_energy_delta(last_time, now, schedule, decay_rate)
@@ -658,12 +732,14 @@ class HumanoidCore(Star):
                 energy = max(0.0, min(max_e, energy))
                 if 13 <= now.hour <= 15:
                     energy *= 0.98
-                if energy < 5.0:        # 保底改为5
+                if energy < 5.0:
                     energy = 5.0
                 async with self.lock:
                     self.state["energy"] = round(energy, 1)
                     self.state["last_update"] = now.strftime("%Y-%m-%d %H:%M:%S")
                     self.save_state_unsafe()
+                if cfg.get("debug_mode", False):
+                    logger.debug(f"[humanoid_core] 精力更新: 从 {self.state.get('energy', 0)} 变化后为 {energy:.1f}")
 
         energy = self.state.get("energy", 80.0)
         max_e = float(cfg.get("max_energy", 100.0))
@@ -726,6 +802,8 @@ class HumanoidCore(Star):
                             self.state["_last_weather_fetch"] = now.strftime("%Y-%m-%d %H:%M:%S")
                             self.state["_cached_location"] = location
                             self.save_state_unsafe()
+                        if cfg.get("debug_mode", False):
+                            logger.debug(f"[humanoid_core] 天气获取成功: {desc}, {temp}°C")
                         return obj
             except Exception as e:
                 logger.warning(f"[humanoid_core] 天气请求失败: {e}")
@@ -788,12 +866,21 @@ class HumanoidCore(Star):
         extra = cfg.get("schedule_prompt_extra", "")
         granularity = cfg.get("schedule_time_granularity", "flexible")
         granularity_hint = ""
-        if granularity == "hourly":
-            granularity_hint = "请按整小时划分时间段（如 00:00-08:00-09:00...），不要出现30分钟或45分钟等非整点时间。"
+        if granularity == "5min":
+            granularity_hint = "请严格按每5分钟划分时间段（如 00:00-00:05-00:10...），每个时段的起止时间必须是5分钟的倍数。"
+        elif granularity == "10min":
+            granularity_hint = "请严格按每10分钟划分时间段（如 00:00-00:10-00:20...），每个时段的起止时间必须是10分钟的倍数。"
+        elif granularity == "15min":
+            granularity_hint = "请严格按每15分钟划分时间段（如 00:00-00:15-00:30...），每个时段的起止时间必须是15分钟的倍数。"
+        elif granularity == "20min":
+            granularity_hint = "请严格按每20分钟划分时间段（如 00:00-00:20-00:40...），每个时段的起止时间必须是20分钟的倍数。"
         elif granularity == "30min":
-            granularity_hint = "请按半小时划分时间段（如 00:00-00:30-01:00...）。"
-        else:
-            granularity_hint = "时间粒度可以灵活，可以是1小时、30分钟、20分钟、15分钟等。"
+            granularity_hint = "请严格按每30分钟划分时间段（如 00:00-00:30-01:00...），每个时段的起止时间必须是30分钟的倍数。"
+        elif granularity == "hourly":
+            granularity_hint = "请按整小时划分时间段（如 00:00-08:00-09:00...），不要出现30分钟或45分钟等非整点时间。"
+        else:  # flexible
+            granularity_hint = "时间粒度可以灵活自由，可以是5分钟、10分钟、15分钟、20分钟、30分钟、1小时等，根据活动内容自然决定。"
+
         prompt = (
             f"请为{personality}生成今天的 24 小时生活日程规划。今天是 {today_str} 星期{weekday}。\n"
             f"额外偏好指导：{extra}\n"
@@ -809,6 +896,8 @@ class HumanoidCore(Star):
             "5. energy_rate：休息为正(0.05~0.2)，工作为负(-0.05~-0.15)。\n"
             "6. 地点变化考虑通勤时间。"
         )
+        if cfg.get("debug_mode", False):
+            logger.debug(f"[humanoid_core] 日程生成 prompt: {prompt}")
         for attempt in range(3):
             try:
                 provider = self.get_target_provider(cfg)
@@ -828,6 +917,8 @@ class HumanoidCore(Star):
                         break
                     continue
                 raw = response.completion_text if hasattr(response, "completion_text") else str(response)
+                if cfg.get("debug_mode", False):
+                    logger.debug(f"[humanoid_core] 日程生成原始响应: {raw[:200]}...")
                 parsed = extract_json_from_response(raw)
                 if parsed and len(parsed) > 0:
                     logger.info(f"[humanoid_core] 生成成功，{len(parsed)} 个时段")
@@ -856,7 +947,7 @@ class HumanoidCore(Star):
                 return slot
         return {"event": "休息/自由活动", "location": "家中", "emotion": "平淡", "energy_rate": 0.0}
 
-    # ======================== 修改后的 get_cycle_status ========================
+    # ======================== 周期状态 ========================
     async def get_cycle_status(self, today_str, cfg):
         if not cfg.get("enable_cycle", True):
             return ""
@@ -904,7 +995,7 @@ class HumanoidCore(Star):
             phase = "黄体晚期"
             desc_full = f"处于【{phase}】，能量水平逐渐回落{note}"
             desc_simple = f"黄体晚期（第{day}天）"
-        else:  # 27~28
+        else:
             phase = "经前期"
             desc_full = f"处于【{phase}】，能量状态略有波动{note}"
             desc_simple = f"经前期（第{day}天）"
@@ -913,6 +1004,7 @@ class HumanoidCore(Star):
             return desc_simple
         return desc_full
 
+    # ======================== 精力描述 ========================
     def get_energy_description(self, energy: float) -> str:
         if energy >= 90:
             return "精力充沛，语气轻快，话比较多"
@@ -925,56 +1017,59 @@ class HumanoidCore(Star):
         else:
             return "很疲惫，语气低落，只想安静待着"
 
-    def apply_energy_inertia(self, energy: float, rate: float) -> float:
-        return rate
-
-    def apply_afternoon_slump(self, energy: float) -> float:
-        now = self._get_plugin_now()
-        hour = now.hour
-        if 13 <= hour <= 15:
-            return energy * 0.98
-        return energy
-
-    def _build_context_prompt(self, ctx: dict, cfg: dict) -> str:
-        chat_mode = cfg.get("inject_activity_context", "low")
-        energy_desc = self.get_energy_description(ctx["energy"])
-        max_e = ctx["max_e"]
-
-        if chat_mode == "full":
-            prompt = (
-                f"[系统暗示：以下内容作为状态参考，严禁念出数值或暴露面板]\n"
-                f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
-                f"- 当前所在城市: {ctx['location_city']}\n"
-                f"- 当前城市时间: {ctx['location_time'] if ctx['location_time'] else '无法获取'}\n"
-                f"- 当前天气环境: {ctx['weather']['env']}\n"
-                f"- 当前参考物理位置: {ctx['current_slot'].get('location', '家中')}\n"
-                f"- 当前日程计划: {ctx['current_slot'].get('event', '休息/自由活动')}\n"
-                f"- 当前生理状况: {ctx['cycle']}\n"
-                f"- 当前基础情绪倾向: {ctx['current_slot'].get('emotion', '平淡')}\n"
-                f"- 当前精力状态: {energy_desc} ({int(ctx['energy'])}/{int(max_e)})\n"
-            )
-        elif chat_mode == "mood_only":
-            prompt = (
-                f"[系统暗示：仅作为语气与情绪背景参考]\n"
-                f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
-                f"- 当前精力状态: {energy_desc}\n"
-                f"- 情绪倾向: {ctx['current_slot'].get('emotion', '平淡')}\n"
-            )
+    # ======================== 心情标签 ========================
+    def _generate_mood_tag(self, affection: float, libido: float, aggression: float, energy: float, use_llm=False) -> str:
+        parts = []
+        if energy >= 70:
+            parts.append("精力充沛")
+        elif energy >= 40:
+            parts.append("状态平稳")
         else:
-            prompt = (
-                f"[系统暗示：仅作为语气与情绪背景参考，严禁主动提及你正在做什么或在哪里，除非用户明确询问。]\n"
-                f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
-                f"- 当前所在城市: {ctx['location_city']}\n"
-                f"- 当前精力状态: {energy_desc} ({int(ctx['energy'])}/{int(max_e)})\n"
-                f"- 情绪倾向: {ctx['current_slot'].get('emotion', '平淡')}\n"
-                f"- 生理背景: {ctx['cycle']}\n"
-            )
-            if cfg.get("show_city_time_in_low_intrusion", True):
-                prompt += f"- 当前城市时间: {ctx['location_time'] if ctx['location_time'] else '无法获取'}\n"
-            prompt += f"- 天气: {ctx['weather']['env']}\n"
+            parts.append("有点疲惫")
 
-        prompt += "\n请以最自然的拟人方式闲聊，不要刻板念出状态。\n-----------------------------------\n"
-        return prompt
+        if affection >= 70:
+            parts.append("开心")
+        elif affection >= 40:
+            parts.append("平静")
+        else:
+            parts.append("冷淡")
+
+        if libido >= 30 and aggression < 20:
+            parts.append("亲切")
+        elif aggression >= 30 and libido < 20:
+            parts.append("疏离")
+        elif aggression >= 30 and libido >= 30:
+            parts.append("矛盾")
+        else:
+            parts.append("自然")
+
+        unique = []
+        for p in parts:
+            if p not in unique:
+                unique.append(p)
+        return "，".join(unique)
+
+    def _get_mood_tag(self, qq: str, cfg: dict) -> str:
+        if not cfg.get("mood_tag_enabled", True):
+            return ""
+        if "mood_tags" not in self.state:
+            self.state["mood_tags"] = {}
+        return self.state["mood_tags"].get(qq, "")
+
+    def _update_mood_tag(self, qq: str, cfg: dict, mood_data: dict, energy: float):
+        if not cfg.get("mood_tag_enabled", True):
+            return
+        tag = self._generate_mood_tag(
+            mood_data["affection"],
+            mood_data["libido"],
+            mood_data["aggression"],
+            energy,
+            cfg.get("mood_tag_use_llm", False)
+        )
+        if "mood_tags" not in self.state:
+            self.state["mood_tags"] = {}
+        self.state["mood_tags"][qq] = tag
+        self.save_state_unsafe()
 
     # ======================== 情绪方法 ========================
     def _get_user_mood(self, qq: str) -> dict:
@@ -1054,6 +1149,23 @@ class HumanoidCore(Star):
             if updated:
                 self.save_state_unsafe()
 
+    # ---------- 本地情绪规则兜底 ----------
+    def _local_mood_delta(self, text: str) -> dict:
+        text_lower = text.lower()
+        if any(k in text_lower for k in ["爱", "喜欢", "好", "棒", "厉害", "赞", "开心", "谢谢", "感谢"]):
+            aff = random.uniform(1, 3)
+            lib = random.uniform(0.5, 2)
+            agg = random.uniform(-1, -0.5)
+        elif any(k in text_lower for k in ["恨", "讨厌", "滚", "烦", "恶心", "吵", "骂"]):
+            aff = random.uniform(-3, -1)
+            lib = random.uniform(-2, -0.5)
+            agg = random.uniform(1, 3)
+        else:
+            aff = random.uniform(-0.5, 0.5)
+            lib = random.uniform(-0.3, 0.3)
+            agg = random.uniform(-0.3, 0.3)
+        return {"affection_delta": aff, "libido_delta": lib, "aggression_delta": agg}
+
     async def _update_mood_by_message(self, event: AstrMessageEvent, qq: str, cfg: dict):
         user_msg = event.message_str.strip() if hasattr(event, "message_str") else ""
         if not user_msg:
@@ -1066,97 +1178,102 @@ class HumanoidCore(Star):
             self._save_user_mood(qq, mood_data)
             return
 
-        prompt = (
-            f"用户说：{user_msg}\n"
-            f"当前情绪状态：好感度 {mood_data['affection']:.1f}/100，亲近欲 {mood_data['libido']:.1f}/50，攻击性 {mood_data['aggression']:.1f}/50\n"
-            "请分析这句话会让AI对用户的情绪产生什么变化。只返回JSON：{\"affection_delta\": 数值(-5~5), \"libido_delta\": 数值(-5~5), \"aggression_delta\": 数值(-5~5)}"
-        )
-
+        local_delta = self._local_mood_delta(user_msg)
+        llm_delta = None
         for attempt in range(2):
             try:
                 provider = self.get_target_provider(cfg)
                 if not provider:
-                    return
+                    break
                 timeout = cfg.get("mood_update_timeout", 30.0)
+                prompt = (
+                    f"用户说：{user_msg}\n"
+                    f"当前情绪状态：好感度 {mood_data['affection']:.1f}/100，亲近欲 {mood_data['libido']:.1f}/50，攻击性 {mood_data['aggression']:.1f}/50\n"
+                    "请分析这句话会让AI对用户的情绪产生什么变化。只返回JSON：{\"affection_delta\": 数值(-5~5), \"libido_delta\": 数值(-5~5), \"aggression_delta\": 数值(-5~5)}"
+                )
+                if cfg.get("debug_mode", False):
+                    logger.debug(f"[humanoid_core] 情绪分析 prompt: {prompt}")
                 response = await asyncio.wait_for(provider.text_chat(prompt=prompt), timeout=timeout)
                 raw = response.completion_text if hasattr(response, "completion_text") else str(response)
+                if cfg.get("debug_mode", False):
+                    logger.debug(f"[humanoid_core] 情绪分析响应: {raw}")
                 match = re.search(r'\{[^{}]*\}', raw)
-                if not match:
-                    logger.warning(f"[humanoid_core] 情绪更新: 未匹配到JSON，原始响应: {raw[:100]}")
-                    continue
-                delta = json.loads(match.group())
-                sensitivity = cfg.get("mood_sensitivity", 28) / 100.0
-                delta_cap = cfg.get("mood_affection_delta_cap", 3)
-
-                aff_delta = delta.get("affection_delta", 0) * sensitivity
-                lib_delta = delta.get("libido_delta", 0) * sensitivity
-                agg_delta = delta.get("aggression_delta", 0) * sensitivity
-
-                aff_delta = max(-delta_cap, min(delta_cap, aff_delta))
-                lib_delta = max(-delta_cap, min(delta_cap, lib_delta))
-                agg_delta = max(-delta_cap, min(delta_cap, agg_delta))
-
-                energy = self.state.get("energy", 80)
-                if energy > 70:
-                    if aff_delta > 0: aff_delta *= 1.3
-                    else: aff_delta *= 0.7
-                    if lib_delta > 0: lib_delta *= 1.3
-                    else: lib_delta *= 0.7
-                    if agg_delta > 0: agg_delta *= 1.3
-                    else: agg_delta *= 0.7
-                elif energy < 40:
-                    aff_delta *= 0.5
-                    lib_delta *= 0.5
-                    agg_delta *= 0.5
-
-                cycle_day = self.state.get("current_cycle_day", 1)
-                if 1 <= cycle_day <= 5:
-                    if aff_delta > 0: aff_delta *= 0.5
-                    else: aff_delta *= 1.5
-                    if lib_delta > 0: lib_delta *= 0.5
-                    else: lib_delta *= 1.5
-                    if agg_delta > 0: agg_delta *= 0.8
-                    else: agg_delta *= 1.5
-                elif 14 <= cycle_day <= 16:
-                    if aff_delta > 0: aff_delta *= 1.4
-                    else: aff_delta *= 0.6
-                    if lib_delta > 0: lib_delta *= 1.4
-                    else: lib_delta *= 0.6
-                    if agg_delta > 0: agg_delta *= 1.2
-                    else: agg_delta *= 0.8
-
-                old_affection = mood_data["affection"]
-                old_libido = mood_data["libido"]
-                old_aggression = mood_data["aggression"]
-
-                mood_data["affection"] = max(0.0, min(100.0, mood_data["affection"] + aff_delta))
-                mood_data["libido"] = max(0.0, min(50.0, mood_data["libido"] + lib_delta))
-                mood_data["aggression"] = max(0.0, min(50.0, mood_data["aggression"] + agg_delta))
-
-                turn = mood_data.get("turn_count", 1)
-                base_coef = 1.0 if turn <= 10 else 0.2
-                mood_data["base_affection"] = max(0.0, min(100.0, mood_data["base_affection"] + aff_delta * base_coef * 0.5))
-                mood_data["base_libido"] = max(0.0, min(50.0, mood_data["base_libido"] + lib_delta * base_coef * 0.5))
-                mood_data["base_aggression"] = max(0.0, min(50.0, mood_data["base_aggression"] + agg_delta * base_coef * 0.5))
-
-                mood_data["turn_count"] = turn + 1
-                mood_data["last_interaction"] = now
-
-                self._log_mood_event(qq, old_affection, old_libido, old_aggression,
-                                     mood_data["affection"], mood_data["libido"], mood_data["aggression"], cfg)
-
-                self._save_user_mood(qq, mood_data)
-                return
-
-            except asyncio.TimeoutError:
-                if attempt == 1:
-                    logger.warning(f"[humanoid_core] 情绪更新超时，已重试2次，超时时间 {timeout}秒")
-                    return
+                if match:
+                    llm_delta = json.loads(match.group())
+                    break
             except Exception as e:
-                import traceback
-                if attempt == 1:
-                    logger.warning(f"[humanoid_core] 情绪更新失败: {e}\n{traceback.format_exc()}")
-                    return
+                logger.warning(f"[humanoid_core] LLM情绪分析失败(尝试{attempt+1}): {e}")
+                continue
+
+        if llm_delta:
+            weight_llm = 0.8
+            aff_delta = llm_delta.get("affection_delta", 0) * weight_llm + local_delta["affection_delta"] * (1 - weight_llm)
+            lib_delta = llm_delta.get("libido_delta", 0) * weight_llm + local_delta["libido_delta"] * (1 - weight_llm)
+            agg_delta = llm_delta.get("aggression_delta", 0) * weight_llm + local_delta["aggression_delta"] * (1 - weight_llm)
+        else:
+            aff_delta = local_delta["affection_delta"]
+            lib_delta = local_delta["libido_delta"]
+            agg_delta = local_delta["aggression_delta"]
+
+        sensitivity = cfg.get("mood_sensitivity", 28) / 100.0
+        delta_cap = cfg.get("mood_affection_delta_cap", 3)
+        aff_delta *= sensitivity
+        lib_delta *= sensitivity
+        agg_delta *= sensitivity
+        aff_delta = max(-delta_cap, min(delta_cap, aff_delta))
+        lib_delta = max(-delta_cap, min(delta_cap, lib_delta))
+        agg_delta = max(-delta_cap, min(delta_cap, agg_delta))
+
+        energy = self.state.get("energy", 80)
+        if energy > 70:
+            if aff_delta > 0: aff_delta *= 1.3
+            else: aff_delta *= 0.7
+            if lib_delta > 0: lib_delta *= 1.3
+            else: lib_delta *= 0.7
+            if agg_delta > 0: agg_delta *= 1.3
+            else: agg_delta *= 0.7
+        elif energy < 40:
+            aff_delta *= 0.5
+            lib_delta *= 0.5
+            agg_delta *= 0.5
+
+        cycle_day = self.state.get("current_cycle_day", 1)
+        if 1 <= cycle_day <= 5:
+            if aff_delta > 0: aff_delta *= 0.5
+            else: aff_delta *= 1.5
+            if lib_delta > 0: lib_delta *= 0.5
+            else: lib_delta *= 1.5
+            if agg_delta > 0: agg_delta *= 0.8
+            else: agg_delta *= 1.5
+        elif 14 <= cycle_day <= 16:
+            if aff_delta > 0: aff_delta *= 1.4
+            else: aff_delta *= 0.6
+            if lib_delta > 0: lib_delta *= 1.4
+            else: lib_delta *= 0.6
+            if agg_delta > 0: agg_delta *= 1.2
+            else: agg_delta *= 0.8
+
+        old_affection = mood_data["affection"]
+        old_libido = mood_data["libido"]
+        old_aggression = mood_data["aggression"]
+
+        mood_data["affection"] = max(0.0, min(100.0, mood_data["affection"] + aff_delta))
+        mood_data["libido"] = max(0.0, min(50.0, mood_data["libido"] + lib_delta))
+        mood_data["aggression"] = max(0.0, min(50.0, mood_data["aggression"] + agg_delta))
+
+        turn = mood_data.get("turn_count", 1)
+        base_coef = 1.0 if turn <= 10 else 0.2
+        mood_data["base_affection"] = max(0.0, min(100.0, mood_data["base_affection"] + aff_delta * base_coef * 0.5))
+        mood_data["base_libido"] = max(0.0, min(50.0, mood_data["base_libido"] + lib_delta * base_coef * 0.5))
+        mood_data["base_aggression"] = max(0.0, min(50.0, mood_data["base_aggression"] + agg_delta * base_coef * 0.5))
+
+        mood_data["turn_count"] = turn + 1
+        mood_data["last_interaction"] = now
+
+        self._log_mood_event(qq, old_affection, old_libido, old_aggression,
+                             mood_data["affection"], mood_data["libido"], mood_data["aggression"], cfg)
+        self._update_mood_tag(qq, cfg, mood_data, energy)
+        self._save_user_mood(qq, mood_data)
 
     def _log_mood_event(self, qq: str, old_aff, old_lib, old_agg, new_aff, new_lib, new_agg, cfg: dict):
         if not cfg.get("mood_log_enabled", True):
@@ -1258,6 +1375,19 @@ class HumanoidCore(Star):
         self.save_state_unsafe()
 
     # ======================== 指令 ========================
+    @filter.command("重载配置")
+    async def reload_config_cmd(self, event: AstrMessageEvent):
+        """管理员指令：重载配置文件，无需重启"""
+        cfg = self.get_latest_config()
+        admin_list = [str(a).strip() for a in cfg.get("admin_qq", [])]
+        if str(event.get_sender_id()) not in admin_list:
+            yield event.plain_result("❌ 权限不足，仅管理员可重载配置。")
+            return
+        # 重新加载配置（会从 self.config 和默认值合并）
+        self.reload_config(self.config)
+        # 重置一些可能受配置影响的状态（如时区？此处可留空，因为 _get_plugin_tz 每次会重新读取）
+        yield event.plain_result("✅ 配置已重载，当前版本已生效。")
+
     @filter.command("你的状态")
     async def my_status(self, event: AstrMessageEvent):
         cfg = self.get_latest_config()
@@ -1273,14 +1403,21 @@ class HumanoidCore(Star):
             f"- 今日日程: {schedule_summary}",
             f"- 今日是：{ctx['today_str']} 星期{ctx['weekday']}"
         ]
+        qq = str(event.get_sender_id())
         if cfg.get("mood_enabled", True):
-            qq = str(event.get_sender_id())
             await self._apply_mood_decay(cfg)
             mood = self._get_user_mood(qq)
             label = get_mood_label(mood["affection"], mood["libido"], mood["aggression"])
             lines.append(f"- 情绪: {label} (好感度 {mood['affection']:.1f})")
+        if cfg.get("mood_tag_enabled", True):
+            tag = self._get_mood_tag(qq, cfg)
+            if tag:
+                lines.append(f"- 心情标签: {tag}")
+        if cfg.get("social_energy_enabled", True):
+            se = self.state.get("social_energy", 100.0)
+            se_desc = "充足" if se > 70 else "一般" if se > 40 else "较低"
+            lines.append(f"- 社交能量: {int(se)}% ({se_desc})")
         if cfg.get("persona_enabled", False):
-            qq = str(event.get_sender_id())
             persona = self._get_user_persona(qq, cfg)
             if persona:
                 lines.append(f"- 人格: {persona.get('name', '未知')}")
@@ -1303,6 +1440,10 @@ class HumanoidCore(Star):
             f"攻击性：{data['aggression']:.1f}/50（基线 {data['base_aggression']:.1f}）\n"
             f"当前标签：{label}"
         )
+        if cfg.get("mood_tag_enabled", True):
+            tag = self._get_mood_tag(qq, cfg)
+            if tag:
+                msg += f"\n心情标签：{tag}"
         yield event.plain_result(msg)
 
     @filter.command("情绪详情")
@@ -1323,6 +1464,10 @@ class HumanoidCore(Star):
             f"当前标签：{label}\n"
             f"交互轮次：{data.get('turn_count', 0)}"
         )
+        if cfg.get("mood_tag_enabled", True):
+            tag = self._get_mood_tag(qq, cfg)
+            if tag:
+                msg += f"\n心情标签：{tag}"
         yield event.plain_result(msg)
 
     @filter.command("情绪日志")
@@ -1619,6 +1764,7 @@ class HumanoidCore(Star):
             "/切换人格 人格名 [时间] - 切换到指定人格，可带时间（2h/30m/18:00）自动恢复\n"
             "/查看人格 - 查看当前人格和可用人格列表\n"
             "/人格详情 [名称] - 查看人格详细设定\n"
+            "/重载配置 - 重载插件配置（管理员）\n"
             "/拟人帮助 - 显示本帮助"
         )
         yield event.plain_result(help_text)
@@ -1686,6 +1832,32 @@ class HumanoidCore(Star):
                 chat_env_note = "【环境感知】当前你在私聊中与用户一对一对话，回复时语气可以更亲密、自然一些。\n"
             context_prompt = chat_env_note + context_prompt
 
+        if cfg.get("night_mode_enabled", True):
+            now = self._get_plugin_now(cfg)
+            start = cfg.get("night_start_hour", 23)
+            end = cfg.get("night_end_hour", 7)
+            if start <= end:
+                is_night = start <= now.hour < end
+            else:
+                is_night = now.hour >= start or now.hour < end
+            if is_night:
+                force_sleep = cfg.get("night_mode_force_sleep", False)
+                if force_sleep:
+                    night_hint = "【夜间模式】当前是深夜，AI 处于睡眠状态，请仅回复一句“我现在需要休息，明天再聊吧”或类似简短提示。"
+                else:
+                    night_hint = "【夜间模式】当前是深夜，AI 应该表现得困倦、慵懒，回复尽量简短（不超过50字），可带“困”、“累”等词语。"
+                context_prompt = night_hint + "\n" + context_prompt
+
+        if cfg.get("social_energy_enabled", True):
+            se = self.state.get("social_energy", 100.0)
+            if se > 70:
+                se_desc = "社交能量充足，回复可以热情、话多"
+            elif se > 40:
+                se_desc = "社交能量一般，回复保持正常"
+            else:
+                se_desc = "社交能量较低，回复应尽量简短，避免长篇大论"
+            context_prompt += f"\n【社交能量】{se_desc}（当前值 {int(se)}%）"
+
         if req.system_prompt:
             req.system_prompt += "\n" + context_prompt
         else:
@@ -1716,6 +1888,47 @@ class HumanoidCore(Star):
                 "（请根据上述数值和你在人设中定义的「情绪驱动规则」来演绎角色，不要提及数值。）"
             )
             req.system_prompt += "\n\n" + mood_prompt
+
+    def _build_context_prompt(self, ctx: dict, cfg: dict) -> str:
+        chat_mode = cfg.get("inject_activity_context", "low")
+        energy_desc = self.get_energy_description(ctx["energy"])
+        max_e = ctx["max_e"]
+
+        if chat_mode == "full":
+            prompt = (
+                f"[系统暗示：以下内容作为状态参考，严禁念出数值或暴露面板]\n"
+                f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
+                f"- 当前所在城市: {ctx['location_city']}\n"
+                f"- 当前城市时间: {ctx['location_time'] if ctx['location_time'] else '无法获取'}\n"
+                f"- 当前天气环境: {ctx['weather']['env']}\n"
+                f"- 当前参考物理位置: {ctx['current_slot'].get('location', '家中')}\n"
+                f"- 当前日程计划: {ctx['current_slot'].get('event', '休息/自由活动')}\n"
+                f"- 当前生理状况: {ctx['cycle']}\n"
+                f"- 当前基础情绪倾向: {ctx['current_slot'].get('emotion', '平淡')}\n"
+                f"- 当前精力状态: {energy_desc} ({int(ctx['energy'])}/{int(max_e)})\n"
+            )
+        elif chat_mode == "mood_only":
+            prompt = (
+                f"[系统暗示：仅作为语气与情绪背景参考]\n"
+                f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
+                f"- 当前精力状态: {energy_desc}\n"
+                f"- 情绪倾向: {ctx['current_slot'].get('emotion', '平淡')}\n"
+            )
+        else:
+            prompt = (
+                f"[系统暗示：仅作为语气与情绪背景参考，严禁主动提及你正在做什么或在哪里，除非用户明确询问。]\n"
+                f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
+                f"- 当前所在城市: {ctx['location_city']}\n"
+                f"- 当前精力状态: {energy_desc} ({int(ctx['energy'])}/{int(max_e)})\n"
+                f"- 情绪倾向: {ctx['current_slot'].get('emotion', '平淡')}\n"
+                f"- 生理背景: {ctx['cycle']}\n"
+            )
+            if cfg.get("show_city_time_in_low_intrusion", True):
+                prompt += f"- 当前城市时间: {ctx['location_time'] if ctx['location_time'] else '无法获取'}\n"
+            prompt += f"- 天气: {ctx['weather']['env']}\n"
+
+        prompt += "\n请以最自然的拟人方式闲聊，不要刻板念出状态。\n-----------------------------------\n"
+        return prompt
 
     # ======================== 消息监听 ========================
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -1749,6 +1962,22 @@ class HumanoidCore(Star):
             return
 
         await self._get_current_context(update_energy=True)
+
+        if cfg.get("social_energy_enabled", True):
+            consumption = cfg.get("social_energy_consumption_per_msg", 1.0)
+            async with self.lock:
+                se = self.state.get("social_energy", 100.0)
+                se = max(0.0, se - consumption)
+                self.state["social_energy"] = se
+                reset_hour = cfg.get("social_energy_reset_hour", 0)
+                if reset_hour >= 0:
+                    now = self._get_plugin_now(cfg)
+                    today = now.strftime("%Y-%m-%d")
+                    last_reset = self.state.get("_last_social_energy_reset_date", "")
+                    if last_reset != today and now.hour >= reset_hour:
+                        self.state["social_energy"] = 100.0
+                        self.state["_last_social_energy_reset_date"] = today
+                self.save_state_unsafe()
 
         if cfg.get("mood_enabled", True):
             qq = str(event.get_sender_id())
