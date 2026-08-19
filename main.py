@@ -327,7 +327,7 @@ class HumanoidCore(Star):
         self._stop_event = asyncio.Event()
         self._persona_switch_task = None
         self._social_energy_task = None
-        logger.info("[humanoid_core] 插件加载成功")
+        logger.info("[humanoid_core] 插件加载成功 (v2.7.9)")
         self._start_persona_auto_switch()
         self._start_social_energy_recovery()
 
@@ -700,7 +700,12 @@ class HumanoidCore(Star):
                     if e < s:
                         e += timedelta(days=1)
                     if s <= mid_time <= e:
-                        rate = slot.get("energy_rate", 0.0)
+                        raw_rate = slot.get("energy_rate", 0.0)
+                        # ---- 关键修复：强制转为浮点数 ----
+                        try:
+                            rate = float(raw_rate)
+                        except (TypeError, ValueError):
+                            rate = 0.0
                         break
                 except Exception:
                     continue
@@ -880,10 +885,16 @@ class HumanoidCore(Star):
             })
         for slot in fixed:
             rate = slot.get("energy_rate", 0.0)
+            try:
+                rate = float(rate)
+            except:
+                rate = 0.0
             if rate > 0.3:
                 slot["energy_rate"] = 0.3
             elif rate < -0.3:
                 slot["energy_rate"] = -0.3
+            else:
+                slot["energy_rate"] = rate
         return fixed
 
     async def generate_llm_daily_schedule(self, today_str: str, cfg: dict) -> list:
@@ -1848,6 +1859,8 @@ class HumanoidCore(Star):
             return
         async with self.lock:
             self.state["energy"] = 80.0
+            # ---- 修复：重置状态时同时重置社交能量为100 ----
+            self.state["social_energy"] = 100.0
             now_today = self._get_plugin_now(cfg).strftime("%Y-%m-%d")
             seed_date = self._get_plugin_now(cfg).strftime("%Y%m%d")
             seed_hash = int(hashlib.md5(seed_date.encode()).hexdigest()[:8], 16)
@@ -1855,7 +1868,7 @@ class HumanoidCore(Star):
             self.state["last_cycle_update"] = now_today
             self.state["_energy_noise_date"] = ""
             self.save_state_unsafe()
-        yield event.plain_result("✅ 已重置状态：精力恢复至 80，生理周期已重新计算。")
+        yield event.plain_result("✅ 已重置状态：精力恢复至 80，社交能量恢复至 100，生理周期已重新计算。")
 
     # ======================== 状态注入 ========================
     @filter.on_llm_request()
