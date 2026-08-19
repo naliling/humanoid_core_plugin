@@ -292,5 +292,10 @@
         "description": "【调试】是否启用调试模式（输出详细日志，包括LLM请求/响应、情绪计算过程等）",
         "type": "bool",
         "default": false
+    },
+    "holidays": {
+        "description": "【节日】自定义节日列表，格式：[{\"date\": \"YYYY-MM-DD\", \"name\": \"节日名\"}]，内置公历节日自动识别",
+        "type": "list",
+        "default": []
     }
-}
+    }
