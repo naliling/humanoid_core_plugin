@@ -275,13 +275,29 @@ CITY_TO_TIMEZONE = {
     "那霸": "Asia/Tokyo",
 }
 
+# ======================== 内置公历节日 ========================
+BUILTIN_HOLIDAYS = {
+    "01-01": "元旦",
+    "02-14": "情人节",
+    "03-08": "妇女节",
+    "03-12": "植树节",
+    "04-01": "愚人节",
+    "05-01": "劳动节",
+    "06-01": "儿童节",
+    "07-01": "建党节",
+    "08-01": "建军节",
+    "09-10": "教师节",
+    "10-01": "国庆节",
+    "12-25": "圣诞节",
+}
+
 def get_timezone(city: str):
     return CITY_TO_TIMEZONE.get(city)
 
 def get_time_in_city(city: str):
     tz_name = get_timezone(city)
     if not tz_name:
-        return None, None
+        return None, None, None
     try:
         tz = ZoneInfo(tz_name)
         now = datetime.now(tz)
@@ -289,9 +305,9 @@ def get_time_in_city(city: str):
         time_str = now.strftime(f"%Y-%m-%d %H:%M:%S (UTC{offset[:3]}:{offset[3:]})")
         weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
         weekday = weekday_names[now.weekday()]
-        return time_str, weekday
+        return time_str, weekday, now
     except:
-        return None, None
+        return None, None, None
 
 # ======================== 插件主类 ========================
 class HumanoidCore(Star):
@@ -331,9 +347,6 @@ class HumanoidCore(Star):
         if self.http_session and not self.http_session.closed:
             await self.http_session.close()
         logger.info("[humanoid_core] 已清理资源")
-
-    def __del__(self):
-        pass
 
     # ---------- 人格自动切换 ----------
     def _start_persona_auto_switch(self):
@@ -475,6 +488,8 @@ class HumanoidCore(Star):
                                 self.state["social_energy"] = 100.0
                                 self.state["_last_social_energy_reset_date"] = today
                         self.save_state_unsafe()
+                        if cfg.get("debug_mode", False):
+                            logger.debug(f"[humanoid_core] 社交能量恢复: {se:.1f}%")
                 await asyncio.sleep(60)
             except Exception as e:
                 logger.error(f"[humanoid_core] 社交能量恢复异常: {e}")
@@ -551,6 +566,7 @@ class HumanoidCore(Star):
             "night_end_hour": 7,
             "night_mode_force_sleep": False,
             "debug_mode": False,
+            "holidays": [],
         }
         if isinstance(self.config, dict):
             defaults.update(self.config)
@@ -625,25 +641,34 @@ class HumanoidCore(Star):
     def _get_plugin_now(self, cfg: dict = None):
         return datetime.now(self._get_plugin_tz(cfg))
 
-    # ======================== 精力计算（优化版） ========================
+    # ======================== 精力计算（修复版） ========================
+    def _parse_time_to_datetime(self, time_str: str, base_date: datetime.date) -> datetime:
+        """将时间字符串（如 '07:30' 或 '24:00'）转为当天的 datetime，'24:00' 视为次日 00:00"""
+        if time_str == "24:00":
+            return datetime.combine(base_date, datetime.min.time()) + timedelta(days=1)
+        else:
+            return datetime.combine(base_date, datetime.strptime(time_str, "%H:%M").time())
+
     def _compute_energy_delta(self, start_time: datetime, end_time: datetime, schedule: list, decay_rate: float) -> float:
         if start_time >= end_time:
             return 0.0
         total_minutes = (end_time - start_time).total_seconds() / 60
         if total_minutes <= 0:
             return 0.0
+
         boundaries = {start_time, end_time}
         for slot in schedule:
             try:
-                slot_start = datetime.combine(start_time.date(), datetime.strptime(slot["start"], "%H:%M").time())
-                slot_end = datetime.combine(start_time.date(), datetime.strptime(slot["end"], "%H:%M").time())
-                if slot_end < slot_start:
-                    slot_end += timedelta(days=1)
-                if slot_end > start_time and slot_start < end_time:
-                    boundaries.add(max(slot_start, start_time))
-                    boundaries.add(min(slot_end, end_time))
-            except:
+                s_dt = self._parse_time_to_datetime(slot["start"], start_time.date())
+                e_dt = self._parse_time_to_datetime(slot["end"], start_time.date())
+                if e_dt < s_dt:
+                    e_dt += timedelta(days=1)
+                if e_dt > start_time and s_dt < end_time:
+                    boundaries.add(max(s_dt, start_time))
+                    boundaries.add(min(e_dt, end_time))
+            except Exception:
                 continue
+
         sorted_times = sorted(boundaries)
         delta = 0.0
         consumption_discount = 0.7
@@ -670,14 +695,14 @@ class HumanoidCore(Star):
             rate = 0.0
             for slot in schedule:
                 try:
-                    s = datetime.combine(mid_time.date(), datetime.strptime(slot["start"], "%H:%M").time())
-                    e = datetime.combine(mid_time.date(), datetime.strptime(slot["end"], "%H:%M").time())
+                    s = self._parse_time_to_datetime(slot["start"], mid_time.date())
+                    e = self._parse_time_to_datetime(slot["end"], mid_time.date())
                     if e < s:
                         e += timedelta(days=1)
                     if s <= mid_time <= e:
                         rate = slot.get("energy_rate", 0.0)
                         break
-                except:
+                except Exception:
                     continue
             minutes = (seg_end - seg_start).total_seconds() / 60
             if rate < 0:
@@ -686,7 +711,6 @@ class HumanoidCore(Star):
                 effective_rate = rate
             delta += effective_rate * decay_rate * minutes
 
-        # 调试日志
         cfg = self.get_latest_config()
         if cfg.get("debug_mode", False):
             logger.debug(f"[humanoid_core] 精力计算: 时段 {start_time} - {end_time}, 总变化 {delta:.2f}")
@@ -745,9 +769,12 @@ class HumanoidCore(Star):
         max_e = float(cfg.get("max_energy", 100.0))
         current_slot = self.get_slot_by_time(now_time, schedule)
         location_city = cfg.get("timezone_city", "未知")
-        location_time, weekday_ignore = get_time_in_city(location_city)
+        location_time, weekday_ignore = get_time_in_city(location_city)[:2]
         weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
         weekday = weekday_names[now.weekday()]
+
+        # 节日检测
+        holiday = self._get_holiday_for_date(now, cfg)
 
         return {
             "energy": energy,
@@ -760,7 +787,8 @@ class HumanoidCore(Star):
             "location_time": location_time,
             "weekday": weekday,
             "today_str": today_str,
-            "now_time": now_time
+            "now_time": now_time,
+            "holiday": holiday,
         }
 
     def _safe_float(self, value, default=1.0):
@@ -1016,6 +1044,19 @@ class HumanoidCore(Star):
             return "有点累，语气偏慵懒，不想说太多"
         else:
             return "很疲惫，语气低落，只想安静待着"
+
+    # ======================== 节日处理（内置 + 自定义） ========================
+    def _get_holiday_for_date(self, date_obj: datetime, cfg: dict) -> str:
+        """获取给定日期的节日名称，优先用户自定义，其次内置公历节日"""
+        date_str = date_obj.strftime("%Y-%m-%d")
+        # 1. 用户自定义优先
+        holidays = cfg.get("holidays", [])
+        for h in holidays:
+            if isinstance(h, dict) and h.get("date") == date_str:
+                return h.get("name", "")
+        # 2. 内置公历节日
+        month_day = date_obj.strftime("%m-%d")
+        return BUILTIN_HOLIDAYS.get(month_day, "")
 
     # ======================== 心情标签 ========================
     def _generate_mood_tag(self, affection: float, libido: float, aggression: float, energy: float, use_llm=False) -> str:
@@ -1383,9 +1424,7 @@ class HumanoidCore(Star):
         if str(event.get_sender_id()) not in admin_list:
             yield event.plain_result("❌ 权限不足，仅管理员可重载配置。")
             return
-        # 重新加载配置（会从 self.config 和默认值合并）
         self.reload_config(self.config)
-        # 重置一些可能受配置影响的状态（如时区？此处可留空，因为 _get_plugin_tz 每次会重新读取）
         yield event.plain_result("✅ 配置已重载，当前版本已生效。")
 
     @filter.command("你的状态")
@@ -1401,7 +1440,7 @@ class HumanoidCore(Star):
             f"- 生理: {ctx['cycle'] if ctx['cycle'] else '未开启'}",
             f"- 天气: {ctx['weather']['weather']}",
             f"- 今日日程: {schedule_summary}",
-            f"- 今日是：{ctx['today_str']} 星期{ctx['weekday']}"
+            f"- 今日是：{ctx['today_str']} 星期{ctx['weekday']}" + (f"（{ctx['holiday']}）" if ctx['holiday'] else "")
         ]
         qq = str(event.get_sender_id())
         if cfg.get("mood_enabled", True):
@@ -1701,11 +1740,15 @@ class HumanoidCore(Star):
         if not city:
             yield event.plain_result("请指定城市名，或在配置中设置默认时区城市。")
             return
-        time_str, weekday = get_time_in_city(city)
+        time_str, weekday, now_dt = get_time_in_city(city)
         if time_str is None:
             yield event.plain_result(f"暂不支持 {city}，目前支持中国、俄罗斯、日本的主要城市。")
         else:
-            yield event.plain_result(f"📍 {city} 当前时间: {time_str}（星期{weekday}）")
+            holiday = self._get_holiday_for_date(now_dt, cfg) if now_dt else ""
+            msg = f"📍 {city} 当前时间: {time_str}（星期{weekday}）"
+            if holiday:
+                msg += f"，今日节日：{holiday}"
+            yield event.plain_result(msg)
 
     @filter.command("叫我")
     async def set_nickname(self, event: AstrMessageEvent):
@@ -1893,11 +1936,14 @@ class HumanoidCore(Star):
         chat_mode = cfg.get("inject_activity_context", "low")
         energy_desc = self.get_energy_description(ctx["energy"])
         max_e = ctx["max_e"]
+        date_line = f"今天是：{ctx['today_str']} 星期{ctx['weekday']}"
+        if ctx.get("holiday"):
+            date_line += f"（{ctx['holiday']}）"
 
         if chat_mode == "full":
             prompt = (
                 f"[系统暗示：以下内容作为状态参考，严禁念出数值或暴露面板]\n"
-                f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
+                f"- {date_line}\n"
                 f"- 当前所在城市: {ctx['location_city']}\n"
                 f"- 当前城市时间: {ctx['location_time'] if ctx['location_time'] else '无法获取'}\n"
                 f"- 当前天气环境: {ctx['weather']['env']}\n"
@@ -1910,14 +1956,14 @@ class HumanoidCore(Star):
         elif chat_mode == "mood_only":
             prompt = (
                 f"[系统暗示：仅作为语气与情绪背景参考]\n"
-                f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
+                f"- {date_line}\n"
                 f"- 当前精力状态: {energy_desc}\n"
                 f"- 情绪倾向: {ctx['current_slot'].get('emotion', '平淡')}\n"
             )
         else:
             prompt = (
                 f"[系统暗示：仅作为语气与情绪背景参考，严禁主动提及你正在做什么或在哪里，除非用户明确询问。]\n"
-                f"- 今天是：{ctx['today_str']} 星期{ctx['weekday']}\n"
+                f"- {date_line}\n"
                 f"- 当前所在城市: {ctx['location_city']}\n"
                 f"- 当前精力状态: {energy_desc} ({int(ctx['energy'])}/{int(max_e)})\n"
                 f"- 情绪倾向: {ctx['current_slot'].get('emotion', '平淡')}\n"
