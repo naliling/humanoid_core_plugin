@@ -17,7 +17,7 @@
     "energy_decay_rate": {
         "description": "【生理】精力变化速度倍率",
         "type": "string",
-        "default": "0.5",
+        "default": "1.0",
         "options": ["0.5", "1.0", "2.0", "3.0"]
     },
     "cycle_description_style": {
@@ -311,7 +311,7 @@
     "energy_natural_recovery_per_minute": {
         "description": "【精力】每分钟自然恢复的精力值（0.05~0.9）",
         "type": "float",
-        "default": 0.3
+        "default": 0.9
     },
     "energy_natural_recovery_interval_minutes": {
         "description": "【精力】自然恢复间隔（分钟），1表示每分钟恢复一次，值越大恢复越慢但每次恢复值相应增加",
