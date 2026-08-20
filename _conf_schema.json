@@ -15,7 +15,7 @@
         "default": 28
     },
     "energy_decay_rate": {
-        "description": "【生理】精力变化速度倍率（下拉选择）",
+        "description": "【生理】精力变化速度倍率",
         "type": "string",
         "default": "0.5",
         "options": ["0.5", "1.0", "2.0", "3.0"]
@@ -120,7 +120,7 @@
     "timezone_city": {
         "description": "【时间】默认时区城市（用于 /时间 指令，同时作为AI感知的所在城市），如：北京、莫斯科、东京",
         "type": "string",
-        "default": "广州"
+        "default": "河源（记得改~）"
     },
     "mood_enabled": {
         "description": "【情绪】是否开启情绪模拟（好感度/亲近欲/攻击性）",
@@ -130,12 +130,12 @@
     "mood_sensitivity": {
         "description": "【情绪】情绪变化敏感度 (0-100)，数值越高单次变化越大",
         "type": "int",
-        "default": 28
+        "default": 62
     },
     "mood_decay_hours": {
         "description": "【情绪】情绪衰减周期（小时），当前值回归基线所需时间",
         "type": "float",
-        "default": 2.0
+        "default": 6.0
     },
     "mood_initial_affection": {
         "description": "【情绪】新用户初始好感度 (0-100)",
@@ -145,7 +145,7 @@
     "mood_initial_libido": {
         "description": "【情绪】新用户初始亲近欲 (0-50)",
         "type": "int",
-        "default": 24
+        "default": 34
     },
     "mood_initial_aggression": {
         "description": "【情绪】新用户初始攻击性 (0-50)",
@@ -153,7 +153,7 @@
         "default": 28
     },
     "mood_affection_override": {
-        "description": "【情绪】指定QQ号的初始好感度覆盖（格式：QQ号:数值，如 123456:100，多个用英文逗号分隔）",
+        "description": "【情绪】指定好感（格式：3881756548:100,多个用英文逗号分隔）",
         "type": "list",
         "default": []
     },
@@ -170,25 +170,25 @@
     "mood_log_max_entries": {
         "description": "【情绪日志】每个用户最多保留的事件记录条数",
         "type": "int",
-        "default": 30
+        "default": 28
     },
     "mood_log_threshold_affection": {
         "description": "【情绪日志】好感度变化多少时触发记录",
         "type": "int",
-        "default": 15
+        "default": 5
     },
     "mood_log_threshold_libido": {
         "description": "【情绪日志】亲近欲变化多少时触发记录",
         "type": "int",
-        "default": 12
+        "default": 4
     },
     "mood_log_threshold_aggression": {
         "description": "【情绪日志】攻击性变化多少时触发记录",
         "type": "int",
-        "default": 12
+        "default": 3
     },
     "persona_enabled": {
-        "description": "【多人格】是否启用多人格系统",
+        "description": "【多人格】可不开多人格系统",
         "type": "bool",
         "default": false
     },
@@ -306,12 +306,12 @@
     "enable_energy_natural_recovery": {
         "description": "【精力】是否启用自然恢复（独立于日程的缓慢恢复）",
         "type": "bool",
-        "default": false
+        "default": true
     },
     "energy_natural_recovery_per_minute": {
         "description": "【精力】每分钟自然恢复的精力值（0.05~0.5）",
         "type": "float",
-        "default": 0.1
+        "default": 0.2
     },
     "energy_natural_recovery_interval_minutes": {
         "description": "【精力】自然恢复间隔（分钟），1表示每分钟恢复一次，值越大恢复越慢但每次恢复值相应增加",
@@ -321,11 +321,11 @@
     "energy_consumption_per_msg": {
         "description": "【精力】每次聊天消耗的精力值（0.04~0.5）",
         "type": "float",
-        "default": 0.1
+        "default": 0.05
     },
     "energy_recovery_phase_multipliers": {
         "description": "【精力】生理周期各阶段恢复倍率，顺序：经期、卵泡期、排卵期、黄体早期、黄体晚期、经前期",
         "type": "list",
-        "default": [0.5, 1.0, 1.2, 1.0, 0.8, 0.7]
+        "default": [0.5, 1.0, 2.0, 1.0, 0.8, 0.7]
     }
 }
