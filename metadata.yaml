@@ -1,0 +1,23 @@
+name: astrbot_plugin_humanoid_core
+display_name: 人形化伴侣插件
+short_desc: 轻量拟人插件，内置生理时钟与情绪，选地区即用。
+desc: |
+  想要使用轻量又简单的拟人插件？娜莉灵建议可以来尝尝我的这款——内置拟人与时钟与情绪系统，无需额外配置，选个地区就能让AI拥有真实的生活节奏。它能感知时间、天气，情绪随对话起伏，支持多人格切换，还能自定义昵称和心情标签。轻巧、简单，却足够生动。
+
+version: 2.8.0
+author: 娜莉灵
+repo: https://github.com/naliling/humanoid_core_plugin
+astrbot_version: ">=4.0.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+tags:
+  - 拟真
+  - 生理拟人
+  - 情绪系统
+  - 时间感知
+  - 状态写实
+  - 位置地区
+  - 社交能量
+  - 睡眠
+  - 节日感知
