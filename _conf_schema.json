@@ -135,7 +135,7 @@
     "mood_decay_hours": {
         "description": "【情绪】情绪衰减周期（小时），当前值回归基线所需时间",
         "type": "float",
-        "default": 6.0
+        "default": 12
     },
     "mood_initial_affection": {
         "description": "【情绪】新用户初始好感度 (0-100)",
@@ -145,12 +145,12 @@
     "mood_initial_libido": {
         "description": "【情绪】新用户初始亲近欲 (0-50)",
         "type": "int",
-        "default": 34
+        "default": 24
     },
     "mood_initial_aggression": {
         "description": "【情绪】新用户初始攻击性 (0-50)",
         "type": "int",
-        "default": 28
+        "default": 24
     },
     "mood_affection_override": {
         "description": "【情绪】指定好感（格式：3881756548:100,多个用英文逗号分隔）",
@@ -261,7 +261,7 @@
     "social_energy_recovery_per_minute": {
         "description": "【社交能量】每分钟恢复的社交能量值 (0.1~3.0)",
         "type": "float",
-        "default": 2.0
+        "default": 3.0
     },
     "social_energy_reset_hour": {
         "description": "【社交能量】每天重置社交能量的小时 (0-23)，设为 -1 则不重置",
