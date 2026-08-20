@@ -327,7 +327,7 @@ class HumanoidCore(Star):
         self._stop_event = asyncio.Event()
         self._persona_switch_task = None
         self._social_energy_task = None
-        logger.info("[humanoid_core] 插件加载成功 (v2.8.0)")
+        logger.info("[humanoid_core] 插件加载成功 (v2.8.1)")
         self._start_persona_auto_switch()
         self._start_social_energy_recovery()
 
@@ -435,30 +435,29 @@ class HumanoidCore(Star):
             self.save_state_unsafe()
             logger.info(f"[humanoid_core] 已恢复 {len(to_recover)} 个用户的人格为默认")
 
+    # ========== 修复：人格切换不再修改全局 cfg ==========
     async def _apply_global_persona_switch(self, cfg: dict):
         try:
             default_name = cfg.get("persona_default_name", "")
             switch_name = cfg.get("persona_switch_name", "")
             if not default_name or not switch_name:
                 return
-            new_default = switch_name
-            new_switch = default_name
-            default_desc = cfg.get("persona_default_description", "")
-            switch_desc = cfg.get("persona_switch_description", "")
-            cfg["persona_default_name"] = new_default
-            cfg["persona_switch_name"] = new_switch
-            cfg["persona_default_description"] = switch_desc
-            cfg["persona_switch_description"] = default_desc
+            
+            # 只交换 state 中已切换的用户人格，不修改 cfg 对象
             async with self.lock:
                 user_personas = self.state.get("user_persona", {})
-                for qq, pname in list(user_personas.items()):
+                new_user_personas = {}
+                for qq, pname in user_personas.items():
                     if pname == default_name:
-                        user_personas[qq] = new_default
+                        new_user_personas[qq] = switch_name
                     elif pname == switch_name:
-                        user_personas[qq] = new_switch
-                self.state["user_persona"] = user_personas
+                        new_user_personas[qq] = default_name
+                    else:
+                        new_user_personas[qq] = pname
+                self.state["user_persona"] = new_user_personas
                 self.save_state_unsafe()
-            logger.info(f"[humanoid_core] 全局人格自动切换: {default_name} ↔ {switch_name}")
+            
+            logger.info(f"[humanoid_core] 全局人格自动切换: {default_name} ↔ {switch_name} (仅影响已切换用户)")
         except Exception as e:
             logger.error(f"[humanoid_core] 全局人格切换失败: {e}")
 
@@ -475,7 +474,7 @@ class HumanoidCore(Star):
             interval = max(60, min(300, interval))  # 限制范围 60~300 秒
 
             if cfg.get("social_energy_enabled", True):
-                recovery_per_min = cfg.get("social_energy_recovery_per_minute", 0.2)
+                recovery_per_min = cfg.get("social_energy_recovery_per_minute", 2.0)  # 与 schema 一致
                 recovery = recovery_per_min * (interval / 60.0)
                 async with self.lock:
                     se = self.state.get("social_energy", 100.0)
@@ -510,6 +509,7 @@ class HumanoidCore(Star):
         self._config_version += 1
         logger.info("[humanoid_core] 配置已重载")
 
+    # ========== 修复：默认值与 _conf_schema.json 完全对齐 ==========
     def _merge_config(self, overrides: dict) -> dict:
         defaults = {
             "max_energy": 100.0,
@@ -519,32 +519,32 @@ class HumanoidCore(Star):
             "cycle_description_style": "default",
             "use_llm_schedule": True,
             "schedule_provider_name": "",
-            "schedule_prompt_extra": "偏向普通的日常居家、工作与休闲生活，作息正常",
-            "schedule_time_granularity": "flexible",
-            "character_personality": "一位普通人，过着普通的日常生活",
+            "schedule_prompt_extra": "休闲日常，愉快的生活。",
+            "schedule_time_granularity": "15min",
+            "character_personality": "温柔体贴",
             "admin_qq": [],
             "weather_enabled": True,
             "weather_api_key": "",
-            "weather_location": "Zelenogradsk,RU",
+            "weather_location": "Heyuan,CN",
             "weather_refresh_minutes": 60,
             "inject_activity_context": "low",
             "environment_mode": "both",
             "show_city_time_in_low_intrusion": True,
-            "timezone_city": "广州",
+            "timezone_city": "河源（记得改~）",
             "enable_chat_awareness": True,
             "mood_enabled": True,
-            "mood_sensitivity": 28,
-            "mood_decay_hours": 2.0,
+            "mood_sensitivity": 62,
+            "mood_decay_hours": 6.0,
             "mood_initial_affection": 46,
-            "mood_initial_libido": 24,
+            "mood_initial_libido": 34,
             "mood_initial_aggression": 28,
             "mood_affection_override": [],
             "mood_affection_delta_cap": 3,
             "mood_log_enabled": True,
-            "mood_log_max_entries": 30,
-            "mood_log_threshold_affection": 15,
-            "mood_log_threshold_libido": 12,
-            "mood_log_threshold_aggression": 12,
+            "mood_log_max_entries": 28,
+            "mood_log_threshold_affection": 5,
+            "mood_log_threshold_libido": 4,
+            "mood_log_threshold_aggression": 3,
             "persona_enabled": False,
             "persona_default_name": "",
             "persona_default_description": "",
@@ -554,26 +554,25 @@ class HumanoidCore(Star):
             "persona_switch_custom_time": "08:00",
             "persona_reset_mood_on_switch": False,
             "persona_auto_recover_enabled": True,
-            "mood_update_timeout": 30.0,
+            "mood_update_timeout": 120.0,
             "mood_tag_enabled": True,
-            "mood_tag_use_llm": False,
+            "mood_tag_use_llm": True,
             "social_energy_enabled": True,
-            "social_energy_consumption_per_msg": 0.5,
-            "social_energy_recovery_per_minute": 0.2,
+            "social_energy_consumption_per_msg": 0.05,
+            "social_energy_recovery_per_minute": 2.0,
             "social_energy_reset_hour": 0,
             "social_energy_recovery_interval_seconds": 60,
             "night_mode_enabled": True,
             "night_start_hour": 23,
-            "night_end_hour": 7,
+            "night_end_hour": 6,
             "night_mode_force_sleep": False,
             "debug_mode": False,
             "holidays": [],
-            # 新增精力系统配置
-            "enable_energy_natural_recovery": False,
-            "energy_natural_recovery_per_minute": 0.1,
+            "enable_energy_natural_recovery": True,
+            "energy_natural_recovery_per_minute": 0.9,
             "energy_natural_recovery_interval_minutes": 1,
-            "energy_consumption_per_msg": 0.1,
-            "energy_recovery_phase_multipliers": [0.5, 1.0, 1.2, 1.0, 0.8, 0.7],
+            "energy_consumption_per_msg": 0.03,
+            "energy_recovery_phase_multipliers": [0.5, 1.0, 2.0, 1.0, 0.8, 0.7],
         }
         if isinstance(self.config, dict):
             defaults.update(self.config)
@@ -765,11 +764,11 @@ class HumanoidCore(Star):
                 energy = self.state.get("energy", 80.0) + delta
 
                 # 新增：自然恢复（独立于日程）
-                if cfg.get("enable_energy_natural_recovery", False):
+                if cfg.get("enable_energy_natural_recovery", True):
                     minutes = (now - last_time).total_seconds() / 60.0
-                    recovery_per_min = cfg.get("energy_natural_recovery_per_minute", 0.1)
+                    recovery_per_min = cfg.get("energy_natural_recovery_per_minute", 0.9)
                     cycle_day = self.state.get("current_cycle_day", 1)
-                    phase_multipliers = cfg.get("energy_recovery_phase_multipliers", [0.5, 1.0, 1.2, 1.0, 0.8, 0.7])
+                    phase_multipliers = cfg.get("energy_recovery_phase_multipliers", [0.5, 1.0, 2.0, 1.0, 0.8, 0.7])
                     if 1 <= cycle_day <= 5:
                         phase_idx = 0
                     elif 6 <= cycle_day <= 12:
@@ -831,7 +830,7 @@ class HumanoidCore(Star):
         if not cfg.get("weather_enabled", True):
             return {"weather": "晴朗 ☀️", "env": "天气未开启"}
         api_key = str(cfg.get("weather_api_key", "")).strip()
-        location = str(cfg.get("weather_location", "Zelenogradsk,RU")).strip()
+        location = str(cfg.get("weather_location", "Heyuan,CN")).strip()
         if not api_key or len(api_key) < 10:
             return {"weather": "晴朗 ☀️", "env": f"当前城市 [{location}]（未填API Key）"}
         now = self._get_plugin_now(cfg)
@@ -926,9 +925,9 @@ class HumanoidCore(Star):
         now = self._get_plugin_now(cfg)
         weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
         weekday = weekday_names[now.weekday()]
-        personality = cfg.get("character_personality", "一位普通人")
-        extra = cfg.get("schedule_prompt_extra", "")
-        granularity = cfg.get("schedule_time_granularity", "flexible")
+        personality = cfg.get("character_personality", "温柔体贴")
+        extra = cfg.get("schedule_prompt_extra", "休闲日常，愉快的生活。")
+        granularity = cfg.get("schedule_time_granularity", "15min")
         granularity_hint = ""
         if granularity == "5min":
             granularity_hint = "请严格按每5分钟划分时间段（如 00:00-00:05-00:10...），每个时段的起止时间必须是5分钟的倍数。"
@@ -1141,7 +1140,7 @@ class HumanoidCore(Star):
             mood_data["libido"],
             mood_data["aggression"],
             energy,
-            cfg.get("mood_tag_use_llm", False)
+            cfg.get("mood_tag_use_llm", True)
         )
         if "mood_tags" not in self.state:
             self.state["mood_tags"] = {}
@@ -1170,10 +1169,10 @@ class HumanoidCore(Star):
                 affection = min(100.0, max(0.0, override_val))
             self.state["moods"][qq] = {
                 "affection": affection,
-                "libido": float(cfg.get("mood_initial_libido", 24)),
+                "libido": float(cfg.get("mood_initial_libido", 34)),
                 "aggression": float(cfg.get("mood_initial_aggression", 28)),
                 "base_affection": affection,
-                "base_libido": float(cfg.get("mood_initial_libido", 24)),
+                "base_libido": float(cfg.get("mood_initial_libido", 34)),
                 "base_aggression": float(cfg.get("mood_initial_aggression", 28)),
                 "last_interaction": 0.0,
                 "turn_count": 0
@@ -1194,7 +1193,7 @@ class HumanoidCore(Star):
             elapsed_hours = (now - last_run) / 3600.0
             if elapsed_hours < 0.1:
                 return
-            duration = float(cfg.get("mood_decay_hours", 2.0))
+            duration = float(cfg.get("mood_decay_hours", 6.0))
             if duration <= 0:
                 duration = 0.5
 
@@ -1262,7 +1261,7 @@ class HumanoidCore(Star):
                 provider = self.get_target_provider(cfg)
                 if not provider:
                     break
-                timeout = cfg.get("mood_update_timeout", 30.0)
+                timeout = cfg.get("mood_update_timeout", 120.0)
                 prompt = (
                     f"用户说：{user_msg}\n"
                     f"当前情绪状态：好感度 {mood_data['affection']:.1f}/100，亲近欲 {mood_data['libido']:.1f}/50，攻击性 {mood_data['aggression']:.1f}/50\n"
@@ -1292,7 +1291,7 @@ class HumanoidCore(Star):
             lib_delta = local_delta["libido_delta"]
             agg_delta = local_delta["aggression_delta"]
 
-        sensitivity = cfg.get("mood_sensitivity", 28) / 100.0
+        sensitivity = cfg.get("mood_sensitivity", 62) / 100.0
         delta_cap = cfg.get("mood_affection_delta_cap", 3)
         aff_delta *= sensitivity
         lib_delta *= sensitivity
@@ -1355,9 +1354,9 @@ class HumanoidCore(Star):
     def _log_mood_event(self, qq: str, old_aff, old_lib, old_agg, new_aff, new_lib, new_agg, cfg: dict):
         if not cfg.get("mood_log_enabled", True):
             return
-        thresh_aff = cfg.get("mood_log_threshold_affection", 15)
-        thresh_lib = cfg.get("mood_log_threshold_libido", 12)
-        thresh_agg = cfg.get("mood_log_threshold_aggression", 12)
+        thresh_aff = cfg.get("mood_log_threshold_affection", 5)
+        thresh_lib = cfg.get("mood_log_threshold_libido", 4)
+        thresh_agg = cfg.get("mood_log_threshold_aggression", 3)
 
         aff_delta = new_aff - old_aff
         lib_delta = new_lib - old_lib
@@ -1378,7 +1377,7 @@ class HumanoidCore(Star):
             self.state["mood_logs"] = {}
         if qq not in self.state["mood_logs"]:
             self.state["mood_logs"][qq] = []
-        max_entries = cfg.get("mood_log_max_entries", 30)
+        max_entries = cfg.get("mood_log_max_entries", 28)
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.state["mood_logs"][qq].append({
             "time": now_str,
@@ -1443,10 +1442,10 @@ class HumanoidCore(Star):
         if cfg.get("persona_reset_mood_on_switch", False):
             mood_data = self._get_user_mood(qq)
             mood_data["affection"] = cfg.get("mood_initial_affection", 46)
-            mood_data["libido"] = cfg.get("mood_initial_libido", 24)
+            mood_data["libido"] = cfg.get("mood_initial_libido", 34)
             mood_data["aggression"] = cfg.get("mood_initial_aggression", 28)
             mood_data["base_affection"] = cfg.get("mood_initial_affection", 46)
-            mood_data["base_libido"] = cfg.get("mood_initial_libido", 24)
+            mood_data["base_libido"] = cfg.get("mood_initial_libido", 34)
             mood_data["base_aggression"] = cfg.get("mood_initial_aggression", 28)
             self._save_user_mood(qq, mood_data)
         self.save_state_unsafe()
@@ -1572,7 +1571,7 @@ class HumanoidCore(Star):
         qq = str(event.get_sender_id())
         mood_data = self._get_user_mood(qq)
         affection = float(cfg.get("mood_initial_affection", 46))
-        libido = float(cfg.get("mood_initial_libido", 24))
+        libido = float(cfg.get("mood_initial_libido", 34))
         aggression = float(cfg.get("mood_initial_aggression", 28))
         mood_data["affection"] = affection
         mood_data["libido"] = libido
@@ -1825,7 +1824,7 @@ class HumanoidCore(Star):
     @filter.command("拟人帮助")
     async def help_command(self, event: AstrMessageEvent):
         help_text = (
-            "📖 人形化伴侣插件 指令列表 (v2.8.0)\n"
+            "📖 人形化伴侣插件 指令列表 (v2.8.1)\n"
             "\n"
             "/查看日程 - 查看今日完整日程\n"
             "/重置日程 - 强制重新生成日程（管理员）\n"
@@ -1915,7 +1914,7 @@ class HumanoidCore(Star):
         if cfg.get("night_mode_enabled", True):
             now = self._get_plugin_now(cfg)
             start = cfg.get("night_start_hour", 23)
-            end = cfg.get("night_end_hour", 7)
+            end = cfg.get("night_end_hour", 6)
             if start <= end:
                 is_night = start <= now.hour < end
             else:
@@ -2041,15 +2040,16 @@ class HumanoidCore(Star):
         if not hasattr(event, "message_str") or not event.message_str:
             return
         raw = event.message_str.strip()
-        if raw.startswith(("/", "!", ".", "！", "#")) or not raw:
+        # ========== 修复：只过滤空消息，命令交给 @filter.command 处理 ==========
+        if not raw:
             return
 
         # 更新精力和上下文
         await self._get_current_context(update_energy=True)
 
         # 精力聊天消耗
-        if cfg.get("energy_consumption_per_msg", 0.1) > 0:
-            consume = cfg.get("energy_consumption_per_msg", 0.1)
+        if cfg.get("energy_consumption_per_msg", 0.03) > 0:
+            consume = cfg.get("energy_consumption_per_msg", 0.03)
             async with self.lock:
                 energy = self.state.get("energy", 80.0)
                 energy = max(0.0, energy - consume)
@@ -2058,7 +2058,7 @@ class HumanoidCore(Star):
 
         # 社交能量消耗与恢复（原有逻辑）
         if cfg.get("social_energy_enabled", True):
-            consumption = cfg.get("social_energy_consumption_per_msg", 0.5)
+            consumption = cfg.get("social_energy_consumption_per_msg", 0.05)
             async with self.lock:
                 se = self.state.get("social_energy", 100.0)
                 se = max(0.0, se - consumption)
