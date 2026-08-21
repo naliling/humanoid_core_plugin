@@ -363,7 +363,7 @@ class HumanoidCore(Star):
             r'(爱|喜欢|好|棒|厉害|赞|开心|谢谢|感谢|乖|可爱|聪明)',
             re.IGNORECASE
         )
-        logger.info("[humanoid_core] 插件加载成功 (v2.10.0)")
+        logger.info("[humanoid_core] 插件加载成功 (v2.10.1)")
         self._start_social_energy_recovery()
 
     # ---------- 生命周期 ----------
@@ -833,11 +833,10 @@ class HumanoidCore(Star):
                 logger.warning(f"[humanoid_core] 天气请求失败: {e}")
         return self.state.get("_cached_weather_obj") or {"weather": "晴朗 ☀️", "env": "天气获取失败"}
 
-    # ---------- 指定 Provider 获取：配置了目标后绝不静默回退 ----------
+    # ---------- 获取目标 Provider（已修复列表兼容） ----------
     def get_target_provider(self, cfg: dict):
         target = str(cfg.get("schedule_provider_name", "")).strip()
         if not target:
-            # 未指定专用模型时，保持原有行为：允许使用全局默认模型。
             if hasattr(self.context, "get_using_provider"):
                 try:
                     return self.context.get_using_provider()
@@ -846,7 +845,7 @@ class HumanoidCore(Star):
             return None
         return self._resolve_provider_by_name(target, cfg, purpose="目标模型")
 
-    # ======================== Provider 选择（严格绑定配置） ========================
+    # ======================== Provider 选择（修复 list 兼容） ========================
     def _normalize_provider_name(self, name: str) -> str:
         """规范化完整 Provider 名称；只用于等值匹配，不做危险的子串匹配。"""
         n = str(name or "").strip().lower()
@@ -861,7 +860,7 @@ class HumanoidCore(Star):
             aliases.add(str(key))
         for attr in (
             "provider_name", "name", "id", "provider_id", "key",
-            "model_name", "model", "unified_name", "identifier"
+            "model_name", "model", "unified_name", "identifier", "display_name"
         ):
             try:
                 value = getattr(provider, attr, None)
@@ -872,11 +871,12 @@ class HumanoidCore(Star):
         return aliases
 
     def _resolve_provider_by_name(self, name: str, cfg: dict, purpose: str = "Provider"):
+        """根据名称解析 Provider，兼容 AstrBot 的 dict/list 两种存储格式"""
         target = str(name or "").strip()
         if not target:
             return None
 
-        # 1. 首选上下文的精确查找。
+        # 1. 精确查找（按 id / key）
         get_provider = getattr(self.context, "get_provider", None)
         if callable(get_provider):
             try:
@@ -888,11 +888,26 @@ class HumanoidCore(Star):
                 if cfg.get("debug_mode", False):
                     logger.debug(f"[humanoid_core] get_provider('{target}') 失败: {e}")
 
-        # 2. 遍历已加载 Provider，只做完整名称的规范化等值匹配。
+        # 2. 遍历所有 Provider（兼容 dict / list / callable）
         available = {}
         providers = getattr(self.context, "providers", None)
+
         if isinstance(providers, dict):
             available = providers
+        elif isinstance(providers, list):
+            for p in providers:
+                # 收集所有可能的标识
+                ids = [
+                    getattr(p, 'id', None),
+                    getattr(p, 'name', None),
+                    getattr(p, 'display_name', None),
+                    getattr(p, 'provider_name', None),
+                    getattr(p, 'key', None),
+                ]
+                for alias in ids:
+                    if alias:
+                        available[alias] = p
+                        break
         else:
             get_providers = getattr(self.context, "get_providers", None)
             if callable(get_providers):
@@ -900,23 +915,35 @@ class HumanoidCore(Star):
                     result = get_providers()
                     if isinstance(result, dict):
                         available = result
+                    elif isinstance(result, list):
+                        for p in result:
+                            ids = [
+                                getattr(p, 'id', None),
+                                getattr(p, 'name', None),
+                                getattr(p, 'display_name', None),
+                                getattr(p, 'provider_name', None),
+                                getattr(p, 'key', None),
+                            ]
+                            for alias in ids:
+                                if alias:
+                                    available[alias] = p
+                                    break
                 except Exception as e:
                     if cfg.get("debug_mode", False):
                         logger.debug(f"[humanoid_core] get_providers() 失败: {e}")
 
+        # 3. 规范化匹配
         target_norm = self._normalize_provider_name(target)
         for key, prov in available.items():
             for alias in self._provider_aliases(key, prov):
                 if self._normalize_provider_name(alias) == target_norm:
-                    logger.info(
-                        f"[humanoid_core] {purpose}规范化精确命中: {alias} (配置: {target})"
-                    )
+                    logger.info(f"[humanoid_core] {purpose}规范化匹配成功: {alias} (配置: {target})")
                     return prov
 
         if cfg.get("debug_mode", False):
             logger.debug(
                 f"[humanoid_core] {purpose}未找到: {target}; "
-                f"可用 Provider: {list(available.keys())}"
+                f"可用 Provider keys: {list(available.keys())}"
             )
         return None
 
@@ -927,8 +954,6 @@ class HumanoidCore(Star):
         - 首选/备用都不可用：默认返回 None，使用本地日程模板。
         - 只有显式打开 schedule_allow_global_fallback 时，才允许回退全局默认模型。
         - 首选和备用都为空时，为兼容旧配置仍使用全局默认模型。
-
-        这样可以避免“已选择便宜模型，但失败后悄悄切到全局贵模型”。
         """
         target = str(cfg.get("schedule_provider_name", "")).strip()
         fallback = str(cfg.get("schedule_fallback_provider_name", "")).strip()
@@ -1767,7 +1792,7 @@ class HumanoidCore(Star):
     @filter.command("拟人帮助")
     async def help_command(self, event: AstrMessageEvent):
         help_text = (
-            "📖 人形化伴侣插件 指令列表 (v2.10.0)\n"
+            "📖 人形化伴侣插件 指令列表 (v2.10.1)\n"
             "\n"
             "/查看日程 - 查看今日完整日程\n"
             "/重置日程 - 强制重新生成日程（管理员）\n"
