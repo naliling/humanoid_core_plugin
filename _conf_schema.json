@@ -40,28 +40,62 @@
         "default": true
     },
     "schedule_provider_name": {
-        "description": "【日程】指定生成日程的模型 Provider（下拉选择已配置的 Provider）",
+        "description": "【日程】指定生成日程的首选模型 Provider（下拉选择已配置的 Provider）",
+        "hint": "存的是 Provider ID。若填了不存在的 ID，插件会在日志里列出全部可用 ID，也可用 /拟人诊断 查看。",
         "type": "string",
         "_special": "select_provider",
         "default": ""
     },
     "schedule_fallback_provider_name": {
-        "description": "【日程】备用模型 Provider，当指定模型不可用时使用（下拉选择）",
+        "description": "【日程】备用模型 Provider，首选模型「未找到 / 超时 / 报错」时自动切换",
+        "hint": "三种失败等价处理，都会切到备用模型。",
         "type": "string",
         "_special": "select_provider",
         "default": ""
     },
     "schedule_allow_global_fallback": {
-        "description": "【日程/费用控制】首选和备用模型都不可用时是否允许回退到全局默认模型。关闭可避免意外调用高价全局模型（推荐关闭）。",
+        "description": "【日程/费用控制】首选和备用模型都失败时，是否回退到 AstrBot 全局默认模型",
+        "hint": "开启后链路为 首选 → 备用 → 全局默认 → 内置模板。关闭则跳过全局默认，直接用内置模板（可控成本，但配错 ID 时不易发现）。",
         "type": "bool",
-        "default": false
+        "default": true
     },
     "schedule_retry_interval_seconds": {
-        "description": "【日程】生成日程失败时的重试间隔（秒），每次重试等待固定秒数",
+        "description": "【日程】同一个模型多次尝试之间的等待秒数",
+        "type": "int",
+        "default": 2,
+        "minimum": 0,
+        "maximum": 600
+    },
+    "schedule_llm_timeout_seconds": {
+        "description": "【日程】单次日程生成的超时秒数（超时按失败处理并切下一个模型）",
+        "hint": "调大可容纳较慢的模型；调小能更快落回内置模板。",
+        "type": "int",
+        "default": 60,
+        "minimum": 10,
+        "maximum": 300
+    },
+    "schedule_generation_max_attempts": {
+        "description": "【日程】每个模型最多尝试几次（失败后才切下一个模型）",
         "type": "int",
         "default": 2,
         "minimum": 1,
-        "maximum": 60
+        "maximum": 5
+    },
+    "schedule_max_slots": {
+        "description": "【日程】日程时段数量上限，直接决定模型一次要输出多少内容",
+        "hint": "值越小生成越快越稳。设为 16 时会要求模型输出 8~16 个合并后的活动块，而不是逐格切分出近百个时段。",
+        "type": "int",
+        "default": 16,
+        "minimum": 6,
+        "maximum": 48
+    },
+    "schedule_provider_cooldown_minutes": {
+        "description": "【日程】模型失败后的冷却分钟数，冷却期内直接跳过该模型",
+        "hint": "避免一个配错或挂掉的模型让之后每次生成都白等一轮超时。设为 0 表示不冷却。/重置日程 会绕过冷却。",
+        "type": "int",
+        "default": 30,
+        "minimum": 0,
+        "maximum": 1440
     },
     "schedule_prompt_extra": {
         "description": "【日程】大模型生成日程时的额外偏好指导语 (如: 喜欢户外运动/偏爱宅家)。",
@@ -69,7 +103,8 @@
         "default": "休闲日常，愉快的生活。"
     },
     "schedule_time_granularity": {
-        "description": "【日程】生成粒度（下拉选择：flexible=灵活，5min=5分钟，10min=10分钟，15min=15分钟，20min=20分钟，30min=半小时，hourly=整点）",
+        "description": "【日程】时间点对齐粒度（flexible=不要求对齐，其余为对齐到 5/10/15/20/30 分钟或整点）",
+        "hint": "只约束时段的起止时间落在哪些刻度上，不再决定切多少段——段数由 schedule_max_slots 控制。",
         "type": "string",
         "default": "15min",
         "options": [
@@ -240,9 +275,16 @@
         "default": true
     },
     "mood_use_llm_for_delta": {
-        "description": "【情绪】是否使用 LLM 分析单次对话的情绪变化（关闭后仅使用本地规则，更可控）",
+        "description": "【情绪】是否使用 LLM 分析单次对话的情绪变化（关闭后仅使用本地规则，更可控、零额外调用）",
         "type": "bool",
         "default": false
+    },
+    "mood_provider_name": {
+        "description": "【情绪】情绪分析专用模型 Provider（留空则沿用日程模型链）",
+        "hint": "仅在上面的「使用 LLM 分析情绪变化」开启时生效。留空则与日程共用同一条模型链。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
     },
     "social_energy_enabled": {
         "description": "【社交能量】是否开启社交能量（影响回复热情）",
@@ -300,7 +342,8 @@
         "default": []
     },
     "enable_energy_natural_recovery": {
-        "description": "【精力】是否启用自然恢复（独立于日程的缓慢恢复）",
+        "description": "【精力】是否启用自然恢复（仅在日程处于休息类时段时生效）",
+        "hint": "只在日程处于睡眠/休息类时段（energy_rate ≥ 0）时叠加；工作、外出、社交时段严格只减不加。",
         "type": "bool",
         "default": true
     },
@@ -310,9 +353,12 @@
         "default": 0.9
     },
     "energy_natural_recovery_interval_minutes": {
-        "description": "【精力】自然恢复间隔（分钟），1表示每分钟恢复一次，值越大恢复越慢但每次恢复值相应增加",
+        "description": "【精力】自然恢复的最小计费间隔（分钟）。不足一个间隔的休息时间不计入自然恢复",
+        "hint": "例如设为 30，则一次休息里只有满 30 分钟的整段才计入自然恢复，零头忽略。",
         "type": "int",
-        "default": 1
+        "default": 1,
+        "minimum": 1,
+        "maximum": 1440
     },
     "energy_consumption_per_msg": {
         "description": "【精力】每次聊天消耗的精力值（0.01~0.9）",
@@ -330,5 +376,13 @@
             0.8,
             0.7
         ]
+    },
+    "state_flush_interval_seconds": {
+        "description": "【性能】状态文件的合并写盘间隔（秒）",
+        "hint": "一个间隔内的所有改动合并成一次写入。调大更省磁盘 IO，调小则崩溃时丢失的状态更少。",
+        "type": "int",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 60
     }
 }
