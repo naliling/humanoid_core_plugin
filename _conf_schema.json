@@ -68,7 +68,7 @@
     },
     "schedule_llm_timeout_seconds": {
         "description": "【日程】单次日程生成的超时秒数（超时按失败处理并切下一个模型）",
-        "hint": "v2.10.2 里这个值被硬编码为 60 秒且不可调。",
+        "hint": "调大可容纳较慢的模型；调小能更快落回内置模板。",
         "type": "int",
         "default": 60,
         "minimum": 10,
@@ -281,7 +281,7 @@
     },
     "mood_provider_name": {
         "description": "【情绪】情绪分析专用模型 Provider（留空则沿用日程模型链）",
-        "hint": "仅在上面的「使用 LLM 分析情绪变化」开启时生效。v2.10.2 里情绪模型被日程模型配置项间接控制，现已解耦。",
+        "hint": "仅在上面的「使用 LLM 分析情绪变化」开启时生效。留空则与日程共用同一条模型链。",
         "type": "string",
         "_special": "select_provider",
         "default": ""
@@ -343,7 +343,7 @@
     },
     "enable_energy_natural_recovery": {
         "description": "【精力】是否启用自然恢复（仅在日程处于休息类时段时生效）",
-        "hint": "v2.10.2 无条件叠加自然恢复，量级上完全盖住日程驱动的变化；现在工作/外出时段严格只减不加。",
+        "hint": "只在日程处于睡眠/休息类时段（energy_rate ≥ 0）时叠加；工作、外出、社交时段严格只减不加。",
         "type": "bool",
         "default": true
     },
@@ -354,7 +354,7 @@
     },
     "energy_natural_recovery_interval_minutes": {
         "description": "【精力】自然恢复的最小计费间隔（分钟）。不足一个间隔的休息时间不计入自然恢复",
-        "hint": "v2.10.2 里这个配置项从未被读取，调它没有任何效果；现已真正接上。",
+        "hint": "例如设为 30，则一次休息里只有满 30 分钟的整段才计入自然恢复，零头忽略。",
         "type": "int",
         "default": 1,
         "minimum": 1,
@@ -379,7 +379,7 @@
     },
     "state_flush_interval_seconds": {
         "description": "【性能】状态文件的合并写盘间隔（秒）",
-        "hint": "v2.10.2 每条消息同步写 3~7 次 state.json；现在一个间隔内的所有改动合并成一次写入，且写盘不占用事件循环。",
+        "hint": "一个间隔内的所有改动合并成一次写入。调大更省磁盘 IO，调小则崩溃时丢失的状态更少。",
         "type": "int",
         "default": 5,
         "minimum": 1,
