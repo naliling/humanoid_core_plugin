@@ -1,0 +1,497 @@
+"""编排层：把配置、状态、各服务与后台任务串起来。
+
+`main.py` 只做 AstrBot 适配（装饰器 + 事件对象解包），所有编排都在这里，
+所以这一层同样可以脱离 AstrBot 单测。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import re
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Any
+
+from . import __version__
+from .clock import Clock, lookup_city_time
+from .config import HumanoidConfig
+from .diagnostics import build_report
+from .llm import LLMGateway, ProviderResolver
+from .prompt import (
+    StatusSnapshot,
+    build_mood_prompt,
+    build_nickname_instruction,
+    compose_injection,
+)
+from .services.energy import EnergyService
+from .services.mood import MoodService
+from .services.schedule import ScheduleService
+from .services.social import SocialEnergyService
+from .services.weather import FetchJson, WeatherService
+from .state import StateStore
+
+LOG_PREFIX = "[humanoid_core]"
+
+# 一次性配置迁移的目标版本号（2.11.0 → 21100）
+CONFIG_MIGRATION_TARGET = 21100
+
+# 全量情绪衰减的后台清扫间隔
+MOOD_SWEEP_SECONDS = 1800.0
+
+# 后台任务异常后的重启等待
+SUPERVISOR_BACKOFF = 30.0
+
+_BATCH_SPLIT = re.compile(r"[,，\s]+")
+
+
+class HumanoidEngine:
+    """插件的业务大脑。生命周期：`start()` → 运行 → `stop()`。"""
+
+    def __init__(
+        self,
+        context: Any,
+        raw_config: Any,
+        data_dir: str | Path,
+        logger: Any,
+        fetch_json: FetchJson | None = None,
+    ) -> None:
+        self._context = context
+        self._raw_config = raw_config
+        self._log = logger
+        self._config = HumanoidConfig.from_raw(raw_config)
+        self._config_version = 1
+
+        data_dir = Path(data_dir)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        self.state = StateStore(
+            data_dir / "state.json",
+            lambda: float(self._config.state_flush_interval_seconds),
+            logger,
+        )
+        self.state.load(_today_guess(self._config), self._config.cycle_length)
+
+        self.clock = Clock(self.get_config)
+        self.resolver = ProviderResolver(context, logger)
+        self.gateway = LLMGateway(self.resolver, self.get_config, logger)
+
+        self.schedule = ScheduleService(
+            self.state, self.get_config, self.clock, self.gateway, logger, self._spawn
+        )
+        self.energy = EnergyService(
+            self.state, self.get_config, self.clock, self.schedule.current_slots, logger
+        )
+        self.mood = MoodService(self.state, self.get_config, self.gateway, self.clock, logger)
+        self.social = SocialEnergyService(self.state, self.get_config, self.clock, logger)
+        self.weather = WeatherService(self.state, self.get_config, self.clock, fetch_json, logger)
+
+        self._stop_event = asyncio.Event()
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    # ---------- 配置 ----------
+
+    def get_config(self) -> HumanoidConfig:
+        return self._config
+
+    @property
+    def config(self) -> HumanoidConfig:
+        return self._config
+
+    @property
+    def config_version(self) -> int:
+        return self._config_version
+
+    def reload_config(self, raw_config: Any = None) -> HumanoidConfig:
+        if raw_config is not None:
+            self._raw_config = raw_config
+        self._config = HumanoidConfig.from_raw(self._raw_config)
+        self._config_version += 1
+        self._info("配置已重载")
+        return self._config
+
+    # ---------- 生命周期 ----------
+
+    async def start(self) -> None:
+        self._stop_event.clear()
+        await self.state.start()
+        self._migrate_config_once()
+        # 先把本地日程摆好（同步、不阻塞），再让后台去问模型
+        self.schedule.current_slots()
+        self.energy.advance_cycle()
+        self._spawn(self._supervise(self._social_loop, "社交能量恢复"), "humanoid-social")
+        self._spawn(self._supervise(self._weather_loop, "天气刷新"), "humanoid-weather")
+        self._spawn(self._supervise(self._mood_sweep_loop, "情绪衰减清扫"), "humanoid-mood-sweep")
+        self.schedule.request_refresh()
+        self._info(f"插件已启动 (v{__version__})")
+
+    async def stop(self) -> None:
+        self._stop_event.set()
+        await self.schedule.aclose()
+        tasks = list(self._tasks)
+        self._tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        await self.state.stop()
+        self._info("已清理资源（后台任务已停止，状态已落盘）")
+
+    # ---------- 后台任务 ----------
+
+    def _spawn(self, coro: Awaitable[Any], name: str) -> asyncio.Task[Any]:
+        """统一登记后台任务：保住引用（防 GC）并把异常打出来。
+
+        缺陷 8：v2.10.2 的 `asyncio.create_task(...)` 既不保引用也不看异常。
+        """
+        task = asyncio.ensure_future(coro)
+        with contextlib.suppress(Exception):
+            task.set_name(name)
+        self._tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._error(f"后台任务 {task.get_name()} 异常退出: {error!r}")
+
+    async def _supervise(self, factory: Callable[[], Awaitable[None]], label: str) -> None:
+        """长驻循环的看护：异常后等一会儿重启，不静默消失。"""
+        while not self._stop_event.is_set():
+            try:
+                await factory()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._error(f"{label} 异常退出，{SUPERVISOR_BACKOFF:.0f} 秒后重启: {exc!r}")
+                with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=SUPERVISOR_BACKOFF)
+
+    async def _social_loop(self) -> None:
+        await self.social.run_recovery_loop(self._stop_event)
+
+    async def _weather_loop(self) -> None:
+        await self.weather.run_refresh_loop(self._stop_event)
+
+    async def _mood_sweep_loop(self) -> None:
+        while not self._stop_event.is_set():
+            with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
+                await asyncio.wait_for(self._stop_event.wait(), timeout=MOOD_SWEEP_SECONDS)
+            if self._stop_event.is_set():
+                return
+            self.mood.decay_all()
+
+    # ---------- 一次性配置迁移 ----------
+
+    def _migrate_config_once(self) -> None:
+        """把 `schedule_allow_global_fallback` 的默认值从关改为开。
+
+        必须做迁移而不是只改 schema：`AstrBotConfig` 首次加载时就把 schema 默认值
+        整份写进 `data/config/<plugin>_config.json`
+        （`astrbot/core/config/astrbot_config.py:56-59`），老用户磁盘上已经存着
+        `false`，只改 schema 对他们无效。
+        """
+        try:
+            done = int(self.state.get("_schema_migrated_to", 0))
+        except (TypeError, ValueError):
+            done = 0
+        if done >= CONFIG_MIGRATION_TARGET:
+            return
+
+        raw = self._raw_config
+        changed = False
+        if isinstance(raw, dict) and raw.get("schedule_allow_global_fallback") is False:
+            raw["schedule_allow_global_fallback"] = True
+            saver = getattr(raw, "save_config", None)
+            if callable(saver):
+                try:
+                    saver()
+                    changed = True
+                except Exception as exc:
+                    self._warn(f"配置迁移写盘失败（本次运行内仍生效）: {exc}")
+                    changed = True
+            else:
+                changed = True
+            self.reload_config()
+
+        self.state.data["_schema_migrated_to"] = CONFIG_MIGRATION_TARGET
+        self.state.mark_dirty()
+        if changed:
+            self._info(
+                "已把「首选/备用模型都不可用时回退全局默认模型」从关改为开"
+                "（v2.11.0 一次性迁移）。若你确实想禁止回退以控成本，"
+                "可在插件配置里把 schedule_allow_global_fallback 重新关掉。"
+            )
+
+    # ---------- 状态快照（全同步） ----------
+
+    def snapshot(self, *, advance_energy: bool = False) -> StatusSnapshot:
+        """构建当前状态视图。整个过程不含 await，可安全放在消息路径上。"""
+        cfg = self._config
+        now = self.clock.now()
+        self.energy.advance_cycle(now.strftime("%Y-%m-%d"))
+        slots = self.schedule.current_slots()
+        if advance_energy:
+            self.energy.advance(now)
+        # 日程可能过期需要重建，投递一次后台刷新（内部已去重）
+        self.schedule.request_refresh()
+
+        return StatusSnapshot(
+            today=now.strftime("%Y-%m-%d"),
+            weekday=self.clock.weekday(),
+            holiday=self.clock.holiday(now),
+            city=self.clock.display_city,
+            city_time=self.clock.city_time_text(),
+            energy=self.energy.energy,
+            max_energy=self.energy.max_energy,
+            energy_text=self.energy.describe(),
+            cycle_text=self.energy.cycle_description(),
+            weather=self.weather.snapshot(),
+            slot=self.schedule.current_slot(now.hour * 60 + now.minute),
+            schedule=tuple(slots),
+            social_energy=self.social.value,
+            is_night=cfg.night_mode_enabled and cfg.is_night_hour(now.hour),
+            schedule_source_text=self.schedule.source_text,
+        )
+
+    # ---------- 消息路径 ----------
+
+    def environment_allows(self, is_private: bool) -> bool:
+        """`environment_mode` 过滤。
+
+        缺陷 2：v2.10.2 调用的 `event.is_group()` / `event.is_private()` 在
+        `AstrMessageEvent` 上并不存在，且被 `hasattr` 包着，所以这个配置项一直是死的。
+        """
+        mode = self._config.environment_mode
+        if mode == "private":
+            return is_private
+        if mode == "group":
+            return not is_private
+        return True
+
+    def on_message(self, qq: str) -> None:
+        """每条消息的同步记账：精力推进、消耗、社交能量、当前用户情绪衰减。"""
+        cfg = self._config
+        self.energy.advance()
+        self.energy.consume_for_message()
+        if cfg.social_energy_enabled:
+            self.social.consume_for_message()
+        if cfg.mood_enabled:
+            self.mood.decay_user(qq)
+
+    async def track_mood(self, qq: str, text: str, umo: str | None = None) -> None:
+        """情绪更新里唯一可能碰模型的部分，单独 await，失败不影响主流程。"""
+        if not self._config.mood_enabled:
+            return
+        try:
+            await self.mood.update_from_message(
+                qq, text, self.energy.energy, self.energy.cycle_day, umo
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._warn(f"情绪更新失败: {exc!r}")
+
+    def spawn_mood_update(self, qq: str, text: str, umo: str | None = None) -> None:
+        self._spawn(self.track_mood(qq, text, umo), "humanoid-mood-update")
+
+    # ---------- 提示词注入 ----------
+
+    def build_injection(self, qq: str, *, is_group: bool | None = None) -> str:
+        cfg = self._config
+        snap = self.snapshot(advance_energy=False)
+        text = compose_injection(snap, cfg, is_group=is_group)
+
+        nickname = self.nickname(qq)
+        if nickname:
+            text += "\n" + build_nickname_instruction(nickname)
+
+        if cfg.mood_enabled:
+            self.mood.decay_user(qq)
+            profile = self.mood.profile(qq)
+            text += "\n\n" + build_mood_prompt(profile, self.mood.label(qq))
+        return text
+
+    # ---------- 昵称 ----------
+
+    def nickname(self, qq: str) -> str:
+        names = self.state.data.setdefault("nicknames", {})
+        return str(names.get(str(qq), "") or "")
+
+    def set_nickname(self, qq: str, nickname: str) -> str:
+        # 缺陷 4：v2.10.2 在这里调用 load_state() 把整个内存状态从磁盘覆盖回来，会丢数据
+        self.state.data.setdefault("nicknames", {})[str(qq)] = nickname
+        self.state.mark_dirty()
+        return nickname
+
+    def all_nicknames(self) -> dict[str, str]:
+        names = self.state.data.setdefault("nicknames", {})
+        return {str(k): str(v) for k, v in names.items()}
+
+    # ---------- 权限 ----------
+
+    def is_admin(self, sender_id: str, astrbot_admin: bool = False) -> bool:
+        """缺陷 9：AstrBot 自己的管理员也应当算管理员。"""
+        return bool(astrbot_admin) or self._config.is_admin(sender_id)
+
+    # ---------- 指令用的文本 ----------
+
+    def status_lines(self, qq: str) -> list[str]:
+        cfg = self._config
+        snap = self.snapshot(advance_energy=False)
+        events = [str(slot.get("event", "")) for slot in snap.schedule[:3] if slot.get("event")]
+        lines = [
+            "🧠 当前状态",
+            f"- 精力: {int(snap.energy)}/{int(snap.max_energy)} ({snap.energy_text})",
+            f"- 生理: {snap.cycle_text or '未开启'}",
+            f"- 天气: {snap.weather_text}",
+            f"- 今日日程: {' → '.join(events) if events else '无'}（{snap.schedule_source_text}）",
+            f"- 今日是：{snap.today} 星期{snap.weekday}"
+            + (f"（{snap.holiday}）" if snap.holiday else ""),
+        ]
+        if cfg.mood_enabled:
+            self.mood.decay_user(qq)
+            profile = self.mood.profile(qq)
+            lines.append(f"- 情绪: {self.mood.label(qq)} (好感度 {profile['affection']:.1f})")
+        if cfg.mood_tag_enabled:
+            tag = self.mood.tag(qq)
+            if tag:
+                lines.append(f"- 心情标签: {tag}")
+        if cfg.social_energy_enabled:
+            lines.append(f"- 社交能量: {int(self.social.value)}% ({self.social.text})")
+        return lines
+
+    def mood_profile_text(self, qq: str, detailed: bool = False) -> str:
+        cfg = self._config
+        self.mood.decay_user(qq)
+        data = self.mood.profile(qq)
+        title = "〖情绪详细档案〗" if detailed else "〖情绪档案〗"
+        lines = [title]
+        if detailed:
+            lines.append(
+                f"好感度：{data['affection']:.1f}/100（基线 {data['base_affection']:.1f}）"
+            )
+        else:
+            lines.append(f"好感度：{data['affection']:.1f}/100")
+        lines += [
+            f"亲近欲：{data['libido']:.1f}/50（基线 {data['base_libido']:.1f}）",
+            f"攻击性：{data['aggression']:.1f}/50（基线 {data['base_aggression']:.1f}）",
+            f"当前标签：{self.mood.label(qq)}",
+        ]
+        if detailed:
+            lines.append(f"交互轮次：{int(data.get('turn_count', 0))}")
+        if cfg.mood_tag_enabled:
+            tag = self.mood.tag(qq)
+            if tag:
+                lines.append(f"心情标签：{tag}")
+        return "\n".join(lines)
+
+    def mood_log_text(self, qq: str, limit: int = 10) -> str:
+        entries = self.mood.logs(qq, limit)
+        if not entries:
+            return "📭 暂无情绪波动记录。"
+        lines = [f"📋 情绪波动记录（最近{len(entries)}条）：", "——————————————"]
+        lines += [f"{item.get('time', '')} | {item.get('event', '')}" for item in entries]
+        return "\n".join(lines)
+
+    def schedule_text(self) -> str:
+        snap = self.snapshot(advance_energy=False)
+        lines = [f"📅 {snap.today} 日程表（{snap.schedule_source_text}）："]
+        for slot in snap.schedule:
+            lines.append(
+                f"{slot.get('start', '')} - {slot.get('end', '')}  "
+                f"【{slot.get('event', '')}】@{slot.get('location', '')} "
+                f"({slot.get('emotion', '')})"
+            )
+        if self.schedule.generating:
+            lines.append("（正在后台向模型请求新日程，稍后再看会更新）")
+        return "\n".join(lines)
+
+    def city_time_text(self, city: str) -> str | None:
+        result = lookup_city_time(city)
+        if result is None:
+            return None
+        holiday = self.clock.holiday(result.moment)
+        text = f"📍 {result.display_city} 当前时间: {result.text}（星期{result.weekday}）"
+        if holiday:
+            text += f"，今日节日：{holiday}"
+        return text
+
+    def diagnostics_text(self) -> str:
+        return build_report(
+            cfg=self._config,
+            resolver=self.resolver,
+            gateway=self.gateway,
+            schedule_status=self.schedule.status(),
+            version=__version__,
+        )
+
+    # ---------- 管理操作 ----------
+
+    async def reset_schedule(self) -> bool:
+        """管理员显式重置：绕过冷却，让坏掉的 provider 也重新试一次。"""
+        return await self.schedule.ensure_fresh(force=True, ignore_cooldown=True)
+
+    def reset_state(self) -> tuple[float, float, int]:
+        from .state import seed_cycle_day
+
+        today = self.clock.today_str()
+        energy = self.energy.reset()
+        social = self.social.reset()
+        cycle_day = self.energy.reset_cycle(
+            seed_cycle_day(today, self._config.cycle_length), today
+        )
+        return energy, social, cycle_day
+
+    @staticmethod
+    def parse_affection_batch(raw: str) -> list[tuple[str, float]]:
+        """支持 `QQ:数值, QQ:数值` 与 JSON 数组两种写法。"""
+        text = (raw or "").strip()
+        if not text:
+            return []
+        with contextlib.suppress(ValueError, TypeError):
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                out: list[tuple[str, float]] = []
+                for item in parsed:
+                    if isinstance(item, dict) and "qq" in item and "value" in item:
+                        with contextlib.suppress(TypeError, ValueError):
+                            out.append((str(item["qq"]).strip(), float(item["value"])))
+                if out:
+                    return out
+        pairs: list[tuple[str, float]] = []
+        for part in _BATCH_SPLIT.split(text):
+            if ":" not in part and "：" not in part:
+                continue
+            key, _, value = part.replace("：", ":").partition(":")
+            with contextlib.suppress(TypeError, ValueError):
+                pairs.append((key.strip(), float(value.strip())))
+        return pairs
+
+    # ---------- 日志 ----------
+
+    def _info(self, message: str) -> None:
+        self._log.info(f"{LOG_PREFIX} {message}")
+
+    def _warn(self, message: str) -> None:
+        self._log.warning(f"{LOG_PREFIX} {message}")
+
+    def _error(self, message: str) -> None:
+        self._log.error(f"{LOG_PREFIX} {message}")
+
+
+def _today_guess(cfg: HumanoidConfig) -> str:
+    """StateStore 需要在 Clock 建好之前就知道「今天」，这里独立算一次。"""
+    from .clock import now_in_city
+
+    return now_in_city(cfg.timezone_city).strftime("%Y-%m-%d")
+
+
+
