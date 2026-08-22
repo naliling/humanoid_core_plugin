@@ -1,8 +1,8 @@
 """测试替身：模拟 AstrBot 4.x 的 Context / Provider 表面。
 
 刻意只暴露 AstrBot 4.26.3 真实存在的方法（`get_provider_by_id`、`get_all_providers`、
-`get_using_provider`）。v2.10.2 的解析代码探测的是 `get_provider`/`providers`/`get_providers`，
-在这里同样会全部落空 —— 这正是根因 1 的回归护栏。
+`get_using_provider`）。任何依赖 `get_provider` / `providers` / `get_providers`
+的解析代码在这里都会落空，和真实框架下的表现一致。
 """
 
 from __future__ import annotations

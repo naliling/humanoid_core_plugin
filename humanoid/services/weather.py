@@ -1,12 +1,11 @@
 """天气：后台定时刷新 + 读缓存。
 
-v2.10.2 把 OpenWeather 请求内联在消息路径上（main.py:815 重试 2 次 × 10 秒超时），
-接口不通时每条消息最坏多等 20 秒；`_ensure_session()` 还没有锁保护，并发首次调用会
-创建两个 session 并泄漏一个。
+读路径 `snapshot()` 完全同步、只取缓存；抓取由后台循环按 `weather_refresh_minutes`
+触发。不要把 HTTP 请求放回消息路径上 —— OpenWeather 不通时重试会直接加到用户等回复的
+时间里。
 
-这里改为：读路径 `snapshot()` 完全同步只取缓存；抓取由后台循环按
-`weather_refresh_minutes` 触发。HTTP 细节通过注入的 `fetch_json` 回调完成，
-所以本模块（以及整个 humanoid 包）不依赖 aiohttp。
+HTTP 细节通过注入的 `fetch_json` 回调完成，所以本模块（以及整个 humanoid 包）
+不依赖 aiohttp。
 """
 
 from __future__ import annotations

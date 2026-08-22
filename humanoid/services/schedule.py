@@ -1,15 +1,13 @@
-"""日程服务 —— 根因 2 的修复。
+"""日程服务：读同步、写后台。
 
-v2.10.2 的读路径是「缺日程就当场同步生成」：`on_llm_request` 钩子 →
-`_get_current_context()` → `get_or_update_today_schedule()` → 3 轮 × 60 秒
-`asyncio.wait_for`。AstrBot 内联 await 这个钩子且没有超时保护
-（`astrbot/core/pipeline/context_utils.py:98`），于是最坏情况下用户的消息要等约 184 秒。
-
-这里把读写彻底分开：
+`on_llm_request` 钩子被 AstrBot 内联 await 且没有超时保护
+（`astrbot/core/pipeline/context_utils.py:98`），钩子里花掉的时间会一比一变成用户
+等回复的时间。所以读写在这里彻底分开：
 
 * 读（`current_slots` / `current_slot`）**完全同步**，只碰内存缓存。跨天时立刻就地
   装上确定性模板，保证状态自洽，绝不 await。
 * 写（`ensure_fresh`）在后台跑，单飞去重，成功后热替换缓存，下一条消息自然读到新日程。
+  失败则沿用现有日程并进入退避窗口。
 """
 
 from __future__ import annotations
@@ -43,9 +41,9 @@ TaskSpawner = Callable[[Any, str], "asyncio.Task[Any]"]
 def build_prompt(cfg: HumanoidConfig, today: str, weekday: str) -> str:
     """限制时段数量的日程 prompt。
 
-    v2.10.2 要求「按 15 分钟切片且连续覆盖 24 小时」，等于让模型一次吐 96 个 6 字段
-    对象（5min 档 288 个），这是 60 秒超时最直接的诱因。改为要求合并后的活动块，
-    粒度退化为「时间点对齐要求」，输出量降到原来的十分之一左右。
+    时段数量是生成耗时的主要变量：要求「按 15 分钟切片且连续覆盖 24 小时」等于让模型
+    一次吐出约 96 个 6 字段对象（5min 档 288 个），慢一点的模型根本吐不完。
+    这里改为要求合并后的活动块，粒度只作为「时间点对齐要求」，输出量约为前者的十分之一。
     """
     max_slots = cfg.schedule_max_slots
     min_slots = max(4, min(max_slots, max_slots // 2))

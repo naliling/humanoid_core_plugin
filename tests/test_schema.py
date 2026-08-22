@@ -1,7 +1,7 @@
 """守护 `_conf_schema.json` 与 `HumanoidConfig` 的一致性。
 
-两边一旦漂移，用户在 WebUI 看到的默认值就会和插件实际使用的不一样 ——
-v2.10.2 就是把默认值同时写在 schema 和 `_merge_config()` 两处才出的问题。
+两边一旦漂移，用户在 WebUI 看到的默认值就会和插件实际使用的不一样。
+默认值的唯一来源是 `HumanoidConfig`，schema 只负责展示。
 """
 
 from __future__ import annotations

@@ -115,7 +115,7 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
             await engine.stop()
 
     async def test_slow_provider_never_blocks_injection(self):
-        """根因 2 的端到端护栏：模型再慢也不该拖慢注入。"""
+        """端到端护栏：模型再慢也不该拖慢注入。"""
         slow = FakeProvider("p1", reply=GOOD_SCHEDULE, delay=5.0)
         engine, _, _ = self.build(
             {"timezone_city": "北京", "schedule_provider_name": "p1"}, [slow]
@@ -134,7 +134,7 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
             await engine.stop()
 
     async def test_environment_mode_filter_actually_works(self):
-        """缺陷 2 回归：environment_mode 在 v2.10.2 是死配置。"""
+        """environment_mode 必须真的过滤掉不匹配的会话类型。"""
         engine, raw, _ = self.build({"timezone_city": "北京", "environment_mode": "private"})
         self.assertTrue(engine.environment_allows(is_private=True))
         self.assertFalse(engine.environment_allows(is_private=False))
@@ -211,7 +211,7 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("可用列表里没有它", report2)
 
     async def test_nickname_roundtrip_does_not_lose_state(self):
-        """缺陷 4 回归：设置昵称不应把内存状态从磁盘覆盖回来。"""
+        """设置昵称不应把内存状态从磁盘覆盖回来。"""
         engine, _, _ = self.build()
         await engine.start()
         try:

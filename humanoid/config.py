@@ -1,9 +1,9 @@
 """插件配置：唯一的默认值来源 + 类型强制 + 范围钳制。
 
-v2.10.2 的默认值同时散落在 `_conf_schema.json` 和 `main.py:_merge_config()` 两处，
-容易漂移。这里收敛为一份；`_conf_schema.json` 只负责 WebUI 的展示与控件类型。
+默认值只写在这里一份，`_conf_schema.json` 只负责 WebUI 的展示与控件类型
+（两边的一致性由 `tests/test_schema.py` 守护）。
 
-所有键名与 v2.10.2 保持一致，老配置文件可直接加载。
+键名与 v2.10.x 一致，老配置文件可直接加载。
 """
 
 from __future__ import annotations
@@ -344,7 +344,7 @@ class HumanoidConfig:
 
     @property
     def mood_provider_ids(self) -> tuple[tuple[str, str], ...]:
-        """情绪分析模型链。留空时沿用日程链，保持 v2.10.2 的行为。"""
+        """情绪分析模型链。留空时沿用日程链。"""
         if self.mood_provider_name:
             return (("情绪模型", self.mood_provider_name),)
         return self.schedule_provider_ids

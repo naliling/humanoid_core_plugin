@@ -1,7 +1,7 @@
 """注入给大模型的上下文文本。
 
-全部是纯函数：吃一个 `StatusSnapshot`，吐字符串。文案与 v2.10.2 保持一致，
-只把拼装逻辑从 `HumanoidCore` 里拆出来，方便单测与调整。
+全部是纯函数：吃一个 `StatusSnapshot`，吐字符串。调整措辞只需改这里，
+不涉及任何状态或框架调用。
 """
 
 from __future__ import annotations

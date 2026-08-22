@@ -1,9 +1,7 @@
 """社交能量：按消息消耗、后台恢复、每日重置。
 
-相比 v2.10.2 的两点改进：
-* 恢复循环用 `wait_for(stop_event.wait(), interval)` 代替 `asyncio.sleep(interval)`，
-  关停时立刻退出，不用最多等 300 秒；
-* 配置每轮从 provider 现取，热重载天然生效，不再需要 `_config_version` 比对。
+恢复循环用 `wait_for(stop_event.wait(), interval)` 而不是 `asyncio.sleep(interval)`，
+这样关停时能立刻退出，不必等满一个间隔。配置每轮从 provider 现取，热重载天然生效。
 """
 
 from __future__ import annotations

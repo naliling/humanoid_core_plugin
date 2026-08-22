@@ -142,9 +142,9 @@ class HumanoidEngine:
     # ---------- 后台任务 ----------
 
     def _spawn(self, coro: Awaitable[Any], name: str) -> asyncio.Task[Any]:
-        """统一登记后台任务：保住引用（防 GC）并把异常打出来。
+        """统一登记后台任务：保住引用（防止被 GC）并把异常打出来。
 
-        缺陷 8：v2.10.2 的 `asyncio.create_task(...)` 既不保引用也不看异常。
+        裸 `asyncio.create_task()` 不保引用时任务可能被回收，异常也会静默丢失。
         """
         task = asyncio.ensure_future(coro)
         with contextlib.suppress(Exception):
@@ -266,8 +266,8 @@ class HumanoidEngine:
     def environment_allows(self, is_private: bool) -> bool:
         """`environment_mode` 过滤。
 
-        缺陷 2：v2.10.2 调用的 `event.is_group()` / `event.is_private()` 在
-        `AstrMessageEvent` 上并不存在，且被 `hasattr` 包着，所以这个配置项一直是死的。
+        判定必须由调用方给出 `is_private`：`AstrMessageEvent` 提供的是
+        `is_private_chat()` 和 `get_group_id()`，没有 `is_group()` / `is_private()`。
         """
         mode = self._config.environment_mode
         if mode == "private":
@@ -326,7 +326,8 @@ class HumanoidEngine:
         return str(names.get(str(qq), "") or "")
 
     def set_nickname(self, qq: str, nickname: str) -> str:
-        # 缺陷 4：v2.10.2 在这里调用 load_state() 把整个内存状态从磁盘覆盖回来，会丢数据
+        # 只改内存 + 标脏，落盘交给 StateStore。
+        # 注意不要在这里重新从磁盘读状态，那会覆盖掉尚未 flush 的其它改动。
         self.state.data.setdefault("nicknames", {})[str(qq)] = nickname
         self.state.mark_dirty()
         return nickname
@@ -338,7 +339,7 @@ class HumanoidEngine:
     # ---------- 权限 ----------
 
     def is_admin(self, sender_id: str, astrbot_admin: bool = False) -> bool:
-        """缺陷 9：AstrBot 自己的管理员也应当算管理员。"""
+        """AstrBot 自身的管理员，或 `admin_qq` 里列出的 QQ，都算管理员。"""
         return bool(astrbot_admin) or self._config.is_admin(sender_id)
 
     # ---------- 指令用的文本 ----------

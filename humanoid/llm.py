@@ -1,22 +1,22 @@
-"""模型解析与调用网关 —— 本次重构的核心修复。
+"""模型解析与调用网关。
 
-## 为什么要重写
+## AstrBot 4.x 的 Provider API
 
-v2.10.2 的 `_resolve_provider_by_name()` 依次探测 `context.get_provider(...)`、
-`context.providers`、`context.get_providers()`。这三个入口在 AstrBot 4.x 里**都不存在**
-（见 `astrbot/core/star/context.py`），于是函数恒定返回 None：任何在下拉框里选中的
-专用/备用模型都解析不到，插件静默退回内置日程模板；而「全局默认」那条分支用的
-`context.get_using_provider()` 是真实 API，所以只有它能用。
+只有这三个入口存在（`astrbot/core/star/context.py`）：
 
-真实 API：
-- `context.get_provider_by_id(provider_id)` —— 查 `provider_manager.inst_map`，
-  下拉框（`_special: select_provider`）存的就是这个 id
+- `context.get_provider_by_id(provider_id)` —— 查 `provider_manager.inst_map`；
+  配置项里 `_special: select_provider` 的下拉框存的正是这个 id
 - `context.get_all_providers()` —— 已过滤为 chat_completion 类型的列表
 - `context.get_using_provider(umo)` —— 当前会话使用的对话模型
 
-注意 `get_provider_by_id` 的返回类型是
+`context.get_provider()`、`context.providers`、`context.get_providers()`
+**都不存在**。用它们探测会静默失败（`getattr` 拿不到就当没有），表现为「下拉框里选了
+模型却始终不生效，不选反而正常」—— 因为不选时走的是上面第三个真实 API。
+`tests/test_llm.py::RootCauseWitnessTest` 会对真实 `Context` 类断言这一点。
+
+另外注意 `get_provider_by_id` 的返回类型是
 `Provider | TTSProvider | STTProvider | EmbeddingProvider | RerankProvider | None`，
-所以拿到对象后必须确认它真的能对话（有 `text_chat`）。
+拿到对象后必须确认它真的能对话（有 `text_chat`）。
 
 本模块不 import astrbot，Context / Provider 都按鸭子类型处理。
 """
@@ -93,7 +93,7 @@ class LLMResult:
 
 
 def extract_text(response: Any) -> str:
-    """从 LLMResponse 取纯文本。兼容 result_chain 与旧的 completion_text。"""
+    """从 LLMResponse 取纯文本。先看 completion_text，再退到 result_chain。"""
     if response is None:
         return ""
     text = getattr(response, "completion_text", None)
@@ -119,7 +119,7 @@ def _is_chat_provider(candidate: Any) -> bool:
 
 
 class ProviderResolver:
-    """只使用 AstrBot 4.x 真实存在的 API 解析 provider。"""
+    """按 id 解析对话 provider。"""
 
     __slots__ = ("_context", "_log")
 

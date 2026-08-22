@@ -1,4 +1,4 @@
-"""根因 2 的回归测试：日程读路径不阻塞、生成单飞、时段规范化。"""
+"""日程：读路径不阻塞、生成单飞、时段规范化。"""
 
 from __future__ import annotations
 
@@ -28,6 +28,11 @@ from .fakes import FakeClock, FakeContext, FakeProvider, RecordingLogger
 
 def cfg(**overrides) -> HumanoidConfig:
     return HumanoidConfig.from_raw({"timezone_city": "北京", **overrides})
+
+
+def today() -> str:
+    """ScheduleServiceTest 用的是真实 Clock，断言日期时不能写死字面量。"""
+    return Clock(cfg).today_str()
 
 
 GOOD_SCHEDULE = json.dumps(
@@ -222,7 +227,7 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(coverage_is_complete(slots))
         self.assertEqual(service.source, SOURCE_TEMPLATE)
         self.assertEqual(provider.calls, 0, "读路径不允许调用模型")
-        self.assertEqual(store.get("today_date"), "2026-08-22")
+        self.assertEqual(store.get("today_date"), today())
 
     async def test_current_slot_returns_something_usable(self):
         service, _, _ = self.build()
@@ -378,7 +383,7 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         await service.ensure_fresh()
         status = service.status()
         self.assertEqual(status["source"], SOURCE_LLM)
-        self.assertEqual(status["date"], "2026-08-22")
+        self.assertEqual(status["date"], today())
         self.assertGreater(status["slots"], 0)
         self.assertIn("成功", status["last_attempt"])
         self.assertFalse(status["generating"], "空闲时不该报告正在生成")

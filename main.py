@@ -96,11 +96,11 @@ class HumanoidCore(Star):
         await self.engine.start()
 
     async def terminate(self) -> None:
-        """AstrBot 在插件被禁用 / 重载时调用这个方法。
+        """插件被禁用 / 重载时的清理入口。
 
-        缺陷 1：v2.10.2 把清理逻辑写在 `cleanup()` 里，而 AstrBot 的钩子叫
-        `terminate()`（`astrbot/core/star/base.py:84`），所以从来没被调用过 ——
-        每次在 WebUI 保存配置触发重载，都会多留一个后台任务和一个未关闭的 HTTP 会话。
+        AstrBot 的生命周期钩子名是 `terminate()`（`astrbot/core/star/base.py:84`，
+        由 `star_manager.py:1909` 调用），不是 `cleanup()`。名字写错的话这里不会被
+        调用，每次重载都会遗留一个后台任务和一个未关闭的 HTTP 会话。
         """
         await self.engine.stop()
         session, self._session = self._session, None
@@ -114,7 +114,7 @@ class HumanoidCore(Star):
     # ---------- HTTP ----------
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        # 缺陷 10：v2.10.2 没有锁，并发首次调用会创建两个 session 并泄漏一个
+        # 双重检查加锁：并发首次调用若不加锁会创建两个 session 并泄漏一个
         if self._session is None or self._session.closed:
             async with self._session_lock:
                 if self._session is None or self._session.closed:
@@ -133,7 +133,7 @@ class HumanoidCore(Star):
         return str(event.get_sender_id())
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
-        """缺陷 9：AstrBot 自己的管理员名单也应当算数。"""
+        """AstrBot 自身的管理员，或插件 `admin_qq` 里列出的 QQ，都算管理员。"""
         astrbot_admin = False
         checker = getattr(event, "is_admin", None)
         if callable(checker):
@@ -327,10 +327,10 @@ class HumanoidCore(Star):
     async def inject_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """把状态注入 system_prompt。
 
-        根因 2：AstrBot 内联 await 这个钩子且没有超时保护
-        （`astrbot/core/pipeline/context_utils.py:98`），所以这里**绝不允许**出现
-        任何可能长时间阻塞的 await。`build_injection()` 是纯同步的，
-        日程生成一律走后台任务。
+        AstrBot 内联 await 这个钩子且没有超时保护
+        （`astrbot/core/pipeline/context_utils.py:98`），钩子里花掉的时间会一比一
+        变成用户等回复的时间。所以这里**不允许**出现任何可能长时间阻塞的 await：
+        `build_injection()` 是纯同步的，日程生成一律走后台任务。
         """
         try:
             is_private = _is_private_chat(event)

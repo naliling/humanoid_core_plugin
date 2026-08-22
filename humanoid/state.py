@@ -1,10 +1,11 @@
 """状态持久化：单一 state.json + 异步锁 + 去抖原子写。
 
-v2.10.2 的问题：每条消息会同步 `json.dump(indent=4)` 整个状态 3~7 次（精力、社交能量、
-情绪、心情标签、情绪日志各一次），直接阻塞事件循环。这里改为「标脏 + 定时合并写」，
-一个去抖窗口内无论标脏多少次都只落盘一次，且落盘动作走 `asyncio.to_thread`。
+写模型是「标脏 + 定时合并写」：一个去抖窗口内无论标脏多少次都只落盘一次，
+序列化在事件循环内完成（保证快照与状态一致），实际写盘交给 `asyncio.to_thread`。
+不要在这里做同步写 —— 情绪、精力、社交能量每条消息都会各自标脏若干次，
+逐次同步 `json.dump` 整个状态会直接阻塞事件循环。
 
-写入仍然是 tmp 文件 + `os.replace` 的原子替换，保留 v2.10.0 引入的防损坏特性。
+写入是 tmp 文件 + `os.replace` 的原子替换，中途崩溃不会留下半个文件。
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ _CONTAINER_FIELDS: dict[str, type] = {
     "mood_tags": dict,
 }
 
-# v2.10.2 里只写不读的僵尸字段，加载时丢弃
+# 早期版本只写不读的僵尸字段，加载时丢弃
 _DROPPED_FIELDS = ("_energy_noise_date",)
 
 
@@ -177,7 +178,7 @@ class StateStore:
         state["social_energy"] = _clamp_float(state.get("social_energy"), 100.0, 0.0, 100.0)
         state["_mood_decay_last_run"] = _clamp_float(state.get("_mood_decay_last_run"), 0.0, 0.0, 1e18)
 
-        # v2.10.2 把 current_cycle_day 硬编码钳制在 1-28，cycle_length 可配时会错位
+        # 按实际的 cycle_length 取模，不能硬编码 28，否则自定义周期长度会错位
         length = max(1, int(cycle_length))
         try:
             day = int(state.get("current_cycle_day", 1))

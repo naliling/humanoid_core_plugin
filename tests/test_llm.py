@@ -1,4 +1,4 @@
-"""根因 1 的回归测试：Provider 解析与回退链。"""
+"""Provider 解析与回退链。"""
 
 from __future__ import annotations
 
@@ -110,10 +110,10 @@ def _resp(text: str):
 
 
 class RootCauseWitnessTest(unittest.TestCase):
-    """把根因 1 钉死：v2.10.2 依赖的三个入口在 AstrBot 4.x 上并不存在。
+    """钉死 Provider API 的形状：这三个名字在 AstrBot 4.x 上不存在。
 
-    如果哪天 AstrBot 真的加回了这些名字，这个测试会失败并提醒我们复查；
-    在此之前它保证我们不会又写回那套探测逻辑。
+    用它们做探测会静默失败，表现为「下拉框选了模型却不生效」。哪天 AstrBot 真的
+    加回这些名字，这个测试会失败并提醒复查；在此之前它防止代码又写回那套探测逻辑。
     """
 
     LEGACY_NAMES = ("get_provider", "providers", "get_providers")

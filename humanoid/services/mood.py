@@ -1,12 +1,12 @@
 """情绪：好感度 / 亲近欲 / 攻击性，含衰减、心情标签与情绪日志。
 
-修掉 v2.10.2 的两个实现缺陷：
+两条设计约定：
 
-1. **`mood_affection_delta_cap` 可被突破约 2 倍**：旧代码先钳制（main.py:1444），
-   再乘精力系数（×1.3）和周期系数（×1.5）。现在钳制放到所有系数之后，
-   与配置项自己的描述一致。
-2. **每条消息遍历所有用户并全程持锁**（main.py:1330）：现在改为每个用户各自记录
-   `last_decay`，消息路径只衰减当前用户；全量清扫交给后台低频任务。
+1. **`mood_affection_delta_cap` 的钳制放在所有系数之后。**
+   精力系数（最多 ×1.3）和周期系数（最多 ×1.5）会放大变化量，先钳制再乘等于
+   让上限失效，实际单次变化可达配置值的两倍。
+2. **衰减按用户各自记账**（每份档案自带 `last_decay`）。
+   消息路径只衰减当前用户，全量清扫交给后台低频任务，避免每条消息都遍历全表。
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class Delta:
 
 
 def local_delta(text: str) -> Delta:
-    """本地规则判定。与 v2.10.2 的取值区间保持一致。"""
+    """本地规则判定：命中负面词、正面词、或都不命中时的三档取值区间。"""
     if NEGATIVE_PATTERN.search(text):
         return Delta(random.uniform(-4, -2), random.uniform(-2, -1), random.uniform(2, 4))
     if POSITIVE_PATTERN.search(text):
@@ -144,7 +144,7 @@ class MoodService:
         return record
 
     def _repair(self, record: dict[str, Any]) -> dict[str, Any]:
-        """补齐老档案缺失的字段（如 v2.10.2 没有的 last_decay）。"""
+        """补齐老档案缺失的字段（如早期版本没有的 last_decay）并把数值夹回合法区间。"""
         changed = False
         for key, base_key, bounds in DIMENSIONS:
             for target in (key, base_key):
@@ -258,7 +258,7 @@ class MoodService:
             record = self.profile(qq)
             now = self._time()
             if not record.get("last_interaction"):
-                # 首次交互只建档，不产生情绪波动（与 v2.10.2 一致）
+                # 首次交互只建档，不产生情绪波动
                 record["last_interaction"] = now
                 record["last_decay"] = now
                 record["turn_count"] = 1
@@ -312,7 +312,7 @@ class MoodService:
                 delta.aggression * 1.2 if delta.aggression > 0 else delta.aggression,
             )
 
-        # 缺陷 6：钳制必须放在所有系数之后，否则 delta_cap 可被突破约 2 倍
+        # 钳制必须放在所有系数之后，否则 delta_cap 会被上面的倍率放大突破
         return delta.capped(cfg.mood_affection_delta_cap)
 
     def _commit(

@@ -73,7 +73,10 @@ class EnergyTest(unittest.TestCase):
         return service, store, clock
 
     def test_new_day_reset_does_not_pin_energy_to_max(self):
-        """缺陷 5 回归：凌晨三点的第一条消息不应把精力顶到上限。"""
+        """跨天后凌晨三点的第一条消息不应把精力顶到上限。
+
+        计费起点若被写成当天 00:00，自然恢复会按三小时计入，直接冲满。
+        """
         service, store, clock = self.build(moment=datetime(2026, 8, 22, 3, 0, tzinfo=TZ))
         store.data["energy"] = 30.0
         store.data["last_update"] = "2026-08-21 22:10:00"
@@ -82,12 +85,6 @@ class EnergyTest(unittest.TestCase):
         self.assertGreater(energy, 70.0)
         # 计费起点必须是「现在」，不是午夜
         self.assertEqual(store.get("last_update"), "2026-08-22 03:00:00")
-
-    def test_old_behaviour_would_have_charged_from_midnight(self):
-        """把旧算法的量级钉下来，说明为什么必须改。"""
-        minutes_since_midnight = 3 * 60
-        old_natural_gain = minutes_since_midnight * 0.9 * 1.0
-        self.assertGreater(old_natural_gain, 100.0)
 
     def test_work_slot_only_consumes(self):
         service, store, clock = self.build(moment=datetime(2026, 8, 22, 9, 0, tzinfo=TZ))
@@ -207,7 +204,7 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.profile("1")["turn_count"], 1)
 
     async def test_delta_cap_holds_after_all_modifiers(self):
-        """缺陷 6 回归：精力 ×1.3 与排卵期 ×1.4 之后，单次变化仍不得超过 cap。"""
+        """精力 ×1.3 与排卵期 ×1.4 之后，单次变化仍不得超过 cap。"""
         service, _, _ = self.build(cfg(mood_affection_delta_cap=2, mood_sensitivity=100))
         service.profile("1")["last_interaction"] = self.time_value
         for _ in range(60):
@@ -265,7 +262,7 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.profile("1")["affection"], 90.0)
 
     async def test_decay_all_is_per_user(self):
-        """缺陷 11：每个用户各自记 last_decay，全量清扫与单用户衰减不会互相吃掉。"""
+        """每个用户各自记 last_decay，全量清扫与单用户衰减不会互相吃掉。"""
         service, store, _ = self.build(cfg(mood_decay_hours=6.0))
         for qq in ("1", "2"):
             record = service.profile(qq)
