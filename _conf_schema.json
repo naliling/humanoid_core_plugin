@@ -230,7 +230,7 @@
         "default": 28
     },
     "mood_affection_override": {
-        "description": "【情绪】指定好感（格式：3881756548:100,多个用英文逗号分隔）",
+        "description": "【情���】指定好感（格式：3881756548:100,多个用英文逗号分隔）",
         "type": "list",
         "default": []
     },
@@ -270,7 +270,7 @@
         "default": 120
     },
     "mood_tag_enabled": {
-        "description": "【心情标签】是否启用可读的心情标签（如“疲惫但开心”）",
+        "description": "【心情标签】是否启用可读的心情标签（如"疲惫但开心"）",
         "type": "bool",
         "default": true
     },
@@ -285,6 +285,14 @@
         "type": "string",
         "_special": "select_provider",
         "default": ""
+    },
+    "mood_provider_cooldown_minutes": {
+        "description": "【情绪】情绪分析模型失败后的冷却分钟数，冷却期内直接跳过该模型",
+        "hint": "独立控制情绪分析的冷却期。专用/备用模型失败回退全局默认后，冷却时间结束就能重新尝试小模型，避免长期被锁定在大模型。设为 0 表示不冷却。",
+        "type": "int",
+        "default": 5,
+        "minimum": 0,
+        "maximum": 1440
     },
     "social_energy_enabled": {
         "description": "【社交能量】是否开启社交能量（影响回复热情）",
