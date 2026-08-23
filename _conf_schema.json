@@ -230,7 +230,7 @@
         "default": 28
     },
     "mood_affection_override": {
-        "description": "【情���】指定好感（格式：3881756548:100,多个用英文逗号分隔）",
+        "description": "【情绪】指定好感（格式：3881756548:100,多个用英文逗号分隔）",
         "type": "list",
         "default": []
     },
