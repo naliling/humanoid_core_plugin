@@ -1,4 +1,4 @@
-# Humanoid Core - 拟真生活状态引擎 (v2.11.0)
+# Humanoid Core - 拟真生活状态引擎 (v2.11.1)
 
 一个有自己的时间、会累会恢复、情绪会积累的 AI 生活引擎。
 联系作者：3881756548（重度依赖用户反馈与建议）
@@ -116,6 +116,7 @@
 | `use_llm_schedule` | `true` | 关掉就只用内置模板，完全不调模型 |
 | `mood_use_llm_for_delta` | `false` | 是否用模型分析每句话的情绪变化 |
 | `mood_provider_name` | 空 | 情绪分析专用模型，留空沿用日程链 |
+| `mood_provider_cooldown_minutes` | 5 | **[NEW]** 情绪分析模型失败的冷却分钟数，独立于日程冷却 |
 | `inject_activity_context` | `low` | 注入程度：`full` / `low` / `mood_only` |
 | `environment_mode` | `both` | 生效范围：全部 / 仅私聊 / 仅群聊 |
 | `timezone_city` | `河源（记得改~）` | 时区城市，同时是 AI 感知的所在城市 |
@@ -182,6 +183,8 @@ python -m unittest discover
 
 ## 版本历史
 
+- **v2.11.1**：新增情绪分析模型独立冷却配置 `mood_provider_cooldown_minutes`（默认 5 分钟）。
+  专用/备用情绪模型失败回退全局默认后，冷却时间结束即可重新尝试小模型，避免长期被锁定在大模型，降低成本。
 - **v2.11.0**：架构化重构。修复专用/备用模型无法被解析（用错了 AstrBot API）；
   日程生成移出聊天关键路径，不再阻塞回复；补上 `terminate()` 生命周期，重载不再
   泄漏后台任务；修复 `environment_mode` 失效、跨天精力拉满、单次情绪变化上限被
