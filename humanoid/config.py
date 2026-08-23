@@ -200,6 +200,7 @@ class HumanoidConfig:
     mood_update_timeout: float = 120.0
     mood_tag_enabled: bool = True
     mood_use_llm_for_delta: bool = False
+    mood_provider_cooldown_minutes: int = 5
 
     # ---------- 社交能量 ----------
     social_energy_enabled: bool = True
@@ -221,7 +222,7 @@ class HumanoidConfig:
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any] | None) -> HumanoidConfig:
-        """从 AstrBotConfig（dict 子类）构造。缺失键用默认值，越界值就地钳制。"""
+        """从 AstrBotConfig（dict 子类）构造。缺失键���默认值，越界值就地钳制。"""
         src: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
 
         def pick(key: str) -> Any:
@@ -307,6 +308,7 @@ class HumanoidConfig:
             mood_update_timeout=f("mood_update_timeout", 5.0, 600.0),
             mood_tag_enabled=b("mood_tag_enabled"),
             mood_use_llm_for_delta=b("mood_use_llm_for_delta"),
+            mood_provider_cooldown_minutes=i("mood_provider_cooldown_minutes", 0, 1440),
             social_energy_enabled=b("social_energy_enabled"),
             social_energy_consumption_per_msg=f("social_energy_consumption_per_msg", 0.0, 100.0),
             social_energy_recovery_per_minute=f("social_energy_recovery_per_minute", 0.0, 100.0),
@@ -404,6 +406,3 @@ class HumanoidConfig:
 
 DEFAULTS = HumanoidConfig()
 """默认配置快照。`_conf_schema.json` 的默认值应与此保持一致（有测试守护）。"""
-
-
-
