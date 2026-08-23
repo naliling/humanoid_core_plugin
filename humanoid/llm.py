@@ -245,8 +245,12 @@ class LLMGateway:
 
     # ---------- 冷却 ----------
 
-    def _cooldown_seconds(self) -> float:
-        return max(0.0, float(getattr(self._config(), "schedule_provider_cooldown_minutes", 0)) * 60.0)
+    def _cooldown_seconds(self, purpose: str = "llm") -> float:
+        """根据用途返回冷却时间。情绪分析使用独立配置，其他使用日程配置。"""
+        cfg = self._config()
+        if purpose == "情绪分析":
+            return max(0.0, float(getattr(cfg, "mood_provider_cooldown_minutes", 5)) * 60.0)
+        return max(0.0, float(getattr(cfg, "schedule_provider_cooldown_minutes", 0)) * 60.0)
 
     def cooldown_remaining(self, provider_id: str) -> float:
         until = self._cooldown.get(provider_id)
@@ -268,8 +272,8 @@ class LLMGateway:
         else:
             self._cooldown.pop(provider_id, None)
 
-    def _enter_cooldown(self, provider_id: str) -> None:
-        seconds = self._cooldown_seconds()
+    def _enter_cooldown(self, provider_id: str, purpose: str = "llm") -> None:
+        seconds = self._cooldown_seconds(purpose)
         if provider_id and seconds > 0:
             self._cooldown[provider_id] = self._monotonic() + seconds
 
@@ -325,7 +329,7 @@ class LLMGateway:
                 attempts.append(Attempt(label, configured_id, OUTCOME_NOT_FOUND, self._not_found_detail(is_global)))
                 self._warn_not_found(purpose, label, configured_id, is_global)
                 if not is_global:
-                    self._enter_cooldown(configured_id)
+                    self._enter_cooldown(configured_id, purpose)
                 continue
 
             actual_id = self._resolver.id_of(provider) or configured_id
@@ -357,7 +361,7 @@ class LLMGateway:
                 return result
 
             if not is_global:
-                self._enter_cooldown(actual_id or configured_id)
+                self._enter_cooldown(actual_id or configured_id, purpose)
             self._warn(f"{purpose} {label}({actual_id}) {describe_outcome(outcome)}：{detail}")
 
         last = attempts[-1] if attempts else None
@@ -438,6 +442,3 @@ class LLMGateway:
     def _warn(self, message: str) -> None:
         if self._log is not None:
             self._log.warning(f"[humanoid_core] {message}")
-
-
-
