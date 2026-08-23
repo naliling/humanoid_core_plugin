@@ -184,7 +184,7 @@ python -m unittest discover
 ---
 
 ## 版本历史
-- **v2.11.2**：新增情绪分析模型消息使用避免长时间一直调用`mood_llm_interval_messages`（默认15条）
+- **v2.11.3**：新增情绪分析模型消息使用避免长时间一直调用`mood_llm_interval_messages`（默认15条）
 将原本会刷屏的消息日志分开的开关`mood_use_llm_for_delta`（默认关闭）没啥用不建议开。
 - **v2.11.1**：新增情绪分析模型独立冷却配置 `mood_provider_cooldown_minutes`（默认 5 分钟）。
   专用/备用情绪模型失败回退全局默认后，冷却时间结束即可重新尝试小模型，避免长期被锁定在大模型，降低成本。
