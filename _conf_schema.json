@@ -312,10 +312,10 @@
         "default": false
     },
     "mood_data_retention_days": {
-        "description": "【情绪】用户情绪数据保留天数（默认2天）。超过此天数未与插件交互的用户，其情绪档案、日志、标签将被自动清理，避免数据无限累积。",
+        "description": "【情绪】用户情绪数据保留天数（默认7天）。设为0表示永不清理。超过此天数未与插件交互的用户，其情绪档案、日志、标签将被自动清理，避免数据无限累积。",
         "type": "int",
-        "default": 2,
-        "minimum": 1,
+        "default": 7,
+        "minimum": 0,
         "maximum": 365
     },
     "social_energy_enabled": {
@@ -423,5 +423,12 @@
         "default": 5,
         "minimum": 1,
         "maximum": 60
+    },
+    "last_interaction_threshold_minutes": {
+        "description": "【对话间隔】距离上次对话超过多少分钟后，才向模型告知间隔时长（默认10分钟）。设为0则始终告知。",
+        "type": "int",
+        "default": 10,
+        "minimum": 0,
+        "maximum": 1440
     }
 }
