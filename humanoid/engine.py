@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -189,7 +190,8 @@ class HumanoidEngine:
             self.mood.decay_all()
             # 清理过期用户
             retention_days = self._config.mood_data_retention_days
-            self.mood.cleanup_expired_users(retention_days)
+            if retention_days > 0:
+                self.mood.cleanup_expired_users(retention_days)
 
     # ---------- 一次性配置迁移 ----------
 
@@ -289,6 +291,10 @@ class HumanoidEngine:
         if cfg.mood_enabled:
             self.mood.decay_user(qq)
 
+        # 记录用户最后对话时间（独立于情绪，用于间隔感知）
+        self.state.data.setdefault("user_last_seen", {})[str(qq)] = time.time()
+        self.state.mark_dirty()
+
     async def track_mood(self, qq: str, text: str, umo: str | None = None) -> None:
         """情绪更新里唯一可能碰模型的部分，单独 await，失败不影响主流程。"""
         if not self._config.mood_enabled:
@@ -320,6 +326,23 @@ class HumanoidEngine:
             self.mood.decay_user(qq)
             profile = self.mood.profile(qq)
             text += "\n\n" + build_mood_prompt(profile, self.mood.label(qq))
+
+        # 上次对话间隔（独立于情绪，始终工作）
+        last_seen = self.state.data.get("user_last_seen", {}).get(str(qq))
+        if last_seen is not None:
+            elapsed = time.time() - float(last_seen)
+            threshold = cfg.last_interaction_threshold_minutes * 60
+            if elapsed >= threshold:
+                if elapsed < 60:
+                    interval_text = "不到1分钟"
+                elif elapsed < 3600:
+                    interval_text = f"约 {int(elapsed / 60)} 分钟"
+                elif elapsed < 86400:
+                    interval_text = f"约 {int(elapsed / 3600)} 小时"
+                else:
+                    interval_text = f"约 {int(elapsed / 86400)} 天"
+                text += f"\n【上次对话间隔】距离你上一次和用户对话已过去 {interval_text}。"
+
         return text
 
     # ---------- 昵称 ----------
