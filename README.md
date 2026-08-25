@@ -96,7 +96,7 @@
 生理周期会给消耗和恢复各自乘一个阶段系数。跨天时精力重置到 80 上下。
 
 想让曲线更陡或更平，调 `energy_decay_rate`（全局速度倍率）和
-`energy_natural_recovery_per_minute`（休息时段的额外恢复速度）。后者默认 0.9/分钟
+`energy_natural_recovery_per_minute`（休息时段的额外恢复速度）。后者默认 0.15/分钟
 偏快，睡一觉基本满值；想要更明显的起伏可以调到 0.1~0.2。
 
 ---
@@ -104,18 +104,18 @@
 ## 关键配置项
 
 | 配置 | 默认值 | 说明 |
-|--------|--------|------|
 | `schedule_provider_name` | 空 | 生成日程的首选模型，下拉选择 |
 | `schedule_fallback_provider_name` | 空 | 备用模型 |
 | `schedule_allow_global_fallback` | `true` | 是否允许回退到全局默认模型 |
 | `schedule_llm_timeout_seconds` | 60 | 单次生成超时 |
+| `night_deep_sleep_ratio`| 0.5 | 夜间深度睡眠占全程比例（0.1~1.0），剩余为浅睡/半醒
 | `schedule_generation_max_attempts` | 2 | 每个模型尝试几次 |
 | `schedule_max_slots` | 16 | 时段数量上限，直接决定模型要输出多少内容 |
 | `schedule_provider_cooldown_minutes` | 30 | 失败模型的冷却分钟数，0 = 不冷却 |
 | `schedule_time_granularity` | `15min` | 时段起止时间对齐到哪个刻度 |
 | `use_llm_schedule` | `true` | 关掉就只用内置模板，完全不调模型 |
 | `mood_provider_name` | 空 | 情绪分析专用模型，留空沿用日程链 |
-|.`mood_llm_interval_messages` | 15 | 在第几条消息时使用模型情绪分析 |
+|.`mood_llm_interval_messages` | 5 | 在第几条消息时使用模型情绪分析 |
 |.`mood_use_llm_for_delta`| `true` | 启用llm情绪分析（日志会正常显示情绪分析Llm调用成功）|
 |.`mood_verbose_log`| `false` | 显示情绪计数的日志（默认关闭：避免太多刷新污染日志） |
 | `mood_provider_cooldown_minutes` | 5 | **[NEW]** 情绪分析模型失败的冷却分钟数，独立于日程冷却 |
@@ -184,9 +184,10 @@ python -m unittest discover
 ---
 
 ## 版本历史
-- **v2.11.3**：新增情绪分析模型消息使用避免长时间一直调用`mood_llm_interval_messages`（默认15条）
+- **v2.11.3**：夜间模式细化为深度睡眠/浅睡两段，新增 `night_deep_sleep_ratio` 配置（默认0.5）；好感度高时攻击性自然回落；调整默认值：精力自然恢复0.15、消息消耗精力0.04、社交能量恢复1.5、情绪LLM间隔改为5条。
+- **v2.11.2**：新增情绪分析模型消息使用避免长时间一直调用`mood_llm_interval_messages`（默认15条）
 将原本会刷屏的消息日志分开的开关`mood_use_llm_for_delta`（默认关闭）没啥用不建议开。
-- **v2.11.1**：新增情绪分析模型独立冷却配置 `mood_provider_cooldown_minutes`（默认 5 分钟）。
+- v2.11.1：新增情绪分析模型独立冷却配置 `mood_provider_cooldown_minutes`（默认 5 分钟）。
   专用/备用情绪模型失败回退全局默认后，冷却时间结束即可重新尝试小模型，避免长期被锁定在大模型，降低成本。
 - v2.11.0：架构化重构。修复专用/备用模型无法被解析（用错了 AstrBot API）；
   日程生成移出聊天关键路径，不再阻塞回复；补上 `terminate()` 生命周期，重载不再
