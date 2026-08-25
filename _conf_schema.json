@@ -297,7 +297,7 @@
     "mood_llm_interval_messages": {
         "description": "【情绪】调用LLM分析情绪的消息间隔（条），每N条消息调用一次模型进行分析。仅私聊生效，群聊受 mood_enabled_in_group 控制。",
         "type": "int",
-        "default": 15,
+        "default": 5,
         "minimum": 1,
         "maximum": 100
     },
@@ -331,7 +331,7 @@
     "social_energy_recovery_per_minute": {
         "description": "【社交能量】每分钟恢复的社交能量值 (0.1~3.0)",
         "type": "float",
-        "default": 2.0
+        "default": 1.5
     },
     "social_energy_reset_hour": {
         "description": "【社交能量】每天重置社交能量的小时 (0-23)，设为 -1 则不重置",
@@ -363,6 +363,13 @@
         "type": "bool",
         "default": false
     },
+    "night_deep_sleep_ratio": {
+        "description": "【夜间模式】深度睡眠占整个夜间时长的比例（0.1~1.0），剩余为浅睡/半醒。1.0=整夜深度睡眠，0.1=几乎全程浅睡。",
+        "type": "float",
+        "default": 0.5,
+        "minimum": 0.1,
+        "maximum": 1.0
+    },
     "debug_mode": {
         "description": "【调试】是否启用调试模式（输出详细日志，包括LLM请求/响应、情绪计算过程等）",
         "type": "bool",
@@ -382,7 +389,7 @@
     "energy_natural_recovery_per_minute": {
         "description": "【精力】每分钟自然恢复的精力值（0.05~0.9）",
         "type": "float",
-        "default": 0.9
+        "default": 0.15
     },
     "energy_natural_recovery_interval_minutes": {
         "description": "【精力】自然恢复的最小计费间隔（分钟）。不足一个间隔的休息时间不计入自然恢复",
@@ -395,7 +402,7 @@
     "energy_consumption_per_msg": {
         "description": "【精力】每次聊天消耗的精力值（0.01~0.9）",
         "type": "float",
-        "default": 0.03
+        "default": 0.04
     },
     "energy_recovery_phase_multipliers": {
         "description": "【精力】生理周期各阶段恢复倍率，顺序：经期、卵泡期、排卵期、黄体早期、黄体晚期、经前期",
