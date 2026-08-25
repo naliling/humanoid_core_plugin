@@ -203,7 +203,7 @@ class HumanoidConfig:
     mood_llm_interval_messages: int = 5
     mood_verbose_log: bool = False
     mood_enabled_in_group: bool = False
-    mood_data_retention_days: int = 2
+    mood_data_retention_days: int = 7
 
     # ---------- 社交能量 ----------
     social_energy_enabled: bool = True
@@ -223,6 +223,7 @@ class HumanoidConfig:
     debug_mode: bool = False
     holidays: tuple[dict[str, Any], ...] = ()
     state_flush_interval_seconds: int = 5
+    last_interaction_threshold_minutes: int = 10
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any] | None) -> HumanoidConfig:
@@ -315,7 +316,7 @@ class HumanoidConfig:
             mood_llm_interval_messages=i("mood_llm_interval_messages", 1, 100),
             mood_verbose_log=b("mood_verbose_log"),
             mood_enabled_in_group=b("mood_enabled_in_group"),
-            mood_data_retention_days=i("mood_data_retention_days", 1, 365),
+            mood_data_retention_days=i("mood_data_retention_days", 0, 365),
             social_energy_enabled=b("social_energy_enabled"),
             social_energy_consumption_per_msg=f("social_energy_consumption_per_msg", 0.0, 100.0),
             social_energy_recovery_per_minute=f("social_energy_recovery_per_minute", 0.0, 100.0),
@@ -329,6 +330,7 @@ class HumanoidConfig:
             debug_mode=b("debug_mode"),
             holidays=_as_mapping_tuple(pick("holidays")),
             state_flush_interval_seconds=i("state_flush_interval_seconds", 1, 60),
+            last_interaction_threshold_minutes=i("last_interaction_threshold_minutes", 0, 1440),
         )
 
     # ---------- 派生属性 ----------
