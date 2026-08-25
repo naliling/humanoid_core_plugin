@@ -108,7 +108,7 @@
 | `schedule_fallback_provider_name` | 空 | 备用模型 |
 | `schedule_allow_global_fallback` | `true` | 是否允许回退到全局默认模型 |
 | `schedule_llm_timeout_seconds` | 60 | 单次生成超时 |
-| `night_deep_sleep_ratio`| 0.5 | 夜间深度睡眠占全程比例（0.1~1.0），剩余为浅睡/半醒
+| `night_deep_sleep_ratio`| 0.5 | 夜间深度睡眠占全程比例（0.1~1.0），剩余为浅睡/半醒 |
 | `schedule_generation_max_attempts` | 2 | 每个模型尝试几次 |
 | `schedule_max_slots` | 16 | 时段数量上限，直接决定模型要输出多少内容 |
 | `schedule_provider_cooldown_minutes` | 30 | 失败模型的冷却分钟数，0 = 不冷却 |
