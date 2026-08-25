@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-__version__ = "2.11.3"
+__version__ = "2.11.4"
 
 LOG_PREFIX = "[humanoid_core]"
 
