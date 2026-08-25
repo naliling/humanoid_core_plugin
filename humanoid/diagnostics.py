@@ -10,9 +10,13 @@ from __future__ import annotations
 from typing import Any
 
 from .config import HumanoidConfig
-from .llm import GLOBAL_LABEL, LLMGateway, ProviderResolver
-from .services.mood import PURPOSE as MOOD_PURPOSE
-from .services.schedule import PURPOSE as SCHEDULE_PURPOSE
+from .llm import (
+    GLOBAL_LABEL,
+    PURPOSE_MOOD as MOOD_PURPOSE,
+    PURPOSE_SCHEDULE as SCHEDULE_PURPOSE,
+    LLMGateway,
+    ProviderResolver,
+)
 
 OK_MARK = "✓"
 BAD_MARK = "✗"
@@ -46,9 +50,10 @@ def _chain_pick(
     gateway: LLMGateway,
     chain: tuple[tuple[str, str], ...],
     allow_global: bool,
+    purpose: str,
 ) -> str:
     for label, provider_id in chain:
-        if gateway.cooldown_remaining(provider_id) > 0:
+        if gateway.cooldown_remaining(provider_id, purpose) > 0:
             continue
         if resolver.resolve(provider_id) is not None:
             return f"{label}({provider_id})"
@@ -85,16 +90,22 @@ def build_report(
         lines.append("- 全局默认回退: 已关闭（schedule_allow_global_fallback = false）")
 
     picked = _chain_pick(
-        resolver, gateway, cfg.schedule_provider_ids, cfg.schedule_allow_global_fallback
+        resolver,
+        gateway,
+        cfg.schedule_provider_ids,
+        cfg.schedule_allow_global_fallback,
+        SCHEDULE_PURPOSE,
     )
     lines.append(f"- 本次实际将使用: {picked}")
 
-    cooldowns = gateway.cooldowns()
-    if cooldowns:
-        detail = "，".join(f"{pid} 剩余 {rem / 60:.0f} 分钟" for pid, rem in cooldowns.items())
-        lines.append(f"- 冷却中: {detail}")
-    else:
-        lines.append("- 冷却中: 无")
+    # 冷却按用途分区，所以分开列 —— 同一个 id 可能只在情绪那边冷却，日程仍然可用
+    for purpose in (SCHEDULE_PURPOSE, MOOD_PURPOSE):
+        cooldowns = gateway.cooldowns(purpose)
+        if cooldowns:
+            detail = "，".join(f"{pid} 剩余 {rem / 60:.0f} 分钟" for pid, rem in cooldowns.items())
+            lines.append(f"- {purpose}冷却中: {detail}")
+        else:
+            lines.append(f"- {purpose}冷却中: 无")
 
     lines += ["", "【今日日程】"]
     lines.append(f"- 日期: {schedule_status.get('date') or '未生成'}")
@@ -130,6 +141,11 @@ def build_report(
         mood_last = gateway.last_result(MOOD_PURPOSE)
         if mood_last is not None:
             lines.append(f"- 上次尝试: {mood_last.summary()}")
+        lines.append(
+            f"- 每 {cfg.mood_llm_interval_messages} 条消息分析一次"
+            f"，失败冷却 {cfg.mood_provider_cooldown_minutes} 分钟"
+            f"，群聊{'启用' if cfg.mood_enabled_in_group else '不启用'}"
+        )
 
     lines += [
         "",
@@ -138,7 +154,8 @@ def build_report(
         f"，每个模型尝试 {cfg.schedule_generation_max_attempts} 次"
         f"，重试间隔 {cfg.schedule_retry_interval_seconds}s",
         f"- 时段上限 {cfg.schedule_max_slots}，时间对齐 {cfg.schedule_time_granularity}",
-        f"- 失败冷却 {cfg.schedule_provider_cooldown_minutes} 分钟",
+        f"- 日程失败冷却 {cfg.schedule_provider_cooldown_minutes} 分钟"
+        f"，情绪失败冷却 {cfg.mood_provider_cooldown_minutes} 分钟（两者各自记账）",
         f"- 大模型日程 {'开启' if cfg.use_llm_schedule else '关闭'}"
         f"，调试日志 {'开启' if cfg.debug_mode else '关闭'}",
     ]

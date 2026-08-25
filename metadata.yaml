@@ -3,7 +3,7 @@ display_name: 人形化伴侣插件
 short_desc: 轻量拟人插件，内置生理时钟与情绪，选地区即用。
 desc: |
   想要使用轻量又简单的拟人插件？娜莉灵建议可以来尝尝我的这款——内置拟人与时钟与情绪系统，无需额外配置，选个地区就能让AI拥有真实的生活节奏。它能感知时间、天气，情绪随对话起伏，还能自定义昵称和心情标签。轻巧、简单，却足够生动，插件也是只做拟人的核心没有太复杂的配置默认值也经过作者调试使用的推荐值。
-version: 2.11.5
+version: 2.11.6
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"

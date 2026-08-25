@@ -352,7 +352,8 @@ class HumanoidCore(Star):
     async def on_message(self, event: AstrMessageEvent):
         """每条消息的记账。同步部分立即完成，情绪分析（可能调模型）丢后台。"""
         try:
-            if not self.engine.environment_allows(_is_private_chat(event)):
+            is_private = _is_private_chat(event)
+            if not self.engine.environment_allows(is_private):
                 return
             sender = self._sender(event)
             if sender == str(event.get_self_id()):
@@ -360,11 +361,10 @@ class HumanoidCore(Star):
             text = (getattr(event, "message_str", "") or "").strip()
             if not text:
                 return
-            self.engine.on_message(sender)
+            self.engine.on_message(sender, is_group=not is_private)
 
-            # 判断是否允许情绪分析：私聊始终允许；群聊取决于 mood_enabled_in_group
-            is_private = _is_private_chat(event)
-            if self.engine.config.mood_enabled and (is_private or self.engine.config.mood_enabled_in_group):
+            # 私聊始终允许情绪分析；群聊取决于 mood_enabled_in_group
+            if self.engine.mood_allowed(not is_private):
                 self.engine.spawn_mood_update(sender, text, self._umo(event))
         except Exception as exc:
             logger.warning(f"{LOG_PREFIX} 消息记账失败: {exc!r}")

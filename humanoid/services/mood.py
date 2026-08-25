@@ -1,12 +1,15 @@
 """情绪：好感度 / 亲近欲 / 攻击性，含衰减、心情标签与情绪日志。
 
-两条设计约定：
+三条设计约定：
 
 1. **`mood_affection_delta_cap` 的钳制放在所有系数之后。**
    精力系数（最多 ×1.3）和周期系数（最多 ×1.5）会放大变化量，先钳制再乘等于
    让上限失效，实际单次变化可达配置值的两倍。
 2. **衰减按用户各自记账**（每份档案自带 `last_decay`）。
    消息路径只衰减当前用户，全量清扫交给后台低频任务，避免每条消息都遍历全表。
+3. **`messages_since_llm` 从 0 起算。**
+   每 `mood_llm_interval_messages` 条消息才调一次模型，新面孔的第一条消息只走本地
+   词典规则 —— 不为建档花一次模型调用，但仍然产生正常的情绪波动。
 """
 
 from __future__ import annotations
@@ -23,10 +26,11 @@ from typing import Any
 from ..config import HumanoidConfig
 from ..data.mood_map import generate_mood_tag, get_mood_label
 from ..jsonx import extract_json_object
-from ..llm import LLMGateway
+from ..llm import PURPOSE_MOOD, LLMGateway
 from ..state import StateStore
 
-PURPOSE = "情绪分析"
+# 冷却记账要按用途分区，所以用途常量的唯一来源在 llm.py
+PURPOSE = PURPOSE_MOOD
 
 NEGATIVE_PATTERN = re.compile(
     r"(傻|蠢|笨|白痴|废物|垃圾|去死|死吧|滚蛋|操|妈|逼|贱|恶心|讨厌|恨|烦|骂|吵|滚|弱智|脑残|sb|煞笔)",
@@ -90,6 +94,17 @@ def _clamp(value: float, bounds: tuple[float, float]) -> float:
     return max(bounds[0], min(bounds[1], value))
 
 
+def _as_timestamp(value: Any) -> float:
+    """把档案里的时间戳读成 float。不可解析、负数或 0（老版本的哨兵值）都返回 0.0。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if out != out or out <= 0.0:  # NaN 或非正数
+        return 0.0
+    return out
+
+
 class MoodService:
     __slots__ = ("_clock", "_config", "_gateway", "_lock", "_log", "_state", "_time")
 
@@ -128,7 +143,6 @@ class MoodService:
         libido = float(cfg.mood_initial_libido)
         aggression = float(cfg.mood_initial_aggression)
         now = self._time()
-        interval = max(1, cfg.mood_llm_interval_messages)
         record = {
             "affection": affection,
             "libido": libido,
@@ -139,7 +153,8 @@ class MoodService:
             "last_interaction": now,
             "last_decay": now,
             "turn_count": 0,
-            "messages_since_llm": interval - 1,
+            # 从 0 起算：新面孔的第一条消息只走本地词典规则，不为建档花一次模型调用
+            "messages_since_llm": 0,
         }
         moods[qq] = record
         self._state.mark_dirty()
@@ -165,11 +180,11 @@ class MoodService:
             record["turn_count"] = 0
             changed = True
         if "messages_since_llm" not in record:
-            cfg = self._config()
-            interval = max(1, cfg.mood_llm_interval_messages)
-            record["messages_since_llm"] = interval - 1
+            record["messages_since_llm"] = 0
             changed = True
-        if "last_interaction" not in record:
+        # v2.11.0 及更早的建档把 last_interaction 存成 0.0（哨兵值）。键是存在的，所以不能只
+        # 判断「缺失」—— 留着 0 会让 cleanup_expired_users 把这些老档案当成过期用户删掉。
+        if not _as_timestamp(record.get("last_interaction")):
             record["last_interaction"] = self._time()
             changed = True
         if changed:
@@ -266,26 +281,24 @@ class MoodService:
 
         async with self._lock:
             record = self.profile(qq)
-            now = self._time()
-            record["last_interaction"] = now
+            record["last_interaction"] = self._time()
 
-            if not record.get("last_interaction"):
-                record["last_interaction"] = now
-                record["last_decay"] = now
-                record["turn_count"] = 1
-                self._state.mark_dirty()
-                return None
-
-            messages_since = record.get("messages_since_llm", 0) + 1
+            try:
+                messages_since = int(record.get("messages_since_llm", 0)) + 1
+            except (TypeError, ValueError):
+                messages_since = 1
             record["messages_since_llm"] = messages_since
-            interval = cfg.mood_llm_interval_messages
+            interval = max(1, cfg.mood_llm_interval_messages)
             should_call_llm = cfg.mood_use_llm_for_delta and messages_since >= interval
             if should_call_llm:
                 record["messages_since_llm"] = 0
             self._state.mark_dirty()
 
             if cfg.mood_verbose_log:
-                self._info(f"用户 {qq} 消息计数：{messages_since}/{interval}，{'将调用LLM' if should_call_llm else '不调用'}")
+                self._info(
+                    f"用户 {qq} 消息计数：{messages_since}/{interval}，"
+                    f"{'将调用LLM' if should_call_llm else '不调用'}"
+                )
 
         base = local_delta(message)
         llm = None
@@ -352,7 +365,12 @@ class MoodService:
         before = {key: float(record[key]) for key, _, _ in DIMENSIONS}
         amounts = {"affection": delta.affection, "libido": delta.libido, "aggression": delta.aggression}
 
-        turn = int(record.get("turn_count", 1) or 1)
+        # turn 是「包含本次在内的第几轮」。`_ensure` 存的是 0，所以先自增再用，
+        # 否则第一条消息会被记成第 2 轮，`/情绪详情` 的轮次会一直多一。
+        try:
+            turn = int(record.get("turn_count", 0) or 0) + 1
+        except (TypeError, ValueError):
+            turn = 1
         base_coef = 1.0 if turn <= 10 else 0.2
         for key, base_key, bounds in DIMENSIONS:
             amount = amounts[key]
@@ -362,7 +380,7 @@ class MoodService:
                 drift += amount * 0.3
             record[base_key] = _clamp(float(record[base_key]) + drift, bounds)
 
-        record["turn_count"] = turn + 1
+        record["turn_count"] = turn
         record["last_interaction"] = self._time()
         self._log_event(qq, before, record, cfg)
         self.update_tag(qq, energy)
@@ -401,15 +419,18 @@ class MoodService:
             except (TypeError, ValueError):
                 return 0.0
 
-        self._info(
-            f"情绪分析 LLM 调用成功，耗时 {result.elapsed:.1f}s，消息片段：{message[:30]}..."
-        )
+        # 成功行保留耗时（用户靠它确认专用模型真的在工作），但不带用户原文 ——
+        # 默认每 5 条消息就是一次，无条件打印等于把聊天内容持续写进日志。
+        self._info(f"情绪分析 LLM 调用成功，耗时 {result.elapsed:.1f}s")
+        if cfg.debug_mode:
+            self._info(f"情绪分析消息片段：{message[:30]}")
 
         return Delta(pick("affection_delta"), pick("libido_delta"), pick("aggression_delta"))
 
     # ---------- 清理过期用户 ----------
 
     def cleanup_expired_users(self, days: int) -> int:
+        """删掉超过 `days` 天没有交互的情绪档案、日志与心情标签。`days <= 0` 表示不清理。"""
         if days <= 0:
             return 0
         now = self._time()
@@ -417,7 +438,10 @@ class MoodService:
         moods = self._state.data.get("moods", {})
         removed = 0
         for qq, record in list(moods.items()):
-            last = float(record.get("last_interaction", 0))
+            if not isinstance(record, dict):
+                continue
+            # 读不出时间戳时按「刚刚交互过」处理：宁可留着，也不要因为一条写坏的记录删数据
+            last = _as_timestamp(record.get("last_interaction")) or now
             if last < cutoff:
                 del moods[qq]
                 self._state.data.get("mood_logs", {}).pop(qq, None)
@@ -492,7 +516,7 @@ class MoodService:
         record["turn_count"] = 0
         record["last_interaction"] = self._time()
         record["last_decay"] = self._time()
-        record["messages_since_llm"] = max(1, cfg.mood_llm_interval_messages) - 1
+        record["messages_since_llm"] = 0
         self._state.mark_dirty()
         return record
 

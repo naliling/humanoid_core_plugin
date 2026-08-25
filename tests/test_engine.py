@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -71,7 +72,7 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
             await engine.stop()
 
     async def test_injection_contains_expected_sections(self):
-        engine, _, _ = self.build()
+        engine, _, _ = self.build({"timezone_city": "北京", "mood_enabled_in_group": True})
         await engine.start()
         try:
             engine.set_nickname("42", "小明")
@@ -81,6 +82,55 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("小明", text)
             self.assertIn("当前情绪数值", text)
             self.assertIn("社交能量", text)
+        finally:
+            await engine.stop()
+
+    async def test_group_mood_gated_by_config(self):
+        """mood_enabled_in_group 默认关闭时，群聊既不注入情绪段也不为群成员建档。"""
+        engine, raw, _ = self.build()
+        await engine.start()
+        try:
+            self.assertNotIn("当前情绪数值", engine.build_injection("42", is_group=True))
+            engine.on_message("42", is_group=True)
+            self.assertNotIn("42", engine.state.data.get("moods", {}), "群聊不该为成员建情绪档案")
+
+            # 私聊始终生效
+            self.assertIn("当前情绪数值", engine.build_injection("42", is_group=False))
+
+            raw["mood_enabled_in_group"] = True
+            engine.reload_config()
+            self.assertIn("当前情绪数值", engine.build_injection("42", is_group=True))
+        finally:
+            await engine.stop()
+
+    async def test_interval_note_uses_previous_turn(self):
+        """间隔提示必须比较「上一次注入」的时间戳，否则同一条消息里读到的永远是 0。"""
+        engine, _, _ = self.build({"timezone_city": "北京", "last_interaction_threshold_minutes": 10})
+        await engine.start()
+        try:
+            first = engine.build_injection("42")
+            self.assertNotIn("上次对话间隔", first, "第一次对话没有历史，不该出现间隔提示")
+            self.assertNotIn("上次对话间隔", engine.build_injection("42"), "间隔未超阈值时不提示")
+
+            engine.state.data["user_last_seen"]["42"] = time.time() - 2 * 3600
+            self.assertIn("约 2 小时", engine.build_injection("42"))
+
+            engine.state.data["user_last_seen"]["42"] = time.time() - 3 * 86400
+            self.assertIn("约 3 天", engine.build_injection("42"))
+        finally:
+            await engine.stop()
+
+    async def test_prune_last_seen_drops_stale_entries(self):
+        engine, _, _ = self.build()
+        await engine.start()
+        try:
+            seen = engine.state.data.setdefault("user_last_seen", {})
+            seen["fresh"] = time.time()
+            seen["stale"] = time.time() - 30 * 86400
+            seen["broken"] = "not-a-number"
+            self.assertEqual(engine.prune_last_seen(7), 2)
+            self.assertEqual(list(seen), ["fresh"])
+            self.assertEqual(engine.prune_last_seen(0), 0, "0 表示不清理")
         finally:
             await engine.stop()
 
@@ -274,10 +324,11 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
         engine, _, _ = self.build({"timezone_city": "北京", "mood_sensitivity": 100})
         await engine.start()
         try:
-            engine.mood.profile("1")["last_interaction"] = 1.0
             engine.spawn_mood_update("1", "你好棒")
             await asyncio.sleep(0.05)
-            self.assertGreater(engine.mood.profile("1")["turn_count"], 1)
+            self.assertEqual(
+                engine.mood.profile("1")["turn_count"], 1, "后台情绪任务应该已经提交了这一轮"
+            )
         finally:
             await engine.stop()
 

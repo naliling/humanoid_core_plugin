@@ -14,6 +14,8 @@ from humanoid.llm import (
     OUTCOME_NO_CANDIDATE,
     OUTCOME_NOT_FOUND,
     OUTCOME_TIMEOUT,
+    PURPOSE_MOOD,
+    PURPOSE_SCHEDULE,
     LLMGateway,
     ProviderResolver,
     extract_text,
@@ -335,6 +337,66 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
         res = await gw.generate(prompt="a", chain=(), allow_global=True, timeout=5)
         self.assertFalse(res.ok)
         self.assertEqual(gw.cooldowns(), {}, "全局默认模型不该被本插件拉黑")
+
+    async def test_cooldown_is_scoped_per_purpose(self):
+        """情绪分析的失败不能把日程生成也打下去，两边的时长也各按自己的配置算。
+
+        默认 `mood_provider_name` 留空时 `mood_provider_ids` 就是 `schedule_provider_ids`，
+        所以两个用途解析到的是同一个 provider —— 只按 id 记冷却会互相污染。
+        """
+        clock = FakeClock()
+        broken = FakeProvider("shared", error=RuntimeError("down"))
+        conf = cfg(schedule_provider_cooldown_minutes=30, mood_provider_cooldown_minutes=5)
+        gw, _ = self.build(FakeContext(chat_providers=[broken]), conf, clock)
+        chain = (("首选模型", "shared"),)
+
+        await gw.generate(
+            prompt="a", chain=chain, allow_global=False, timeout=5, purpose=PURPOSE_MOOD
+        )
+        self.assertAlmostEqual(gw.cooldown_remaining("shared", PURPOSE_MOOD), 300.0)
+        self.assertEqual(
+            gw.cooldown_remaining("shared", PURPOSE_SCHEDULE), 0.0, "情绪的冷却不该拦住日程"
+        )
+
+        await gw.generate(
+            prompt="b", chain=chain, allow_global=False, timeout=5, purpose=PURPOSE_SCHEDULE
+        )
+        self.assertEqual(broken.calls, 2, "日程应该真的发出了请求，而不是被情绪的冷却短路")
+        self.assertAlmostEqual(gw.cooldown_remaining("shared", PURPOSE_SCHEDULE), 1800.0)
+        self.assertAlmostEqual(
+            gw.cooldown_remaining("shared", PURPOSE_MOOD), 300.0, msg="情绪不该被日程的 30 分钟顶掉"
+        )
+
+        # 不带 purpose 的合并视图取最长的那个，诊断报告靠它一次列全
+        self.assertAlmostEqual(gw.cooldowns()["shared"], 1800.0)
+        self.assertAlmostEqual(gw.cooldowns(PURPOSE_MOOD)["shared"], 300.0)
+
+    async def test_success_clears_only_its_own_purpose(self):
+        clock = FakeClock()
+        flaky = FakeProvider("shared", error=RuntimeError("down"))
+        conf = cfg(schedule_provider_cooldown_minutes=30, mood_provider_cooldown_minutes=5)
+        gw, _ = self.build(FakeContext(chat_providers=[flaky]), conf, clock)
+        chain = (("首选模型", "shared"),)
+        for purpose in (PURPOSE_MOOD, PURPOSE_SCHEDULE):
+            await gw.generate(
+                prompt="a", chain=chain, allow_global=False, timeout=5, purpose=purpose
+            )
+
+        flaky.error = None
+        flaky.reply = "OK"
+        res = await gw.generate(
+            prompt="b",
+            chain=chain,
+            allow_global=False,
+            timeout=5,
+            purpose=PURPOSE_MOOD,
+            ignore_cooldown=True,
+        )
+        self.assertTrue(res.ok)
+        self.assertEqual(gw.cooldown_remaining("shared", PURPOSE_MOOD), 0.0)
+        self.assertGreater(
+            gw.cooldown_remaining("shared", PURPOSE_SCHEDULE), 0.0, "日程那边还没成功过，不该被解除"
+        )
 
     async def test_last_result_recorded_for_diagnostics(self):
         ctx = FakeContext(chat_providers=[FakeProvider("p", reply="OK")])

@@ -38,6 +38,18 @@ OUTCOME_EMPTY = "empty"
 OUTCOME_COOLDOWN = "cooldown"
 OUTCOME_NO_CANDIDATE = "no_candidate"
 
+# 调用用途。同时是日志/诊断里的显示名，以及冷却记账的分区键 —— 定义在这里而不是各服务里，
+# 是为了让 `_COOLDOWN_CONFIG_BY_PURPOSE` 不必依赖 services（llm.py 不 import 任何服务）。
+PURPOSE_SCHEDULE = "日程生成"
+PURPOSE_MOOD = "情绪分析"
+
+# 每个用途读哪个配置项决定冷却时长。没登记的用途沿用日程的配置。
+_COOLDOWN_CONFIG_BY_PURPOSE = {
+    PURPOSE_SCHEDULE: "schedule_provider_cooldown_minutes",
+    PURPOSE_MOOD: "mood_provider_cooldown_minutes",
+}
+_DEFAULT_COOLDOWN_CONFIG = "schedule_provider_cooldown_minutes"
+
 _OUTCOME_TEXT = {
     OUTCOME_OK: "成功",
     OUTCOME_NOT_FOUND: "未找到",
@@ -225,6 +237,11 @@ class LLMGateway:
 
     失败的 provider 进入冷却期，冷却期内直接跳过 —— 这样「配错一个 id」不会让
     之后每一次生成都白等一轮超时。成功一次即解除该 id 的冷却。
+
+    冷却按 `(purpose, provider_id)` 记账，不能只按 provider_id：日程和情绪共用同一个
+    gateway，而 `mood_provider_name` 留空时两者解析到的就是同一个 provider。只按 id 记的话
+    情绪分析的失败会顺带把日程生成也打下去（情绪调用频次高得多），日程的 30 分钟冷却也会
+    反过来把情绪锁在全局默认模型上 —— 那正是 `mood_provider_cooldown_minutes` 要避免的。
     """
 
     __slots__ = ("_config", "_cooldown", "_last_results", "_log", "_monotonic", "_resolver")
@@ -240,42 +257,54 @@ class LLMGateway:
         self._config = config_provider
         self._log = logger
         self._monotonic = monotonic
-        self._cooldown: dict[str, float] = {}
+        self._cooldown: dict[tuple[str, str], float] = {}
         self._last_results: dict[str, LLMResult] = {}
 
     # ---------- 冷却 ----------
 
-    def _cooldown_seconds(self, purpose: str = "llm") -> float:
-        """根据用途返回冷却时间。情绪分析使用独立配置，其他使用日程配置。"""
+    def _cooldown_seconds(self, purpose: str) -> float:
+        """按用途取冷却时长。情绪分析读自己的配置项，其余沿用日程的。"""
         cfg = self._config()
-        if purpose == "情绪分析":
-            return max(0.0, float(getattr(cfg, "mood_provider_cooldown_minutes", 5)) * 60.0)
-        return max(0.0, float(getattr(cfg, "schedule_provider_cooldown_minutes", 0)) * 60.0)
+        key = _COOLDOWN_CONFIG_BY_PURPOSE.get(purpose, _DEFAULT_COOLDOWN_CONFIG)
+        return max(0.0, float(getattr(cfg, key, 0)) * 60.0)
 
-    def cooldown_remaining(self, provider_id: str) -> float:
-        until = self._cooldown.get(provider_id)
+    def cooldown_remaining(self, provider_id: str, purpose: str = PURPOSE_SCHEDULE) -> float:
+        until = self._cooldown.get((purpose, provider_id))
         if until is None:
             return 0.0
         remaining = until - self._monotonic()
         if remaining <= 0:
-            self._cooldown.pop(provider_id, None)
+            self._cooldown.pop((purpose, provider_id), None)
             return 0.0
         return remaining
 
-    def cooldowns(self) -> dict[str, float]:
-        """当前处于冷却中的 provider → 剩余秒数。"""
-        return {pid: rem for pid in list(self._cooldown) if (rem := self.cooldown_remaining(pid)) > 0}
+    def cooldowns(self, purpose: str | None = None) -> dict[str, float]:
+        """处于冷却中的 provider → 剩余秒数。
 
-    def clear_cooldown(self, provider_id: str | None = None) -> None:
-        if provider_id is None:
-            self._cooldown.clear()
-        else:
-            self._cooldown.pop(provider_id, None)
+        不传 `purpose` 时跨用途合并，同一个 id 取剩余时间最长的那个，方便诊断报告一次列全。
+        """
+        out: dict[str, float] = {}
+        for entry_purpose, pid in list(self._cooldown):
+            if purpose is not None and entry_purpose != purpose:
+                continue
+            remaining = self.cooldown_remaining(pid, entry_purpose)
+            if remaining > 0 and remaining > out.get(pid, 0.0):
+                out[pid] = remaining
+        return out
 
-    def _enter_cooldown(self, provider_id: str, purpose: str = "llm") -> None:
+    def clear_cooldown(self, provider_id: str | None = None, purpose: str | None = None) -> None:
+        """清除冷却。两个参数都可省略，省略即「不限制该维度」。"""
+        for entry_purpose, pid in list(self._cooldown):
+            if provider_id is not None and pid != provider_id:
+                continue
+            if purpose is not None and entry_purpose != purpose:
+                continue
+            self._cooldown.pop((entry_purpose, pid), None)
+
+    def _enter_cooldown(self, provider_id: str, purpose: str) -> None:
         seconds = self._cooldown_seconds(purpose)
         if provider_id and seconds > 0:
-            self._cooldown[provider_id] = self._monotonic() + seconds
+            self._cooldown[(purpose, provider_id)] = self._monotonic() + seconds
 
     # ---------- 诊断 ----------
 
@@ -294,7 +323,7 @@ class LLMGateway:
         attempts_per_provider: int = 1,
         retry_interval: float = 0.0,
         umo: str | None = None,
-        purpose: str = "llm",
+        purpose: str = PURPOSE_SCHEDULE,
         ignore_cooldown: bool = False,
         **call_kwargs: Any,
     ) -> LLMResult:
@@ -317,7 +346,7 @@ class LLMGateway:
             is_global = label == GLOBAL_LABEL and not configured_id
 
             if not is_global and not ignore_cooldown:
-                remaining = self.cooldown_remaining(configured_id)
+                remaining = self.cooldown_remaining(configured_id, purpose)
                 if remaining > 0:
                     attempts.append(
                         Attempt(label, configured_id, OUTCOME_COOLDOWN, f"剩余约 {remaining / 60:.0f} 分钟")
@@ -345,8 +374,8 @@ class LLMGateway:
                 call_kwargs=call_kwargs,
             )
             if outcome == OUTCOME_OK:
-                self.clear_cooldown(actual_id)
-                self.clear_cooldown(configured_id)
+                self.clear_cooldown(actual_id, purpose)
+                self.clear_cooldown(configured_id, purpose)
                 result = LLMResult(
                     ok=True,
                     text=text,
