@@ -22,13 +22,14 @@ from ..clock import Clock
 from ..config import HumanoidConfig
 from ..data.schedule_templates import get_fallback_schedule
 from ..jsonx import extract_json_array
-from ..llm import LLMGateway, LLMResult
+from ..llm import PURPOSE_SCHEDULE, LLMGateway, LLMResult
 from ..slots import Slot, coverage_is_complete, find_slot, normalize_slots
 from ..state import StateStore
 
 SOURCE_TEMPLATE = "template"
 SOURCE_LLM = "llm"
-PURPOSE = "日程生成"
+# 冷却记账要按用途分区，所以用途常量的唯一来源在 llm.py
+PURPOSE = PURPOSE_SCHEDULE
 
 # 生成失败后，最少隔这么久再自动重试一次。
 # 否则「每条消息都投递一次后台生成」会在模型持续不可用时反复空转，

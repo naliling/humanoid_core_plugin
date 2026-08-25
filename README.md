@@ -17,8 +17,9 @@
 - 你可以设定它对你的称呼
 - 心情标签（如「疲惫但开心」），直观显示当前情绪
 - 社交能量：每条消息消耗，长时间不聊天恢复，影响回复热情
-- 夜间睡眠模式：深夜回复变短，或主动提示休息
-- 三档注入程度，控制它"知道你多少状态"
+- 夜间睡眠模式：分深睡 / 浅睡两段，深夜回复变短，或主动提示休息
+- 知道你上次找它是多久以前
+- 三档注入程度，控制它「知道你多少状态」
 - 私聊 / 群聊 / 全开都行，它会根据场景调整语气
 
 ---
@@ -96,8 +97,49 @@
 生理周期会给消耗和恢复各自乘一个阶段系数。跨天时精力重置到 80 上下。
 
 想让曲线更陡或更平，调 `energy_decay_rate`（全局速度倍率）和
-`energy_natural_recovery_per_minute`（休息时段的额外恢复速度）。后者默认 0.15/分钟
-偏快，睡一觉基本满值；想要更明显的起伏可以调到 0.1~0.2。
+`energy_natural_recovery_per_minute`（休息时段的额外恢复速度）。后者默认 0.15/分钟，
+睡满一夜基本回满；想要更明显的日内起伏就降到 0.05~0.1，想睡一会儿就回满则调到 0.3 以上。
+
+---
+
+## 夜间模式
+
+夜间窗口默认 23:00–06:00（`night_start_hour` / `night_end_hour`），按
+`night_deep_sleep_ratio`（默认 0.5）从窗口开头切出一段深度睡眠，剩下的是浅睡/半醒。
+默认配置下深睡大致覆盖 23 点到凌晨 2 点，之后是浅睡。
+
+`night_mode_force_sleep` 决定强度，开启后更严格：
+
+| | 关（默认） | 开 |
+|---|---|---|
+| 深睡段 | 极简短、迷糊、断续，像刚被吵醒，≤20 字 | 只回一句「我现在需要休息，明天再聊吧」 |
+| 浅睡段 | 迷糊、慵懒，≤30 字 | 简短回应并提一句想睡了，≤30 字 |
+
+这些都是写进 system_prompt 的语气指导 —— 插件不会拦下你的消息，最终怎么回还是模型决定。
+
+---
+
+## 上次对话间隔
+
+间隔超过 `last_interaction_threshold_minutes`（默认 10 分钟）时，注入里会多一句「距离你
+上一次和用户对话已过去约 N 分钟/小时/天」。算的是**上一次触发回复**到现在，所以纯指令
+消息和没唤醒它的群消息不会重置这个计时。第一次对话没有历史，不会出现这段。
+
+---
+
+## 情绪是怎么算的
+
+好感度、亲近欲、攻击性三个维度，每条消息先过一遍本地词典规则；开着
+`mood_use_llm_for_delta`（默认开）时，每 `mood_llm_interval_messages` 条消息（默认 5）
+再叫模型分析一次，两个结果加权融合。计数从 0 起算，所以新面孔的第一条消息只走本地规则，
+不为建档花一次模型调用。
+
+- 群聊默认不参与情绪：`mood_enabled_in_group` 关着时群消息完全不碰情绪系统，不分析、
+  不衰减、也不给群成员建档。
+- 情绪模型的失败冷却（`mood_provider_cooldown_minutes`，默认 5 分钟）与日程的冷却
+  （默认 30 分钟）各自记账，即使两边用同一个模型也互不影响。
+- `mood_data_retention_days` 默认 7 天：**超过 7 天没说话的用户，好感度会被清回初始值。**
+  不希望它忘掉老朋友就把这项设为 0。
 
 ---
 
@@ -109,17 +151,20 @@
 | `schedule_fallback_provider_name` | 空 | 备用模型 |
 | `schedule_allow_global_fallback` | `true` | 是否允许回退到全局默认模型 |
 | `schedule_llm_timeout_seconds` | 60 | 单次生成超时 |
-| `night_deep_sleep_ratio` | 0.5 | 夜间深度睡眠占全程比例（0.1~1.0），剩余为浅睡/半醒 |
 | `schedule_generation_max_attempts` | 2 | 每个模型尝试几次 |
 | `schedule_max_slots` | 16 | 时段数量上限，直接决定模型要输出多少内容 |
-| `schedule_provider_cooldown_minutes` | 30 | 失败模型的冷却分钟数，0 = 不冷却 |
+| `schedule_provider_cooldown_minutes` | 30 | 日程模型失败后的冷却分钟数，0 = 不冷却 |
 | `schedule_time_granularity` | `15min` | 时段起止时间对齐到哪个刻度 |
 | `use_llm_schedule` | `true` | 关掉就只用内置模板，完全不调模型 |
 | `mood_provider_name` | 空 | 情绪分析专用模型，留空沿用日程链 |
-| `mood_llm_interval_messages` | 5 | 在第几条消息时使用模型情绪分析 |
-| `mood_use_llm_for_delta` | `true` | 启用llm情绪分析（日志会正常显示情绪分析Llm调用成功） |
-| `mood_verbose_log` | `false` | 显示情绪计数的日志（默认关闭：避免太多刷新污染日志） |
-| `mood_provider_cooldown_minutes` | 5 | **[NEW]** 情绪分析模型失败的冷却分钟数，独立于日程冷却 |
+| `mood_use_llm_for_delta` | `true` | 是否用模型分析情绪变化，关掉就只用本地词典规则 |
+| `mood_llm_interval_messages` | 5 | 每多少条消息用模型分析一次情绪 |
+| `mood_provider_cooldown_minutes` | 5 | 情绪模型失败后的冷却分钟数，与日程冷却各自记账 |
+| `mood_enabled_in_group` | `false` | 群聊是否启用情绪系统，私聊始终启用 |
+| `mood_data_retention_days` | 7 | 情绪数据保留天数，过期会清掉好感度；0 = 永不清理 |
+| `mood_verbose_log` | `false` | 是否打印情绪的消息计数日志（默认关，避免刷屏） |
+| `night_deep_sleep_ratio` | 0.5 | 深度睡眠占整个夜间时长的比例（0.1~1.0） |
+| `last_interaction_threshold_minutes` | 10 | 间隔超过多少分钟才把「上次对话隔了多久」告诉模型 |
 | `inject_activity_context` | `low` | 注入程度：`full` / `low` / `mood_only` |
 | `environment_mode` | `both` | 生效范围：全部 / 仅私聊 / 仅群聊 |
 | `timezone_city` | `河源（记得改~）` | 时区城市，同时是 AI 感知的所在城市 |
@@ -134,9 +179,15 @@
 
 配置键与 `state.json` 完全兼容，直接覆盖即可，昵称、好感度、情绪日志都不会丢。
 
-唯一的一次性变更：`schedule_allow_global_fallback` 默认从关改为开，并会写进你已有的
-配置文件（启动日志里有一条 INFO 说明）。如果你确实想禁止回退以控制成本，在插件配置
-里重新关掉即可。
+两个需要留意的默认值变更：
+
+- `schedule_allow_global_fallback` 从关改为开，并会写进你已有的配置文件（启动日志里有一条
+  INFO 说明）。想禁止回退以控制成本，在插件配置里重新关掉即可。
+- `mood_use_llm_for_delta` 从关改为开（v2.11.4），配合 `mood_llm_interval_messages`
+  默认每 5 条消息调一次情绪模型。不想产生这部分调用就把它关掉，情绪会退回本地词典规则。
+
+另外 `mood_data_retention_days` 默认 7 天会清理长期不说话的用户的情绪数据，想永久保留
+就设为 0，详见上面的「情绪是怎么算的」。
 
 ---
 
@@ -166,8 +217,10 @@ tests/                   # 纯 stdlib unittest，不引入运行时依赖
 跑测试（在插件根目录）：
 
 ```bash
-python -m unittest discover
+python -m unittest discover -s tests -t .
 ```
+
+201 项，其中 24 项是 `main.py` 的集成测试，本机没装 AstrBot 时会自动跳过。
 
 ---
 
@@ -185,12 +238,24 @@ python -m unittest discover
 ---
 
 ## 版本历史
-- **v2.11.5**：上次对话间隔感知独立于情绪系统，新增 `user_last_seen` 修复情绪关闭时间隔功能失效的问题。
-- **v2.11.3**：夜间模式细化为深度睡眠/浅睡两段，新增 `night_deep_sleep_ratio` 配置（默认0.5）；好感度高时攻击性自然回落；调整默认值：精力自然恢复0.15、消息消耗精力0.04、社交能量恢复1.5、情绪LLM间隔改为5条。
-- **v2.11.2**：新增情绪分析模型消息使用避免长时间一直调用`mood_llm_interval_messages`（默认15条）
-将原本会刷屏的消息日志分开的开关`mood_use_llm_for_delta`（默认关闭）没啥用不建议开。
-- v2.11.1：新增情绪分析模型独立冷却配置 `mood_provider_cooldown_minutes`（默认 5 分钟）。
-  专用/备用情绪模型失败回退全局默认后，冷却时间结束即可重新尝试小模型，避免长期被锁定在大模型，降低成本。
+
+- **v2.11.6**：修好 v2.11.1~v2.11.5 里三个没真正生效的功能 —— 情绪模型的失败冷却改为按用途
+  分区记账（之前与日程共用一个格子，两边互相误伤）；【上次对话间隔】改在注入时读写（之前
+  先写后读，间隔恒为 0，提示从未出现过）；深睡提示语与 `night_mode_force_sleep` 的强弱关系
+  改回正确方向。另外修掉语气提示词表里 5 条永不命中的标签、`turn_count` 多一、
+  `user_last_seen` 只增不减、情绪日志打印用户消息原文、群聊关闭情绪仍为成员建档；
+  恢复了从 v2.11.2 起就跑不起来的测试套件。
+- v2.11.5：【上次对话间隔】感知，新增 `user_last_seen` 与
+  `last_interaction_threshold_minutes`；情绪数据保留天数从 2 天放宽到 7 天。
+- v2.11.4：夜间模式细化为深度睡眠 / 浅睡两段，新增 `night_deep_sleep_ratio`（默认 0.5）；
+  好感度高时攻击性自然回落；情绪标签附加语气提示；调整默认值：精力自然恢复 0.15、
+  消息消耗精力 0.04、社交能量恢复 1.5、`mood_llm_interval_messages` 5、
+  `mood_use_llm_for_delta` 默认改为开启。
+- v2.11.3：过期用户数据自动清理（`mood_data_retention_days`）。
+- v2.11.2：新增 `mood_llm_interval_messages`，每 N 条消息才调一次情绪模型，不再每条都调；
+  新增 `mood_verbose_log`（情绪计数日志开关，默认关）与 `mood_enabled_in_group`
+  （群聊情绪开关，默认关）。
+- v2.11.1：新增情绪分析模型的独立冷却配置 `mood_provider_cooldown_minutes`（默认 5 分钟）。
 - v2.11.0：架构化重构。修复专用/备用模型无法被解析（用错了 AstrBot API）；
   日程生成移出聊天关键路径，不再阻塞回复；补上 `terminate()` 生命周期，重载不再
   泄漏后台任务；修复 `environment_mode` 失效、跨天精力拉满、单次情绪变化上限被

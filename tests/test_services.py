@@ -139,7 +139,8 @@ class EnergyTest(unittest.TestCase):
     def test_consume_for_message(self):
         service, store, _ = self.build()
         store.data["energy"] = 50.0
-        self.assertAlmostEqual(service.consume_for_message(), 49.97, places=2)
+        # energy_consumption_per_msg 默认 0.04
+        self.assertAlmostEqual(service.consume_for_message(), 49.96, places=2)
 
     def test_cycle_advances_by_elapsed_days(self):
         service, store, clock = self.build()
@@ -198,10 +199,18 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.profile("777")["affection"], 95.0)
         self.assertEqual(service.profile("888")["affection"], 46.0)
 
-    async def test_first_message_only_creates_profile(self):
-        service, _, _ = self.build()
-        self.assertIsNone(await service.update_from_message("1", "你好", 80.0, 8))
-        self.assertEqual(service.profile("1")["turn_count"], 1)
+    async def test_first_message_uses_local_rules_only(self):
+        """新面孔的第一条消息不调模型，但走本地词典规则产生正常波动。"""
+        provider = FakeProvider("p", reply='{"affection_delta":5,"libido_delta":0,"aggression_delta":0}')
+        service, _, _ = self.build(
+            cfg(mood_use_llm_for_delta=True, mood_provider_name="p", mood_sensitivity=100),
+            [provider],
+        )
+        delta = await service.update_from_message("1", "你好棒", 80.0, 8)
+        self.assertIsNotNone(delta, "第一条消息也应该产生情绪波动")
+        self.assertGreater(delta.affection, 0)
+        self.assertEqual(provider.calls, 0, "第一条消息不该为建档花一次模型调用")
+        self.assertEqual(service.profile("1")["turn_count"], 1, "第一条消息是第 1 轮，不是第 2 轮")
 
     async def test_delta_cap_holds_after_all_modifiers(self):
         """精力 ×1.3 与排卵期 ×1.4 之后，单次变化仍不得超过 cap。"""
@@ -295,7 +304,12 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
             "p", reply='{"affection_delta": 5, "libido_delta": 5, "aggression_delta": -5}'
         )
         service, _, _ = self.build(
-            cfg(mood_use_llm_for_delta=True, mood_provider_name="p", mood_sensitivity=100),
+            cfg(
+                mood_use_llm_for_delta=True,
+                mood_provider_name="p",
+                mood_sensitivity=100,
+                mood_llm_interval_messages=1,
+            ),
             [provider],
         )
         service.profile("1")["last_interaction"] = self.time_value
@@ -305,7 +319,8 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
     async def test_llm_failure_falls_back_to_local(self):
         broken = FakeProvider("p", error=RuntimeError("nope"))
         service, _, log = self.build(
-            cfg(mood_use_llm_for_delta=True, mood_provider_name="p"), [broken]
+            cfg(mood_use_llm_for_delta=True, mood_provider_name="p", mood_llm_interval_messages=1),
+            [broken],
         )
         service.profile("1")["last_interaction"] = self.time_value
         delta = await service.update_from_message("1", "你好棒", 80.0, 8)
@@ -374,28 +389,58 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
         await service.update_from_message("1", "hi", 80, 8)
         self.assertEqual(provider.calls, 2)
 
-    async def test_initial_counter_triggers_first_message(self):
+    async def test_first_message_does_not_call_llm(self):
+        """计数器从 0 起算，所以新面孔要攒满 interval 条消息才会触发第一次模型分析。"""
         provider = FakeProvider("p", reply='{"affection_delta":1,"libido_delta":0,"aggression_delta":0}')
         service, _, _ = self.build(
             cfg(mood_use_llm_for_delta=True, mood_llm_interval_messages=5, mood_provider_name="p"),
             [provider]
         )
         await service.update_from_message("1", "hello", 80, 8)
-        self.assertEqual(provider.calls, 1)
+        self.assertEqual(provider.calls, 0)
+        for _ in range(4):
+            await service.update_from_message("1", "hello", 80, 8)
+        self.assertEqual(provider.calls, 1, "第 5 条消息才该调模型")
 
-    async def test_interval_reset_after_failure(self):
+    async def test_interval_rearms_after_failure(self):
+        """失败也会重置计数器：再攒满一个间隔就重新尝试（此处关掉冷却单独验计数器）。"""
         broken = FakeProvider("p", error=RuntimeError("fail"))
         service, _, _ = self.build(
-            cfg(mood_use_llm_for_delta=True, mood_llm_interval_messages=2, mood_provider_name="p"),
+            cfg(
+                mood_use_llm_for_delta=True,
+                mood_llm_interval_messages=2,
+                mood_provider_name="p",
+                mood_provider_cooldown_minutes=0,
+            ),
             [broken]
         )
         service.profile("1")["last_interaction"] = self.time_value
+        await service.update_from_message("1", "hi", 80, 8)
+        self.assertEqual(broken.calls, 0)
         await service.update_from_message("1", "hi", 80, 8)
         self.assertEqual(broken.calls, 1)
         await service.update_from_message("1", "hi", 80, 8)
         self.assertEqual(broken.calls, 1)
         await service.update_from_message("1", "hi", 80, 8)
         self.assertEqual(broken.calls, 2)
+
+    async def test_cooldown_blocks_retry_even_when_interval_is_reached(self):
+        """冷却期内即使凑够了间隔也不会真的发请求 —— 把这个组合行为显式钉下来。"""
+        broken = FakeProvider("p", error=RuntimeError("fail"))
+        service, _, _ = self.build(
+            cfg(
+                mood_use_llm_for_delta=True,
+                mood_llm_interval_messages=2,
+                mood_provider_name="p",
+                mood_provider_cooldown_minutes=5,
+                schedule_allow_global_fallback=False,
+            ),
+            [broken]
+        )
+        service.profile("1")["last_interaction"] = self.time_value
+        for _ in range(6):
+            await service.update_from_message("1", "hi", 80, 8)
+        self.assertEqual(broken.calls, 1, "第一次失败后进入冷却，后续尝试都被网关短路")
 
 
 class SocialEnergyTest(unittest.IsolatedAsyncioTestCase):
@@ -413,7 +458,7 @@ class SocialEnergyTest(unittest.IsolatedAsyncioTestCase):
         for _ in range(10):
             service.consume_for_message()
         self.assertAlmostEqual(service.value, 90.0)
-        service.recover(300)  # 5 分钟 × 2.0/分钟
+        service.recover(400)  # 400 秒 ≈ 6.67 分钟 × 1.5/分钟 = 10
         self.assertAlmostEqual(service.value, 100.0)
 
     async def test_never_exceeds_bounds(self):

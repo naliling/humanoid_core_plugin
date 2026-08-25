@@ -188,10 +188,38 @@ class HumanoidEngine:
             if self._stop_event.is_set():
                 return
             self.mood.decay_all()
-            # 清理过期用户
+            # 清理过期数据。两个容器共用同一个保留天数，0 表示都不清理。
             retention_days = self._config.mood_data_retention_days
             if retention_days > 0:
                 self.mood.cleanup_expired_users(retention_days)
+                self.prune_last_seen(retention_days)
+
+    def prune_last_seen(self, days: int) -> int:
+        """删掉 `user_last_seen` 里超过 `days` 天的条目，返回删除数量。
+
+        这个容器在每次注入时对当前发言者写一条，群里每个成员都会占位，而 state.json 是
+        全量重写的 —— 不清理会一直变大。它不属于情绪数据，所以清理逻辑放在编排层而不是
+        `MoodService` 里。
+        """
+        if days <= 0:
+            return 0
+        seen = self.state.data.get("user_last_seen")
+        if not isinstance(seen, dict):
+            return 0
+        cutoff = time.time() - days * 86400.0
+        removed = 0
+        for qq, stamp in list(seen.items()):
+            try:
+                last = float(stamp)
+            except (TypeError, ValueError):
+                last = 0.0  # 读不出来的条目本身就是垃圾，直接清掉
+            if last < cutoff:
+                del seen[qq]
+                removed += 1
+        if removed:
+            self.state.mark_dirty()
+            self._info(f"清理了 {removed} 条过期的对话间隔记录（超过 {days} 天）")
+        return removed
 
     # ---------- 一次性配置迁移 ----------
 
@@ -281,19 +309,26 @@ class HumanoidEngine:
             return not is_private
         return True
 
-    def on_message(self, qq: str) -> None:
+    def mood_allowed(self, is_group: bool) -> bool:
+        """情绪系统在当前会话类型下是否生效。
+
+        规则只写在这里一处：消息记账、后台分析、提示词注入三条路径都问它。分散判断的话
+        很容易出现「群聊不分析情绪，但仍然给每个群成员建了档」这种半开状态。
+        """
+        cfg = self._config
+        if not cfg.mood_enabled:
+            return False
+        return cfg.mood_enabled_in_group if is_group else True
+
+    def on_message(self, qq: str, *, is_group: bool = False) -> None:
         """每条消息的同步记账：精力推进、消耗、社交能量、当前用户情绪衰减。"""
         cfg = self._config
         self.energy.advance()
         self.energy.consume_for_message()
         if cfg.social_energy_enabled:
             self.social.consume_for_message()
-        if cfg.mood_enabled:
+        if self.mood_allowed(is_group):
             self.mood.decay_user(qq)
-
-        # 记录用户最后对话时间（独立于情绪，用于间隔感知）
-        self.state.data.setdefault("user_last_seen", {})[str(qq)] = time.time()
-        self.state.mark_dirty()
 
     async def track_mood(self, qq: str, text: str, umo: str | None = None) -> None:
         """情绪更新里唯一可能碰模型的部分，单独 await，失败不影响主流程。"""
@@ -322,28 +357,48 @@ class HumanoidEngine:
         if nickname:
             text += "\n" + build_nickname_instruction(nickname)
 
-        if cfg.mood_enabled:
+        if self.mood_allowed(is_group is True):
             self.mood.decay_user(qq)
             profile = self.mood.profile(qq)
             text += "\n\n" + build_mood_prompt(profile, self.mood.label(qq))
 
-        # 上次对话间隔（独立于情绪，始终工作）
-        last_seen = self.state.data.get("user_last_seen", {}).get(str(qq))
-        if last_seen is not None:
-            elapsed = time.time() - float(last_seen)
-            threshold = cfg.last_interaction_threshold_minutes * 60
-            if elapsed >= threshold:
-                if elapsed < 60:
-                    interval_text = "不到1分钟"
-                elif elapsed < 3600:
-                    interval_text = f"约 {int(elapsed / 60)} 分钟"
-                elif elapsed < 86400:
-                    interval_text = f"约 {int(elapsed / 3600)} 小时"
-                else:
-                    interval_text = f"约 {int(elapsed / 86400)} 天"
-                text += f"\n【上次对话间隔】距离你上一次和用户对话已过去 {interval_text}。"
-
+        text += self._interval_note(qq)
         return text
+
+    def _interval_note(self, qq: str) -> str:
+        """【上次对话间隔】：读旧时间戳算间隔，然后把时间戳推到现在。
+
+        读写必须都在这里：AstrBot 先跑 `event_message_type` 的 handler（消息记账），
+        再跑 `on_llm_request` 钩子（本方法所在的注入路径）
+        —— `ProcessStage.process()` 是 `star_request_sub_stage` → `agent_sub_stage` 的顺序。
+        所以如果在记账里写、在注入里读，同一条消息里就是先写后读，间隔恒为 0，这段提示
+        永远不会出现。语义因此是「距离上一次触发回复的间隔」，正好对上提示语的说法。
+        """
+        cfg = self._config
+        seen = self.state.data.setdefault("user_last_seen", {})
+        key = str(qq)
+        previous = seen.get(key)
+        now = time.time()
+        seen[key] = now
+        self.state.mark_dirty()
+
+        if previous is None:
+            return ""
+        try:
+            elapsed = now - float(previous)
+        except (TypeError, ValueError):
+            return ""
+        if elapsed < cfg.last_interaction_threshold_minutes * 60:
+            return ""
+        if elapsed < 60:
+            interval_text = "不到1分钟"
+        elif elapsed < 3600:
+            interval_text = f"约 {int(elapsed / 60)} 分钟"
+        elif elapsed < 86400:
+            interval_text = f"约 {int(elapsed / 3600)} 小时"
+        else:
+            interval_text = f"约 {int(elapsed / 86400)} 天"
+        return f"\n【上次对话间隔】距离你上一次和用户对话已过去 {interval_text}。"
 
     # ---------- 昵称 ----------
 
