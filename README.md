@@ -104,20 +104,21 @@
 ## 关键配置项
 
 | 配置 | 默认值 | 说明 |
+|---|---|---|
 | `schedule_provider_name` | 空 | 生成日程的首选模型，下拉选择 |
 | `schedule_fallback_provider_name` | 空 | 备用模型 |
 | `schedule_allow_global_fallback` | `true` | 是否允许回退到全局默认模型 |
 | `schedule_llm_timeout_seconds` | 60 | 单次生成超时 |
-| `night_deep_sleep_ratio`| 0.5 | 夜间深度睡眠占全程比例（0.1~1.0），剩余为浅睡/半醒 |
+| `night_deep_sleep_ratio` | 0.5 | 夜间深度睡眠占全程比例（0.1~1.0），剩余为浅睡/半醒 |
 | `schedule_generation_max_attempts` | 2 | 每个模型尝试几次 |
 | `schedule_max_slots` | 16 | 时段数量上限，直接决定模型要输出多少内容 |
 | `schedule_provider_cooldown_minutes` | 30 | 失败模型的冷却分钟数，0 = 不冷却 |
 | `schedule_time_granularity` | `15min` | 时段起止时间对齐到哪个刻度 |
 | `use_llm_schedule` | `true` | 关掉就只用内置模板，完全不调模型 |
 | `mood_provider_name` | 空 | 情绪分析专用模型，留空沿用日程链 |
-|.`mood_llm_interval_messages` | 5 | 在第几条消息时使用模型情绪分析 |
-|.`mood_use_llm_for_delta`| `true` | 启用llm情绪分析（日志会正常显示情绪分析Llm调用成功）|
-|.`mood_verbose_log`| `false` | 显示情绪计数的日志（默认关闭：避免太多刷新污染日志） |
+| `mood_llm_interval_messages` | 5 | 在第几条消息时使用模型情绪分析 |
+| `mood_use_llm_for_delta` | `true` | 启用llm情绪分析（日志会正常显示情绪分析Llm调用成功） |
+| `mood_verbose_log` | `false` | 显示情绪计数的日志（默认关闭：避免太多刷新污染日志） |
 | `mood_provider_cooldown_minutes` | 5 | **[NEW]** 情绪分析模型失败的冷却分钟数，独立于日程冷却 |
 | `inject_activity_context` | `low` | 注入程度：`full` / `low` / `mood_only` |
 | `environment_mode` | `both` | 生效范围：全部 / 仅私聊 / 仅群聊 |
