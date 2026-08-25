@@ -29,6 +29,7 @@ _CONTAINER_FIELDS: dict[str, type] = {
     "moods": dict,
     "mood_logs": dict,
     "mood_tags": dict,
+    "user_last_seen": dict,
 }
 
 # 早期版本只写不读的僵尸字段，加载时丢弃
@@ -54,6 +55,7 @@ def default_state(today: str = "", cycle_day: int = 1) -> dict[str, Any]:
         "moods": {},
         "mood_logs": {},
         "mood_tags": {},
+        "user_last_seen": {},
         "_mood_decay_last_run": 0.0,
         "_last_social_energy_reset_date": "",
         "_schema_migrated_to": 0,
@@ -283,5 +285,3 @@ def _clamp_float(value: Any, default: float, low: float, high: float) -> float:
     if out != out:
         return default
     return max(low, min(high, out))
-
-
