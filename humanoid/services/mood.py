@@ -136,7 +136,7 @@ class MoodService:
             "base_affection": affection,
             "base_libido": libido,
             "base_aggression": aggression,
-            "last_interaction": now,  # 记录首次交互时间，用于清理过期
+            "last_interaction": now,
             "last_decay": now,
             "turn_count": 0,
             "messages_since_llm": interval - 1,
@@ -267,11 +267,9 @@ class MoodService:
         async with self._lock:
             record = self.profile(qq)
             now = self._time()
-            # 更新最后交互时间（用于清理过期）
             record["last_interaction"] = now
 
             if not record.get("last_interaction"):
-                # 首次交互只建档，不产生情绪波动（但上面已更新，此处不会执行）
                 record["last_interaction"] = now
                 record["last_decay"] = now
                 record["turn_count"] = 1
@@ -286,7 +284,6 @@ class MoodService:
                 record["messages_since_llm"] = 0
             self._state.mark_dirty()
 
-            # 受 mood_verbose_log 控制的详细日志
             if cfg.mood_verbose_log:
                 self._info(f"用户 {qq} 消息计数：{messages_since}/{interval}，{'将调用LLM' if should_call_llm else '不调用'}")
 
@@ -298,7 +295,7 @@ class MoodService:
         async with self._lock:
             record = self.profile(qq)
             delta = self._resolve_delta(base, llm)
-            delta = self._apply_modifiers(delta, cfg, energy, cycle_day)
+            delta = self._apply_modifiers(delta, cfg, energy, cycle_day, record)
             self._commit(qq, record, delta, cfg, energy)
             return delta
 
@@ -306,16 +303,15 @@ class MoodService:
         if llm is None:
             return base
         if base.affection < STRONG_NEGATIVE_THRESHOLD:
-            # 本地已判定为明显负面：以本地为准并略微放大，不让模型和稀泥
             return base.scaled(STRONG_NEGATIVE_BOOST)
         return base.blend(llm, LLM_WEIGHT)
 
     def _apply_modifiers(
-        self, delta: Delta, cfg: HumanoidConfig, energy: float, cycle_day: int
+        self, delta: Delta, cfg: HumanoidConfig, energy: float, cycle_day: int, record: dict[str, Any]
     ) -> Delta:
         delta = delta.scaled(max(0.0, cfg.mood_sensitivity / 100.0))
 
-        # 精力影响：状态好时正向反应更强，疲惫时整体钝化
+        # 精力影响
         if energy > 70:
             delta = Delta(
                 delta.affection * 1.3 if delta.affection > 0 else delta.affection,
@@ -325,21 +321,29 @@ class MoodService:
         elif energy < 40:
             delta = delta.scaled(0.8)
 
+        # 生理周期
         phase = cfg.cycle_phase_index(cycle_day)
-        if phase == 0:  # 经期：正向变化打折，负向变化放大
+        if phase == 0:
             delta = Delta(
                 delta.affection * (0.5 if delta.affection > 0 else 1.5),
                 delta.libido * (0.5 if delta.libido > 0 else 1.5),
                 delta.aggression * (0.8 if delta.aggression > 0 else 1.5),
             )
-        elif phase == 2:  # 排卵期：正向变化增强
+        elif phase == 2:
             delta = Delta(
                 delta.affection * 1.4 if delta.affection > 0 else delta.affection,
                 delta.libido * 1.4 if delta.libido > 0 else delta.libido,
                 delta.aggression * 1.2 if delta.aggression > 0 else delta.aggression,
             )
 
-        # 钳制必须放在所有系数之后，否则 delta_cap 会被上面的倍率放大突破
+        # 好感度高时攻击性自然回落
+        affection = float(record.get("affection", 50))
+        if affection > 80:
+            if delta.aggression > 0:
+                delta = Delta(delta.affection, delta.libido, delta.aggression * 0.5)
+            elif delta.aggression < 0:
+                delta = Delta(delta.affection, delta.libido, delta.aggression * 1.2)
+
         return delta.capped(cfg.mood_affection_delta_cap)
 
     def _commit(
@@ -355,7 +359,6 @@ class MoodService:
             record[key] = _clamp(before[key] + amount, bounds)
             drift = amount * base_coef * 0.5
             if key == "affection" and amount < -1:
-                # 明显的负面互动会额外压低基线，情绪不会立刻回弹
                 drift += amount * 0.3
             record[base_key] = _clamp(float(record[base_key]) + drift, bounds)
 
@@ -398,7 +401,6 @@ class MoodService:
             except (TypeError, ValueError):
                 return 0.0
 
-        # 强制输出日志：告知用户本次 LLM 情绪分析调用成功（不受 mood_verbose_log 控制）
         self._info(
             f"情绪分析 LLM 调用成功，耗时 {result.elapsed:.1f}s，消息片段：{message[:30]}..."
         )
@@ -408,7 +410,6 @@ class MoodService:
     # ---------- 清理过期用户 ----------
 
     def cleanup_expired_users(self, days: int) -> int:
-        """删除超过 days 天未交互的用户情绪数据。返回清理的用户数。"""
         if days <= 0:
             return 0
         now = self._time()
@@ -418,7 +419,6 @@ class MoodService:
         for qq, record in list(moods.items()):
             last = float(record.get("last_interaction", 0))
             if last < cutoff:
-                # 删除该用户的所有相关数据
                 del moods[qq]
                 self._state.data.get("mood_logs", {}).pop(qq, None)
                 self._state.data.get("mood_tags", {}).pop(qq, None)
