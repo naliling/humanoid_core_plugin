@@ -188,37 +188,38 @@ class HumanoidEngine:
             if self._stop_event.is_set():
                 return
             self.mood.decay_all()
-            # 清理过期数据。两个容器共用同一个保留天数，0 表示都不清理。
+            # 清理过期数据。三个容器共用同一个保留天数，0 表示都不清理。
             retention_days = self._config.mood_data_retention_days
             if retention_days > 0:
                 self.mood.cleanup_expired_users(retention_days)
-                self.prune_last_seen(retention_days)
+                self._prune_time_container("user_last_seen", retention_days)
+                self._prune_time_container("last_message", retention_days)
 
-    def prune_last_seen(self, days: int) -> int:
-        """删掉 `user_last_seen` 里超过 `days` 天的条目，返回删除数量。
-
-        这个容器在每次注入时对当前发言者写一条，群里每个成员都会占位，而 state.json 是
-        全量重写的 —— 不清理会一直变大。它不属于情绪数据，所以清理逻辑放在编排层而不是
-        `MoodService` 里。
-        """
+    def _prune_time_container(self, container_name: str, days: int) -> int:
+        """删掉指定容器里超过 `days` 天的条目，返回删除数量。"""
         if days <= 0:
             return 0
-        seen = self.state.data.get("user_last_seen")
-        if not isinstance(seen, dict):
+        container = self.state.data.get(container_name)
+        if not isinstance(container, dict):
             return 0
         cutoff = time.time() - days * 86400.0
         removed = 0
-        for qq, stamp in list(seen.items()):
+        for qq, entry in list(container.items()):
+            # last_message 存的是 {text, timestamp}，user_last_seen 存的是纯时间戳
+            if isinstance(entry, dict):
+                stamp = entry.get("timestamp", 0)
+            else:
+                stamp = entry
             try:
                 last = float(stamp)
             except (TypeError, ValueError):
-                last = 0.0  # 读不出来的条目本身就是垃圾，直接清掉
+                last = 0.0
             if last < cutoff:
-                del seen[qq]
+                del container[qq]
                 removed += 1
         if removed:
             self.state.mark_dirty()
-            self._info(f"清理了 {removed} 条过期的对话间隔记录（超过 {days} 天）")
+            self._info(f"清理了 {removed} 条过期的 {container_name}（超过 {days} 天）")
         return removed
 
     # ---------- 一次性配置迁移 ----------
@@ -320,7 +321,7 @@ class HumanoidEngine:
             return False
         return cfg.mood_enabled_in_group if is_group else True
 
-    def on_message(self, qq: str, *, is_group: bool = False) -> None:
+    def on_message(self, qq: str, *, is_group: bool = False, text: str = "") -> None:
         """每条消息的同步记账：精力推进、消耗、社交能量、当前用户情绪衰减。"""
         cfg = self._config
         self.energy.advance()
@@ -329,6 +330,12 @@ class HumanoidEngine:
             self.social.consume_for_message()
         if self.mood_allowed(is_group):
             self.mood.decay_user(qq)
+
+        # 记录用户最后一条消息内容（供 with_last_msg 模式使用）
+        if cfg.last_interaction_mode == "with_last_msg" and text:
+            msg_store = self.state.data.setdefault("last_message", {})
+            msg_store[str(qq)] = {"text": text[:100], "timestamp": time.time()}
+            self.state.mark_dirty()
 
     async def track_mood(self, qq: str, text: str, umo: str | None = None) -> None:
         """情绪更新里唯一可能碰模型的部分，单独 await，失败不影响主流程。"""
@@ -366,39 +373,59 @@ class HumanoidEngine:
         return text
 
     def _interval_note(self, qq: str) -> str:
-        """【上次对话间隔】：读旧时间戳算间隔，然后把时间戳推到现在。
+        """【上次对话间隔】：两种模式。
 
-        读写必须都在这里：AstrBot 先跑 `event_message_type` 的 handler（消息记账），
-        再跑 `on_llm_request` 钩子（本方法所在的注入路径）
-        —— `ProcessStage.process()` 是 `star_request_sub_stage` → `agent_sub_stage` 的顺序。
-        所以如果在记账里写、在注入里读，同一条消息里就是先写后读，间隔恒为 0，这段提示
-        永远不会出现。语义因此是「距离上一次触发回复的间隔」，正好对上提示语的说法。
+        - simple：只告知时长，模型自己根据性格去理解
+        - with_last_msg：告知时长 + 上次用户说的话，模型自己根据性格去理解
         """
         cfg = self._config
         seen = self.state.data.setdefault("user_last_seen", {})
         key = str(qq)
-        previous = seen.get(key)
+        previous_ts = seen.get(key)
         now = time.time()
         seen[key] = now
         self.state.mark_dirty()
 
-        if previous is None:
+        if previous_ts is None:
             return ""
         try:
-            elapsed = now - float(previous)
+            elapsed = now - float(previous_ts)
         except (TypeError, ValueError):
             return ""
         if elapsed < cfg.last_interaction_threshold_minutes * 60:
             return ""
+
+        # 构建时间文本
         if elapsed < 60:
-            interval_text = "不到1分钟"
+            time_text = "不到1分钟"
         elif elapsed < 3600:
-            interval_text = f"约 {int(elapsed / 60)} 分钟"
+            time_text = f"约 {int(elapsed / 60)} 分钟"
         elif elapsed < 86400:
-            interval_text = f"约 {int(elapsed / 3600)} 小时"
+            time_text = f"约 {int(elapsed / 3600)} 小时"
         else:
-            interval_text = f"约 {int(elapsed / 86400)} 天"
-        return f"\n【上次对话间隔】距离你上一次和用户对话已过去 {interval_text}。"
+            time_text = f"约 {int(elapsed / 86400)} 天"
+
+        mode = cfg.last_interaction_mode
+
+        if mode == "simple":
+            return f"\n【上次对话间隔】距离你上一次和用户对话已过去 {time_text}。"
+
+        # mode == "with_last_msg"
+        msg_store = self.state.data.get("last_message", {})
+        msg_data = msg_store.get(key)
+        if msg_data is None:
+            return f"\n【上次对话间隔】距离你上一次和用户对话已过去 {time_text}。"
+
+        last_text = msg_data.get("text", "")
+        # 注入后清空
+        del msg_store[key]
+        self.state.mark_dirty()
+
+        return (
+            f"\n【上次对话间隔】距离你上一次和用户对话已过去 {time_text}。\n"
+            f"【上次消息】用户最后说：\"{last_text}\"\n"
+            "你知道这句话，也记得那是多久以前说的。"
+        )
 
     # ---------- 昵称 ----------
 
