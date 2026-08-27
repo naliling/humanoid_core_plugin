@@ -431,11 +431,21 @@
         "maximum": 60
     },
     "last_interaction_threshold_minutes": {
-        "description": "【对话间隔】距离上次对话超过多少分钟，才把间隔时长告诉模型（0 = 每次都告诉）",
-        "hint": "间隔算的是「上一次触发回复」到现在。第一次对话没有历史，不会出现这段提示。",
+        "description": "【对话间隔】距离上次对话超过多少分钟，才开始记录并告知模型（默认5分钟）",
+        "hint": "设为 0 则每次都记录。算的是「上一次触发回复」到现在。第一次对话没有历史，不会出现这段提示。",
         "type": "int",
-        "default": 10,
+        "default": 5,
         "minimum": 0,
         "maximum": 1440
+    },
+    "last_interaction_mode": {
+        "description": "【对话间隔】描述模式：simple=仅告知时长；with_last_msg=告知时长+上次用户说了什么",
+        "hint": "with_last_msg 会记录用户最后一条消息内容，在下次对话时告诉模型「上次说了什么 + 隔了多久」，注入后自动清空该记录，不会重复提示。模型会根据自己的性格去理解这个间隔意味着什么。",
+        "type": "string",
+        "default": "simple",
+        "options": [
+            "simple",
+            "with_last_msg"
+        ]
     }
 }
