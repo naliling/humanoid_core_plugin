@@ -30,6 +30,7 @@ _CONTAINER_FIELDS: dict[str, type] = {
     "mood_logs": dict,
     "mood_tags": dict,
     "user_last_seen": dict,
+    "last_message": dict,
 }
 
 # 早期版本只写不读的僵尸字段，加载时丢弃
@@ -56,6 +57,7 @@ def default_state(today: str = "", cycle_day: int = 1) -> dict[str, Any]:
         "mood_logs": {},
         "mood_tags": {},
         "user_last_seen": {},
+        "last_message": {},
         "_mood_decay_last_run": 0.0,
         "_last_social_energy_reset_date": "",
         "_schema_migrated_to": 0,
