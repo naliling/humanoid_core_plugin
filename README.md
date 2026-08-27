@@ -1,7 +1,6 @@
 # Humanoid Core - 拟真生活状态引擎
 
 一个有自己的时间、会累会恢复、情绪会积累的 AI 生活引擎。
-联系作者：3881756548
 
 ---
 
@@ -121,9 +120,16 @@
 
 ## 上次对话间隔
 
-间隔超过 `last_interaction_threshold_minutes`（默认 10 分钟）时，注入里会多一句「距离你
-上一次和用户对话已过去约 N 分钟/小时/天」。算的是**上一次触发回复**到现在，所以纯指令
-消息和没唤醒它的群消息不会重置这个计时。第一次对话没有历史，不会出现这段。
+`last_interaction_threshold_minutes` 默认 **5 分钟**：超过这个时间，插件才开始在提示词里注入间隔信息。
+
+有两种模式可选（`last_interaction_mode`）：
+
+| 模式 | 行为 |
+|---|---|
+| `simple` | 仅告知间隔时长（如「已过去约 3 小时」），模型根据自己的性格去理解这个事实 |
+| `with_last_msg` | 告知间隔时长 + 用户上次最后说的话。模型会同时知道「隔了多久」和「上次说了什么」，根据自己的性格去理解这意味着什么。**注入后自动清空该记录**，不会重复提示 |
+
+算的是**上一次触发回复**到现在，所以纯指令消息和没唤醒它的群消息不会重置这个计时。第一次对话没有历史，不会出现这段提示。
 
 ---
 
@@ -164,7 +170,8 @@
 | `mood_data_retention_days` | 7 | 情绪数据保留天数，过期会清掉好感度；0 = 永不清理 |
 | `mood_verbose_log` | `false` | 是否打印情绪的消息计数日志（默认关，避免刷屏） |
 | `night_deep_sleep_ratio` | 0.5 | 深度睡眠占整个夜间时长的比例（0.1~1.0） |
-| `last_interaction_threshold_minutes` | 10 | 间隔超过多少分钟才把「上次对话隔了多久」告诉模型 |
+| `last_interaction_mode` | `simple` | 对话间隔模式：`simple` / `with_last_msg` |
+| `last_interaction_threshold_minutes` | 5 | 间隔超过多少分钟才开始注入对话间隔提示 |
 | `inject_activity_context` | `low` | 注入程度：`full` / `low` / `mood_only` |
 | `environment_mode` | `both` | 生效范围：全部 / 仅私聊 / 仅群聊 |
 | `timezone_city` | `河源（记得改~）` | 时区城市，同时是 AI 感知的所在城市 |
@@ -239,6 +246,12 @@ python -m unittest discover -s tests -t .
 
 ## 版本历史
 
+- **v2.11.8**：简化对话间隔模式，仅保留 `simple`（仅告知时长）和 `with_last_msg`（时长+上次消息内容）两种。删除固定的情绪预设描述，让模型根据自己的性格去理解间隔的意义。
+- **v2.11.7**：新增 `last_interaction_mode`，支持三种对话间隔感知模式：
+  `simple`（仅告知时长）、`contextual`（时长+感知描述）、`contextual_with_last_msg`
+  （时长+上次用户消息内容）。`last_interaction_threshold_minutes` 默认值从 10 改为 5。
+  新增 `last_message` 状态字段，记录用户最后一条消息内容，在 `contextual_with_last_msg`
+  模式下注入后自动清空。
 - **v2.11.6**：修好 v2.11.1~v2.11.5 里三个没真正生效的功能 —— 情绪模型的失败冷却改为按用途
   分区记账（之前与日程共用一个格子，两边互相误伤）；【上次对话间隔】改在注入时读写（之前
   先写后读，间隔恒为 0，提示从未出现过）；深睡提示语与 `night_mode_force_sleep` 的强弱关系
@@ -268,3 +281,4 @@ python -m unittest discover -s tests -t .
 - v2.7.6：修复精力卡顿；社交能量恢复增强；内置节日感知
 - v2.7.0：心情标签、社交能量、夜间模式、情绪可靠性提升
 - v2.6.x：历史版本略
+- v1.9.0
