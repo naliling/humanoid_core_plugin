@@ -28,6 +28,7 @@ GRANULARITY_MINUTES: dict[str, int] = {
 INJECT_MODES = ("full", "low", "mood_only")
 ENVIRONMENT_MODES = ("both", "private", "group")
 CYCLE_STYLES = ("default", "simple")
+LAST_INTERACTION_MODES = ("simple", "with_last_msg")
 
 _TRUE_STRINGS = {"1", "true", "yes", "y", "on", "是", "开"}
 _FALSE_STRINGS = {"0", "false", "no", "n", "off", "否", "关"}
@@ -223,7 +224,8 @@ class HumanoidConfig:
     debug_mode: bool = False
     holidays: tuple[dict[str, Any], ...] = ()
     state_flush_interval_seconds: int = 5
-    last_interaction_threshold_minutes: int = 10
+    last_interaction_threshold_minutes: int = 5
+    last_interaction_mode: str = "simple"
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any] | None) -> HumanoidConfig:
@@ -331,6 +333,7 @@ class HumanoidConfig:
             holidays=_as_mapping_tuple(pick("holidays")),
             state_flush_interval_seconds=i("state_flush_interval_seconds", 1, 60),
             last_interaction_threshold_minutes=i("last_interaction_threshold_minutes", 0, 1440),
+            last_interaction_mode=c("last_interaction_mode", LAST_INTERACTION_MODES),
         )
 
     # ---------- 派生属性 ----------
