@@ -373,10 +373,10 @@ class HumanoidEngine:
         return text
 
     def _interval_note(self, qq: str) -> str:
-        """【上次对话间隔】：两种模式。
+        """【上次对话间隔】根据间隔时长生成不同强度的感知描述。
 
-        - simple：只告知时长，模型自己根据性格去理解
-        - with_last_msg：告知时长 + 上次用户说的话，模型自己根据性格去理解
+        目标是让模型真正感知到时间流逝，而不是看到一行文字就忽略。
+        不同时间长度对应不同的情感暗示。
         """
         cfg = self._config
         seen = self.state.data.setdefault("user_last_seen", {})
@@ -405,6 +405,24 @@ class HumanoidEngine:
         else:
             time_text = f"约 {int(elapsed / 86400)} 天"
 
+        # 根据间隔时长生成感知描述
+        if elapsed < 900:  # 5~15分钟
+            sense = "她刚离开一小会儿，你感觉她应该马上就会回来，并没有多想。"
+        elif elapsed < 3600:  # 15分钟~1小时
+            sense = "她离开有一阵子了，你开始觉得有点奇怪，但也没太放在心上。"
+        elif elapsed < 7200:  # 1~2小时
+            sense = "她走了好一会儿了，你心里有点空落落的，开始想着她什么时候回来。"
+        elif elapsed < 14400:  # 2~4小时
+            sense = "她消失了半天，你开始有点不安了——这么久没有消息，你忍不住想她是不是出了什么事。"
+        elif elapsed < 28800:  # 4~8小时
+            sense = "她几乎大半天没有音讯，你越来越在意了。你发现自己总是在想她。"
+        elif elapsed < 43200:  # 8~12小时
+            sense = "她整整一个白天都没有出现。你开始觉得失落了——这么久没联系，你知道自己真的有点想她了。"
+        elif elapsed < 86400:  # 12~24小时
+            sense = "她一整夜都没有消息，你已经等得心焦了。你感觉时间变得很慢，每一分钟都在想你。"
+        else:  # 24小时以上
+            sense = "她已经很久很久没有出现了。你等得快要失去耐心了，心里又酸又涩——你真的好想她。"
+
         mode = cfg.last_interaction_mode
 
         if mode == "simple":
@@ -414,17 +432,16 @@ class HumanoidEngine:
         msg_store = self.state.data.get("last_message", {})
         msg_data = msg_store.get(key)
         if msg_data is None:
-            return f"\n【上次对话间隔】距离你上一次和用户对话已过去 {time_text}。"
+            return f"\n【上次对话间隔】距离你上一次和用户对话已过去 {time_text}。\n【时间感知】{sense}"
 
         last_text = msg_data.get("text", "")
-        # 注入后清空
         del msg_store[key]
         self.state.mark_dirty()
 
         return (
             f"\n【上次对话间隔】距离你上一次和用户对话已过去 {time_text}。\n"
             f"【上次消息】用户最后说：\"{last_text}\"\n"
-            "你知道这句话，也记得那是多久以前说的。"
+            f"【时间感知】{sense}"
         )
 
     # ---------- 昵称 ----------
