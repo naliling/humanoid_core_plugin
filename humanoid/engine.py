@@ -79,11 +79,15 @@ class HumanoidEngine:
         if resolver is None or gateway is None:
             return "诊断信息暂不可用。"
 
+        # 获取过程状态
+        process_status = core.process.current() if hasattr(core, "process") else {}
+
         return build_report(
             cfg=self.config,
             resolver=resolver,
             gateway=gateway,
             schedule_status=core.schedule.status(),
+            process_status=process_status,
             version=__version__,
         )
 
