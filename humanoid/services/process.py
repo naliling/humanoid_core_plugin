@@ -92,17 +92,52 @@ class ProcessService:
 
     def _create_initial_process(self) -> dict:
         now = self._clock.now()
-        return self._generate_process_for_slot(now)
+        return self._generate_process_for_slot(now, self._schedule.current_slot(now.hour*60 + now.minute))
 
     def _generate_next_process(self) -> dict:
         now = self._clock.now()
-        return self._generate_process_for_slot(now)
-
-    def _generate_process_for_slot(self, now: datetime) -> dict:
         minutes = now.hour * 60 + now.minute
         slot = self._schedule.current_slot(minutes)
-        category = self._infer_category(slot)
+        current = self.current()
+        # 判断是否延续当前过程
+        if current and self._should_continue_current(current, slot, now):
+            # 延长当前过程
+            new_end = self._calculate_new_end(now, slot)
+            current['expected_end'] = new_end.isoformat()
+            current['duration_minutes'] = int((new_end - now).total_seconds() // 60)
+            self._scope.set_self("current_process", current)
+            return current
+        else:
+            return self._generate_process_for_slot(now, slot)
 
+    def _should_continue_current(self, current: dict, slot: Slot, now: datetime) -> bool:
+        """决定是否继续当前过程，基于随机概率和日程匹配度"""
+        end_str = current.get("expected_end")
+        if not end_str:
+            return False
+        try:
+            end_time = datetime.fromisoformat(end_str)
+        except ValueError:
+            return False
+        if now < end_time:
+            return True  # 还未结束，继续
+        # 已过期，决定是否延续
+        current_category = current.get("category", "")
+        slot_category = self._infer_category(slot)
+        base_prob = 0.7 if current_category == slot_category else 0.3
+        prob = max(0.2, min(0.8, base_prob + random.uniform(-0.2, 0.2)))
+        return random.random() < prob
+
+    def _calculate_new_end(self, now: datetime, slot: Slot) -> datetime:
+        minutes = now.hour * 60 + now.minute
+        remaining = self._slot_remaining_minutes(slot, minutes)
+        duration = max(15, min(remaining, self.config.process_max_duration))
+        duration = int(duration * random.uniform(0.8, 1.2))
+        return now + timedelta(minutes=duration)
+
+    def _generate_process_for_slot(self, now: datetime, slot: Slot) -> dict:
+        minutes = now.hour * 60 + now.minute
+        category = self._infer_category(slot)
         activities = CATEGORY_ACTIVITIES.get(category, ["休息"])
         name = random.choice(activities)
 
