@@ -315,6 +315,10 @@ class HumanoidCore(Star):
 
     @filter.on_llm_request()
     async def inject_context(self, event: AstrMessageEvent, req: ProviderRequest):
+        """
+        将拟人上下文注入到模型的对话消息历史中，而不是仅修改 system_prompt。
+        这样信息作为独立消息存在，模型能更自然地感知时间间隔和新话题。
+        """
         try:
             is_group = not _is_private_chat(event)
             if not self.engine.environment_allows(not is_group):
@@ -324,10 +328,34 @@ class HumanoidCore(Star):
                 self._sender(event),
                 is_group=is_group
             )
-            if req.system_prompt:
-                req.system_prompt = f"{req.system_prompt}\n{injection}"
+            # 将注入信息作为一条 system 消息插入到 messages 列表开头（或末尾）
+            # 这里选择插入到开头，使其在上下文中靠前，但也可以追加到末尾
+            # 为了不破坏已有 system 消息，我们检查 messages 中是否有 system，若没有则插入
+            if not hasattr(req, 'messages') or req.messages is None:
+                # 如果 req 没有 messages，回退到 system_prompt 方式
+                if req.system_prompt:
+                    req.system_prompt = f"{req.system_prompt}\n{injection}"
+                else:
+                    req.system_prompt = injection
+                return
+
+            # 将 injection 作为一条 system 消息添加到 messages 中
+            # 如果已经存在 system 消息，则追加到其后，或合并？为避免重复，我们追加一条新的 system 消息
+            # 但 AstrBot 可能期望 messages 中的 system 只有一条，所以我们合并到已有的 system 消息
+            # 为了简单，我们直接修改第一条 system 消息的内容（如果存在），否则插入新消息
+            messages = req.messages
+            system_index = None
+            for i, msg in enumerate(messages):
+                if msg.get("role") == "system":
+                    system_index = i
+                    break
+            if system_index is not None:
+                # 合并到已有 system
+                messages[system_index]["content"] = messages[system_index]["content"] + "\n" + injection
             else:
-                req.system_prompt = injection
+                # 插入新的 system 消息
+                messages.insert(0, {"role": "system", "content": injection})
+
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 注入失败: {e}")
 
