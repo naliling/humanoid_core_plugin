@@ -65,6 +65,7 @@ def build_report(
     resolver: ProviderResolver,
     gateway: LLMGateway,
     schedule_status: dict[str, Any],
+    process_status: dict[str, Any],   # 新增参数
     version: str,
 ) -> str:
     available = resolver.available_ids()
@@ -119,6 +120,18 @@ def build_report(
         lines.append(f"- 上次尝试: {last.summary()}")
     if schedule_status.get("last_error"):
         lines.append(f"- 上次失败原因: {schedule_status['last_error']}")
+
+    lines += ["", "【当前过程】"]
+    if process_status:
+        name = process_status.get("name", "未知")
+        duration = process_status.get("duration_minutes", 0)
+        started = process_status.get("started_at", "")
+        ended = process_status.get("expected_end", "")
+        lines.append(f"- 正在：{name}（已持续约 {duration} 分钟）")
+        if started and ended:
+            lines.append(f"- 开始：{started}，预计结束：{ended}")
+    else:
+        lines.append("- 无活跃过程")
 
     lines += ["", "【情绪模型】"]
     if not cfg.mood_use_llm_for_delta:
