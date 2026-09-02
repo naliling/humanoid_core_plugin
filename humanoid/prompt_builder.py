@@ -138,10 +138,11 @@ class PromptBuilder:
     def _build_mood(self, user_id: str) -> str:
         data = self._core.mood.profile(user_id)
         label = self._core.mood.label(user_id)
+        # 将好感度和标签单独列为一行，注入到上下文中
         return (
             f"〖与当前用户的关系〗\n"
-            f"亲近欲：{data['libido']:.1f}/50\n"
             f"好感度：{data['affection']:.1f}/100\n"
+            f"亲近欲：{data['libido']:.1f}/50\n"
             f"情绪标签：{label}\n"
             "（请根据上述数值自然演绎，不要直接提及数值）"
         )
@@ -167,6 +168,7 @@ class PromptBuilder:
         if elapsed < threshold:
             return ""
 
+        # 生成精确时间描述
         if elapsed < 60:
             time_text = "不到1分钟"
         elif elapsed < 3600:
@@ -176,6 +178,7 @@ class PromptBuilder:
         else:
             time_text = f"约 {int(elapsed / 86400)} 天"
 
+        # 情感描述（保留原有）
         if elapsed < 900:
             sense = "她/他刚离开一小会儿。"
         elif elapsed < 3600:
@@ -187,6 +190,12 @@ class PromptBuilder:
         else:
             sense = "她/他已经很久没有出现了，你心里有点空落落的。"
 
+        # 当间隔超过1小时，明确标注新话题
+        new_topic_hint = ""
+        if elapsed >= 3600:
+            new_topic_hint = f" 这算是一个新话题，距离上次对话已过去{time_text}。"
+
+        # 如果有 last_message 且模式为 with_last_msg
         last_msg = self._core._scope.get_user(user_id, "last_message")
         if last_msg and cfg.last_interaction_mode == "with_last_msg":
             text = last_msg.get("text", "")
@@ -194,7 +203,7 @@ class PromptBuilder:
                 self._core._scope.set_user(user_id, "last_message", None)
                 return (
                     f"【上次对话】已过去 {time_text}。"
-                    f"用户最后说：「{text}」\n{sense}"
+                    f"用户最后说：「{text}」\n{sense}{new_topic_hint}"
                 )
 
-        return f"【上次对话】已过去 {time_text}。{sense}"
+        return f"【上次对话】已过去 {time_text}。{sense}{new_topic_hint}"
