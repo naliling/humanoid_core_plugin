@@ -1,0 +1,431 @@
+{
+    "max_energy": {
+        "description": "【生理】精力上限值 (默认 100)",
+        "type": "float",
+        "default": 100.0
+    },
+    "enable_cycle": {
+        "description": "【生理】是否开启生理周期模拟",
+        "type": "bool",
+        "default": true
+    },
+    "cycle_length": {
+        "description": "【生理】生理周期总天数 (默认 28 天)",
+        "type": "int",
+        "default": 28
+    },
+    "energy_decay_rate": {
+        "description": "【生理】精力变化速度倍率",
+        "type": "string",
+        "default": "0.5",
+        "options": ["0.5", "1.0", "2.0", "3.0"]
+    },
+    "cycle_description_style": {
+        "description": "【生理】周期描述风格（default=完整描述，simple=简洁描述）",
+        "type": "string",
+        "default": "default",
+        "options": ["default", "simple"]
+    },
+    "use_llm_schedule": {
+        "description": "【日程】是否启用大模型每日自动生成全新动态日程。关闭后使用内置备用模板（基于日期轮换）。",
+        "type": "bool",
+        "default": true
+    },
+    "schedule_provider_name": {
+        "description": "【日程】指定生成日程的首选模型 Provider（下拉选择已配置的 Provider）",
+        "hint": "存的是 Provider ID。若填了不存在的 ID，插件会在日志里列出全部可用 ID，也可用 /拟人诊断 查看。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+    },
+    "schedule_fallback_provider_name": {
+        "description": "【日程】备用模型 Provider，首选模型「未找到 / 超时 / 报错」时自动切换",
+        "hint": "三种失败等价处理，都会切到备用模型。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+    },
+    "schedule_allow_global_fallback": {
+        "description": "【日程/费用控制】首选和备用模型都失败时，是否回退到 AstrBot 全局默认模型",
+        "hint": "开启后链路为 首选 → 备用 → 全局默认 → 内置模板。关闭则跳过全局默认，直接用内置模板（可控成本，但配错 ID 时不易发现）。",
+        "type": "bool",
+        "default": true
+    },
+    "schedule_retry_interval_seconds": {
+        "description": "【日程】同一个模型多次尝试之间的等待秒数",
+        "type": "int",
+        "default": 2,
+        "minimum": 0,
+        "maximum": 600
+    },
+    "schedule_llm_timeout_seconds": {
+        "description": "【日程】单次日程生成的超时秒数（超时按失败处理并切下一个模型）",
+        "hint": "调大可容纳较慢的模型；调小能更快落回内置模板。",
+        "type": "int",
+        "default": 60,
+        "minimum": 10,
+        "maximum": 300
+    },
+    "schedule_generation_max_attempts": {
+        "description": "【日程】每个模型最多尝试几次（失败后才切下一个模型）",
+        "type": "int",
+        "default": 2,
+        "minimum": 1,
+        "maximum": 5
+    },
+    "schedule_max_slots": {
+        "description": "【日程】日程时段数量上限，直接决定模型一次要输出多少内容",
+        "hint": "值越小生成越快越稳。设为 16 时会要求模型输出 8~16 个合并后的活动块，而不是逐格切分出近百个时段。",
+        "type": "int",
+        "default": 16,
+        "minimum": 6,
+        "maximum": 48
+    },
+    "schedule_provider_cooldown_minutes": {
+        "description": "【日程】模型失败后的冷却分钟数，冷却期内直接跳过该模型",
+        "hint": "避免一个配错或挂掉的模型让之后每次生成都白等一轮超时。设为 0 表示不冷却。/重置日程 会绕过冷却。",
+        "type": "int",
+        "default": 30,
+        "minimum": 0,
+        "maximum": 1440
+    },
+    "schedule_prompt_extra": {
+        "description": "【日程】大模型生成日程时的额外偏好指导语 (如: 喜欢户外运动/偏爱宅家)。",
+        "type": "string",
+        "default": "休闲日常，愉快的生活。"
+    },
+    "schedule_time_granularity": {
+        "description": "【日程】时间点对齐粒度（flexible=不要求对齐，其余为对齐到 5/10/15/20/30 分钟或整点）",
+        "hint": "只约束时段的起止时间落在哪些刻度上，不再决定切多少段——段数由 schedule_max_slots 控制。",
+        "type": "string",
+        "default": "15min",
+        "options": ["flexible", "5min", "10min", "15min", "20min", "30min", "hourly"]
+    },
+    "character_personality": {
+        "description": "【人格设定】选择角色人格，模型将按此生成符合人设的日程",
+        "type": "string",
+        "default": "温柔体贴",
+        "options": [
+            "普通人", "工作狂", "懒散宅家", "温柔体贴", "傲娇别扭",
+            "冷静理性", "活泼开朗", "文艺青年", "成熟稳重", "天真烂漫",
+            "腹黑", "高冷", "元气少女", "知性姐姐", "邻家哥哥"
+        ]
+    },
+    "admin_qq": {
+        "description": "【权限】管理员QQ列表（数组），仅管理员可使用重置日程等管理指令",
+        "type": "list",
+        "default": []
+    },
+    "weather_enabled": {
+        "description": "【天气】是否启用 OpenWeather 真实天气",
+        "type": "bool",
+        "default": true
+    },
+    "weather_api_key": {
+        "description": "【天气】OpenWeather API Key (请填入 32 位密钥)",
+        "type": "string",
+        "default": ""
+    },
+    "weather_location": {
+        "description": "【天气】目标城市 (英文格式，如 Zelenogradsk,RU)",
+        "type": "string",
+        "default": "Heyuan,CN"
+    },
+    "weather_refresh_minutes": {
+        "description": "【天气】天气刷新间隔分钟数 (默认 60)",
+        "type": "int",
+        "default": 60
+    },
+    "inject_activity_context": {
+        "description": "【聊天模式】注入程度（下拉选择：full=完整注入，low=低侵入，mood_only=纯情绪）",
+        "type": "string",
+        "default": "low",
+        "options": ["full", "low", "mood_only"]
+    },
+    "environment_mode": {
+        "description": "【环境】生效范围（下拉选择：both=全部，private=仅私聊，group=仅群聊）",
+        "type": "string",
+        "default": "both",
+        "options": ["both", "private", "group"]
+    },
+    "enable_chat_awareness": {
+        "description": "【聊天感知】开启后，AI能感知自己是在群聊还是私聊中与你对话",
+        "type": "bool",
+        "default": true
+    },
+    "show_city_time_in_low_intrusion": {
+        "description": "【低侵入】低侵入模式下是否显示当前城市时间",
+        "type": "bool",
+        "default": true
+    },
+    "timezone_city": {
+        "description": "【时间】默认时区城市（用于 /时间 指令，同时作为AI感知的所在城市），如：北京、莫斯科、东京",
+        "type": "string",
+        "default": "河源（记得改~）"
+    },
+    "mood_enabled": {
+        "description": "【情绪】是否开启情绪模拟（好感度/亲近欲/攻击性）",
+        "type": "bool",
+        "default": true
+    },
+    "mood_sensitivity": {
+        "description": "【情绪】情绪变化敏感度 (0-100)，数值越高单次变化越大",
+        "type": "int",
+        "default": 60
+    },
+    "mood_decay_hours": {
+        "description": "【情绪】情绪衰减周期（小时），当前值回归基线所需时间",
+        "type": "float",
+        "default": 6.0
+    },
+    "mood_initial_affection": {
+        "description": "【情绪】新用户初始好感度 (0-100)",
+        "type": "int",
+        "default": 46
+    },
+    "mood_initial_libido": {
+        "description": "【情绪】新用户初始亲近欲 (0-50)",
+        "type": "int",
+        "default": 34
+    },
+    "mood_initial_aggression": {
+        "description": "【情绪】新用户初始攻击性 (0-50)",
+        "type": "int",
+        "default": 28
+    },
+    "mood_affection_override": {
+        "description": "【情绪】指定好感（格式：3881756548:100,多个用英文逗号分隔）",
+        "type": "list",
+        "default": []
+    },
+    "mood_affection_delta_cap": {
+        "description": "【情绪】单次好感度变化上限 (1-10)，数值越低变化越平缓",
+        "type": "int",
+        "default": 2
+    },
+    "mood_log_enabled": {
+        "description": "【情绪日志】是否启用情绪波动事件记录",
+        "type": "bool",
+        "default": true
+    },
+    "mood_log_max_entries": {
+        "description": "【情绪日志】每个用户最多保留的事件记录条数",
+        "type": "int",
+        "default": 28
+    },
+    "mood_log_threshold_affection": {
+        "description": "【情绪日志】好感度变化多少时触发记录",
+        "type": "int",
+        "default": 2
+    },
+    "mood_log_threshold_libido": {
+        "description": "【情绪日志】亲近欲变化多少时触发记录",
+        "type": "int",
+        "default": 2
+    },
+    "mood_log_threshold_aggression": {
+        "description": "【情绪日志】攻击性变化多少时触发记录",
+        "type": "int",
+        "default": 1
+    },
+    "mood_update_timeout": {
+        "description": "【情绪】单次情绪更新请求超时时间（秒），数值越大越不容易超时",
+        "type": "float",
+        "default": 120
+    },
+    "mood_tag_enabled": {
+        "description": "【心情标签】是否启用可读的心情标签（如\"疲惫但开心\"）",
+        "type": "bool",
+        "default": true
+    },
+    "mood_use_llm_for_delta": {
+        "description": "【情绪】是否用大模型分析单次对话的情绪变化（关闭后仅用本地词典规则，更可控、零额外调用）",
+        "hint": "开启后按 mood_llm_interval_messages 的间隔调模型，不是每条都调。想完全不花模型额度就关掉它。",
+        "type": "bool",
+        "default": true
+    },
+    "mood_provider_name": {
+        "description": "【情绪】情绪分析专用模型 Provider（留空则沿用日程模型链）",
+        "hint": "仅在上面的「使用 LLM 分析情绪变化」开启时生效。留空则与日程共用同一条模型链。",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+    },
+    "mood_provider_cooldown_minutes": {
+        "description": "【情绪】情绪分析模型失败后的冷却分钟数，冷却期内直接跳过该模型（0 = 不冷却）",
+        "hint": "与日程的冷却各自记账：即使两边用的是同一个模型，情绪这边失败也不会影响日程生成，反之亦然。",
+        "type": "int",
+        "default": 5,
+        "minimum": 0,
+        "maximum": 1440
+    },
+    "mood_llm_interval_messages": {
+        "description": "【情绪】每多少条消息用模型分析一次情绪（其余消息只走本地词典规则）",
+        "hint": "计数从 0 起算，所以新面孔的第一条消息不会调模型，攒满 N 条才分析一次。",
+        "type": "int",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 100
+    },
+    "mood_verbose_log": {
+        "description": "【情绪】是否打印情绪分析的消息计数日志（默认关闭，避免刷屏）",
+        "hint": "只控制「消息计数 N/M，将调用LLM/不调用」这一行。",
+        "type": "bool",
+        "default": false
+    },
+    "mood_enabled_in_group": {
+        "description": "【情绪】是否在群聊中启用情绪系统（私聊始终生效）",
+        "hint": "开启后群内每个成员各自积累情绪；关闭则群消息完全不碰情绪。",
+        "type": "bool",
+        "default": false
+    },
+    "mood_data_retention_days": {
+        "description": "【情绪】情绪数据保留天数，超过这个天数没说话的用户数据会被自动清理（0 = 永不清理）",
+        "hint": "会一并删掉该用户的情绪档案、情绪日志、心情标签和对话间隔记录。",
+        "type": "int",
+        "default": 7,
+        "minimum": 0,
+        "maximum": 365
+    },
+    "social_energy_enabled": {
+        "description": "【社交能量】是否开启社交能量（影响回复热情）",
+        "type": "bool",
+        "default": true
+    },
+    "social_energy_consumption_per_msg": {
+        "description": "【社交能量】高频选0.05（每条消耗的社交能量值） (0.05~1.0)",
+        "type": "float",
+        "default": 0.05
+    },
+    "social_energy_recovery_per_minute": {
+        "description": "【社交能量】每分钟恢复的社交能量值 (0.1~3.0)",
+        "type": "float",
+        "default": 1.5
+    },
+    "social_energy_reset_hour": {
+        "description": "【社交能量】每天重置社交能量的小时 (0-23)，设为 -1 则不重置",
+        "type": "int",
+        "default": 0
+    },
+    "social_energy_recovery_interval_seconds": {
+        "description": "【社交能量】恢复间隔（秒），范围 60~300",
+        "type": "int",
+        "default": 60
+    },
+    "night_mode_enabled": {
+        "description": "【夜间模式】是否开启夜间睡眠模式",
+        "type": "bool",
+        "default": true
+    },
+    "night_start_hour": {
+        "description": "【夜间模式】夜间开始小时 (0-23)",
+        "type": "int",
+        "default": 23
+    },
+    "night_end_hour": {
+        "description": "【夜间模式】夜间结束小时 (0-23)",
+        "type": "int",
+        "default": 6
+    },
+    "night_mode_force_sleep": {
+        "description": "【夜间模式】是否强制回复睡眠提示（否则仅缩短回复）",
+        "type": "bool",
+        "default": false
+    },
+    "night_deep_sleep_ratio": {
+        "description": "【夜间模式】深度睡眠占整个夜间时长的比例（0.1~1.0），剩下的是浅睡/半醒",
+        "hint": "1.0 = 整夜都是深睡，0.1 = 几乎全程浅睡。",
+        "type": "float",
+        "default": 0.5,
+        "minimum": 0.1,
+        "maximum": 1.0
+    },
+    "debug_mode": {
+        "description": "【调试】是否启用调试模式（输出详细日志，包括LLM请求/响应、情绪计算过程等）",
+        "type": "bool",
+        "default": false
+    },
+    "holidays": {
+        "description": "【节日】自定义节日列表，格式：[{\"date\": \"YYYY-MM-DD\", \"name\": \"节日名\"}]，内置公历节日自动识别",
+        "type": "list",
+        "default": []
+    },
+    "enable_energy_natural_recovery": {
+        "description": "【精力】是否启用自然恢复（仅在日程处于休息类时段时生效）",
+        "hint": "只在日程处于睡眠/休息类时段（energy_rate ≥ 0）时叠加。",
+        "type": "bool",
+        "default": true
+    },
+    "energy_natural_recovery_per_minute": {
+        "description": "【精力】每分钟自然恢复的精力值（0.05~0.9）",
+        "type": "float",
+        "default": 0.15
+    },
+    "energy_natural_recovery_interval_minutes": {
+        "description": "【精力】自然恢复的最小计费间隔（分钟）。不足一个间隔的休息时间不计入自然恢复",
+        "hint": "例如设为 30，则一次休息里只有满 30 分钟的整段才计入自然恢复，零头忽略。",
+        "type": "int",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 1440
+    },
+    "energy_consumption_per_msg": {
+        "description": "【精力】每次聊天消耗的精力值（0.01~0.9）",
+        "type": "float",
+        "default": 0.04
+    },
+    "energy_recovery_phase_multipliers": {
+        "description": "【精力】生理周期各阶段恢复倍率，顺序：经期、卵泡期、排卵期、黄体早期、黄体晚期、经前期",
+        "type": "list",
+        "default": [0.5, 1.0, 2.0, 1.0, 0.8, 0.7]
+    },
+    "state_flush_interval_seconds": {
+        "description": "【性能】状态文件的合并写盘间隔（秒）",
+        "hint": "一个间隔内的所有改动合并成一次写入。调大更省磁盘 IO，调小则崩溃时丢失的状态更少。",
+        "type": "int",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 60
+    },
+    "last_interaction_threshold_minutes": {
+        "description": "【对话间隔】距离上次对话超过多少分钟，才开始记录并告知模型（默认5分钟）",
+        "hint": "设为 0 则每次都记录。算的是「上一次触发回复」到现在。第一次对话没有历史，不会出现这段提示。",
+        "type": "int",
+        "default": 5,
+        "minimum": 0,
+        "maximum": 1440
+    },
+    "last_interaction_mode": {
+        "description": "【对话间隔】描述模式：simple=仅告知时长；with_last_msg=告知时长+上次用户说了什么",
+        "hint": "with_last_msg 会记录用户最后一条消息内容，在下次对话时告诉模型「上次说了什么 + 隔了多久」。",
+        "type": "string",
+        "default": "simple",
+        "options": ["simple", "with_last_msg"]
+    },
+    "process_min_duration": {
+        "description": "【过程】过程最小持续时间（分钟），避免频繁切换",
+        "type": "int",
+        "default": 15,
+        "minimum": 5,
+        "maximum": 60
+    },
+    "process_max_duration": {
+        "description": "【过程】过程最大持续时间（分钟）",
+        "type": "int",
+        "default": 90,
+        "minimum": 30,
+        "maximum": 240
+    },
+    "process_auto_update": {
+        "description": "【过程】是否自动更新过期过程",
+        "type": "bool",
+        "default": true
+    },
+    "process_history_limit": {
+        "description": "【过程】过程历史保留条数（0 表示不保留）",
+        "type": "int",
+        "default": 5,
+        "minimum": 0,
+        "maximum": 20
+    }
+}
