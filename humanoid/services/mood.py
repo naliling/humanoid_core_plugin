@@ -261,7 +261,7 @@ class MoodService:
             return base.scaled(1.2)
         return base.blend(llm, 0.3)
 
-    def _apply_modifiers(self, delta: dict, user_id: str) -> dict:
+    def _apply_modifiers(self, delta: Delta, user_id: str) -> Delta:
         cfg = self.config
         record = self.profile(user_id)
         factor = cfg.mood_sensitivity / 100.0
@@ -294,7 +294,7 @@ class MoodService:
 
         return delta.capped(float(cfg.mood_affection_delta_cap))
 
-    def _commit(self, user_id: str, record: dict, user_state: dict, delta: dict):
+    def _commit(self, user_id: str, record: dict, user_state: dict, delta: Delta):
         before = {k: float(record[k]) for k, _, _ in DIMENSIONS}
         values = {
             "affection": delta.affection,
@@ -327,6 +327,9 @@ class MoodService:
             "数值范围：affection -10~10，libido -5~5，aggression -5~5。\n"
             f"用户消息：{text[:500]}"
         )
+        if cfg.debug_mode and self._log:
+            self._log.debug(f"[humanoid_core] 情绪分析请求: {prompt}")
+
         result = await self._gateway.generate(
             prompt=prompt,
             chain=cfg.mood_provider_ids,
@@ -345,11 +348,14 @@ class MoodService:
                 self._log.warning("[humanoid_core] 情绪分析失败：模型返回不是有效 JSON")
             return None
         try:
-            return Delta(
+            delta = Delta(
                 float(data.get("affection_delta", 0)),
                 float(data.get("libido_delta", 0)),
                 float(data.get("aggression_delta", 0)),
             ).capped(10.0)
+            if cfg.debug_mode and self._log:
+                self._log.debug(f"[humanoid_core] 情绪分析结果: {delta}")
+            return delta
         except (TypeError, ValueError):
             if self._log is not None:
                 self._log.warning("[humanoid_core] 情绪分析失败：JSON 数值无效")
