@@ -122,6 +122,9 @@ class ScheduleService:
             schedule_source=source,
             schedule_generated_at=self._clock.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
+        # 调试日志：确认写入
+        if self._log and self.config.debug_mode:
+            self._log.debug(f"[humanoid_core] 日程写入存储: source={source}, slots={len(slots)}")
         return slots
 
     def request_refresh(self, force: bool = False, ignore_cooldown: bool = False) -> bool:
@@ -179,6 +182,9 @@ class ScheduleService:
             return False
 
         prompt = build_prompt(cfg, today, self._clock.weekday())
+        if self._log and cfg.debug_mode:
+            self._log.debug(f"[humanoid_core] 日程生成提示词:\n{prompt}")
+
         result: LLMResult = await self.gateway.generate(
             prompt=prompt,
             chain=cfg.schedule_provider_ids,
@@ -191,6 +197,8 @@ class ScheduleService:
         )
         if not result.ok:
             self.last_error = result.summary()
+            if self._log and cfg.debug_mode:
+                self._log.debug(f"[humanoid_core] 日程生成失败: {self.last_error}")
             return False
 
         parsed = extract_json_array(result.text)
@@ -201,10 +209,17 @@ class ScheduleService:
         )
         if not slots or not coverage_is_complete(slots):
             self.last_error = f"无法解析日程：{result.text[:160]}"
+            if self._log and cfg.debug_mode:
+                self._log.debug(f"[humanoid_core] 日程解析失败: {self.last_error}")
             return False
 
+        # 成功生成，安装新日程
         self._install(slots, today, SOURCE_LLM)
         self.last_error = ""
+        if self._log:
+            self._log.info(f"[humanoid_core] 日程生成成功，共 {len(slots)} 个时段")
+            if cfg.debug_mode:
+                self._log.debug(f"[humanoid_core] 新日程内容: {slots}")
         return True
 
     def status(self) -> dict:
