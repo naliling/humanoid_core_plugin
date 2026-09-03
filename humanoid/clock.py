@@ -1,0 +1,126 @@
+"""时间与地点：时区解析、当前时间、星期、节日。"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import datetime, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from .config import HumanoidConfig
+from .data.cities import (
+    CITY_TO_TIMEZONE,
+    DEFAULT_CITY_PLACEHOLDER,
+    lookup_timezone,
+    lookup_city_time,
+)
+from .data.holidays import resolve_holiday
+
+WEEKDAY_NAMES = ("一", "二", "三", "四", "五", "六", "日")
+FALLBACK_TIMEZONE = "Asia/Shanghai"
+
+
+def weekday_cn(moment: datetime) -> str:
+    return WEEKDAY_NAMES[moment.weekday()]
+
+
+def resolve_tzinfo(city: str) -> tzinfo | None:
+    tz_name = lookup_timezone(city)
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        try:
+            return ZoneInfo(FALLBACK_TIMEZONE)
+        except Exception:
+            return None
+
+
+def now_in_city(city: str) -> datetime:
+    tz = resolve_tzinfo(city)
+    if tz is None:
+        return datetime.now().astimezone()
+    return datetime.now(tz)
+
+
+def system_timezone_city() -> str:
+    try:
+        local_tz = datetime.now().astimezone().tzinfo
+        tz_name = getattr(local_tz, "key", None)
+        if tz_name:
+            for city, name in CITY_TO_TIMEZONE.items():
+                if name == tz_name:
+                    return city
+    except Exception:
+        pass
+    return "系统时区"
+
+
+def format_offset(moment: datetime) -> str:
+    raw = moment.strftime("%z")
+    if len(raw) < 5:
+        return "UTC"
+    return f"UTC{raw[:3]}:{raw[3:5]}"
+
+
+class Clock:
+    """按当前配置提供「插件所在地」的时间视图。配置热重载后自动跟随。"""
+
+    __slots__ = ("_config",)
+
+    def __init__(self, config_provider: Callable[[], HumanoidConfig]) -> None:
+        self._config = config_provider
+
+    @property
+    def city(self) -> str:
+        return self._config().timezone_city
+
+    @property
+    def display_city(self) -> str:
+        city = self.city
+        return system_timezone_city() if city == DEFAULT_CITY_PLACEHOLDER else city
+
+    def now(self) -> datetime:
+        return now_in_city(self.city)
+
+    def today_str(self) -> str:
+        return self.now().strftime("%Y-%m-%d")
+
+    def weekday(self) -> str:
+        return weekday_cn(self.now())
+
+    def city_time_text(self) -> str | None:
+        result = lookup_city_time(self.city)
+        return result.text if result else None
+
+    def holiday(self, moment: datetime | None = None) -> str:
+        return resolve_holiday(moment or self.now(), self._config().holidays)
+
+    def is_night(self, moment: datetime | None = None) -> bool:
+        cfg = self._config()
+        if not cfg.night_mode_enabled:
+            return False
+        return cfg.is_night_hour((moment or self.now()).hour)
+
+    def is_deep_sleep(self, moment: datetime | None = None) -> bool:
+        cfg = self._config()
+        if not cfg.night_mode_enabled:
+            return False
+        return cfg.is_deep_sleep((moment or self.now()).hour)
+
+
+def parse_state_timestamp(raw: str, reference: datetime) -> datetime | None:
+    """解析 state.json 里 `%Y-%m-%d %H:%M:%S` 形式的时间戳，附上参考时区。"""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=reference.tzinfo)
+    return parsed
+
+
+def format_state_timestamp(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
