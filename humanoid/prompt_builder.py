@@ -66,12 +66,16 @@ class PromptBuilder:
         mode = cfg.inject_activity_context
         snap = self._core.snapshot()
 
+        # 使用自定义时间格式：YYYY.MM.DD.HH.MM
+        now = self._core.clock.now()
+        time_str = now.strftime("%Y.%m.%d.%H.%M")  # 例如 2026.09.03.12.35
+
         lines = []
         if mode == "full":
             lines.extend([
                 f"- 日期：{snap['today']} 星期{snap['weekday']}",
                 f"- 城市：{snap['city']}",
-                f"- 时间：{snap['time']}",
+                f"- 时间：{time_str}",
                 f"- 精力：{snap['energy']['text']}",
                 f"- 生理：{snap['cycle'] or '正常'}",
             ])
@@ -88,7 +92,7 @@ class PromptBuilder:
                 f"- 生理背景：{snap['cycle'] or '正常'}",
             ])
             if cfg.show_city_time_in_low_intrusion:
-                lines.append(f"- 当前时间：{snap['time']}")
+                lines.append(f"- 当前时间：{time_str}")
 
         if snap['weather']:
             lines.append(f"- 天气：{snap['weather'].get('env', '未知')}")
@@ -136,9 +140,9 @@ class PromptBuilder:
         return f"【社交能量】{hint}（当前值 {int(value)}%）"
 
     def _build_mood(self, user_id: str) -> str:
+        """单独列出好感度和情绪标签，实时从 core.mood 读取最新值。"""
         data = self._core.mood.profile(user_id)
         label = self._core.mood.label(user_id)
-        # 将好感度和标签单独列为一行，注入到上下文中
         return (
             f"〖与当前用户的关系〗\n"
             f"好感度：{data['affection']:.1f}/100\n"
