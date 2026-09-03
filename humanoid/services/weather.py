@@ -76,6 +76,8 @@ class WeatherService:
         if not force and not self.is_stale():
             return False
         url = build_url(cfg.weather_location, cfg.weather_api_key)
+        if cfg.debug_mode and self._log:
+            self._log.debug(f"[humanoid_core] 天气请求 URL: {url}")
         try:
             payload = await self._fetch(url, REQUEST_TIMEOUT)
             parsed = parse_payload(payload, cfg.weather_location)
@@ -88,6 +90,8 @@ class WeatherService:
                 _cached_location=cfg.weather_location,
                 _last_weather_fetch=format_state_timestamp(self._clock.now())
             )
+            if cfg.debug_mode and self._log:
+                self._log.debug(f"[humanoid_core] 天气刷新成功: {parsed}")
             return True
         except Exception as e:
             if self._log:
