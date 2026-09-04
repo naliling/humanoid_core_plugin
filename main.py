@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+from astrbot.core.agent.message import TextPart  # 新增导入
 
 from .humanoid import __version__
 from .humanoid.config import HumanoidConfig
@@ -21,7 +23,6 @@ from .humanoid.engine import LOG_PREFIX, HumanoidEngine
 from .humanoid.llm import LLMGateway, ProviderResolver
 from .humanoid.role_manager import RoleManager
 from .humanoid.state import StateStore
-# 导入 Clock 用于初始化日期
 from .humanoid.clock import Clock
 
 DATA_SUBDIR = ("plugin_data", "humanoid_core")
@@ -89,7 +90,6 @@ class HumanoidCore(Star):
         state_path = data_dir / "state.json"
         self._state_store = StateStore(state_path, lambda: self._config.state_flush_interval_seconds, logger)
 
-        # 关键修复：在创建任何依赖之前加载状态
         clock = Clock(lambda: self._config)
         today = clock.today_str()
         self._state_store.load(today, self._config.cycle_length)
@@ -113,10 +113,8 @@ class HumanoidCore(Star):
         logger.info(f"{LOG_PREFIX} 插件已加载 (v{__version__})")
 
     async def initialize(self) -> None:
-        # 启动状态持久化循环和角色管理器
         await self._state_store.start()
         await self.role_manager.start()
-        # 确保日程和过程初始化
         for core in self.role_manager.get_all():
             core.schedule.current_slots()
             core.process.current()
@@ -163,13 +161,17 @@ class HumanoidCore(Star):
     def _core(self, event: AstrMessageEvent):
         return self.role_manager.get_or_create(self._self_id(event))
 
+    # -------------------- 用户指令 --------------------
+
     @filter.command("你的状态")
     async def cmd_status(self, event: AstrMessageEvent):
+        """查看当前角色的完整状态（精力、生理、天气、日程、过程、社交能量等）。"""
         core = self._core(event)
         yield event.plain_result("\n".join(core.status_lines(self._sender(event))))
 
     @filter.command("好感度")
     async def cmd_mood(self, event: AstrMessageEvent):
+        """查看当前用户的好感度、亲近欲、攻击性及情绪标签。"""
         if not self._config.mood_enabled:
             yield event.plain_result("情绪系统未开启。")
             return
@@ -178,6 +180,7 @@ class HumanoidCore(Star):
 
     @filter.command("情绪详情")
     async def cmd_mood_detail(self, event: AstrMessageEvent):
+        """查看详细情绪档案，包含基线值和交互轮次。"""
         if not self._config.mood_enabled:
             yield event.plain_result("情绪系统未开启。")
             return
@@ -186,6 +189,7 @@ class HumanoidCore(Star):
 
     @filter.command("情绪日志")
     async def cmd_mood_log(self, event: AstrMessageEvent):
+        """查看最近的情绪波动记录（事件列表）。"""
         if not self._config.mood_log_enabled:
             yield event.plain_result("❌ 情绪日志未启用。")
             return
@@ -194,11 +198,13 @@ class HumanoidCore(Star):
 
     @filter.command("查看日程")
     async def cmd_view_schedule(self, event: AstrMessageEvent):
+        """查看今日完整的日程表。"""
         core = self._core(event)
         yield event.plain_result(core.schedule_text())
 
     @filter.command("时间")
     async def cmd_time(self, event: AstrMessageEvent):
+        """查看指定城市（或默认城市）的当前时间、星期和节日。"""
         city = _arg_after(event.message_str, "时间") or self._config.timezone_city
         if not city:
             yield event.plain_result("请指定城市名，或在配置中设置默认时区城市。")
@@ -211,6 +217,7 @@ class HumanoidCore(Star):
 
     @filter.command("叫我")
     async def cmd_set_nickname(self, event: AstrMessageEvent):
+        """设置 AI 对你的称呼（昵称）。"""
         nickname = _arg_after(event.message_str, "叫我")
         if not nickname:
             yield event.plain_result("用法：/叫我 昵称")
@@ -224,11 +231,15 @@ class HumanoidCore(Star):
 
     @filter.command("拟人帮助")
     async def cmd_help(self, event: AstrMessageEvent):
+        """显示所有指令的帮助信息。"""
         yield event.plain_result(HELP_TEXT)
+
+    # -------------------- 管理员指令 --------------------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("拟人诊断")
     async def cmd_diagnose(self, event: AstrMessageEvent):
+        """诊断模型链配置、冷却状态、日程生成情况等。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -238,6 +249,7 @@ class HumanoidCore(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("重载配置")
     async def cmd_reload(self, event: AstrMessageEvent):
+        """热重载插件配置，无需重启。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -247,6 +259,7 @@ class HumanoidCore(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("重置日程")
     async def cmd_reset_schedule(self, event: AstrMessageEvent):
+        """立即强制重新生成今日日程（绕过冷却）。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -267,6 +280,7 @@ class HumanoidCore(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("重置状态")
     async def cmd_reset_state(self, event: AstrMessageEvent):
+        """重置精力、社交能量和生理周期至初始值。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -277,6 +291,7 @@ class HumanoidCore(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("重置情绪")
     async def cmd_reset_mood(self, event: AstrMessageEvent):
+        """重置当前用户的情绪至初始值。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -287,6 +302,7 @@ class HumanoidCore(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("设置好感度")
     async def cmd_set_affection(self, event: AstrMessageEvent):
+        """手动设置当前用户的好感度（0-100）。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -305,6 +321,7 @@ class HumanoidCore(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("批量好感度")
     async def cmd_batch_affection(self, event: AstrMessageEvent):
+        """批量导入好感度（格式：QQ:数值, QQ:数值）。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -319,6 +336,7 @@ class HumanoidCore(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("查看所有昵称")
     async def cmd_list_nicknames(self, event: AstrMessageEvent):
+        """列出所有用户设置的昵称。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -329,44 +347,66 @@ class HumanoidCore(Star):
             return
         yield event.plain_result("📋 昵称列表：\n" + "\n".join(f"{k} → {v}" for k, v in names.items()))
 
+    # -------------------- LLM 请求注入钩子 --------------------
+
     @filter.on_llm_request()
     async def inject_context(self, event: AstrMessageEvent, req: ProviderRequest):
+        """
+        在每次 LLM 请求前动态注入上下文（时间、状态、情绪、间隔等）。
+        使用 extra_user_content_parts 避免污染 system_prompt，保证稳定性和缓存效率。
+        """
         try:
             is_group = not _is_private_chat(event)
             if not self.engine.environment_allows(not is_group):
                 return
             core = self.role_manager.get_or_create(self._self_id(event))
-            injection = core.build_injection(
-                self._sender(event),
-                is_group=is_group
-            )
+            user_id = self._sender(event)
+            cfg = self.engine.config
+
+            # ---- 时间间隔预处理 ----
+            if cfg.last_interaction_threshold_minutes >= 0:
+                last_ts = core._scope.get_user(user_id, "last_interaction")
+                if last_ts is not None:
+                    elapsed = time.time() - float(last_ts)
+                    core._pending_interval = {
+                        "elapsed": elapsed,
+                        "threshold": cfg.last_interaction_threshold_minutes * 60,
+                        "mode": cfg.last_interaction_mode,
+                    }
+                else:
+                    core._pending_interval = None
+                core._scope.set_user(user_id, "last_interaction", time.time())
+            else:
+                core._pending_interval = None
+
+            # 构建注入内容
+            injection = core.build_injection(user_id, is_group=is_group)
+
+            # 清理临时变量
+            if hasattr(core, "_pending_interval"):
+                delattr(core, "_pending_interval")
 
             if self._config.debug_mode:
                 logger.debug(f"[humanoid_core] 注入上下文:\n{injection}")
 
-            if not hasattr(req, 'messages') or req.messages is None:
-                if req.system_prompt:
-                    req.system_prompt = f"{req.system_prompt}\n{injection}"
-                else:
-                    req.system_prompt = injection
-                return
-
-            messages = req.messages
-            system_index = None
-            for i, msg in enumerate(messages):
-                if msg.get("role") == "system":
-                    system_index = i
-                    break
-            if system_index is not None:
-                messages[system_index]["content"] = messages[system_index]["content"] + "\n" + injection
-            else:
-                messages.insert(0, {"role": "system", "content": injection})
+            # ★★★ 关键优化：使用 extra_user_content_parts，不修改 system_prompt ★★★
+            if not hasattr(req, 'extra_user_content_parts'):
+                req.extra_user_content_parts = []
+            # 确保是列表
+            if not isinstance(req.extra_user_content_parts, list):
+                req.extra_user_content_parts = []
+            req.extra_user_content_parts.append(TextPart(text=injection))
 
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 注入失败: {e}")
 
+    # -------------------- 消息事件监听 --------------------
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
+        """
+        监听所有消息，用于更新精力、社交能量、情绪衰减、过程 tick 以及记录 last_message。
+        """
         try:
             text = (getattr(event, "message_str", "") or "").strip()
             if not text:
