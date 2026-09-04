@@ -23,17 +23,17 @@ class PromptBuilder:
     def build(self, user_id: str, is_group: bool = False) -> str:
         parts = []
 
-        # 1. 柔和的系统边界（鼓励参考而非禁止提及）
-        parts.append("【状态参考】以下信息反映当前环境与自身状态，可辅助你理解对话氛围，无需直接复述数值。")
+        # 1. 时间与环境信息（system-reminder 格式，英文系统暗示）
+        parts.append(self._build_time_reminder())
 
-        # 2. 环境感知
+        # 2. 环境感知（中文，柔和）
         if self.config.enable_chat_awareness:
             parts.append(f"【环境】{'群聊' if is_group else '私聊'}中。")
 
-        # 3. 自身状态（根据模式）
+        # 3. 自身状态（根据注入模式）
         parts.append(self._build_self_state())
 
-        # 4. 过程简述（仅名称，除非 full 模式带时长）
+        # 4. 过程简述
         parts.append(self._build_process())
 
         # 5. 情绪（仅标签，除非 full 模式带数值）
@@ -44,51 +44,118 @@ class PromptBuilder:
         # 6. 行为指令（昵称、夜间、社交能量）
         parts.append(self._build_behavior_instructions(user_id))
 
-        # 7. 对话间隔（仅陈述时长）
+        # 7. 对话间隔（拟人化氛围描述）
         interval = self._build_interval_note(user_id)
         if interval:
             parts.append(interval)
 
+        # 过滤空行后拼接
         return "\n".join(part for part in parts if part)
+
+    # ========== 工具方法 ==========
+
+    def _get_time_of_day(self, hour: int) -> str:
+        if 5 <= hour < 8:
+            return "early morning"
+        elif 8 <= hour < 12:
+            return "morning"
+        elif 12 <= hour < 14:
+            return "noon"
+        elif 14 <= hour < 18:
+            return "afternoon"
+        elif 18 <= hour < 21:
+            return "evening"
+        elif 21 <= hour < 24:
+            return "night"
+        else:
+            return "late night"
+
+    def _get_time_of_day_cn(self, hour: int) -> str:
+        if 5 <= hour < 8:
+            return "清晨"
+        elif 8 <= hour < 12:
+            return "上午"
+        elif 12 <= hour < 14:
+            return "中午"
+        elif 14 <= hour < 18:
+            return "下午"
+        elif 18 <= hour < 21:
+            return "傍晚"
+        elif 21 <= hour < 24:
+            return "晚上"
+        else:
+            return "深夜"
+
+    # ========== 核心构建方法 ==========
+
+    def _build_time_reminder(self) -> str:
+        """官方推荐格式：<system-reminder> + 英文系统暗示 + 知而不言指令"""
+        now = self._core.clock.now()
+        tz_name = self._core.clock.city
+        iso_time = now.isoformat(timespec="seconds")
+        weekday_en = now.strftime("%A")
+        date_en = now.strftime("%B %d, %Y")
+        hour = now.hour
+        time_of_day = self._get_time_of_day(hour)
+        time_str = now.strftime("%H:%M")
+        time_of_day_cn = self._get_time_of_day_cn(hour)
+
+        return (
+            "<system-reminder>\n"
+            f"Current date and time: {iso_time} ({tz_name})\n"
+            f"Today is {weekday_en}, {date_en}.\n"
+            f"Time of day: {time_of_day} ({time_str})\n"
+            "\n"
+            "This is contextual information to help you understand the current temporal environment.\n"
+            "Use it naturally in conversation when relevant—for example, to greet appropriately,\n"
+            "understand time-related references, or answer if asked about the time.\n"
+            "Do not explicitly announce or repeat these values unless directly asked.\n"
+            "</system-reminder>"
+        )
 
     def _build_self_state(self) -> str:
         cfg = self.config
         mode = cfg.inject_activity_context
         snap = self._core.snapshot()
         now = self._core.clock.now()
-        time_str = now.strftime("%Y.%m.%d.%H.%M")
+        hour = now.hour
+
+        time_of_day_cn = self._get_time_of_day_cn(hour)
         city = snap['city']
-        weekday = f"星期{snap['weekday']}"
+        weekday_cn = f"星期{snap['weekday']}"
         date_str = snap['today']
 
         if mode == "full":
             lines = [
-                f"日期：{date_str} {weekday}",
+                f"日期：{date_str} {weekday_cn}",
                 f"城市：{city}",
-                f"时间：{time_str}",
+                f"时段：{time_of_day_cn}",
                 f"精力：{snap['energy']['text']} ({int(snap['energy']['value'])}/{int(snap['energy']['max'])})",
                 f"生理：{snap['cycle'] or '正常'}",
                 f"天气：{snap['weather'].get('env', '未知')}"
             ]
         elif mode == "mood_only":
-            lines = [f"日期：{date_str}", f"精力：{snap['energy']['text']}"]
+            lines = [
+                f"日期：{date_str}",
+                f"精力：{snap['energy']['text']}"
+            ]
         else:  # low
             lines = [
-                f"日期：{date_str} {weekday}",
+                f"日期：{date_str} {weekday_cn}",
                 f"城市：{city}",
                 f"精力：{snap['energy']['text']}",
                 f"生理背景：{snap['cycle'] or '正常'}"
             ]
             if cfg.show_city_time_in_low_intrusion:
-                lines.append(f"时间：{time_str}")
+                lines.append(f"时段：{time_of_day_cn}")
             if snap['weather']:
                 lines.append(f"天气：{snap['weather'].get('env', '未知')}")
+
         return "\n".join(lines)
 
     def _build_process(self) -> str:
         proc = self._core.process.current()
         name = proc.get("name", "休息")
-        # 只在 full 模式下显示时长
         if self.config.inject_activity_context == "full":
             start_str = proc.get("started_at")
             if start_str:
@@ -116,18 +183,19 @@ class PromptBuilder:
 
     def _build_behavior_instructions(self, user_id: str) -> str:
         instructions = []
-        # 昵称
+
         nickname = self._core.mood.nickname(user_id)
         if nickname:
             instructions.append(f"【重要指令】用户的昵称是「{nickname}」，请用此称呼。")
-        # 夜间模式
+
         night = self._build_night_instruction()
         if night:
             instructions.append(night)
-        # 社交能量
+
         social = self._build_social_instruction()
         if social:
             instructions.append(social)
+
         return "\n".join(instructions) if instructions else ""
 
     def _build_night_instruction(self) -> str:
@@ -159,29 +227,37 @@ class PromptBuilder:
     def _build_interval_note(self, user_id: str) -> str:
         cfg = self.config
         threshold = cfg.last_interaction_threshold_minutes * 60
-        last_ts = self._core._scope.get_user(user_id, "last_interaction")
-        if last_ts is None:
+        pending = getattr(self._core, "_pending_interval", None)
+        if not pending:
             return ""
-        try:
-            elapsed = time.time() - float(last_ts)
-        except (TypeError, ValueError):
-            return ""
+        elapsed = pending["elapsed"]
         if elapsed < threshold:
             return ""
-        if elapsed < 60:
-            time_text = "不到1分钟"
-        elif elapsed < 3600:
-            time_text = f"约 {int(elapsed / 60)} 分钟"
-        elif elapsed < 86400:
-            time_text = f"约 {int(elapsed / 3600)} 小时"
-        else:
-            time_text = f"约 {int(elapsed / 86400)} 天"
 
-        # 只陈述时长，不加“新话题”标签
+        mood_data = self._core.mood.profile(user_id)
+        affection = mood_data.get("affection", 50)
+
+        if elapsed < 1800:
+            vibe = "仿佛刚才还在聊，余音未散" if affection > 65 else "短暂的间隙，刚好够喝杯茶" if affection > 35 else "安静的片刻，互不打扰"
+        elif elapsed < 10800:
+            vibe = "心里空了一小块，总觉得少了点什么" if affection > 65 else "不知不觉，午后已过半" if affection > 35 else "各自忙碌，相安无事"
+        elif elapsed < 86400:
+            vibe = "像是隔了一个黄昏，思念在悄悄发酵" if affection > 65 else "一天的光阴，就这么平静地流过" if affection > 35 else "久违的沉默，界限更清晰"
+        else:
+            vibe = "像隔了一个季节，这份想念变得清晰" if affection > 65 else "时光流转，生活依旧平淡" if affection > 35 else "长久的疏离，各自安好"
+
+        last_msg_line = ""
         if cfg.last_interaction_mode == "with_last_msg":
             last_msg = self._core._scope.get_user(user_id, "last_message")
             if last_msg and last_msg.get("text"):
-                text = last_msg["text"]
-                self._core._scope.set_user(user_id, "last_message", None)  # 清空
-                return f"【上次对话】已过去 {time_text}，用户最后说：「{text}」。"
-        return f"【上次对话】已过去 {time_text}。"
+                last_msg_line = f"上次分别时，你留下了一句话：「{last_msg['text']}」。"
+                self._core._scope.set_user(user_id, "last_message", None)
+
+        lines = [
+            "【时间感知】",
+            vibe + "。",
+            last_msg_line,
+            "让这份时间带来的自然情绪微妙地渗透进你的语气中。",
+            "严禁直接提及'过了多少分钟/小时/天'这种具体时间数据，用人类直觉去流露。"
+        ]
+        return "\n".join(line for line in lines if line)
