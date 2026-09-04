@@ -112,12 +112,13 @@ class HumanoidCoreInstance:
 
         self.mood.decay_user(user_id)
 
+        # 只记录最新消息内容（供下次注入使用），不再更新 last_interaction
         if cfg.last_interaction_mode == "with_last_msg" and text:
             self._scope.set_user(user_id, "last_message", {
                 "text": text[:100],
                 "timestamp": time.time()
             })
-        self._scope.set_user(user_id, "last_interaction", time.time())
+        # last_interaction 的更新已移至 inject_context 中
 
         self._dispatch_async(user_id, text, is_group=is_group)
 
