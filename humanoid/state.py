@@ -234,7 +234,7 @@ class StateStore:
             if key in raw:
                 self_state[key] = raw[key]
 
-        # 迁移用户相关字段
+        # 迁移用户相关字段 —— 修正：合并同一用户的数据，而不是覆盖
         user_mapping = {
             "moods": "mood",
             "mood_logs": "mood_logs",
@@ -245,9 +245,9 @@ class StateStore:
         for old_key, new_key in user_mapping.items():
             if old_key in raw and isinstance(raw[old_key], dict):
                 for uid, value in raw[old_key].items():
-                    if uid not in users_state:
-                        users_state[uid] = {}
-                    users_state[uid][new_key] = value
+                    # 使用 setdefault 确保不会覆盖已有数据
+                    user_data = users_state.setdefault(uid, {})
+                    user_data[new_key] = value
 
         # 保留未定义的顶层字段（如可能的插件扩展）
         for key, value in raw.items():
