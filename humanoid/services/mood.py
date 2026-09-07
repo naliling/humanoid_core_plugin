@@ -82,9 +82,15 @@ class MoodService:
         self._time = time_source
         self._gateway: LLMGateway | None = None
         self._log = None
-        self._lock = asyncio.Lock()
         self._gateway = gateway
         self._log = logger
+        # 按用户细粒度锁，避免不同用户互相阻塞
+        self._user_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_user_lock(self, user_id: str) -> asyncio.Lock:
+        if user_id not in self._user_locks:
+            self._user_locks[user_id] = asyncio.Lock()
+        return self._user_locks[user_id]
 
     @property
     def config(self) -> HumanoidConfig:
@@ -221,7 +227,9 @@ class MoodService:
 
         base_delta = self._local_delta(text)
 
-        async with self._lock:
+        # 使用用户级锁代替全局锁
+        lock = self._get_user_lock(user_id)
+        async with lock:
             user_state = self._scope.user_state(user_id)
             record = user_state.get("mood")
             if not record:
@@ -240,7 +248,7 @@ class MoodService:
         if should_call_llm:
             llm_delta = await self._llm_delta(user_id, text)
 
-        async with self._lock:
+        async with lock:
             user_state = self._scope.user_state(user_id)
             record = user_state.get("mood")
             if not record:
