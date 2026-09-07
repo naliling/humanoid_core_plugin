@@ -186,7 +186,7 @@ class StateStore:
             roles[default_role] = {"self": {}, "users": {}}
             # 移动顶层字段到 default.self
             self_keys = {
-                "energy", "current_cycle_day", "last_cycle_update", "last_update",
+                "energy", "social_energy", "current_cycle_day", "last_cycle_update", "last_update",
                 "today_date", "daily_schedule", "schedule_source", "schedule_generated_at",
                 "_cached_weather_obj", "_last_weather_fetch", "_cached_location",
                 "_mood_decay_last_run", "_last_social_energy_reset_date",
@@ -225,7 +225,7 @@ class StateStore:
 
         # 迁移自身状态字段
         for key in (
-            "energy", "max_energy", "current_cycle_day", "last_cycle_update",
+            "energy", "max_energy", "social_energy", "current_cycle_day", "last_cycle_update",
             "last_update", "today_date", "daily_schedule", "schedule_source",
             "schedule_generated_at", "_cached_weather_obj", "_last_weather_fetch",
             "_cached_location", "_mood_decay_last_run", "_last_social_energy_reset_date",
