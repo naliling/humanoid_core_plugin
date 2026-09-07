@@ -105,6 +105,10 @@ class LegacyStateTest(unittest.TestCase):
     def test_zombie_field_dropped(self):
         self.assertNotIn("_energy_noise_date", self.load().data)
 
+    def test_social_energy_migrates_into_default_role(self):
+        data = self.load().data
+        self.assertEqual(data["roles"]["default"]["self"]["social_energy"], 44.0)
+
     def test_no_corrupt_backup_created(self):
         store = self.load()
         backups = list(store.path.parent.glob("*.corrupt-*.json"))
