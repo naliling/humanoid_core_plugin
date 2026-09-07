@@ -164,9 +164,13 @@ class EnergyService:
         self._scope.set_self("energy", round(energy, 1))
         return energy
 
-    def reset(self, value: float = DAY_START_ENERGY) -> float:
+    def reset(self, value: float | None = None) -> float:
+        """重置精力。未指定数值时使用一个小范围随机初始值，避免每次固定为 80。"""
         cfg = self.config
-        energy = self._clamp(value, cfg)
+        if value is None:
+            # 保持“状态良好”的合理区间，同时给每次手动重置一点自然波动。
+            value = DAY_START_ENERGY * random.uniform(0.90, 1.10)
+        energy = self._clamp(float(value), cfg)
         self._scope.update_self(
             energy=round(energy, 1),
             last_update=format_state_timestamp(self._clock.now())
