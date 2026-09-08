@@ -158,14 +158,17 @@ class HumanoidCoreInstance:
     def build_injection(self, user_id: str, is_group: bool = False) -> str:
         # 查询阶段只读取短期事件和当前状态，不更新 last_interaction 等持久字段。
         now = time.time()
-        events = self.behavior.get_relevant_events(user_id, now)
-        agency = self.behavior.compute_agency(
-            user_id=user_id,
-            events=events,
-            social_energy=self.social.value,
-            mood_profile=self.mood.profile(user_id),
-            energy=self.energy.energy,
-        )
+        # v2.13.0：事件是一次性短期上下文。没有事件时，不再计算并注入整套行为倾向。
+        events = self.behavior.consume_relevant_events(user_id, now)
+        agency = {}
+        if events:
+            agency = self.behavior.compute_agency(
+                user_id=user_id,
+                events=events,
+                social_energy=self.social.value,
+                mood_profile=self.mood.profile(user_id),
+                energy=self.energy.energy,
+            )
         return self.prompt_builder.build(
             user_id,
             is_group,
