@@ -21,7 +21,7 @@ GAP_SEGMENTS = (
 
 EVENT_TTL = 3600.0
 MAX_EVENTS_PER_USER = 12
-MAX_RELEVANT_EVENTS = 3
+MAX_RELEVANT_EVENTS = 1
 
 
 class BehaviorService:
@@ -149,8 +149,24 @@ class BehaviorService:
         return scored[:MAX_RELEVANT_EVENTS]
 
     def get_relevant_events(self, user_id: str, now: float) -> List[Dict[str, Any]]:
-        """兼容旧调用名。返回已经经过注意力排序的事件。"""
+        """读取短期事件，不消费，兼容旧调用。"""
         return self.compute_attention(user_id, now)
+
+    def consume_relevant_events(self, user_id: str, now: float) -> List[Dict[str, Any]]:
+        """读取并消费一次性事件。
+
+        v2.13.0：同一个时间间隔事件只进入一次 LLM 上下文，
+        防止事件在 TTL 内的每次回复都重复注入。
+        """
+        events = self.compute_attention(user_id, now)
+        if not events:
+            return []
+
+        key = self._key(user_id)
+        consumed = {id(event) for event in events}
+        queue = self._events.get(key, [])
+        self._events[key] = [event for event in queue if id(event) not in consumed]
+        return events
 
     def compute_agency(
         self,
