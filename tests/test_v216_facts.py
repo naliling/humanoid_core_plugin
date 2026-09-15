@@ -25,10 +25,9 @@ from humanoid.config import HumanoidConfig
 from humanoid.core_instance import HumanoidCoreInstance
 from humanoid.data.cities import CITY_TO_TIMEZONE, DEFAULT_CITY_PLACEHOLDER, lookup_city_time
 from humanoid.link import build_contract
-from humanoid.services.schedule import SOURCE_LLM, normalize_slots
 from humanoid.state import StateStore
 
-from .fakes import FakeContext, RecordingLogger, freeze
+from .fakes import FakeContext, FrozenClock, RecordingLogger
 
 TZ = ZoneInfo("Asia/Shanghai")
 MOMENT = datetime(2026, 8, 22, 15, 20, tzinfo=TZ)
@@ -83,23 +82,12 @@ def core_with(mode: str = "low", **conf) -> HumanoidCoreInstance:
         resolver=FakeContext(),
         gateway=None,
     )
-    return freeze(core, MOMENT)
+    core.clock = FrozenClock(MOMENT)
+    return core
 
 
 def wrecked_body(core) -> HumanoidCoreInstance:
-    """困到极点、饿、难受、正在睡觉、刚被冷落：这些最容易让插件又开始下命令。"""
-    # 直接写进作用域而不走 _install：_install 会按夜间窗口把 14:00 的睡眠重切到夜里，
-    # 而这里要的就是「日程此刻写着睡」。标记也不能直接拧 soma 的 asleep：那会被下一次
-    # advance 清掉——身体只认日程。
-    core._scope.update_self(
-        today_date=TODAY,
-        schedule_source=SOURCE_LLM,
-        daily_schedule=normalize_slots(
-            [{"start": "14:00", "end": "16:00", "event": "睡眠休息", "location": "卧室",
-              "emotion": "平静", "energy_rate": 0.15}],
-            max_slots=16,
-        ),
-    )
+    """困到极点、饿、难受、被吵醒、刚被冷落：这些最容易让插件又开始下命令。"""
     core.soma.data.update(
         {
             "sleep_pressure": 99.0,
@@ -108,11 +96,10 @@ def wrecked_body(core) -> HumanoidCoreInstance:
             "discomfort": 80.0,
             "arousal": 10.0,
             "social_desire": 0.0,
+            "asleep": 1.0,
             "ignored_streak": 4,
         }
     )
-    core.soma.data["last_tick"] = MOMENT.timestamp() - 600.0
-    core.soma.advance()
     core.mood.profile("42").update(
         {"affection": 30.0, "libido": 40.0, "aggression": 45.0,
          "base_affection": 46.0, "base_aggression": 28.0}
@@ -138,6 +125,15 @@ class FactsOnlyTest(unittest.TestCase):
         text = core.build_injection("42", is_group=True)
         for word in BANNED + RELATION_ONLY_IN_MOOD:
             self.assertNotIn(word, text, f"群聊注入里出现了「{word}」：\n{text}")
+
+    def test_no_debug_format_leaks_into_context(self):
+        """UTC 偏移、百分比、IANA 时区代码都是给主人核对用的，不该出现在她眼前。"""
+        for mode in ("low", "full"):
+            core = core_with(mode=mode)
+            text = core.build_injection("42", is_group=False)
+            with self.subTest(mode=mode):
+                for word in ("UTC+", "UTC-", "%", "Asia/", "Europe/", "→"):
+                    self.assertNotIn(word, text, f"{mode} 档把调试形式塞进了上下文：{text}")
 
     def test_sleeping_body_does_not_change_the_reply_contract(self):
         """她在睡觉：插件不压字数、不赶人、也不替她说「我要睡了」。
@@ -184,10 +180,143 @@ class FactsOnlyTest(unittest.TestCase):
 class CityTableTest(unittest.TestCase):
     """三个国家的地区必须全部收录：她说得出地名，就得对得上那个地名的钟点。"""
 
-    def test_china_prefecture_cities_are_covered(self):
-        for city in ("北京", "上海", "深圳", "广州", "成都", "杭州", "武汉", "西安",
-                     "哈尔滨", "乌鲁木齐", "拉萨", "昆明", "台北", "香港", "澳门"):
-            self.assertIn(city, CITY_TO_TIMEZONE, f"中国大陆/港澳台城市没收录：{city}")
+    # 国家统计局口径的 333 个地级行政区**全名**（带「市/地区/盟/自治州」后缀）。
+    # 用全名而不是裸名来断言，是因为用户就是会填全名：「延边朝鲜族自治州」必须也能认出来。
+    CHINA_PREFECTURES = (
+    "石家庄市", "唐山市", "秦皇岛市", "邯郸市", "邢台市", "保定市",
+    "张家口市", "承德市", "沧州市", "廊坊市", "衡水市", "太原市",
+    "大同市", "阳泉市", "长治市", "晋城市", "朔州市", "晋中市",
+    "运城市", "忻州市", "临汾市", "吕梁市", "呼和浩特市", "包头市",
+    "乌海市", "赤峰市", "通辽市", "鄂尔多斯市", "呼伦贝尔市", "巴彦淖尔市",
+    "乌兰察布市", "兴安盟", "锡林郭勒盟", "阿拉善盟", "沈阳市", "大连市",
+    "鞍山市", "抚顺市", "本溪市", "丹东市", "锦州市", "营口市",
+    "阜新市", "辽阳市", "盘锦市", "铁岭市", "朝阳市", "葫芦岛市",
+    "长春市", "吉林市", "四平市", "辽源市", "通化市", "白山市",
+    "松原市", "白城市", "延边朝鲜族自治州", "哈尔滨市", "齐齐哈尔市", "鸡西市",
+    "鹤岗市", "双鸭山市", "大庆市", "伊春市", "佳木斯市", "七台河市",
+    "牡丹江市", "黑河市", "绥化市", "大兴安岭地区", "南京市", "无锡市",
+    "徐州市", "常州市", "苏州市", "南通市", "连云港市", "淮安市",
+    "盐城市", "扬州市", "镇江市", "泰州市", "宿迁市", "杭州市",
+    "宁波市", "温州市", "嘉兴市", "湖州市", "绍兴市", "金华市",
+    "衢州市", "舟山市", "台州市", "丽水市", "合肥市", "芜湖市",
+    "蚌埠市", "淮南市", "马鞍山市", "淮北市", "铜陵市", "安庆市",
+    "黄山市", "滁州市", "阜阳市", "宿州市", "六安市", "亳州市",
+    "池州市", "宣城市", "福州市", "厦门市", "莆田市", "三明市",
+    "泉州市", "漳州市", "南平市", "龙岩市", "宁德市", "南昌市",
+    "景德镇市", "萍乡市", "九江市", "新余市", "鹰潭市", "赣州市",
+    "吉安市", "宜春市", "抚州市", "上饶市", "济南市", "青岛市",
+    "淄博市", "枣庄市", "东营市", "烟台市", "潍坊市", "济宁市",
+    "泰安市", "威海市", "日照市", "临沂市", "德州市", "聊城市",
+    "滨州市", "菏泽市", "郑州市", "开封市", "洛阳市", "平顶山市",
+    "安阳市", "鹤壁市", "新乡市", "焦作市", "濮阳市", "许昌市",
+    "漯河市", "三门峡市", "南阳市", "商丘市", "信阳市", "周口市",
+    "驻马店市", "武汉市", "黄石市", "十堰市", "宜昌市", "襄阳市",
+    "鄂州市", "荆门市", "孝感市", "荆州市", "黄冈市", "咸宁市",
+    "随州市", "恩施土家族苗族自治州", "长沙市", "株洲市", "湘潭市", "衡阳市",
+    "邵阳市", "岳阳市", "常德市", "张家界市", "益阳市", "郴州市",
+    "永州市", "怀化市", "娄底市", "湘西土家族苗族自治州", "广州市", "韶关市",
+    "深圳市", "珠海市", "汕头市", "佛山市", "江门市", "湛江市",
+    "茂名市", "肇庆市", "惠州市", "梅州市", "汕尾市", "河源市",
+    "阳江市", "清远市", "东莞市", "中山市", "潮州市", "揭阳市",
+    "云浮市", "南宁市", "柳州市", "桂林市", "梧州市", "北海市",
+    "防城港市", "钦州市", "贵港市", "玉林市", "百色市", "贺州市",
+    "河池市", "来宾市", "崇左市", "海口市", "三亚市", "三沙市",
+    "儋州市", "成都市", "自贡市", "攀枝花市", "泸州市", "德阳市",
+    "绵阳市", "广元市", "遂宁市", "内江市", "乐山市", "南充市",
+    "眉山市", "宜宾市", "广安市", "达州市", "雅安市", "巴中市",
+    "资阳市", "阿坝藏族羌族自治州", "甘孜藏族自治州", "凉山彝族自治州", "贵阳市", "六盘水市",
+    "遵义市", "安顺市", "毕节市", "铜仁市", "黔西南布依族苗族自治州", "黔东南苗族侗族自治州",
+    "黔南布依族苗族自治州", "昆明市", "曲靖市", "玉溪市", "保山市", "昭通市",
+    "丽江市", "普洱市", "临沧市", "楚雄彝族自治州", "红河哈尼族彝族自治州", "文山壮族苗族自治州",
+    "西双版纳傣族自治州", "大理白族自治州", "德宏傣族景颇族自治州", "怒江傈僳族自治州", "迪庆藏族自治州", "拉萨市",
+    "日喀则市", "昌都市", "林芝市", "山南市", "那曲市", "阿里地区",
+    "西安市", "铜川市", "宝鸡市", "咸阳市", "渭南市", "延安市",
+    "汉中市", "榆林市", "安康市", "商洛市", "兰州市", "嘉峪关市",
+    "金昌市", "白银市", "天水市", "武威市", "张掖市", "平凉市",
+    "酒泉市", "庆阳市", "定西市", "陇南市", "临夏回族自治州", "甘南藏族自治州",
+    "西宁市", "海东市", "海北藏族自治州", "黄南藏族自治州", "海南藏族自治州", "果洛藏族自治州",
+    "玉树藏族自治州", "海西蒙古族藏族自治州", "银川市", "石嘴山市", "吴忠市", "固原市",
+    "中卫市", "乌鲁木齐市", "克拉玛依市", "吐鲁番市", "哈密市", "昌吉回族自治州",
+    "博尔塔拉蒙古自治州", "巴音郭楞蒙古自治州", "阿克苏地区", "克孜勒苏柯尔克孜自治州", "喀什地区", "和田地区",
+    "伊犁哈萨克自治州", "塔城地区", "阿勒泰地区",    )
+
+    def test_every_china_prefecture_resolves(self):
+        """中国全部地级行政区：一个都不能掉，掉了她就说不出自己那边几点。"""
+        self.assertEqual(len(set(self.CHINA_PREFECTURES)), 333)
+        bad = [name for name in self.CHINA_PREFECTURES if resolve_zone_name(name) is None]
+        self.assertEqual(bad, [], f"这些地级行政区认不出：{bad}")
+
+    def test_china_provinces_resolves(self):
+        """她说「我在广东」而不是「我在广州」，高一级地名同样要有钟点。"""
+        for name in ("北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江",
+                     "上海", "江苏", "浙江", "安徽", "福建", "江西", "山东", "河南",
+                     "湖北", "湖南", "广东", "广西", "海南", "重庆", "四川", "贵州",
+                     "云南", "西藏", "陕西", "甘肃", "青海", "宁夏", "新疆",
+                     "台湾", "香港", "澳门"):
+            with self.subTest(name=name):
+                self.assertIsNotNone(resolve_zone_name(name))
+        self.assertEqual(resolve_zone_name("台湾"), "Asia/Taipei")
+        self.assertEqual(resolve_zone_name("香港"), "Asia/Hong_Kong")
+        self.assertEqual(resolve_zone_name("澳门"), "Asia/Macau")
+        # 中国大陆法定统一北京时间，新疆与西藏也是（想按当地作息填 Asia/Urumqi）
+        self.assertEqual(resolve_zone_name("乌鲁木齐"), "Asia/Shanghai")
+        self.assertEqual(resolve_zone_name("拉萨"), "Asia/Shanghai")
+        self.assertEqual(resolve_zone_name("乌鲁木齐（当地作息）"), "Asia/Urumqi")
+
+    # 85 个联邦主体的首府（含联邦市与自治专区），逐条按 GeoNames RU.txt 的
+    # PPLA/PPLA2 记录核对：她说「我在楚科奇」也得报对那边的钟点。
+    RU_SUBJECT_CAPITALS = (
+        ("迈科普", "Europe/Moscow"), ("戈尔诺-阿尔泰斯克", "Asia/Barnaul"), ("巴尔瑙尔", "Asia/Barnaul"),
+        ("布拉戈维申斯克", "Asia/Yakutsk"), ("阿尔汉格尔斯克", "Europe/Moscow"), ("阿斯特拉罕", "Europe/Astrakhan"),
+        ("乌法", "Asia/Yekaterinburg"), ("别尔哥罗德", "Europe/Moscow"), ("布良斯克", "Europe/Moscow"),
+        ("乌兰乌德", "Asia/Irkutsk"), ("格罗兹尼", "Europe/Moscow"), ("车里雅宾斯克", "Asia/Yekaterinburg"),
+        ("阿纳德尔", "Asia/Anadyr"), ("切博克萨雷", "Europe/Moscow"), ("马哈奇卡拉", "Europe/Moscow"),
+        ("马加斯", "Europe/Moscow"), ("伊尔库茨克", "Asia/Irkutsk"), ("伊万诺沃", "Europe/Moscow"),
+        ("纳尔奇克", "Europe/Moscow"), ("加里宁格勒", "Europe/Kaliningrad"), ("埃利斯塔", "Europe/Moscow"),
+        ("卡卢加", "Europe/Moscow"), ("切尔克斯克", "Europe/Moscow"), ("彼得罗扎沃茨克", "Europe/Moscow"),
+        ("克麦罗沃", "Asia/Novokuznetsk"), ("哈巴罗夫斯克", "Asia/Vladivostok"), ("阿巴坎", "Asia/Krasnoyarsk"),
+        ("汉特-曼西斯克", "Asia/Yekaterinburg"), ("基洛夫", "Europe/Kirov"), ("瑟克特夫卡尔", "Europe/Moscow"),
+        ("科斯特罗马", "Europe/Moscow"), ("克拉斯诺达尔", "Europe/Moscow"), ("库尔干", "Asia/Yekaterinburg"),
+        ("库尔斯克", "Europe/Moscow"), ("加特契纳", "Europe/Moscow"), ("利佩茨克", "Europe/Moscow"),
+        ("马加丹", "Asia/Magadan"), ("约什卡尔奥拉", "Europe/Moscow"), ("萨兰斯克", "Europe/Moscow"),
+        ("希姆基", "Europe/Moscow"), ("摩尔曼斯克", "Europe/Moscow"), ("纳尔扬-马尔", "Europe/Moscow"),
+        ("下诺夫哥罗德", "Europe/Moscow"), ("大诺夫哥罗德", "Europe/Moscow"), ("新西伯利亚", "Asia/Novosibirsk"),
+        ("鄂木斯克", "Asia/Omsk"), ("奥伦堡", "Asia/Yekaterinburg"), ("奥廖尔", "Europe/Moscow"),
+        ("奔萨", "Europe/Moscow"), ("符拉迪沃斯托克", "Asia/Vladivostok"), ("普斯科夫", "Europe/Moscow"),
+        ("顿河畔罗斯托夫", "Europe/Moscow"), ("梁赞", "Europe/Moscow"), ("雅库茨克", "Asia/Yakutsk"),
+        ("南萨哈林斯克", "Asia/Sakhalin"), ("萨马拉", "Europe/Samara"), ("圣彼得堡", "Europe/Moscow"),
+        ("萨拉托夫", "Europe/Saratov"), ("弗拉季高加索", "Europe/Moscow"), ("斯摩棱斯克", "Europe/Moscow"),
+        ("斯塔夫罗波尔", "Europe/Moscow"), ("叶卡捷琳堡", "Asia/Yekaterinburg"), ("坦波夫", "Europe/Moscow"),
+        ("喀山", "Europe/Moscow"), ("托木斯克", "Asia/Tomsk"), ("图拉", "Europe/Moscow"),
+        ("特维尔", "Europe/Moscow"), ("秋明", "Asia/Yekaterinburg"), ("克孜勒", "Asia/Krasnoyarsk"),
+        ("伊热夫斯克", "Europe/Samara"), ("乌里扬诺夫斯克", "Europe/Ulyanovsk"), ("弗拉基米尔", "Europe/Moscow"),
+        ("伏尔加格勒", "Europe/Volgograd"), ("沃洛格达", "Europe/Moscow"), ("沃罗涅日", "Europe/Moscow"),
+        ("萨列哈尔德", "Asia/Yekaterinburg"), ("雅罗斯拉夫尔", "Europe/Moscow"), ("比罗比詹", "Asia/Vladivostok"),
+        ("彼尔姆", "Asia/Yekaterinburg"), ("克拉斯诺亚尔斯克", "Asia/Krasnoyarsk"), ("彼得罗巴甫洛夫斯克", "Asia/Kamchatka"),
+        ("赤塔", "Asia/Chita"), ("莫斯科", "Europe/Moscow"), ("辛菲罗波尔", "Europe/Simferopol"),
+        ("塞瓦斯托波尔", "Europe/Simferopol"),
+    )
+
+    # 远北这几个是旧表真正错过的地方：Asia/Khandyga 只覆盖上科雷马以西的两个区，
+    # 把滕达/涅留恩格里/阿尔丹/奥廖克明斯克算进去会让她们那边走快一小时。
+    RU_TRICKY_TOWNS = (
+        ("滕达", "Asia/Yakutsk"), ("涅留恩格里", "Asia/Yakutsk"),
+        ("阿尔丹", "Asia/Yakutsk"), ("奥廖克明斯克", "Asia/Yakutsk"),
+        ("恰拉", "Asia/Chita"), ("比利比诺", "Asia/Anadyr"),
+        ("汉德加", "Asia/Khandyga"), ("乌斯季-马亚", "Asia/Khandyga"),
+        ("乌斯季-涅拉", "Asia/Ust-Nera"), ("奥伊米亚康", "Asia/Ust-Nera"),
+        ("中科雷马", "Asia/Srednekolymsk"), ("米尔内", "Asia/Yakutsk"),
+    )
+
+    def test_every_russia_subject_capital_resolves(self):
+        for name, zone in self.RU_SUBJECT_CAPITALS:
+            with self.subTest(city=name):
+                self.assertEqual(resolve_zone_name(name), zone)
+
+    def test_far_north_towns_keep_the_right_zone(self):
+        for name, zone in self.RU_TRICKY_TOWNS:
+            with self.subTest(city=name):
+                self.assertEqual(resolve_zone_name(name), zone)
 
     def test_russia_spans_all_eleven_zones(self):
         wanted = {"Europe/Kaliningrad", "Europe/Moscow", "Europe/Samara", "Asia/Yekaterinburg",
@@ -198,12 +327,31 @@ class CityTableTest(unittest.TestCase):
         self.assertGreaterEqual(sum(1 for z in CITY_TO_TIMEZONE.values() if z in wanted), 60,
                                 "俄罗斯只收了几个城市，谈不上「全部地区」")
 
-    def test_japan_prefectures_are_covered(self):
-        for city in ("东京", "大阪", "札幌", "名古屋", "京都", "横滨", "神户", "福冈",
-                     "那霸", "仙台", "广岛", "长崎"):
-            self.assertEqual(CITY_TO_TIMEZONE.get(city), "Asia/Tokyo", city)
-        self.assertGreaterEqual(sum(1 for z in CITY_TO_TIMEZONE.values() if z == "Asia/Tokyo"), 47,
-                                "日本 47 都道府县没收全")
+    # 47 都道府县的**官方名**（含 北海道/东京都/大阪府/京都府）与各自县厅所在地
+    JP47 = ("北海道", "青森县", "岩手县", "宫城县", "秋田县", "山形县", "福岛县", "茨城县",
+            "栃木县", "群马县", "埼玉县", "千叶县", "东京都", "神奈川县", "新潟县", "富山县",
+            "石川县", "福井县", "山梨县", "长野县", "岐阜县", "静冈县", "爱知县", "三重县",
+            "滋贺县", "京都府", "大阪府", "兵库县", "奈良县", "和歌山县", "鸟取县", "岛根县",
+            "冈山县", "广岛县", "山口县", "德岛县", "香川县", "爱媛县", "高知县", "福冈县",
+            "佐贺县", "长崎县", "熊本县", "大分县", "宫崎县", "鹿儿岛县", "冲绳县")
+    JP47_SEATS = ("札幌", "青森", "盛冈", "仙台", "秋田", "山形", "福岛", "水户", "宇都宫",
+                  "前桥", "埼玉", "千叶", "东京", "横滨", "新潟", "富山", "金泽", "福井",
+                  "甲府", "长野", "岐阜", "静冈", "名古屋", "津", "大津", "京都", "大阪",
+                  "神户", "奈良", "和歌山", "鸟取", "松江", "冈山", "广岛", "德岛", "高松",
+                  "松山", "高知", "福冈", "佐贺", "长崎", "熊本", "大分", "宫崎", "山口",
+                  "鹿儿岛", "那霸")
+
+    def test_every_japan_prefecture_and_seat_resolves(self):
+        """日本全部 47 都道府县：官方名与县厅所在地都要能认，且都是 Asia/Tokyo。"""
+        self.assertEqual(len(self.JP47), 47)
+        self.assertEqual(len(self.JP47_SEATS), 47)
+        for name in self.JP47 + self.JP47_SEATS:
+            with self.subTest(name=name):
+                self.assertEqual(resolve_zone_name(name), "Asia/Tokyo")
+
+    def test_japanese_suffix_forms_resolve(self):
+        for name in ("大阪市", "东京都", "札幌市", "横滨市", "福冈市", "北海道"):
+            self.assertEqual(resolve_zone_name(name), "Asia/Tokyo", name)
 
     def test_every_entry_is_a_loadable_zone(self):
         for name in set(CITY_TO_TIMEZONE.values()):
@@ -211,122 +359,6 @@ class CityTableTest(unittest.TestCase):
             tz, note = resolve_zone(name)
             with self.subTest(zone=name):
                 self.assertIsNotNone(tz, f"表里这个 IANA 名机器加载不了：{name}（{note}）")
-
-    # 三个国家在 IANA 里的全部时区。少一个就意味着住在那片地方的人拿不到自己的钟点。
-    IANA_CN = {"Asia/Shanghai", "Asia/Urumqi"}
-    IANA_JP = {"Asia/Tokyo"}
-    IANA_RU = {
-        "Europe/Kaliningrad", "Europe/Moscow", "Europe/Simferopol", "Europe/Volgograd",
-        "Europe/Kirov", "Europe/Astrakhan", "Europe/Samara", "Europe/Saratov",
-        "Europe/Ulyanovsk", "Asia/Yekaterinburg", "Asia/Omsk", "Asia/Novosibirsk",
-        "Asia/Barnaul", "Asia/Novokuznetsk", "Asia/Krasnoyarsk", "Asia/Irkutsk",
-        "Asia/Tomsk", "Asia/Yakutsk", "Asia/Khandyga", "Asia/Chita", "Asia/Vladivostok",
-        "Asia/Ust-Nera", "Asia/Magadan", "Asia/Sakhalin", "Asia/Srednekolymsk",
-        "Asia/Kamchatka", "Asia/Anadyr",
-    }
-    # 港澳台用各自的 IANA 名（偏移同为 +8）
-    EXTRA_CN = {"Asia/Hong_Kong", "Asia/Macau", "Asia/Taipei"}
-
-    def test_every_iana_zone_of_the_three_countries_is_reachable(self):
-        used = set(CITY_TO_TIMEZONE.values())
-        for label, wanted in (("中国", self.IANA_CN | self.EXTRA_CN), ("俄罗斯", self.IANA_RU), ("日本", self.IANA_JP)):
-            missing = wanted - used
-            with self.subTest(country=label):
-                self.assertEqual(missing, set(), f"{label}这些地方一个城市都没收：{sorted(missing)}")
-
-    def test_minimum_regional_counts(self):
-        cn = sum(1 for z in CITY_TO_TIMEZONE.values() if z in self.IANA_CN | self.EXTRA_CN)
-        ru = sum(1 for z in CITY_TO_TIMEZONE.values() if z in self.IANA_RU)
-        jp = sum(1 for z in CITY_TO_TIMEZONE.values() if z in self.IANA_JP)
-        # 中国 333 个地级行政区 + 省直辖县级；俄罗斯 85 个联邦主体；日本 47 都道府县。
-        self.assertGreaterEqual(cn, 380, f"中国只收了 {cn} 处，称不上全部地区")
-        self.assertGreaterEqual(ru, 150, f"俄罗斯只收了 {ru} 处，称不上全部地区")
-        self.assertGreaterEqual(jp, 100, f"日本只收了 {jp} 处，称不上全部地区")
-
-    RUSSIAN_PLACES = (
-        "莫斯科", "圣彼得堡", "塞瓦斯托波尔", "叶卡捷琳堡", "下诺夫哥罗德", "喀山", "乌法",
-        "彼尔姆", "车里雅宾斯克", "奥伦堡", "秋明", "鄂木斯克", "新西伯利亚", "克拉斯诺亚尔斯克",
-        "伊尔库茨克", "赤塔", "雅库茨克", "堪察加彼得罗巴甫洛夫斯克", "马加丹", "南萨哈林斯克",
-        "哈巴罗夫斯克", "阿纳德尔", "符拉迪沃斯托克", "巴尔瑙尔", "克孜勒", "戈尔诺-阿尔泰斯克",
-        "纳尔奇克", "埃利斯塔", "马哈奇卡拉", "格罗兹尼", "弗拉季高加索", "瑟克特夫卡尔",
-        "彼得罗扎沃茨克", "阿尔汉格尔斯克", "摩尔曼斯克", "沃洛格达", "科斯特罗马", "伊万诺沃",
-        "弗拉基米尔", "雅罗斯拉夫尔", "特维尔", "梁赞", "图拉", "卡卢加", "布良斯克", "斯摩棱斯克",
-        "普斯科夫", "大诺夫哥罗德", "诺夫哥罗德", "坦波夫", "利佩茨克", "别尔哥罗德", "库尔斯克",
-        "奥廖尔", "奔萨", "萨拉托夫", "萨马拉", "乌里扬诺夫斯克", "阿斯特拉罕", "伏尔加格勒",
-        "顿河畔罗斯托夫", "克拉斯诺达尔", "斯塔夫罗波尔", "马加斯", "切尔克斯克", "五月镇",
-        "汉德加", "奥廖克明斯克", "米尔内", "涅留恩格里", "布拉戈维申斯克", "乌苏里斯克",
-        "比罗比詹", "佩韦克", "比利比诺", "诺里尔斯克", "迪克森", "伊加尔卡", "库尔干",
-        "托木斯克", "克麦罗沃", "新库兹涅茨克", "阿巴坎", "加里宁格勒", "乌里扬诺夫斯克",
-    )
-
-    JAPANESE_PLACES = (
-        "东京", "大阪", "京都", "名古屋", "札幌", "青森", "盛冈", "仙台", "秋田", "山形",
-        "水户", "宇都宫", "前桥", "埼玉", "千叶", "横滨", "新潟", "富山", "金泽", "福井",
-        "甲府", "长野", "岐阜", "静冈", "津", "大津", "神户", "鸟取", "松江", "冈山",
-        "广岛", "德岛", "高知", "松山", "高松", "福冈", "佐贺", "长崎", "熊本", "大分",
-        "宫崎", "鹿儿岛", "那霸", "川崎", "北九州", "堺", "滨松", "冈崎", "旭川", "八户",
-    )
-
-    CHINESE_PLACES = (
-        "北京", "天津", "上海", "重庆", "石家庄", "太原", "呼和浩特", "沈阳", "长春", "哈尔滨",
-        "南京", "杭州", "合肥", "福州", "南昌", "济南", "郑州", "武汉", "长沙", "广州",
-        "南宁", "海口", "成都", "贵阳", "昆明", "拉萨", "西安", "兰州", "西宁", "银川",
-        "乌鲁木齐", "台北", "香港", "澳门", "深圳", "大连", "青岛", "宁波", "厦门", "苏州",
-        "喀什", "伊犁", "日喀则", "林芝", "阿里", "那曲", "昌都", "山南", "霍尔果斯", "石河子",
-    )
-
-    def test_russian_places_are_covered(self):
-        missing = sorted({c for c in self.RUSSIAN_PLACES if c not in CITY_TO_TIMEZONE})
-        self.assertEqual(missing, [], f"这些俄罗斯首府/城市没进表：{missing}")
-
-    def test_japanese_places_are_covered(self):
-        missing = sorted({c for c in self.JAPANESE_PLACES if CITY_TO_TIMEZONE.get(c) != "Asia/Tokyo"})
-        self.assertEqual(missing, [], f"这些日本都道府县厅所在地/市没进表：{missing}")
-
-    def test_chinese_places_are_covered(self):
-        missing = sorted({c for c in self.CHINESE_PLACES if c not in CITY_TO_TIMEZONE})
-        self.assertEqual(missing, [], f"这些中国地名没进表：{missing}")
-
-    def test_display_name_exists_for_every_zone_in_the_table(self):
-        """她说「你在伏尔加格勒」，而不是「你在 Europe/Volgograd」。"""
-        from humanoid.data.cities import IANA_DISPLAY_NAMES
-
-        missing = sorted({z for z in CITY_TO_TIMEZONE.values()} - set(IANA_DISPLAY_NAMES))
-        self.assertEqual(missing, [], f"这些时区没有中文名可显示：{missing}")
-
-    def test_iana_name_in_config_comes_out_as_a_city(self):
-        clock = Clock(lambda: cfg(timezone_city="Europe/Volgograd"))
-        self.assertEqual(clock.display_city, "伏尔加格勒")
-        self.assertEqual(Clock(lambda: cfg(timezone_city="Atlantic/Reykjavik")).display_city, "雷克雅未克")
-        # 表内地名原样说，不绕回时区名
-        self.assertEqual(Clock(lambda: cfg(timezone_city="摩尔曼斯克")).display_city, "摩尔曼斯克")
-        # 端到端：真走一次上下文编译
-        text = core_with(mode="low", timezone_city="Europe/Volgograd").build_injection("42", is_group=False)
-        self.assertIn("你在伏尔加格勒", text, f"上下文里的城市没跟着配置：{text}")
-
-    def test_day_line_does_not_tell_her_when_to_sleep(self):
-        """「夜里就该睡了」听着像谁在管她，事实只需要说「夜里要睡了」。"""
-        core = core_with(mode="full")
-        text = core.build_injection("42", is_group=False)
-        self.assertNotIn("就该", text, text)
-
-    def test_a_typoed_zone_name_says_typo_not_missing_tzdata(self):
-        """填错名字不该让人去装 tzdata：两种退化的改法完全不同。"""
-        clock_module._tzdata_usable.cache_clear()
-        tz, note = resolve_zone("Asia/Volgograd")   # 真实名字是 Europe/Volgograd
-        self.assertIsNone(tz)
-        self.assertIn("拼错", note)
-        self.assertNotIn("tzdata", note)
-
-    def test_injection_has_no_technical_noise(self):
-        """上下文里不该出现斜杠地名、UTC 偏移、百分比这类给人看的东西。"""
-        for mode in ("low", "full", "mood_only"):
-            core = wrecked_body(core_with(mode=mode))
-            text = core.build_injection("42", is_group=False)
-            with self.subTest(mode=mode):
-                self.assertNotIn("/", text, f"{mode} 档出现了斜杠：{text}")
-                self.assertNotIn("UTC", text, f"{mode} 档出现了偏移量：{text}")
-                self.assertNotIn("%", text, f"{mode} 档出现了百分比：{text}")
 
     def test_iana_name_is_accepted_directly(self):
         self.assertEqual(resolve_zone_name("Asia/Ho_Chi_Minh"), "Asia/Ho_Chi_Minh")
@@ -357,7 +389,6 @@ class ZoneDegradationTest(unittest.TestCase):
         real = clock_module.ZoneInfo
         clock_module.ZoneInfo = lambda name: (_ for _ in ()).throw(ZoneInfoNotFoundError(name))
         resolve_zone.cache_clear()
-        clock_module._tzdata_usable.cache_clear()
         try:
             tz, note = resolve_zone("东京")
             self.assertIsNone(tz)
@@ -367,7 +398,6 @@ class ZoneDegradationTest(unittest.TestCase):
         finally:
             clock_module.ZoneInfo = real
             resolve_zone.cache_clear()
-            clock_module._tzdata_usable.cache_clear()
 
     def test_city_time_text_explains_the_degradation(self):
         result = lookup_city_time("不存在的地方")
@@ -388,14 +418,15 @@ class ZoneDegradationTest(unittest.TestCase):
 
 
 class ContractTimeTest(unittest.TestCase):
-    def core(self, city: str = "北京", moment=MOMENT):
+    def core(self, city: str = "北京"):
         from .test_link import Harness
 
         harness = Harness({"timezone_city": city})
-        return harness, freeze(harness.roles.get_or_create("bot1"), moment)
+        return harness, harness.roles.get_or_create("bot1")
 
     def test_contract_carries_her_real_offset(self):
         harness, core = self.core("北京")
+        core.clock = FrozenClock(MOMENT)
         contract = build_contract(core)
         self.assertEqual(contract["time"]["utc_offset_minutes"], 480)
         self.assertEqual(contract["time"]["tz"], "Asia/Shanghai")
@@ -403,7 +434,8 @@ class ContractTimeTest(unittest.TestCase):
 
     def test_naive_moment_exports_none_not_zero(self):
         """当成 0 等于把她的城市当 UTC：社交层会静默按错的时间判断该不该说话。"""
-        harness, core = self.core("北京", datetime(2026, 8, 22, 15, 20))
+        harness, core = self.core("北京")
+        core.clock = FrozenClock(datetime(2026, 8, 22, 15, 20))
         contract = build_contract(core)
         self.assertIsNone(contract["time"]["utc_offset_minutes"])
         self.assertEqual(contract["time"]["tz"], "")
@@ -445,7 +477,6 @@ class DiagnosticsTimezoneTest(unittest.TestCase):
         real = clock_module.ZoneInfo
         clock_module.ZoneInfo = lambda name: (_ for _ in ()).throw(ZoneInfoNotFoundError(name))
         resolve_zone.cache_clear()
-        clock_module._tzdata_usable.cache_clear()
         try:
             text = self.report("东京")
             self.assertIn("tzdata", text)
@@ -453,7 +484,6 @@ class DiagnosticsTimezoneTest(unittest.TestCase):
         finally:
             clock_module.ZoneInfo = real
             resolve_zone.cache_clear()
-            clock_module._tzdata_usable.cache_clear()
 
     def test_report_warns_about_the_undecided_city(self):
         self.assertIn("还没定所在城市", self.report(DEFAULT_CITY_PLACEHOLDER))

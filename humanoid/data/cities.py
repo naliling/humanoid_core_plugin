@@ -190,6 +190,8 @@ _RUSSIA = {
     # UTC+3 Europe/Moscow —— 欧俄大部分（含莫斯科、圣彼得堡两个联邦市）
     "俄罗斯": "Europe/Moscow", "莫斯科": "Europe/Moscow", "圣彼得堡": "Europe/Moscow",
     "下诺夫哥罗德": "Europe/Moscow", "喀山": "Europe/Moscow", "鞑靼斯坦": "Europe/Moscow",
+    "希姆基": "Europe/Moscow", "沃洛格达": "Europe/Moscow",
+    "大诺夫哥罗德": "Europe/Moscow", "普斯科夫": "Europe/Moscow",
     "顿河畔罗斯托夫": "Europe/Moscow", "克拉斯诺达尔": "Europe/Moscow", "索契": "Europe/Moscow",
     "沃罗涅日": "Europe/Moscow", "伏尔加格勒": "Europe/Volgograd", "雅罗斯拉夫尔": "Europe/Moscow",
     "伊万诺沃": "Europe/Moscow", "库尔斯克": "Europe/Moscow", "别尔哥罗德": "Europe/Moscow",
@@ -206,8 +208,6 @@ _RUSSIA = {
     "弗拉季高加索": "Europe/Moscow", "北奥塞梯": "Europe/Moscow", "马加斯": "Europe/Moscow",
     "切尔克斯克": "Europe/Moscow", "卡拉恰伊": "Europe/Moscow", "五月镇": "Europe/Moscow",
     "阿迪格": "Europe/Moscow", "埃利斯塔": "Europe/Moscow", "卡尔梅克": "Europe/Moscow",
-    "沃洛格达": "Europe/Moscow", "普斯科夫": "Europe/Moscow", "大诺夫哥罗德": "Europe/Moscow",
-    "诺夫哥罗德": "Europe/Moscow", "维堡": "Europe/Moscow",
     "塞瓦斯托波尔": "Europe/Simferopol", "辛菲罗波尔": "Europe/Simferopol", "雅尔塔": "Europe/Simferopol",
     "克里米亚": "Europe/Simferopol", "费奥多西亚": "Europe/Simferopol", "克拉斯诺达尔边疆区": "Europe/Moscow",
     # UTC+3 Europe/Kirov —— 基洛夫州（偏移同莫斯科，IANA 单列）
@@ -244,9 +244,13 @@ _RUSSIA = {
     "乌斯季-奥尔登斯基": "Asia/Irkutsk", "基廉斯克": "Asia/Irkutsk", "图伦": "Asia/Irkutsk",
     "乌兰乌德": "Asia/Irkutsk", "色楞格": "Asia/Irkutsk", "布里亚特": "Asia/Irkutsk",
     # UTC+9 Asia/Yakutsk / Asia/Chita —— 阿穆尔州、外贝加尔、萨哈西部
-    "雅库茨克": "Asia/Yakutsk", "阿尔丹": "Asia/Khandyga", "奥廖克明斯克": "Asia/Khandyga",
-    "米尔内": "Asia/Yakutsk", "涅留恩格里": "Asia/Khandyga", "汉德加": "Asia/Khandyga",
-    "奥列克明斯克": "Asia/Khandyga", "滕达": "Asia/Yakutsk", "恰拉": "Asia/Yakutsk",
+    # 奥伊米亚康以东的萨哈东部才是 Asia/Khandyga（IANA 自己的注释就是
+    # “Tomponsky, Ust-Maysky”）：滕达/涅留恩格里/阿尔丹/奥廖克明斯克属 Asia/Yakutsk，
+    # 恰拉属 Asia/Chita——旧表把它们归进 Khandyga 会让她们那边走快一小时。
+    "雅库茨克": "Asia/Yakutsk", "阿尔丹": "Asia/Yakutsk", "奥廖克明斯克": "Asia/Yakutsk",
+    "奥列克明斯克": "Asia/Yakutsk", "米尔内": "Asia/Yakutsk", "涅留恩格里": "Asia/Yakutsk",
+    "汉德加": "Asia/Khandyga", "乌斯季-马亚": "Asia/Khandyga",
+    "滕达": "Asia/Yakutsk", "恰拉": "Asia/Chita",
     "波克罗夫斯克": "Asia/Yakutsk", "萨哈": "Asia/Yakutsk",
     "布拉戈维申斯克": "Asia/Yakutsk", "海兰泡": "Asia/Yakutsk", "斯沃博德内": "Asia/Yakutsk",
     "结雅": "Asia/Yakutsk", "阿穆尔": "Asia/Yakutsk",
@@ -262,11 +266,11 @@ _RUSSIA = {
     "南萨哈林斯克": "Asia/Sakhalin", "萨哈林": "Asia/Sakhalin", "霍尔姆斯克": "Asia/Sakhalin",
     "科尔萨科夫": "Asia/Sakhalin", "波罗奈斯克": "Asia/Sakhalin", "诺格利基": "Asia/Sakhalin",
     "库里尔斯克": "Asia/Sakhalin", "中科雷马": "Asia/Srednekolymsk",
-    "佩韦克": "Asia/Anadyr", "比利比诺": "Asia/Anadyr",
     # UTC+12 Asia/Kamchatka / Asia/Anadyr —— 堪察加、楚科奇
     "堪察加彼得罗巴甫洛夫斯克": "Asia/Kamchatka", "彼得罗巴甫洛夫斯克": "Asia/Kamchatka",
     "叶利佐沃": "Asia/Kamchatka", "堪察加": "Asia/Kamchatka", "楚科奇": "Asia/Kamchatka",
-    "阿纳德尔": "Asia/Anadyr", "埃格维金诺特": "Asia/Anadyr", "普罗维杰尼亚": "Asia/Anadyr",
+    "阿纳德尔": "Asia/Anadyr", "比利比诺": "Asia/Anadyr",
+    "埃格维金诺特": "Asia/Anadyr", "普罗维杰尼亚": "Asia/Anadyr",
 }
 
 # ----------------------------------------------------------------------
@@ -299,12 +303,58 @@ _JAPAN = {
     "久留米": _JAPAN_ZONE, "佐贺": _JAPAN_ZONE, "长崎": _JAPAN_ZONE, "佐世保": _JAPAN_ZONE,
     "熊本": _JAPAN_ZONE, "大分": _JAPAN_ZONE, "宫崎": _JAPAN_ZONE, "鹿儿岛": _JAPAN_ZONE,
     "那霸": _JAPAN_ZONE, "冲绳": _JAPAN_ZONE, "宜野湾": _JAPAN_ZONE, "名护": _JAPAN_ZONE,
-    "埼玉": _JAPAN_ZONE, "大宫": _JAPAN_ZONE, "八户": _JAPAN_ZONE, "陆奥": _JAPAN_ZONE,
     "日本": _JAPAN_ZONE, "北海道": _JAPAN_ZONE, "本州": _JAPAN_ZONE, "九州": _JAPAN_ZONE,
     "四国": _JAPAN_ZONE, "关东": _JAPAN_ZONE, "关西": _JAPAN_ZONE, "东北": _JAPAN_ZONE,
 }
 
 # 直接填 IANA 名时，注入里该说人话：她说「你在雷克雅未克」而不是「你在 Atlantic/Reykjavik」。
+# 省/自治区/直辖市/特别行政区：她会说自己住在「广东」而不是「广州」，所以高一级地名
+# 也得认。中国大陆与港澳台均按法定区时（新疆、西藏亦走北京时间）。
+_CHINA_PROVINCES = {
+    "北京": "Asia/Shanghai", "天津": "Asia/Shanghai", "河北": "Asia/Shanghai",
+    "山西": "Asia/Shanghai", "内蒙古": "Asia/Shanghai", "辽宁": "Asia/Shanghai",
+    "吉林": "Asia/Shanghai", "黑龙江": "Asia/Shanghai", "上海": "Asia/Shanghai",
+    "江苏": "Asia/Shanghai", "浙江": "Asia/Shanghai", "安徽": "Asia/Shanghai",
+    "福建": "Asia/Shanghai", "江西": "Asia/Shanghai", "山东": "Asia/Shanghai",
+    "河南": "Asia/Shanghai", "湖北": "Asia/Shanghai", "湖南": "Asia/Shanghai",
+    "广东": "Asia/Shanghai", "广西": "Asia/Shanghai", "海南": "Asia/Shanghai",
+    "重庆": "Asia/Shanghai", "四川": "Asia/Shanghai", "贵州": "Asia/Shanghai",
+    "云南": "Asia/Shanghai", "西藏": "Asia/Shanghai", "陕西": "Asia/Shanghai",
+    "甘肃": "Asia/Shanghai", "青海": "Asia/Shanghai", "宁夏": "Asia/Shanghai",
+    "新疆": "Asia/Shanghai", "台湾": "Asia/Taipei", "香港": "Asia/Hong_Kong",
+    "澳门": "Asia/Macau",
+}
+
+# 俄罗斯联邦主体名（与首府不同名的那些）：按首府所在时区。偏移自 2014 年起固定，无夏令时。
+_RUSSIA_SUBJECTS = {
+    "楚瓦什": "Europe/Moscow", "莫尔多瓦": "Europe/Moscow",
+    "马里埃尔": "Europe/Moscow", "卡巴尔达-巴尔卡尔": "Europe/Moscow",
+    "卡拉恰伊-切尔克斯": "Europe/Moscow", "北奥塞梯-阿兰": "Europe/Moscow",
+    "汉特-曼西": "Asia/Yekaterinburg", "亚马尔-涅涅茨": "Asia/Yekaterinburg",
+    "萨哈（雅库特）": "Asia/Yakutsk", "伊尔库茨克州": "Asia/Irkutsk",
+}
+
+# 日本 47 都道府县：全国唯一区时 UTC+9（包小笠原），所以整张表同一个值。
+_JAPAN_PREFECTURES = {name: _JAPAN_ZONE for name in (
+    "北海道", "青森", "岩手", "宫城", "秋田", "山形", "福岛", "茨城", "栃木", "群马",
+    "埼玉", "千叶", "东京", "神奈川", "新潟", "富山", "石川", "福井", "山梨", "长野",
+    "岐阜", "静冈", "爱知", "三重", "滋贺", "京都", "大阪", "兵库", "奈良", "和歌山",
+    "鸟取", "岛根", "冈山", "广岛", "山口", "德岛", "香川", "爱媛", "高知", "福冈",
+    "佐贺", "长崎", "熊本", "大分", "宫崎", "鹿儿岛", "冲绳",
+)}
+
+# 重名与常用译名补丁：
+# * 松江既是上海的一个区，也是日本岛根县厅所在地（松江市）——裸名归日本那个，
+#   中国这个用带后缀的写法认。
+# * 迈科普是阿迪格共和国首府的标准中译，旧表里只有「五月镇」这个直译。
+_EXTRA_ALIASES = {
+    "松江区": "Asia/Shanghai", "上海松江": "Asia/Shanghai",
+    "迈科普": "Europe/Moscow", "切博克萨雷": "Europe/Moscow",
+    "约什卡尔奥拉": "Europe/Moscow", "萨兰斯克": "Europe/Moscow",
+    "纳尔扬-马尔": "Europe/Moscow", "加特契纳": "Europe/Moscow",
+    "亚速": "Europe/Moscow", "乌辛斯克": "Europe/Moscow",
+}
+
 IANA_DISPLAY_NAMES = {
     "Asia/Shanghai": "北京时间", "Asia/Urumqi": "乌鲁木齐（当地作息）", "Asia/Hong_Kong": "香港",
     "Asia/Macau": "澳门", "Asia/Taipei": "台北", "Asia/Tokyo": "东京", "Asia/Seoul": "首尔",
@@ -318,9 +368,6 @@ IANA_DISPLAY_NAMES = {
     "Asia/Bishkek": "比什凯克", "Asia/Tashkent": "塔什干", "Asia/Astana": "阿斯塔纳",
     # 俄罗斯 11 个时区
     "Europe/Kaliningrad": "加里宁格勒", "Europe/Moscow": "莫斯科", "Europe/Samara": "萨马拉",
-    "Europe/Volgograd": "伏尔加格勒", "Europe/Astrakhan": "阿斯特拉罕", "Europe/Saratov": "萨拉托夫",
-    "Europe/Ulyanovsk": "乌里扬诺夫斯克", "Europe/Simferopol": "辛菲罗波尔",
-    "Asia/Khandyga": "汉德加",
     "Europe/Kirov": "基洛夫", "Asia/Yekaterinburg": "叶卡捷琳堡", "Asia/Omsk": "鄂木斯克",
     "Asia/Novosibirsk": "新西伯利亚", "Asia/Barnaul": "巴尔瑙尔", "Asia/Krasnoyarsk": "克拉斯诺亚尔斯克",
     "Asia/Novokuznetsk": "新库兹涅茨克", "Asia/Tomsk": "托木斯克", "Asia/Dushanbe": "杜尚别",
@@ -352,8 +399,12 @@ IANA_DISPLAY_NAMES = {
 
 CITY_TO_TIMEZONE: dict[str, str] = {}
 CITY_TO_TIMEZONE.update(_CHINA)
+CITY_TO_TIMEZONE.update(_CHINA_PROVINCES)
 CITY_TO_TIMEZONE.update(_RUSSIA)
+CITY_TO_TIMEZONE.update(_RUSSIA_SUBJECTS)
 CITY_TO_TIMEZONE.update(_JAPAN)
+CITY_TO_TIMEZONE.update(_JAPAN_PREFECTURES)
+CITY_TO_TIMEZONE.update(_EXTRA_ALIASES)
 
 
 def _looks_like_zone_name(raw: str) -> bool:
@@ -363,8 +414,34 @@ def _looks_like_zone_name(raw: str) -> bool:
     return bool(_ZONE_NAME_RE.match(raw))
 
 
+# 用户写地名不会只写裸名：「广东省」「大阪市」「东京都」「延边朝鲜族自治州」都是同一个地方。
+# 表里存的是裸名，所以这里按「先去掉行政后缀、再试前缀」的顺序认，只在前面都认不出时才降级匹配。
+# 故意不收的两个后缀：「州」（广州/苏州本身就是键，剪掉会误伤）与「道」（北海道剪成北海
+# 会匹到广西的北海市，跨国家错时区）。
+_ADMIN_SUFFIXES = (
+    "特别行政区", "自治区", "自治州", "地区", "盟", "市", "区", "县", "旗", "省", "府", "都",
+)
+
+
+def _candidates(raw: str):
+    """一个地名可能对应的写法，按可信度从高到低。"""
+    yield raw
+    core = raw.split("（")[0].split("(")[0].strip()
+    if core and core != raw:
+        yield core
+    hit_suffix = False
+    for suffix in _ADMIN_SUFFIXES:
+        if core.endswith(suffix) and len(core) > len(suffix) + 1:
+            hit_suffix = True
+            yield core[: -len(suffix)]
+    if hit_suffix:
+        # 「延边朝鲜族自治州」这类全名：剪到剩下的前缀本身是个收录过的地名才算。
+        for cut in range(2, len(core) - 1):
+            yield core[:cut]
+
+
 def resolve_zone_name(city: str) -> str | None:
-    """城市 → IANA 时区名。表里没有时，允许把配置项直接写成 IANA 名。
+    """地名 → IANA 时区名。表里没有时，允许把配置项直接写成 IANA 名。
 
     加这一手是因为表再怎么铺也覆盖不完：填「河内」「曼谷」的人以前会静默退回宿主机
     时钟，她说自己在河内，过的却是机器所在时区的一天。
@@ -372,9 +449,10 @@ def resolve_zone_name(city: str) -> str | None:
     raw = (city or "").strip()
     if not raw or raw == DEFAULT_CITY_PLACEHOLDER:
         return None
-    name = CITY_TO_TIMEZONE.get(raw)
-    if name:
-        return name
+    for key in _candidates(raw):
+        name = CITY_TO_TIMEZONE.get(key)
+        if name:
+            return name
     return raw if _looks_like_zone_name(raw) else None
 
 
@@ -386,9 +464,15 @@ def display_city_name(city: str, zone_name: str | None) -> str:
     """注入与面板上给她看的地名。
 
     填的是 IANA 名时翻成中文城市名，否则她说「你在Atlantic/Reykjavik」——那不是人话。
+    填的是「广东省」「大阪市」这类带后缀的写法时，给她看她自己写的那个名字。
     """
     raw = (city or "").strip()
-    if raw and raw not in CITY_TO_TIMEZONE and zone_name:
+    if raw in CITY_TO_TIMEZONE:
+        return raw
+    if zone_name:
+        for key in _candidates(raw):
+            if key in CITY_TO_TIMEZONE:
+                return key
         return IANA_DISPLAY_NAMES.get(zone_name, raw)
     return raw
 

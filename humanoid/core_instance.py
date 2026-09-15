@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import time
 from typing import Any, Optional
 
 from .state import seed_cycle_day
@@ -68,6 +68,7 @@ class HumanoidCoreInstance:
         self._stop_event = stop_event
         self._fetch_json = fetch_json
         self.persona_source = persona_source
+        self.last_activity: Optional[float] = None
 
         self.resolver = resolver
         self.gateway = gateway
@@ -76,10 +77,6 @@ class HumanoidCoreInstance:
         self._scope.set_mark_dirty(state_store.mark_dirty)
 
         self.clock = Clock(lambda: self.config)
-        # 一个角色只有一个「现在」：身体、情绪、事件记账共用一个时间源，仿真与诊断才
-        # 对得上。生产环境下 `clock.now().timestamp()` 就是标准 epoch（绝对时刻与时区
-        # 无关），但换城市时它跟着她的钟走，测试里也能被假时钟控住。
-        self._epoch: Callable[[], float] = lambda: self.clock.now().timestamp()
 
         # 新角色的生理周期不能永远从第 1 天（经期）开始：按创建当天错开一个起点，
         # 否则多角色下每一个都是同一个人同一天，且 v2.13.2 从未推进过周期。
@@ -110,7 +107,6 @@ class HumanoidCoreInstance:
             self.clock,
             schedule_provider=lambda: self.schedule.current_slots(),
             weather_provider=lambda: self.weather.snapshot(),
-            time_source=self._epoch,
         )
         self.schedule.on_install = self._on_schedule_installed
 
@@ -135,7 +131,6 @@ class HumanoidCoreInstance:
             self._spawn_background,
             gateway=self.gateway,
             logger=logger,
-            time_source=self._epoch,
         )
         self.social = SocialEnergyService(self._scope, config_provider, self.clock)
         self.weather = WeatherService(
@@ -258,7 +253,8 @@ class HumanoidCoreInstance:
         return task
 
     def on_message(self, user_id: str, text: str, is_group: bool = False, umo: str = "") -> None:
-        now = self._epoch()
+        self.last_activity = time.time()
+        now = time.time()
         cfg = self.config
 
         self.note_umo(umo)
@@ -326,7 +322,7 @@ class HumanoidCoreInstance:
 
     def build_injection(self, user_id: str, is_group: bool = False) -> str:
         # 查询阶段只读取短期事件和当前状态，不更新 last_interaction 等持久字段。
-        now = self._epoch()
+        now = time.time()
         if self.config.soma_enabled:
             self.soma.advance(now)
         # 时间间隔由 Core.on_message 统一记账。这里严格只读取并构建注入内容。

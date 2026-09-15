@@ -345,19 +345,3 @@ class ScopeStore:
 
     async def flush(self) -> bool:
         return await self.store.flush()
-
-
-def freeze(core, moment):
-    """把角色的所有服务换成同一个假时钟。
-
-    各服务在构造时就捕获了 clock 对象，只换 `core.clock` 会让它们各看各的时间：
-    身体会把她的钟点按宿主机小时算，「她在睡觉」「该不该说话」全部错一个偏移量。
-    城市沿用真 Clock 已经算好的显示名（IANA 名会翻成中文），否则测试里看到的
-    「你在北京」其实与配置无关。
-    """
-    clock = FrozenClock(moment, city=getattr(core.clock, "display_city", "北京"))
-    core.clock = clock
-    for service in (core.schedule, core.soma, core.energy, core.process, core.mood,
-                    core.social, core.weather):
-        service._clock = clock
-    return core

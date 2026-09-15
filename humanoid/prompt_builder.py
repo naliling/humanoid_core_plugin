@@ -144,7 +144,7 @@ class PromptBuilder:
             line += f"，{holiday}"
         lines = [line]
         if cfg.show_city_time_in_low_intrusion:
-            # 只地名，不带 UTC±HH:MM：偏移量是给人看的东西，塞进上下文只会让她说话像仪表。
+            # 不带 UTC 偏移：那是给主人核对用的东西，不是她说话时会用的形式（诊断与 /时间 里有）。
             lines.append(f"你在{snap['city']}")
         if cfg.enable_chat_awareness:
             lines.append("这是群聊" if is_group else "这是私聊")

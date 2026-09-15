@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from datetime import datetime
@@ -35,7 +36,6 @@ from .fakes import (
     RecordingLogger,
     fake_persona,
 )
-from .fakes import freeze as _freeze
 
 TZ = ZoneInfo("Asia/Shanghai")
 MOMENT = datetime(2026, 8, 22, 15, 20, tzinfo=TZ)
@@ -68,8 +68,15 @@ GOOD_SCHEDULE = json.dumps(
 
 
 def freeze(core, moment=MOMENT):
-    """把角色换成假时钟（实现收拢在 fakes.freeze，各服务都要看到同一个「现在」）。"""
-    return _freeze(core, moment)
+    """把角色的所有服务换成同一个假时钟。
+
+    各服务在构造时就捕获了 clock 对象，只换 core.clock 会让它们各看各的时间。
+    """
+    clock = FrozenClock(moment)
+    core.clock = clock
+    for service in (core.schedule, core.soma, core.energy, core.process, core.mood, core.social, core.weather):
+        service._clock = clock
+    return core
 
 
 def cfg(**overrides) -> HumanoidConfig:
@@ -354,10 +361,10 @@ class DayNarrativeTest(unittest.TestCase):
         core.schedule._install(slots, TODAY, SOURCE_LLM)
         text = core.build_injection("42", is_group=False)
         self.assertIn("今天到这会", text)
-        self.assertIn("跟客户过方案", text)
-        # 此刻那一件事只说一次：过程与日程各说一遍会互相打脸
-        self.assertNotIn("现在在跟客户过方案；手上在做的：跟客户过方案", text)
         self.assertIn("现在在跟客户过方案", text)
+        # 此刻那一件事只说一次：过程与日程各说一遍会互相打脸
+        self.assertNotIn("手上在做的", text)
+        self.assertEqual(text.count("跟客户过方案"), 1)
 
 
 class RecallTest(unittest.TestCase):
@@ -489,7 +496,6 @@ class EmotionLineTest(unittest.TestCase):
     """情绪不再进上下文：它驱动她的行为与契约，不该被插件翻成句子塞给模型。"""
 
     def core_with_mood(self, mode: str = "low", **mood):
-        import asyncio
         import tempfile
         from pathlib import Path
 
