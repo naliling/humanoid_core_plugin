@@ -8,7 +8,7 @@ desc: |
   插件只负责把这具身体和这一天算出来——往上下文里放的只有时间、称呼、隔了多久这类事实；她说自己
   困不困、回复多长、夜里要不要接着聊，全是她自己的判断，不是插件塞给她的句子。不配模型也有身体，
   配了才有每天新日程。不用配置，不装别的插件也完全能用。
-version: 2.16.0
+version: 2.16.1
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"

@@ -246,7 +246,7 @@ _RUSSIA = {
     # UTC+9 Asia/Yakutsk / Asia/Chita —— 阿穆尔州、外贝加尔、萨哈西部
     "雅库茨克": "Asia/Yakutsk", "阿尔丹": "Asia/Khandyga", "奥廖克明斯克": "Asia/Khandyga",
     "米尔内": "Asia/Yakutsk", "涅留恩格里": "Asia/Khandyga", "汉德加": "Asia/Khandyga",
-    "奥列克明斯克": "Asia/Khandyga", "滕达": "Asia/Khandyga", "恰拉": "Asia/Khandyga",
+    "奥列克明斯克": "Asia/Khandyga", "滕达": "Asia/Yakutsk", "恰拉": "Asia/Yakutsk",
     "波克罗夫斯克": "Asia/Yakutsk", "萨哈": "Asia/Yakutsk",
     "布拉戈维申斯克": "Asia/Yakutsk", "海兰泡": "Asia/Yakutsk", "斯沃博德内": "Asia/Yakutsk",
     "结雅": "Asia/Yakutsk", "阿穆尔": "Asia/Yakutsk",
@@ -262,7 +262,7 @@ _RUSSIA = {
     "南萨哈林斯克": "Asia/Sakhalin", "萨哈林": "Asia/Sakhalin", "霍尔姆斯克": "Asia/Sakhalin",
     "科尔萨科夫": "Asia/Sakhalin", "波罗奈斯克": "Asia/Sakhalin", "诺格利基": "Asia/Sakhalin",
     "库里尔斯克": "Asia/Sakhalin", "中科雷马": "Asia/Srednekolymsk",
-    "佩韦克": "Asia/Anadyr", "比利比诺": "Asia/Magadan",
+    "佩韦克": "Asia/Anadyr", "比利比诺": "Asia/Anadyr",
     # UTC+12 Asia/Kamchatka / Asia/Anadyr —— 堪察加、楚科奇
     "堪察加彼得罗巴甫洛夫斯克": "Asia/Kamchatka", "彼得罗巴甫洛夫斯克": "Asia/Kamchatka",
     "叶利佐沃": "Asia/Kamchatka", "堪察加": "Asia/Kamchatka", "楚科奇": "Asia/Kamchatka",

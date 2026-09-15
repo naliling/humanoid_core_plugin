@@ -435,6 +435,10 @@ pip install --target /tmp/pylibs tzdata && PYTHONPATH=/tmp/pylibs python -m unit
   俄罗斯 179（覆盖 27 个 IANA 时区里的每一个，85 个联邦主体的首府与主要城市）、
   日本 110（47 都道府县厅所在地与政令市）。表内条目都映射到真实 IANA 时区名，夏令时由
   IANA 数据自己处理。
+- 这张表拿 GeoNames cities500 完整文件（235,808 行）逐条对过时区归属与覆盖率：人口≥1 万的
+  中国城市只剩 9 个乡镇级重名条目未收，俄罗斯与日本零缺失；与 GeoNames 不一致的 28 条
+  逐条有结论（新疆按北京时间是既定选择、汉德加以 IANA 自己的注释为准），其中 2 条按核对
+  改正（滕达、比利比诺）。
 - **表里没有的地方直接填 IANA 时区名**：`Asia/Ho_Chi_Minh`、`America/New_York`、
   `Europe/Berlin` 都能用（v2.15.1 起）。她说出来的是中文城市名（「你在伏尔加格勒」），
   不是 `Europe/Volgograd` 这种代码。
