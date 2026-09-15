@@ -113,16 +113,7 @@ def build_contract(core: Any) -> dict[str, Any]:
         # 日程是按哪个 AstrBot 人设排的：社交层靠它确认两边用的是同一个人。
         "persona": str(core.schedule.status().get("persona", "") or ""),
         # 作息：社交层靠它知道她睡够没睡够，诊断靠它提示两套时间不一致。
-        "routine": {
-            "night_start_hour": cfg.night_start_hour,
-            "night_end_hour": cfg.night_end_hour,
-            "night_span_hours": round(cfg.night_span_hours, 2),
-            "sleep_need_hours": cfg.sleep_need_hours,
-            "wake_at": schedule_wake_text(slots),
-            "sleep_spans": [
-                f"{s.get('start')}-{s.get('end')} {s.get('event')}" for s in sleep_spans(slots)
-            ],
-        },
+        "routine": _routine_block(core, cfg, slots),
         "weather": str((snap.get("weather") or {}).get("env", "")),
         # 契约里没有按用户的数据（1000 人时会把文件撑大）；这些路径是稳定承诺。
         "paths": {
@@ -131,6 +122,36 @@ def build_contract(core: Any) -> dict[str, Any]:
             "user_last_interaction": "roles.<bid>.users.<uid>.last_interaction",
             "user_said": "roles.<bid>.users.<uid>.said",
         },
+    }
+
+
+def _routine_block(core, cfg, slots) -> dict:
+    """作息：导出的是**她实际的**生物钟夜，不是配置里那个写死的窗口。
+
+    社交层读的就是 `night_start_hour` / `night_end_hour` 判断「她这会儿该不该睡」。字段名
+    不动、契约版本不动，值改成从她今天的日程推出来的窗口（`soma.biological_night()`）——
+    夜猫子人格凌晨四点睡，社交层就该按凌晨四点算，而不是按配置里的 23:00 硬判。
+    日程还没生成或没排睡眠段时才退回配置窗口，并用 `night_source` 说清是哪来的。
+    """
+    night = None
+    try:
+        night = core.soma.biological_night()
+    except Exception:
+        night = None
+    source = "schedule" if night else "config"
+    start, end = night if night else (float(cfg.night_start_hour), float(cfg.night_end_hour))
+    span = end - start if end > start else (24.0 - start) + end
+    return {
+        "night_start_hour": round(start % 24.0, 2),
+        "night_end_hour": round(end % 24.0, 2),
+        "night_span_hours": round(max(1.0, span), 2),
+        "night_source": source,
+        "configured_night": [cfg.night_start_hour, cfg.night_end_hour],
+        "sleep_need_hours": cfg.sleep_need_hours,
+        "wake_at": schedule_wake_text(slots),
+        "sleep_spans": [
+            f"{s.get('start')}-{s.get('end')} {s.get('event')}" for s in sleep_spans(slots)
+        ],
     }
 
 

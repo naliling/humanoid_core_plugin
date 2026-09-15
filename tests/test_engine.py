@@ -103,8 +103,8 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
             group_text = core.build_injection("42", is_group=True)
             private_text = core.build_injection("42", is_group=False)
             # enable_chat_awareness 必须真的影响注入：v2.13.2 里这个配置项没人读。
-            self.assertIn("群聊里", group_text)
-            self.assertIn("只有你和TA两个人", private_text)
+            self.assertIn("群聊", group_text)
+            self.assertIn("只有你和TA", private_text)
             self.assertIn("小明", private_text)
             self.assertIn("对TA的感觉", private_text)
             self.assertLessEqual(len(private_text), 520)

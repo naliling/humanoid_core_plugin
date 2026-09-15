@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +22,8 @@ from humanoid.data.cities import DEFAULT_CITY_PLACEHOLDER, lookup_city_time
 from humanoid.data.cities import resolve_zone_name as table_zone
 from humanoid.link import build_contract
 from humanoid.prompt_builder import (
-    BOUNDARY_LINE,
-    PERMISSION_LINE,
+    FRAMING_TEXT,
+    MARK_PREFIX,
     PromptBuilder,
 )
 from humanoid.state import StateStore
@@ -111,35 +112,88 @@ class InjectionFreedomTest(unittest.TestCase):
         """去掉禁令不等于去掉身体：她此刻的处境还得说得出。"""
         core = self.wrecked_body(self.core())
         text = core.build_injection("42", is_group=False)
-        self.assertIn("字上下的量", text)
-        self.assertIn("上面这些是你的身体", text)
-        self.assertIn("你自己定", text)
+        self.assertIn("【感觉】", text)
+        self.assertIn("【对TA】", text)
+        self.assertIn("【此刻】", text)
+        # 但「这副身体这会儿只够说一两句，20字上下的量」那种形式限制不许回来：
+        # 插件拦不住她说话，写出来只是让她猜规矩。
+        for gone in ("字上下的量", "只够说一两句", "再多就散了", "展开不了一段长篇"):
+            self.assertNotIn(gone, text, f"形式限制又回来了：{gone}")
 
-    def test_boundary_line_is_a_frame_not_an_order(self):
-        self.assertNotIn("别", BOUNDARY_LINE)
-        self.assertNotIn("不要", BOUNDARY_LINE)
-        self.assertNotIn("必须", BOUNDARY_LINE)
-        self.assertIn("台词", BOUNDARY_LINE)
+    def test_scene_name_and_time_are_always_there(self):
+        """必需品三样：时间、称呼、场景（群聊还是私聊）。三档都得有。"""
+        for mode in ("low", "full", "mood_only"):
+            core = self.core(mode=mode)
+            core.mood.set_nickname("42", "小鱼")
+            text = core.build_injection("42", is_group=False)
+            self.assertIn("私聊", text, f"{mode} 档没告诉她这是私聊：\n{text}")
+            self.assertIn("15:20", text, f"{mode} 档没给她时间：\n{text}")
+            self.assertIn("你管TA叫小鱼", text, f"{mode} 档没给她称呼：\n{text}")
+            group = core.build_injection("42", is_group=True)
+            self.assertIn("群聊", group, f"{mode} 档没告诉她这是群聊：\n{group}")
 
-    def test_permission_line_gives_the_call_back_to_her(self):
-        for word in ("不要", "必须", "别"):
-            self.assertNotIn(word, PERMISSION_LINE)
-        self.assertIn("你自己定", PERMISSION_LINE)
+    def test_framing_is_a_frame_not_an_order(self):
+        """给 system_prompt 的那段只讲「这些是什么、怎么读」，不含禁令也不含事实。"""
+        for word in ("不要", "必须", "别", "控制在", "只说", "回一句"):
+            self.assertNotIn(word, FRAMING_TEXT, f"框架句里出现了「{word}」")
+        self.assertIn("处境", FRAMING_TEXT)
+        self.assertIn(MARK_PREFIX, FRAMING_TEXT, "框架句要指得清它说的是哪几块")
+        for digit in ("%", "UTC+"):
+            self.assertNotIn(digit, FRAMING_TEXT)
+
+    def test_facts_block_carries_no_readings(self):
+        core = self.wrecked_body(self.core(mode="full"))
+        text = core.build_injection("42", is_group=False)
+        for word in ("%", "UTC+", "Asia/", "Europe/", "/100", "0.", "好感度"):
+            self.assertNotIn(word, text, f"体检单读数又进上下文了：{word}\n{text}")
+
+    def test_interest_axes_read_as_states_not_numbers(self):
+        """三轴要变成状态词，而且不同用户、不同话，词不一样。"""
+        core = self.core()
+        builder = PromptBuilder(core)
+        mine = builder._relation_lines("42", False, detailed=False,
+                                       interest={"care": 0.9, "focus": 0.9, "spare": 0.9})
+        cold = builder._relation_lines("43", False, detailed=False,
+                                       interest={"care": 0.05, "focus": 0.05, "spare": 0.05})
+        self.assertTrue(any("要紧" in line or "不一样" in line or "记得住" in line for line in mine), mine)
+        self.assertTrue(
+            any(word in line for line in cold for word in ("不想搭理", "有点意见", "隔着")) or
+            any(word in line for line in cold for word in ("客气", "没那么熟", "端着")),
+            f"低在意度没说出距离感：{cold}")
+        self.assertNotEqual(mine, cold)
+        for line in mine + cold:
+            self.assertNotIn("0.", line, f"三轴把数值端上来了：{line}")
 
     def test_mood_hints_describe_the_heart_not_the_tone(self):
         from humanoid.prompt_builder import MOOD_TONE_HINTS
 
-        for label, hint in MOOD_TONE_HINTS.items():
-            self.assertNotIn("语气", hint, f"{label} 的语气提示又在教她说话：{hint}")
+        for label, hints in MOOD_TONE_HINTS.items():
+            joined = " ".join(hints)
+            self.assertNotIn("语气", joined, f"{label} 的心气提示又在教她说话：{joined}")
+            self.assertNotIn("必须", joined)
 
-    def test_truncation_tail_is_not_a_script(self):
-        """撑到上限时补的那句兜底也不该是命令。"""
-        core = self.core(mode="full")
-        core.clock = FrozenClock(MOMENT)
+    def test_truncation_keeps_whole_blocks_and_the_marker(self):
+        """撑到上限时按块丢：截在半句上模型会自己把那半句补下去。"""
+        core = self.core(mode="low")
         builder = PromptBuilder(core)
         text = builder._finish("【此刻】" + "很长的一段背景。" * 200, cfg())
-        self.assertTrue(any(line.startswith("（以上") for line in text.split("\n")), text)
-        self.assertIn("不用原样说给对方听", text)
+        self.assertTrue(text.startswith(MARK_PREFIX), text[:60])
+        for line in text.split("\n")[1:]:
+            self.assertTrue(line.startswith("【") and line.endswith("。"), f"半块被截进来了：{line}")
+        self.assertNotIn("不必逐条回应", text, "兜底话该在 system_prompt 里，不该每条消息重复")
+
+    def test_gap_is_an_experience_not_a_stopwatch(self):
+        """间隔三段：隔了多久 + TA那句原话 + 她这期间干了什么。"""
+        core = self.core()
+        core.behavior.add_event("42", {
+            "type": "user_returned", "timestamp": time.time(), "importance": 0.7,
+            "data": {"gap_seconds": 3 * 3600 + 12 * 60, "previous_message": "我先去开会"},
+        })
+        text = core.build_injection("42", is_group=False)
+        self.assertIn("3 小时 12 分", text)
+        self.assertIn("我先去开会", text)
+        self.assertIn("这期间她", text, "她这期间在自己过日子，这一条才是「这么久了」的凭据")
+        self.assertNotIn("这是一次性的背景", text)
 
 
 class ZoneNameTest(unittest.TestCase):

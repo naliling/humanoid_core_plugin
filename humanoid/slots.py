@@ -225,6 +225,41 @@ def coverage_is_complete(slots: Iterable[Slot]) -> bool:
     return seen and cursor == DAY_MINUTES
 
 
+def sleep_window_minutes(slots: Iterable[Slot]) -> tuple[int, int] | None:
+    """日程里最长的那一段觉，返回 (起始分钟, 结束分钟)；跨午夜时 end < start。
+
+    soma 的昼夜低谷与睡眠债记账、schedule 的「她几点起」、契约导出的生物钟夜都从这里取，
+    否则同一个「她的睡眠区间」会有三套算法，早上她睡着没睡就说不清了。
+    模型常把一夜拆成 23:30→24:00 与 00:00→07:00 两段，所以先把首尾相接的段并起来，
+    再把 24:00 与 00:00 那个缝接上。
+    """
+    segs: list[list[int]] = []
+    for slot in slots or []:
+        event = slot.get("event") if isinstance(slot, dict) else None
+        if is_meal_event(event) or not is_sleep_event(event):
+            continue
+        lo, hi = parse_time(slot.get("start")), parse_time(slot.get("end"))
+        if lo is None or hi is None or hi <= lo:
+            continue
+        segs.append([lo, hi])
+    if not segs:
+        return None
+    segs.sort()
+    merged = [segs[0]]
+    for lo, hi in segs[1:]:
+        if lo <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    if len(merged) > 1 and merged[-1][1] >= DAY_MINUTES and merged[0][0] == 0:
+        merged[0][0] = merged[-1][0] - DAY_MINUTES
+        merged.pop()
+    best = max(merged, key=lambda seg: seg[1] - seg[0])
+    if best[1] - best[0] < 30:
+        return None
+    return best[0] % DAY_MINUTES, best[1] % DAY_MINUTES
+
+
 def find_slot(slots: Iterable[Slot], minutes: int) -> Slot:
     minutes = max(0, min(DAY_MINUTES - 1, int(minutes)))
     fallback: Slot = {

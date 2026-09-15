@@ -21,7 +21,7 @@ from humanoid.services.schedule import (
     schedule_wake_text,
 )
 from humanoid.services.soma import SomaService
-from humanoid.slots import coverage_is_complete, find_slot, normalize_slots
+from humanoid.slots import coverage_is_complete, find_slot, is_sleep_event, normalize_slots
 
 from .fakes import FrozenClock, ScopeStore
 
@@ -246,10 +246,12 @@ class AlignSleepToNightWindowTest(unittest.TestCase):
         self.assertEqual(align_sleep_to_night(base, config), base)
 
     def test_evening_routine_before_bedtime_is_named_after_itself(self):
+        """睡前那一格叫「洗漱与护肤」就该保持这个名字：它不是觉，别被改名、更别被当成在睡。"""
         config = cfg()
         aligned = align_sleep_to_night(normalize_slots(FALLBACK_TEMPLATES[0], max_slots=16), config)
         slot = find_slot(aligned, 22 * 60 + 30)
-        self.assertEqual(slot["event"], "夜间洗漱")
+        self.assertEqual(slot["event"], "夜间洗漱与护肤")
+        self.assertFalse(is_sleep_event(slot["event"]), "把睡前流程算成睡眠，她就 22 点起再没醒过")
 
 
 class RoutinePromptTest(unittest.TestCase):
@@ -263,9 +265,22 @@ class RoutinePromptTest(unittest.TestCase):
         self.assertIn("赖床", routine_prompt(cfg(sleep_need_hours=8.0)))
         self.assertNotIn("赖床", routine_prompt(cfg(night_start_hour=22, night_end_hour=8)))
 
-    def test_prompt_silent_when_not_following(self):
-        self.assertEqual(routine_prompt(cfg(schedule_follow_night_window=False)), "")
-        self.assertEqual(routine_prompt(cfg(night_mode_enabled=False)), "")
+    def test_prompt_lets_the_persona_choose_her_routine(self):
+        """不锁窗口时不再写「必须 23:00 上床」，但也不能什么都不说——那会退回模型的直觉。"""
+        free = routine_prompt(cfg(schedule_follow_night_window=False))
+        self.assertNotIn("必须遵守", free)
+        self.assertNotIn("23:00 上床", free)
+        self.assertIn("由她是谁决定", free)
+        self.assertIn("夜猫子", free)
+        # 关掉夜间模式只是不算生物钟夜，「几点睡由她自己定」这句照样该给模型——
+        # 不给的话模型会退回直觉，把所有人都排成 00:00→08:00。
+        self.assertIn("由她是谁决定", routine_prompt(cfg(night_mode_enabled=False)))
+        self.assertNotIn("锁定了", routine_prompt(cfg(night_mode_enabled=False)))
+
+    def test_locked_window_is_an_explicit_override(self):
+        locked = routine_prompt(cfg(schedule_follow_night_window=True))
+        self.assertIn("用户把她的作息锁定了", locked)
+        self.assertIn("23:00 上床", locked)
 
 
 if __name__ == "__main__":

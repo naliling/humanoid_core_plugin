@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional
 
 import aiohttp
 
@@ -39,7 +39,8 @@ HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 /拟人帮助 - 显示本帮助
 
 管理员指令：
-/拟人诊断 - 排查模型选择问题
+/拟人设置 - 看常用项；写成「/拟人设置 城市 大阪」就改一项，立即生效
+/拟人诊断 - 排查模型选择、时区是否真的生效、上下文多大
 /重置日程 - 立即重新生成今日日程
 /重置状态 - 重置精力、社交能量与生理周期
 /重置情绪 - 重置自己的情绪至初始值
@@ -52,7 +53,7 @@ NO_PERMISSION = "❌ 权限不足，该指令仅管理员可用。"
 
 # 默认值一次性迁移的标记文件。AstrBot 更新配置只补缺不覆盖，不调这一手的话老用户
 # 会永远停在装插件那一版的行为上。
-DEFAULTS_MIGRATION_MARK = ".defaults-migrated-v2.15"
+DEFAULTS_MIGRATION_MARK = ".defaults-migrated-v2.16.4"
 
 
 def _arg_after(text: str, command: str) -> str:
@@ -78,6 +79,123 @@ def _is_private_chat(event: AstrMessageEvent) -> bool:
             pass
     message_obj = getattr(event, "message_obj", None)
     return not bool(getattr(message_obj, "group_id", None))
+
+
+def _append_framing(req: Any) -> None:
+    """把「这些事实该怎么读」放进 system_prompt，一个请求只放一次。
+
+    AstrBot 在 `build_main_agent` 里先把人设写进 system_prompt，再跑 OnLLMRequestEvent
+    钩子，所以这里追加的内容排在人设后面；而初始 system 消息不会落进会话历史，
+    这段话不会越滚越多。
+    """
+    from .humanoid.prompt_builder import FRAMING_TEXT, MARK_PREFIX
+
+    current = getattr(req, "system_prompt", None)
+    if not isinstance(current, str):
+        current = ""
+    if MARK_PREFIX in current:
+        return
+    req.system_prompt = current + FRAMING_TEXT
+
+
+def _drop_stale_blocks(req: Any, current_text: str = "") -> int:
+    """从本次递出去的上下文里抹掉以前每一份身体事实块，返回抹掉了多少份。
+
+    事实块走的是用户消息后面，而 AstrBot 存的就是拼装后的用户消息，不清的话长对话里
+    会堆几十份过期状态（她上午很困、下午很饿，模型看到的是同时成立的十几条）。
+    只动 user 消息，只认自己那个标记开头的块，不碰用户真正说过的字。
+    """
+    from .humanoid.prompt_builder import MARK_PREFIX
+
+    contexts = getattr(req, "contexts", None)
+    if not isinstance(contexts, list):
+        return 0
+    removed = 0
+    for item in contexts:
+        if not isinstance(item, dict) or str(item.get("role", "")) != "user":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            index = content.find(MARK_PREFIX)
+            if index >= 0:
+                item["content"] = content[:index].rstrip()
+                removed += 1
+            continue
+        if not isinstance(content, list):
+            continue
+        kept: List[Any] = []
+        for part in content:
+            text = _part_text(part)
+            if text is None:
+                kept.append(part)
+                continue
+            index = text.find(MARK_PREFIX)
+            if index < 0:
+                kept.append(part)
+                continue
+            removed += 1
+            head = text[:index].rstrip()
+            if head:
+                _set_part_text(part, head)
+                kept.append(part)
+        if len(kept) != len(content):
+            # 只剩一个文本块时收回成纯字符串：content 要么是 str 要么是 parts 列表，
+            # 不能留一个单独的 part 对象在列表里（那不是合法的 OpenAI 消息体）。
+            only = _part_text(kept[0]) if len(kept) == 1 else None
+            item["content"] = only if only is not None else kept
+    return removed
+
+
+# 常用项里各类型的写法：布尔能接受 开/关/是/否/true/false，枚举认面板那几个值。
+_BOOL_WORDS = {
+    "开": True, "关": False, "是": True, "否": False, "on": True, "off": False,
+    "true": True, "false": False, "1": True, "0": False, "要": True, "不要": False,
+}
+_ENUM_WORDS = {
+    "inject_activity_context": {"low", "full", "mood_only"},
+    "environment_mode": {"private", "group", "both"},
+}
+
+
+def _coerce_setting(key: str, value: str, current: Any) -> Any:
+    """把命令行上的一句话翻成这一项该存的类型。认不出来时返回 None，让调用方报错。"""
+    text = (value or "").strip()
+    if isinstance(current, bool) or key in ("schedule_use_persona", "use_llm_schedule", "debug_mode"):
+        lowered = text.lower()
+        for word, flag in _BOOL_WORDS.items():
+            if lowered == word.lower():
+                return flag
+        return None
+    if key in _ENUM_WORDS:
+        lowered = text.lower()
+        return lowered if lowered in _ENUM_WORDS[key] else None
+    if key == "admin_qq":
+        items = [part.strip() for part in re.split(r"[,，\s]+", text) if part.strip()]
+        return items or None
+    if not text:
+        return None
+    return text
+
+
+def _part_text(part: Any) -> Optional[str]:
+    if isinstance(part, dict):
+        if str(part.get("type", "text")) not in ("text", ""):
+            return None
+        value = part.get("text")
+        return value if isinstance(value, str) else None
+    value = getattr(part, "text", None)
+    return value if isinstance(value, str) else None
+
+
+def _set_part_text(part: Any, value: str) -> bool:
+    if isinstance(part, dict):
+        part["text"] = value
+        return True
+    try:
+        part.text = value
+        return True
+    except Exception:
+        return False
 
 
 class HumanoidCore(Star):
@@ -288,7 +406,82 @@ class HumanoidCore(Star):
         core = self._core(event)
         yield event.plain_result(self.engine.diagnostics_text(core))
 
+    # 面板上 82 项、AstrBot 又不支持分组，改一个城市要翻半天。这一条命令只管常用那几项，
+    # 进阶项仍然去面板改——两边改的是同一份配置文件。
+    SETTINGS_ALIASES = {
+        "城市": "timezone_city",
+        "所在地": "timezone_city",
+        "人设": "schedule_use_persona",
+        "日程人设": "schedule_use_persona",
+        "模型日程": "use_llm_schedule",
+        "偏好": "schedule_prompt_extra",
+        "上下文": "inject_activity_context",
+        "环境": "environment_mode",
+        "管理员": "admin_qq",
+        "调试": "debug_mode",
+    }
+
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("拟人设置")
+    async def cmd_settings(self, event: AstrMessageEvent):
+        """`/拟人设置` 看常用项；`/拟人设置 城市 大阪` 改一项，改完立即生效。"""
+        if not self._is_admin(event):
+            yield event.plain_result(NO_PERMISSION)
+            return
+        raw = event.message_str or ""
+        argument = _arg_after(raw, "拟人设置")
+        if not argument:
+            yield event.plain_result(self._settings_summary())
+            return
+        parts = argument.replace("=", " ").replace("：", " ").split(None, 1)
+        key_word = parts[0] if parts else ""
+        value = parts[1].strip() if len(parts) > 1 else ""
+        key = self.SETTINGS_ALIASES.get(key_word)
+        if not key:
+            yield event.plain_result(
+                "不认识这一项。能改的：" + "、".join(self.SETTINGS_ALIASES)
+                + "\n例：/拟人设置 城市 大阪"
+            )
+            return
+        raw_config = self._config_box.raw
+        if not isinstance(raw_config, dict):
+            yield event.plain_result("配置不是可写的字典，这次没改。请去面板里改。")
+            return
+        current = raw_config.get(key)
+        new_value = _coerce_setting(key, value, current)
+        if new_value is None:
+            yield event.plain_result(f"「{value}」不是这一项能接受的值。当前值：{current!r}")
+            return
+        raw_config[key] = new_value
+        saved = True
+        save = getattr(raw_config, "save_config", None)
+        if callable(save):
+            try:
+                save()
+            except Exception as exc:
+                saved = False
+                logger.warning(f"{LOG_PREFIX} 设置写回失败: {exc}")
+        # 所有服务都拿 `lambda: box()` 读配置，换掉内部实例就全链路生效，不用逐个通知角色。
+        self._config_box.reload()
+        yield event.plain_result(
+            f"✅ {key_word} 已设为 {new_value!r}"
+            + ("（未能写入配置文件，重启后会回到旧值）" if not saved else "")
+        )
+
+    def _settings_summary(self) -> str:
+        cfg = self._config
+        lines = [f"⚙️ 常用设置（共 82 项，其余标了【进阶】，在面板里改）"]
+        lines.append(f"- 城市：{cfg.timezone_city or '（未定）'}　→ /拟人设置 城市 大阪")
+        lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人设置 人设 开")
+        lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}")
+        lines.append(f"- 日程额外偏好：{cfg.schedule_prompt_extra or '（空）'}")
+        lines.append(f"- 上下文详略：{cfg.inject_activity_context}（low/full/mood_only）")
+        lines.append(f"- 参与环境：{cfg.environment_mode}（private/group/both）")
+        lines.append(f"- 管理员：{cfg.admin_qq or '（未设，靠 AstrBot 全局 admins_id）'}")
+        lines.append(f"- 调试日志：{'开' if cfg.debug_mode else '关'}")
+        lines.append("改完立即生效；进阶项用 /重载配置 刷新。")
+        return "\n".join(lines)
+
     @filter.command("重载配置")
     async def cmd_reload(self, event: AstrMessageEvent):
         """热重载插件配置，无需重启。"""
@@ -393,9 +586,18 @@ class HumanoidCore(Star):
 
     @filter.on_llm_request()
     async def inject_context(self, event: AstrMessageEvent, req: ProviderRequest):
-        """
-        在每次 LLM 请求前动态注入上下文（时间、状态、情绪、间隔等）。
-        使用 extra_user_content_parts 避免污染 system_prompt，保证稳定性和缓存效率。
+        """身体与生活进上下文：事实进用户消息，「怎么读它」进 system_prompt。
+
+        为什么分两处：事实每条消息都在变，而 AstrBot 保存历史时存的是拼装后的用户
+        消息（`agent_sub_stages/internal.py` 里 `_save_to_history` 存的是 run_context.messages），
+        所以往 `extra_user_content_parts` 里塞东西会永久留在会话历史里——以前没人管过，
+        聊得越久历史里堆的过期身体状态越多。现在：
+
+        1. 拼新块之前先把上下文里旧的块抹掉（改的是本次递出去的历史，跟着一起落盘），
+           所以全程只有一份、永远是新鲜的；
+        2. 「这些事实是什么、按什么方式读」这段不随消息变的说明只进 system_prompt——
+           它是参考，不该被当成用户刚说的一句话。初始 system 消息不入历史（同一处代码
+           里 `skipped_initial_system` 就是干这个的）。
         """
         try:
             is_group = not _is_private_chat(event)
@@ -403,8 +605,9 @@ class HumanoidCore(Star):
                 return
             core = self.role_manager.get_or_create(self._self_id(event))
             user_id = self._sender(event)
-            # 时间间隔由 Core.on_message 统一记账。这里严格只读取并构建注入内容。
-            injection = core.build_injection(user_id, is_group=is_group)
+            text = (getattr(event, "message_str", "") or "").strip()
+            # 时间间隔由 Core.on_message 统一记账，这里只读。
+            injection = core.build_injection(user_id, is_group=is_group, text=text)
 
             if self._config.debug_mode:
                 from .humanoid.prompt_builder import estimate_tokens
@@ -414,13 +617,19 @@ class HumanoidCore(Star):
                     f" ≈{estimate_tokens(injection)} token（{self._config.inject_activity_context} 档）:\n{injection}"
                 )
 
-            # ★★★ 关键优化：使用 extra_user_content_parts，不修改 system_prompt ★★★
-            if not hasattr(req, 'extra_user_content_parts'):
-                req.extra_user_content_parts = []
-            # 确保是列表
-            if not isinstance(req.extra_user_content_parts, list):
-                req.extra_user_content_parts = []
-            req.extra_user_content_parts.append(TextPart(text=injection))
+            _append_framing(req)
+            if injection:
+                stale = _drop_stale_blocks(req, text)
+                if stale:
+                    logger.debug(f"{LOG_PREFIX} 从上下文里抹掉 {stale} 份旧的身体事实块")
+                if hasattr(req, "extra_user_content_parts"):
+                    parts = getattr(req, "extra_user_content_parts", None)
+                    if not isinstance(parts, list):
+                        parts = []
+                        req.extra_user_content_parts = parts
+                    parts.append(TextPart(text=injection))
+                else:  # 老版本 AstrBot 没这个字段：退回 system_prompt，至少事实是新鲜的。
+                    req.system_prompt = f"{getattr(req, 'system_prompt', '') or ''}\n{injection}"
 
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 注入失败: {e}")

@@ -17,6 +17,8 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
+from .cities_bulk import _BULK_BY_ZONE
+
 DEFAULT_CITY_PLACEHOLDER = "河源（记得改~）"
 
 _ZONE_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+-]*/[A-Za-z0-9_/+-]+")
@@ -326,13 +328,111 @@ _CHINA_PROVINCES = {
 }
 
 # 俄罗斯联邦主体名（与首府不同名的那些）：按首府所在时区。偏移自 2014 年起固定，无夏令时。
-_RUSSIA_SUBJECTS = {
-    "楚瓦什": "Europe/Moscow", "莫尔多瓦": "Europe/Moscow",
-    "马里埃尔": "Europe/Moscow", "卡巴尔达-巴尔卡尔": "Europe/Moscow",
-    "卡拉恰伊-切尔克斯": "Europe/Moscow", "北奥塞梯-阿兰": "Europe/Moscow",
-    "汉特-曼西": "Asia/Yekaterinburg", "亚马尔-涅涅茨": "Asia/Yekaterinburg",
-    "萨哈（雅库特）": "Asia/Yakutsk", "伊尔库茨克州": "Asia/Irkutsk",
-}
+# 俄罗斯 85 个联邦主体：一个主体的名字本身就是一串地名（「斯维尔德洛夫斯克」不是城，
+# 「萨哈林」也不是城），光有城市表就会「斯维尔德洛夫斯克州」认不出、静默退回机器时间。
+# 时区一律按**首府**给：主体内部跨区的（萨哈共和国跨 3 个区、鄂木斯克与克拉斯诺亚尔斯克
+# 边界）以首府所在的那个为准，这是人能说清楚的最近答案。
+# (裸名, 官方写法, 首府) —— 首府必须已在上面的城市表里，tests/test_v216_facts.py 逐项卡着。
+_RUSSIA_SUBJECT_ROWS = (
+    ("阿迪格", "阿迪格共和国", "迈科普"),
+    ("阿尔泰共和国", "阿尔泰共和国", "戈尔诺-阿尔泰斯克"),
+    ("巴什科尔托斯坦", "巴什科尔托斯坦共和国", "乌法"),
+    ("布里亚特", "布里亚特共和国", "乌兰乌德"),
+    ("达吉斯坦", "达吉斯坦共和国", "马哈奇卡拉"),
+    ("印古什", "印古什共和国", "马加斯"),
+    ("卡巴尔达-巴尔卡尔", "卡巴尔达-巴尔卡尔共和国", "纳尔奇克"),
+    ("卡尔梅克", "卡尔梅克共和国", "埃利斯塔"),
+    ("卡拉恰伊-切尔克斯", "卡拉恰伊-切尔克斯共和国", "切尔克斯克"),
+    ("卡累利阿", "卡累利阿共和国", "彼得罗扎沃茨克"),
+    ("克里米亚", "克里米亚共和国", "辛菲罗波尔"),
+    ("科米", "科米共和国", "瑟克特夫卡尔"),
+    ("马里埃尔", "马里埃尔共和国", "约什卡尔奥拉"),
+    ("莫尔多瓦", "莫尔多瓦共和国", "萨兰斯克"),
+    ("北奥塞梯-阿兰", "北奥塞梯-阿兰共和国", "弗拉季高加索"),
+    ("鞑靼斯坦", "鞑靼斯坦共和国", "喀山"),
+    ("图瓦", "图瓦共和国", "克孜勒"),
+    ("乌德穆尔特", "乌德穆尔特共和国", "伊热夫斯克"),
+    ("哈卡斯", "哈卡斯共和国", "阿巴坎"),
+    ("车臣", "车臣共和国", "格罗兹尼"),
+    ("楚瓦什", "楚瓦什共和国", "切博克萨雷"),
+    ("萨哈", "萨哈共和国", "雅库茨克"),
+    ("雅库特", "雅库特", "雅库茨克"),
+    ("阿尔泰", "阿尔泰边疆区", "巴尔瑙尔"),
+    ("外贝加尔", "外贝加尔边疆区", "赤塔"),
+    ("堪察加", "堪察加边疆区", "彼得罗巴甫洛夫斯克"),
+    ("哈巴罗夫斯克", "哈巴罗夫斯克边疆区", "伯力"),
+    ("克拉斯诺达尔", "克拉斯诺达尔边疆区", "克拉斯诺达尔"),
+    ("彼尔姆", "彼尔姆边疆区", "彼尔姆"),
+    ("滨海", "滨海边疆区", "海参崴"),
+    ("斯塔夫罗波尔", "斯塔夫罗波尔边疆区", "斯塔夫罗波尔"),
+    ("阿穆尔", "阿穆尔州", "布拉戈维申斯克"),
+    ("阿尔汉格尔斯克", "阿尔汉格尔斯克州", "阿尔汉格尔斯克"),
+    ("阿斯特拉罕", "阿斯特拉罕州", "阿斯特拉罕"),
+    ("别尔哥罗德", "别尔哥罗德州", "别尔哥罗德"),
+    ("布良斯克", "布良斯克州", "布良斯克"),
+    ("弗拉基米尔", "弗拉基米尔州", "弗拉基米尔"),
+    ("伏尔加格勒", "伏尔加格勒州", "伏尔加格勒"),
+    ("沃洛格达", "沃洛格达州", "沃洛格达"),
+    ("沃罗涅日", "沃罗涅德州", "沃罗涅日"),
+    ("伊万诺沃", "伊万诺沃州", "伊万诺沃"),
+    ("伊尔库茨克", "伊尔库茨克州", "伊尔库茨克"),
+    ("加里宁格勒", "加里宁格勒州", "加里宁格勒"),
+    ("卡卢加", "卡卢加州", "卡卢加"),
+    ("基洛夫", "基洛夫州", "基洛夫"),
+    ("科斯特罗马", "科斯特罗马州", "科斯特罗马"),
+    ("库尔干", "库尔干州", "库尔干"),
+    ("库尔斯克", "库尔斯克州", "库尔斯克"),
+    ("列宁格勒", "列宁格勒州", "加特契纳"),
+    ("利佩茨克", "利佩茨克州", "利佩茨克"),
+    ("马加丹", "马加丹州", "马加丹"),
+    ("莫斯科", "莫斯科州", "莫斯科"),
+    ("摩尔曼斯克", "摩尔曼斯克州", "摩尔曼斯克"),
+    ("下诺夫哥罗德", "下诺夫哥罗德州", "下诺夫哥罗德"),
+    ("诺夫哥罗德", "诺夫哥罗德州", "大诺夫哥罗德"),
+    ("新西伯利亚", "新西伯利亚州", "新西伯利亚"),
+    ("鄂木斯克", "鄂木斯克州", "鄂木斯克"),
+    ("奥伦堡", "奥伦堡州", "奥伦堡"),
+    ("奥廖尔", "奥廖尔州", "奥廖尔"),
+    ("奔萨", "奔萨州", "奔萨"),
+    ("普斯科夫", "普斯科夫州", "普斯科夫"),
+    ("罗斯托夫", "罗斯托夫州", "罗斯托夫"),
+    ("梁赞", "梁赞州", "梁赞"),
+    ("萨马拉", "萨马拉州", "萨马拉"),
+    ("萨拉托夫", "萨拉托夫州", "萨拉托夫"),
+    ("萨哈林", "萨哈林州", "南萨哈林斯克"),
+    ("斯维尔德洛夫斯克", "斯维尔德洛夫斯克州", "叶卡捷琳堡"),
+    ("坦波夫", "坦波夫州", "坦波夫"),
+    ("特维尔", "特维尔州", "特维尔"),
+    ("托木斯克", "托木斯克州", "托木斯克"),
+    ("图拉", "图拉州", "图拉"),
+    ("秋明", "秋明州", "秋明"),
+    ("乌里扬诺夫斯克", "乌里扬诺夫斯克州", "乌里扬诺夫斯克"),
+    ("车里雅宾斯克", "车里雅宾斯克州", "车里雅宾斯克"),
+    ("雅罗斯拉夫尔", "雅罗斯拉夫尔州", "雅罗斯拉夫尔"),
+    ("斯摩棱斯克", "斯摩棱斯克州", "斯摩棱斯克"),
+    ("克麦罗沃", "克麦罗沃州", "克麦罗沃"),
+    ("圣彼得堡", "圣彼得堡", "圣彼得堡"),
+    ("塞瓦斯托波尔", "塞瓦斯托波尔", "塞瓦斯托波尔"),
+    ("犹太", "犹太自治州", "比罗比詹"),
+    ("比罗比詹", "比罗比詹", "比罗比詹"),
+    ("涅涅茨", "涅涅茨自治区", "纳尔扬-马尔"),
+    ("汉特-曼西", "汉特-曼西自治区", "汉特-曼西斯克"),
+    ("楚科奇", "楚科奇自治区", "阿纳德尔"),
+    ("亚马尔-涅涅茨", "亚马尔-涅涅茨自治区", "萨列哈尔德"),
+)
+
+
+def _russia_subjects(table: dict[str, str]) -> dict[str, str]:
+    """把上面的行展开成「主体名（含官方写法）→ 首府所在时区」。"""
+    out: dict[str, str] = {}
+    for bare, official, capital in _RUSSIA_SUBJECT_ROWS:
+        zone = table.get(capital)
+        if not zone:                      # 首府没进表：宁可这个主体名认不出（会明说），
+            continue                      # 也不要猜一个时区给她过。
+        out.setdefault(bare, zone)
+        out.setdefault(official, zone)
+    return out
+
 
 # 日本 47 都道府县：全国唯一区时 UTC+9（包小笠原），所以整张表同一个值。
 _JAPAN_PREFECTURES = {name: _JAPAN_ZONE for name in (
@@ -353,6 +453,44 @@ _EXTRA_ALIASES = {
     "约什卡尔奥拉": "Europe/Moscow", "萨兰斯克": "Europe/Moscow",
     "纳尔扬-马尔": "Europe/Moscow", "加特契纳": "Europe/Moscow",
     "亚速": "Europe/Moscow", "乌辛斯克": "Europe/Moscow",
+    # 阿斯塔纳：tzdata 2024f 才有独立的 Asia/Astana，老机器上只有 Asia/Almaty，
+    # 两者今天同为 UTC+5，填后者不会在老 tzdata 上静默退回机器时间。
+    "阿斯塔纳": "Asia/Almaty",
+    "维堡": "Europe/Moscow", "佩韦克": "Asia/Vladivostok",
+    # 2005-2008 年合并掉的旧主体名，上了年纪的人还会这么写
+    "堪察加州": "Asia/Kamchatka", "赤塔州": "Asia/Chita",
+    "科米亚科米共和国": "Europe/Moscow",
+    "八户": "Asia/Tokyo", "轻井泽": "Asia/Tokyo", "都江堰": "Asia/Shanghai",
+}
+
+# 批量表只收到县级以上驻地，但人报出地名时不会按行政区划级别说话：她说「我在乌镇」
+# 就是在乌镇。这些乡镇/景区级的名字进手写表，一个一个人过，不拿人口阈值卡。
+_FAMOUS_PLACES = {
+    "乌镇": "Asia/Shanghai", "西塘": "Asia/Shanghai", "周庄": "Asia/Shanghai",
+    "同里": "Asia/Shanghai", "凤凰古城": "Asia/Shanghai", "芙蓉镇": "Asia/Shanghai",
+    "镇远": "Asia/Shanghai", "黄姚": "Asia/Shanghai", "靖西": "Asia/Shanghai",
+    "开平碉楼": "Asia/Shanghai", "鼓浪屿": "Asia/Shanghai", "武当山": "Asia/Shanghai",
+    "黄山风景区": "Asia/Shanghai", "九寨沟": "Asia/Shanghai", "稻城": "Asia/Shanghai",
+    "亚丁": "Asia/Shanghai", "德格": "Asia/Shanghai", "色达": "Asia/Shanghai",
+    "额尔古纳": "Asia/Shanghai", "莫尔道嘎": "Asia/Shanghai", "北极村": "Asia/Shanghai",
+    "长汀": "Asia/Shanghai", "碛口": "Asia/Shanghai", "平遥古城": "Asia/Shanghai",
+    "梵净山": "Asia/Shanghai", "恩施": "Asia/Shanghai", "芒康": "Asia/Shanghai",
+    "雅鲁藏布": "Asia/Shanghai", "札达": "Asia/Shanghai", "墨脱": "Asia/Shanghai",
+    "庐山": "Asia/Shanghai", "三清山": "Asia/Shanghai", "武夷山": "Asia/Shanghai",
+    "泰山": "Asia/Shanghai", "华山": "Asia/Shanghai", "嵩山": "Asia/Shanghai",
+    "恒山": "Asia/Shanghai", "衡山": "Asia/Shanghai", "五台山": "Asia/Shanghai",
+    "峨眉山": "Asia/Shanghai", "普陀山": "Asia/Shanghai", "九华山": "Asia/Shanghai",
+    "长白山": "Asia/Shanghai", "天山": "Asia/Shanghai", "昆仑山": "Asia/Shanghai",
+    "祁连山": "Asia/Shanghai", "大理古城": "Asia/Shanghai", "丽江古城": "Asia/Shanghai",
+    "西双版纳": "Asia/Shanghai", "香格里拉": "Asia/Shanghai", "泸沽湖": "Asia/Shanghai",
+    "青海湖": "Asia/Shanghai", "茶卡": "Asia/Shanghai", "敦煌莫高窟": "Asia/Shanghai",
+    "三峡": "Asia/Shanghai", "张家界": "Asia/Shanghai", "阳朔西街": "Asia/Shanghai",
+    "三亚湾": "Asia/Shanghai", "海陵岛": "Asia/Shanghai", "漠河": "Asia/Shanghai",
+    "箱根": "Asia/Tokyo", "富士山": "Asia/Tokyo", "镰仓": "Asia/Tokyo",
+    "奈良公园": "Asia/Tokyo", "小樽": "Asia/Tokyo", "富良野": "Asia/Tokyo",
+    "登别": "Asia/Tokyo", "草津": "Asia/Tokyo", "由布院": "Asia/Tokyo",
+    "鸟取沙丘": "Asia/Tokyo", "严岛": "Asia/Tokyo", "屋久岛": "Asia/Tokyo",
+    "与那国": "Asia/Tokyo", "石垣": "Asia/Tokyo", "宫古岛": "Asia/Tokyo",
 }
 
 IANA_DISPLAY_NAMES = {
@@ -398,13 +536,31 @@ IANA_DISPLAY_NAMES = {
 }
 
 CITY_TO_TIMEZONE: dict[str, str] = {}
+
+# 先铺 GeoNames 批量表（县级以上的中国地名、日本市町村、有中文名的俄罗斯居民点），
+# 再让手写表盖上去：手写表里那些逐条对过 IANA 自注的结论（汉德加、滕达、比利比诺）
+# 不能被 GeoNames 的默认值顶掉。
+for _zone, _blob in _BULK_BY_ZONE.items():
+    for _name in _blob.split("|"):
+        # 单字名（柏、津、堺）不收：她打一个字多半是打错了，而不是在报地名。
+        if len(_name) >= 2:
+            CITY_TO_TIMEZONE[_name] = _zone
+
 CITY_TO_TIMEZONE.update(_CHINA)
 CITY_TO_TIMEZONE.update(_CHINA_PROVINCES)
 CITY_TO_TIMEZONE.update(_RUSSIA)
-CITY_TO_TIMEZONE.update(_RUSSIA_SUBJECTS)
 CITY_TO_TIMEZONE.update(_JAPAN)
 CITY_TO_TIMEZONE.update(_JAPAN_PREFECTURES)
 CITY_TO_TIMEZONE.update(_EXTRA_ALIASES)
+CITY_TO_TIMEZONE.update(_FAMOUS_PLACES)
+# 联邦主体名要在城市表齐了之后才能按首府推。
+_RUSSIA_SUBJECTS = _russia_subjects(CITY_TO_TIMEZONE)
+CITY_TO_TIMEZONE.update(_RUSSIA_SUBJECTS)
+# 她说「你在雷克雅未克」，下一句就该能把「雷克雅未克」填回去：显示名反着进表。
+for _zone, _display in IANA_DISPLAY_NAMES.items():
+    for _alias in (_display, _display.split("（")[0].strip()):
+        if _alias and _alias not in CITY_TO_TIMEZONE:
+            CITY_TO_TIMEZONE[_alias] = _zone
 
 
 def _looks_like_zone_name(raw: str) -> bool:

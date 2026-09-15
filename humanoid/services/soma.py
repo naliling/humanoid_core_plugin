@@ -23,7 +23,8 @@ from typing import Any
 
 from ..config import HumanoidConfig
 from ..role_scope import RoleScope
-from ..slots import is_meal_event, is_sleep_event
+from ..slots import is_meal_event, is_sleep_event, sleep_window_minutes
+from ..wording import FEELING_WORDS, pick, scale_word
 
 # 一次补算最多推进多久。插件停机一周后重启，不该攒出「睡眠压力 5000」。
 MAX_CATCHUP_HOURS = 72.0
@@ -49,6 +50,17 @@ def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
 
 def _rounded(value: float) -> float:
     return round(value, 2)
+
+
+def _sleep_window(slots: list[dict]) -> tuple[float, float] | None:
+    """日程里那段觉的小时表示；判定与合并都在 `slots.sleep_window_minutes`。"""
+    window = sleep_window_minutes(slots)
+    if window is None:
+        return None
+    start, end = window
+    if end == start:
+        return None
+    return start / 60.0, end / 60.0
 
 
 class SomaService:
@@ -224,12 +236,13 @@ class SomaService:
             pressure += self.circadian_dip(hour_of_day) * 4.0 * hours
             self._set("sleep_pressure", pressure)
             if in_night:
-                # 该睡的时候醒着 = 在欠睡。夜间窗口比 sleep_need_hours 短的人，同样熬一小时
-                # 更补不回来，所以按 cfg.sleep_debt_gain_per_hour 放大。封顶 SLEEP_DEBT_CAP：
-                # 欠到一定程度之后多欠的部分已经反映在困意里，再堆只会让后面的系数失去区分度。
+                # 该睡的时候醒着 = 在欠睡。窗口比她一晚需要的睡眠短的人，同样熬一小时
+                # 更补不回来。封顶 SLEEP_DEBT_CAP：欠到一定程度后多欠的部分已经反映在
+                # 困意里，再堆只会让后面的系数失去区分度。
+                gain = min(3.0, max(1.0, cfg.sleep_need_hours / self._night_span_hours()))
                 debt = min(
                     SLEEP_DEBT_CAP,
-                    self._get("sleep_debt", 0.0) + hours * cfg.sleep_debt_gain_per_hour,
+                    self._get("sleep_debt", 0.0) + hours * gain,
                 )
                 self.data["sleep_debt"] = _rounded(debt)
             if self.data.get("asleep_since") is not None:
@@ -298,11 +311,42 @@ class SomaService:
         self.data["last_wake_at"] = _rounded(moment.timestamp())
         self.data["sitting_since"] = _rounded(moment.timestamp())
 
-    def _in_biological_night(self, hour_of_day: float) -> bool:
+    def biological_night(self) -> tuple[float, float] | None:
+        """她的生物钟夜里是哪一段：**(起始小时, 结束小时)**，跨午夜用 start > end 表示。
+
+        优先按她自己今天那份日程里最长的连续睡眠段推，日程没排睡眠（或还没生成）才退回
+        配置里的夜间窗口。以前是反过来的：日程被 `align_sleep_to_night` 切到 23:00→06:00
+        上去，夜猫子人格凌晨四点睡、十一点起，身体却按早上六点算“该醒了”，低谷也摆在
+        下午——那等于一个固定窗口替所有人决定几点睡。
+        """
         cfg = self.config
-        if not cfg.night_mode_enabled:
+        window = _sleep_window(self._slots())
+        if window is None:
+            if not cfg.night_mode_enabled or cfg.night_start_hour == cfg.night_end_hour:
+                return None
+            return float(cfg.night_start_hour), float(cfg.night_end_hour)
+        return window
+
+    def _night_span_hours(self) -> float:
+        night = self.biological_night()
+        if night is None:
+            return max(1.0, self.config.night_span_hours)
+        start, end = night
+        span = end - start if end > start else (24.0 - start) + end
+        return max(1.0, min(16.0, span))
+
+    def _night_mid_hour(self) -> float:
+        night = self.biological_night()
+        if night is None:
+            return self.config.night_mid_hour
+        start, end = night
+        return ((start + (end + 24.0 if end < start else end)) / 2.0) % 24.0
+
+    def _in_biological_night(self, hour_of_day: float) -> bool:
+        night = self.biological_night()
+        if night is None:
             return False
-        start, end = cfg.night_start_hour, cfg.night_end_hour
+        start, end = night
         if start == end:
             return False
         if start < end:
@@ -357,9 +401,12 @@ class SomaService:
     # ------------------------------------------------------------------
 
     def circadian_dip(self, hour_of_day: float) -> float:
-        """昼夜低谷强度 0~1：生物钟夜里中点后最低，午后有个次低谷，其余时段清醒。"""
+        """昼夜低谷强度 0~1：生物钟夜里中点后最低，午后有个次低谷，其余时段清醒。
+
+        锚点用的是 `biological_night()`——她自己的日程里那段觉的中点，不是配置里那个
+        写死的 23→6。低谷摆错位会让她下午 5 点最想睡、凌晨 3 点最清醒。"""
         cfg = self.config
-        anchor = cfg.night_mid_hour
+        anchor = self._night_mid_hour()
         # 主低谷：生物钟夜里中点后 2 小时左右（核心体温最低点）。
         main = (hour_of_day - (anchor + 3.0)) % 24.0
         main_cost = min(main, 24.0 - main)
@@ -413,57 +460,91 @@ class SomaService:
     # ------------------------------------------------------------------
 
     def feelings(self, energy: float) -> list[tuple[float, str]]:
-        """(显著度 0~1, 第一人称体感)。显著度用于门控，只挑最高的几条注入。"""
+        """(显著度 0~1, 体感一句话)。只说身体现在是什么状态。
+
+        v2.16.3 之前这里每条都是整句硬编码（「眼皮很沉，句子不想写长，脑子转不动」）：
+        前半句是身体，后半句已经是插件替她决定怎么开口。现在只留身体那半句，而且程度
+        从轴值里挑、措辞按天抽签（见 `wording.py`），不再是一天二十四小时同一句稿子。
+        显著度也由数值算，不再手写——不然「有点饿」和「饿得难受」在门控眼里一样重。
+        """
         out: list[tuple[float, str]] = []
         snap = self.snapshot()
         cfg = self.config
+        seed = [self._scope.role_id, self._today_key()]
 
-        pressure = snap["sleep_pressure"]
-        if pressure >= 88:
-            out.append((0.95, "眼皮很沉，句子不想写长，脑子转不动"))
-        elif pressure >= 72:
-            out.append((0.75, "困意上来了，说话开始有气无力"))
-        elif pressure >= 55:
-            out.append((0.45, "有点想睡了"))
+        def say(kind: str, value: float, floor: float, span: float, top: float) -> str:
+            ladder = FEELING_WORDS.get(kind) or []
+            word = pick(kind, seed + [round(value / 5.0)], scale_word(value, ladder))
+            if word and value >= floor:
+                out.append((_clamp((value - floor) / span, 0.0, top), word))
+            return word
+
+        say("sleepy", snap["sleep_pressure"], 50.0, 45.0, 0.95)
 
         debt = snap["sleep_debt"]
-        if debt >= 4.0:
-            out.append((0.85, f"欠的觉还没补回来，整个人是钝的"))
-        elif debt >= 1.5:
-            out.append((0.55, "昨晚没睡够，今天有点缓不过来"))
+        if debt >= 1.0:
+            say("debt", debt, 1.0, 5.0, 0.85)
 
         if snap["asleep"] >= 1.0:
-            out.append((0.9, "正在睡着，被吵醒的话只会迷迷糊糊说一两句"))
+            # 只是事实：按她自己的日程，这段时间是她的睡眠时段。怎么回应别人是她的事。
+            out.append((0.9, pick("asleep", seed, (
+                "按她自己排的日程，这会儿是她的睡眠时段",
+                "她的日程上此刻写着睡觉",
+                "这段时间她自己排的是觉",
+            ))))
 
-        hunger = snap["hunger"]
-        if hunger >= 88:
-            out.append((0.8, "肚子饿得有点难受，没什么耐心聊复杂的事"))
-        elif hunger >= 60:
-            out.append((0.45, "有点饿了"))
+        say("hunger", snap["hunger"], 55.0, 45.0, 0.8)
 
         discomfort = snap["discomfort"]
         if discomfort >= 62:
-            out.append((0.85, "身上不太舒服，只想安静待着"))
+            say("discomfort", discomfort, 60.0, 40.0, 0.85)
         elif discomfort >= 38:
-            out.append((0.5, _pick_discomfort_text(self, cfg)))
+            out.append((0.5, _pick_discomfort_text(self, cfg, seed)))
 
         if snap["arousal"] >= 78 and energy < 45:
-            out.append((0.6, "其实很累，但精神还有点亢，安静不下来"))
+            out.append((0.6, pick("wired", seed, (
+                "其实很累，但精神还有点亢",
+                "身体困着，人却静不下来",
+                "累和醒同时在身上",
+            ))))
         elif snap["arousal"] <= 22 and energy >= 55:
-            out.append((0.4, "提不起劲，得有人说点什么我才动得了"))
+            out.append((0.4, pick("flat", seed, (
+                "提不起劲",
+                "人不难受但就是不想动",
+                "身上是懒的",
+            ))))
 
         if int(self.data.get("ignored_streak", 0) or 0) >= 3:
-            out.append((0.5, "主动找TA几次都没回，不太想先开口了"))
+            out.append((0.5, pick("ignored", seed, (
+                "主动找TA几次都没回",
+                "前几次都是她先开的口，都没下文",
+                "连着几次没接上话",
+            ))))
 
         if cfg.enable_cycle:
             day = int(self._scope.get_self("current_cycle_day", 1) or 1)
             phase = cfg.cycle_phase_index(day)
             if phase == 0 and discomfort >= 30:
-                out.append((0.7, "肚子坠着疼，情绪也比平时薄"))
+                out.append((0.7, pick("cycle_period", seed, (
+                    "肚子坠着疼",
+                    "小腹坠得难受",
+                    "身上来事的那几天",
+                ))))
             elif phase == 2:
-                out.append((0.35, "今天身上比较松快，做事有劲"))
+                out.append((0.35, pick("cycle_good", seed, (
+                    "今天身上比较松快",
+                    "身上没毛病，做事有劲",
+                    "这几天状态最好",
+                ))))
 
         return out
+
+    def _today_key(self) -> str:
+        """措辞抽签用的「今天」：拿她自己城市的日期，跨午夜那天换一套说法。"""
+        try:
+            return self._clock.today_str()
+        except Exception:
+            return ""
 
     def form_policy(self, energy: float, social_energy: float) -> dict[str, Any]:
         """身体这一轮够得着多大份量：只算状态，不是给她的规矩，也不碰内容。"""
@@ -578,13 +659,14 @@ def _extract_celsius(text: str) -> float | None:
     return None
 
 
-def _pick_discomfort_text(soma: SomaService, cfg: HumanoidConfig) -> str:
+def _pick_discomfort_text(soma: SomaService, cfg: HumanoidConfig, seed=None) -> str:
+    seed = list(seed or []) + ["discomfort"]
     sitting = soma.data.get("sitting_since", 0.0)
     thermal = soma._thermal_discomfort()
     if thermal >= 18:
-        return "身上凉飕飕的，缩着"
+        return pick("cold", seed, ("身上凉得慌，缩着", "冷，手有点冰", "身上发凉"))
     if thermal >= 12:
-        return "有点热，闷得慌"
+        return pick("hot", seed, ("有点热，闷得慌", "身上黏", "热得不太想动"))
     if sitting:
-        return "坐太久了，肩颈发僵"
+        return pick("sitting", seed, ("坐太久了，肩颈发僵", "坐得腰都硬了", "久坐着，身上发僵"))
     return "身上不太得劲"

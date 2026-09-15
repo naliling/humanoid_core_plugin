@@ -97,6 +97,7 @@ class HumanoidEngine:
                 "energy": float(core.energy.energy),
                 "cycle_day": core.energy.cycle_day,
                 "contract": core._scope.get_self("contract"),
+                "biological_night": getattr(core.soma, "biological_night", lambda: None)(),
                 "signals": {
                     "found": bool(at > 0),
                     "last_proactive_age": max(0.0, now - at) if at > 0 else -1.0,

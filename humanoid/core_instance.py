@@ -78,6 +78,7 @@ class HumanoidCoreInstance:
 
         self.clock = Clock(lambda: self.config)
 
+
         # 新角色的生理周期不能永远从第 1 天（经期）开始：按创建当天错开一个起点，
         # 否则多角色下每一个都是同一个人同一天，且 v2.13.2 从未推进过周期。
         if self._scope.get_self("current_cycle_day") is None:
@@ -178,6 +179,11 @@ class HumanoidCoreInstance:
     @property
     def config(self) -> HumanoidConfig:
         return self._config_provider()
+
+    @property
+    def scope(self) -> RoleScope:
+        """服务层读写自己那份数据的唯一入口（不递 `self._scope` 那个私名）。"""
+        return self._scope
 
     def _on_schedule_installed(self) -> None:
         """新日程装上后的一次性回调：身体要重置「在睡」的起点，过程要离开旧日程那件事。"""
@@ -320,13 +326,15 @@ class HumanoidCoreInstance:
         if self.weather.is_stale():
             self._spawn_background(self.weather.refresh_async(), "weather-refresh")
 
-    def build_injection(self, user_id: str, is_group: bool = False) -> str:
-        # 查询阶段只读取短期事件和当前状态，不更新 last_interaction 等持久字段。
+    def build_injection(self, user_id: str, is_group: bool = False, text: str = "") -> str:
+        """拼本次请求要追加的事实块。
+
+        只读不写：时间间隔、情绪、注意力都在 `on_message` 里记过账，这里再记一次就会
+        把「上一次说话」推到当前这一条上，间隔永远算不出来。
+        """
         now = time.time()
         if self.config.soma_enabled:
             self.soma.advance(now)
-        # 时间间隔由 Core.on_message 统一记账。这里严格只读取并构建注入内容。
-        # v2.16：注入里只有事实（时间/称呼/间隔），行为倾向不再参与——那会被模型当成任务。
         events = self.behavior.consume_relevant_events(user_id, now)
         agency = {}
         if events:
@@ -337,8 +345,13 @@ class HumanoidCoreInstance:
                 mood_profile=self.mood.profile(user_id),
                 energy=self.energy.energy,
             )
+        # 注意力三轴：上心程度要看 TA 这句活本身，所以得把原文递进去。
+        try:
+            interest = self.behavior.interest_state(user_id, now, text=text, is_group=is_group)
+        except Exception:
+            interest = {}
         return self.prompt_builder.build(
-            user_id, is_group, events=events, agency=agency
+            user_id, is_group, events=events, agency=agency, text=text, interest=interest
         )
 
     def refresh_contract(self) -> dict | None:
@@ -468,6 +481,18 @@ class HumanoidCoreInstance:
             lines.append(f"- 社交能量：{int(s['social_energy']['value'])}% ({s['social_energy']['text']})")
         if user_id and 'mood' in s:
             lines.append(f"- 好感度：{s['mood']['affection']:.1f}（{s['mood']['label']}）")
+            # 注意力三轴只在这个地方给人看数值：进上下文的是措辞，不是百分比。
+            try:
+                axes = self.behavior.interest_state(user_id, time.time())
+            except Exception:
+                axes = {}
+            if axes:
+                lines.append(
+                    "- 注意力：在意 {:.0%}、上心 {:.0%}、余量 {:.0%}".format(
+                        axes.get("care", 0.0), axes.get("focus", 0.0), axes.get("spare", 0.0)
+                    )
+                )
+                lines.append("  （上心程度拿你刚这句话现算，所以每条消息都在动）")
         return lines
 
     def schedule_text(self) -> str:

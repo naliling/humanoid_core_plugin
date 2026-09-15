@@ -26,7 +26,12 @@ from humanoid import clock as clock_module
 from humanoid.clock import Clock, now_in_city, resolve_zone, resolve_zone_name
 from humanoid.config import HumanoidConfig
 from humanoid.core_instance import HumanoidCoreInstance
-from humanoid.data.cities import CITY_TO_TIMEZONE, DEFAULT_CITY_PLACEHOLDER, lookup_city_time
+from humanoid.data.cities import (
+    CITY_TO_TIMEZONE,
+    DEFAULT_CITY_PLACEHOLDER,
+    IANA_DISPLAY_NAMES,
+    lookup_city_time,
+)
 from humanoid.link import build_contract
 from humanoid.state import StateStore
 
@@ -117,7 +122,8 @@ class ContextShapeTest(unittest.TestCase):
         text = core.build_injection("42", is_group=False)
         self.assertIn("2026-08-22 15:20", text)
         self.assertIn("小鱼", text)
-        self.assertIn("距上次说话 3 小时 12 分", text)
+        self.assertIn("3 小时 12 分", text)
+        self.assertIn("这期间她", text)
         self.assertIn("我猫今天吐了", text)
 
     def test_interval_is_an_exact_duration_not_a_bucket_phrase(self):
@@ -128,7 +134,7 @@ class ContextShapeTest(unittest.TestCase):
             "data": {"gap_seconds": 9000.0},
         })
         text = core.build_injection("42", is_group=False)
-        self.assertIn("距上次说话 2 小时 30 分", text)
+        self.assertIn("2 小时 30 分", text)
         for vague in ("约2～6小时", "约30分钟～2小时", "6小时以上"):
             self.assertNotIn(vague, text)
 
@@ -495,6 +501,114 @@ class MovedCityTest(unittest.TestCase):
         stamp = str(self.self_state(store).get("last_update"))
         self.make_core(store, "北京")
         self.assertEqual(str(self.self_state(store).get("last_update")), stamp, "没搬家就别动计时")
+
+
+class RegionBulkTest(unittest.TestCase):
+    """v2.16.4：批量地名表 + 俄罗斯 85 个联邦主体。她说得出地名就必须对得上钟点。"""
+
+    # 85 个联邦主体名（用户会怎么写就怎么写：裸名与官方写法各测一种）
+    RU_SUBJECTS = (
+        ("斯维尔德洛夫斯克州", "Asia/Yekaterinburg"), ("萨哈林州", "Asia/Sakhalin"),
+        ("堪察加边疆区", "Asia/Kamchatka"), ("哈巴罗夫斯克边疆区", "Asia/Vladivostok"),
+        ("滨海边疆区", "Asia/Vladivostok"), ("外贝加尔边疆区", "Asia/Chita"),
+        ("阿尔泰边疆区", "Asia/Barnaul"), ("彼尔姆边疆区", "Asia/Yekaterinburg"),
+        ("克拉斯诺达尔边疆区", "Europe/Moscow"), ("斯塔夫罗波尔边疆区", "Europe/Moscow"),
+        ("鞑靼斯坦共和国", "Europe/Moscow"), ("巴什科尔托斯坦共和国", "Asia/Yekaterinburg"),
+        ("萨哈共和国", "Asia/Yakutsk"), ("雅库特", "Asia/Yakutsk"),
+        ("布里亚特共和国", "Asia/Irkutsk"), ("图瓦共和国", "Asia/Krasnoyarsk"),
+        ("哈卡斯共和国", "Asia/Krasnoyarsk"), ("阿尔泰共和国", "Asia/Barnaul"),
+        ("车臣共和国", "Europe/Moscow"), ("达吉斯坦共和国", "Europe/Moscow"),
+        ("印古什共和国", "Europe/Moscow"), ("卡巴尔达-巴尔卡尔共和国", "Europe/Moscow"),
+        ("北奥塞梯-阿兰共和国", "Europe/Moscow"), ("卡拉恰伊-切尔克斯共和国", "Europe/Moscow"),
+        ("阿迪格共和国", "Europe/Moscow"), ("卡尔梅克共和国", "Europe/Moscow"),
+        ("克里米亚共和国", "Europe/Simferopol"), ("塞瓦斯托波尔", "Europe/Simferopol"),
+        ("楚瓦什共和国", "Europe/Moscow"), ("马里埃尔共和国", "Europe/Moscow"),
+        ("莫尔多瓦共和国", "Europe/Moscow"), ("乌德穆尔特共和国", "Europe/Samara"),
+        ("科米共和国", "Europe/Moscow"), ("卡累利阿共和国", "Europe/Moscow"),
+        ("莫斯科州", "Europe/Moscow"), ("列宁格勒州", "Europe/Moscow"),
+        ("新西伯利亚州", "Asia/Novosibirsk"), ("鄂木斯克州", "Asia/Omsk"),
+        ("托木斯克州", "Asia/Tomsk"), ("克麦罗沃州", "Asia/Novokuznetsk"),
+        ("伊尔库茨克州", "Asia/Irkutsk"), ("阿穆尔州", "Asia/Yakutsk"),
+        ("马加丹州", "Asia/Magadan"), ("萨哈林州", "Asia/Sakhalin"),
+        ("犹太自治州", "Asia/Vladivostok"), ("汉特-曼西自治区", "Asia/Yekaterinburg"),
+        ("亚马尔-涅涅茨自治区", "Asia/Yekaterinburg"), ("涅涅茨自治区", "Europe/Moscow"),
+        ("楚科奇自治区", "Asia/Anadyr"), ("加里宁格勒州", "Europe/Kaliningrad"),
+        ("伏尔加格勒州", "Europe/Volgograd"), ("阿斯特拉罕州", "Europe/Astrakhan"),
+        ("萨拉托夫州", "Europe/Saratov"), ("萨马拉州", "Europe/Samara"),
+        ("乌里扬诺夫斯克州", "Europe/Ulyanovsk"), ("基洛夫州", "Europe/Kirov"),
+        ("下诺夫哥罗德州", "Europe/Moscow"), ("沃罗涅德州", "Europe/Moscow"),
+        ("罗斯托夫州", "Europe/Moscow"), ("梁赞州", "Europe/Moscow"),
+        ("坦波夫州", "Europe/Moscow"), ("奔萨州", "Europe/Moscow"),
+        ("利佩茨克州", "Europe/Moscow"), ("奥廖尔州", "Europe/Moscow"),
+        ("布良斯克州", "Europe/Moscow"), ("斯摩棱斯克州", "Europe/Moscow"),
+        ("特维尔州", "Europe/Moscow"), ("雅罗斯拉夫尔州", "Europe/Moscow"),
+        ("科斯特罗马州", "Europe/Moscow"), ("伊万诺沃州", "Europe/Moscow"),
+        ("弗拉基米尔州", "Europe/Moscow"), ("卡卢加州", "Europe/Moscow"),
+        ("图拉州", "Europe/Moscow"), ("沃洛格达州", "Europe/Moscow"),
+        ("摩尔曼斯克州", "Europe/Moscow"), ("阿尔汉格尔斯克州", "Europe/Moscow"),
+        ("库尔干州", "Asia/Yekaterinburg"), ("秋明州", "Asia/Yekaterinburg"),
+        ("车里雅宾斯克州", "Asia/Yekaterinburg"), ("奥伦堡州", "Asia/Yekaterinburg"),
+        ("圣彼得堡", "Europe/Moscow"),
+    )
+
+    def test_every_russian_subject_resolves(self):
+        for name, zone in self.RU_SUBJECTS:
+            self.assertEqual(resolve_zone_name(name), zone, f"{name} 认不出或给错了区")
+
+    def test_subject_count_covers_the_federation(self):
+        self.assertGreaterEqual(len({name for name, _ in self.RU_SUBJECTS}), 80)
+        self.assertGreaterEqual(len(CITY_TO_TIMEZONE), 5000, "批量表没并进解析层")
+
+    def test_china_county_level_places_resolve(self):
+        """县级以上一个都不该掉：这些都是会被直接填进配置的名字。"""
+        for name in ("敦煌", "满洲里", "乌兰浩特", "霍林郭勒", "二连浩特", "曲阜", "阳朔",
+                     "婺源", "香格里拉", "井冈山", "喀什", "伊宁", "延吉", "都江堰", "平遥"):
+            self.assertEqual(resolve_zone_name(name), "Asia/Shanghai", f"{name} 认不出")
+
+    def test_japanese_city_names_resolve(self):
+        """日本全国一个区时，所以市町村名与简体/繁体两种写法都该认。"""
+        for name in ("札幌", "川崎", "横滨", "横浜", "那霸", "那覇", "箱根", "轻井泽",
+                     "盛冈", "八户", "小樽", "富良野", "由布院"):
+            self.assertEqual(resolve_zone_name(name), "Asia/Tokyo", f"{name} 认不出")
+
+    def test_russian_cities_in_simplified_chinese(self):
+        for name, zone in (("摩尔曼斯克", "Europe/Moscow"), ("雅库茨克", "Asia/Yakutsk"),
+                           ("乌法", "Asia/Yekaterinburg"), ("马加斯", "Europe/Moscow"),
+                           ("纳尔奇克", "Europe/Moscow"), ("南萨哈林斯克", "Asia/Sakhalin"),
+                           ("伯力", "Asia/Vladivostok"), ("海参崴", "Asia/Vladivostok")):
+            self.assertEqual(resolve_zone_name(name), zone, f"{name} 认不出")
+
+    def test_display_names_can_be_typed_back(self):
+        """她说「你在雷克雅未克」，用户把这几个字填回去就必须生效，不能静默退化。"""
+        for zone, display in IANA_DISPLAY_NAMES.items():
+            bare = display.split("（")[0].strip()
+            if not bare or bare == "UTC":
+                continue
+            self.assertIsNotNone(resolve_zone_name(bare), f"显示名「{bare}」填不回去")
+
+    def test_urumqi_name_keeps_beijing_time_policy(self):
+        """「乌鲁木齐」这个中文名同时对应两件事：法定北京时间（写名字）与 UTC+6（写 IANA 名）。
+        名字必须归北京时间，想要当地作息的人填 Asia/Urumqi——这是文档里写明的选择。"""
+        self.assertEqual(resolve_zone_name("乌鲁木齐"), "Asia/Shanghai")
+        self.assertEqual(resolve_zone_name("Asia/Urumqi"), "Asia/Urumqi")
+
+    def test_unrecognised_place_says_so_instead_of_lying(self):
+        tz, note = resolve_zone("肯定不存在的地方名")
+        self.assertIsNone(tz)
+        self.assertIn("认不出", note)
+
+    def test_bulk_table_never_shadows_a_hand_checked_entry(self):
+        """手写表里逐条对过 IANA 自注的结论，不能被 GeoNames 的默认值盖掉。"""
+        for name, zone in (("滕达", "Asia/Yakutsk"), ("恰拉", "Asia/Chita"),
+                           ("比利比诺", "Asia/Anadyr"), ("汉德加", "Asia/Khandyga")):
+            self.assertEqual(CITY_TO_TIMEZONE.get(name), zone, f"{name} 被批量表改写了")
+
+    def test_bulk_data_is_compact_and_loadable(self):
+        from humanoid.data.cities_bulk import _BULK_BY_ZONE
+
+        self.assertGreaterEqual(len(_BULK_BY_ZONE), 20)
+        total = sum(len(blob.split("|")) for blob in _BULK_BY_ZONE.values())
+        self.assertGreater(total, 5000)
 
 
 if __name__ == "__main__":

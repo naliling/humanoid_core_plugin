@@ -23,6 +23,7 @@ from ..slots import (
     is_sleep_event,
     normalize_slots,
     parse_time,
+    sleep_window_minutes,
 )
 
 PURPOSE = "日程生成"
@@ -36,20 +37,25 @@ WAKE_SIDE_EVENT = "赖床与洗漱"     # 起床点后、日程还写着睡的�
 BEDSIDE_EVENT = "夜间洗漱"         # 入睡点前、日程已写着睡的那截零头
 
 
-def routine_prompt(cfg: HumanoidConfig, first_index: int = 9) -> str:
-    """写进日程 prompt 的作息硬约束。
+def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
+    """作息那一条怎么写进日程 prompt。
 
-    不加这个约束时，模型会按自己的直觉把她排成 00:00–08:00 睡觉，而夜间窗口写着
-    5 点结束——于是早上永远处于「日程在睡、生物钟已醒」的两套时间里。
+    v2.16.3 之前这里无条件写「她的作息必须遵守：23:00 上床，生物钟夜到 6:00 结束」——
+    那等于一个写死的窗口替所有人决定几点睡，夜猫子人格根本排不出来。现在默认让模型从
+    人设里读她几点睡；只有用户显式打开「日程贴合夜间窗口」时，才把它当成硬约束递进去。
     """
     if not cfg.night_mode_enabled or not cfg.schedule_follow_night_window:
-        return ""
+        return (
+            f"{first_index}. 几点睡、几点起由她是谁决定：从人设里读她的年纪感、工作或学业、"
+            "生活习惯。夜猫子就排凌晨睡晚起，早起的就排晚上九点困。"
+            "别把所有人都排成 00:00→08:00，也别因为「正常人应该这样」就改掉人设里写着的作息。\n"
+        )
     start, end = cfg.night_start_hour, cfg.night_end_hour
     if start == end:
         return ""
     span = cfg.night_span_hours
     lines = [
-        f"{first_index}. 她的作息必须遵守：{start:02d}:00 上床，生物钟夜到 {end:02d}:00 结束。",
+        f"{first_index}. 用户把她的作息锁定了：{start:02d}:00 上床，生物钟夜到 {end:02d}:00 结束。",
         f"   睡眠排成首尾相接的两段：{start:02d}:00→24:00 与 00:00→{end:02d}:00，"
         "这两段的 event 里要带「睡眠」二字；",
         f"   {end:02d}:00 往后从起床、洗漱开始排。",
@@ -87,9 +93,9 @@ def _subtract(seg: tuple[int, int], spans: list[tuple[int, int]]) -> list[tuple[
 def align_sleep_to_night(slots: list[Slot], cfg: HumanoidConfig) -> list[Slot]:
     """把一份日程里的睡眠区间挪到夜间窗口上。
 
-    内置模板的睡眠时间是写死的（00:00–07:30 那一类），而用户设的夜间窗口是另一回事；
-    不对齐的话「她几点起」就有两个答案。这里按夜间窗口把每个时段切成「睡」与
-    「不睡」两部分，剩下的交给 normalize_slots 保证首尾相连。
+    默认不再跑这一步（`schedule_follow_night_window` 默认关）：作息该由人设决定，身体
+    反过来跟着她的日程走。留着这一手是因为确实有人希望「她的夜就是 23:00→06:00」，
+    开了就是显式覆盖：模型不听 prompt 也能对上。
     """
     if not cfg.night_mode_enabled or not cfg.schedule_follow_night_window:
         return slots
@@ -173,13 +179,12 @@ def sleep_spans(slots: list[Slot]) -> list[Slot]:
 
 
 def schedule_wake_minute(slots: list[Slot]) -> int | None:
-    """从日程里读出她的起床时间：凌晨那段睡眠的结束点。"""
-    for slot in sleep_spans(slots):
-        if parse_time(slot.get("start")) == 0:
-            end = parse_time(slot.get("end"))
-            if end:
-                return end
-    return None
+    """从日程里读出她的起床时间：最长那段觉的结束点。
+
+    以前只认「从 00:00 开始的那段」，于是夜猫子（04:00→11:30）根本没有起床时间，
+    诊断与契约里那一格永远空着。现在与身体层同一个窗口来源。"""
+    window = sleep_window_minutes(slots)
+    return window[1] if window else None
 
 
 def schedule_wake_text(slots: list[Slot]) -> str:
@@ -279,6 +284,32 @@ def day_phrases(
         "done": done[:max(0, int(past_limit))],
         "next": upcoming[:max(0, int(future_limit))],
     }
+
+
+def done_between(
+    slots: list[Slot], start_minutes: int, end_minutes: int, limit: int = 2
+) -> list[str]:
+    """落在 [start, end) 之间结束掉的时段，说成「上午在改海报」这种能接进句子里的话。
+
+    【刚刚】那块要的是「TA不在的这段时间她自己在干什么」，而【今天】要的是「今天到这会
+    过了什么」——同一份日程的两个切法。两处都直接取 done 会撞出完全一样的句子，所以这里
+    按时间窗取，调用方再把这些从【今天】里挑掉。
+    """
+    out: list[str] = []
+    for slot in slots or []:
+        lo = parse_time(slot.get("start"))
+        hi = parse_time(slot.get("end"))
+        if lo is None or hi is None or hi <= lo:
+            continue
+        if not (start_minutes <= hi <= end_minutes):
+            continue
+        event = str(slot.get("event") or "").strip()
+        if not event or is_sleep_event(event):
+            continue
+        phrase = _event_phrase(event)
+        if phrase:
+            out.append(f"{period_of(lo)}在{phrase}")
+    return out[: max(0, int(limit))]
 
 
 def day_lines(

@@ -518,7 +518,7 @@ class EmotionLineTest(unittest.TestCase):
     def test_still_angry_changes_the_tone_line(self):
         core = self.core_with_mood(affection=55.0, libido=10.0, aggression=40.0, base_aggression=28.0)
         text = core.build_injection("42", is_group=False)
-        self.assertIn("积了点火", text)
+        self.assertTrue(any(w in text for w in ("积了点火", "攒着点事", "火压在底下")), text)
 
     def test_attitude_line_stops_at_the_feeling(self):
         """插件只说她心里怎么样，不替她决定这句话怎么说出口。"""
@@ -532,11 +532,16 @@ class EmotionLineTest(unittest.TestCase):
         text = core.build_injection("42", is_group=False)
         self.assertNotIn("说话会短、会顶回去", text)
 
-    def test_permission_line_survives_truncation(self):
-        """只说「别报数值」会把情绪一起压掉，许可那句必须在。"""
-        core = self.core_with_mood(affection=50.0)
+    def test_framing_survives_where_it_belongs(self):
+        """许可与「怎么读」那句搬到 system_prompt 后，事实块里不该再重复它。"""
+        from humanoid.prompt_builder import FRAMING_TEXT
+
+        core = self.core_with_mood()
         text = core.build_injection("42", is_group=False)
-        self.assertIn("不用永远热情得体", text)
+        self.assertNotIn("不必逐条回应", text)
+        self.assertIn("由她自己判断", FRAMING_TEXT)
+        self.assertIn("处境", FRAMING_TEXT)
+
 
 
 class ContractDayTest(unittest.TestCase):

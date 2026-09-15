@@ -75,8 +75,10 @@ class ContractTest(unittest.TestCase):
         ):
             self.assertIn(key, contract["body"], f"契约 body 少了 {key}")
         self.assertEqual(contract["body"]["sleep_pressure"], 78.0)
-        self.assertIn("困意上来了", " ".join(contract["feelings"]))
-        self.assertIn("有点饿了", " ".join(contract["feelings"]))
+        # 措辞按天抽签（wording.pick），断言只能认「这一档说的就是困」而不是某一句原话。
+        joined = " ".join(contract["feelings"])
+        self.assertTrue(any(w in joined for w in ("困意上来", "犯困", "眼皮", "发懵", "蒙了一层")), joined)
+        self.assertTrue(any(w in joined for w in ("饿", "肚子")), joined)
         self.assertLessEqual(contract["form"]["max_chars"], 60, "困成这样还允许长篇说明 form 没联动")
 
     def test_contract_carries_clock_offset_and_routine(self):
@@ -84,12 +86,32 @@ class ContractTest(unittest.TestCase):
         contract = build_contract(self.core)
         self.assertEqual(contract["time"]["utc_offset_minutes"], 8 * 60)
         routine = contract["routine"]
-        self.assertEqual(routine["night_start_hour"], 23)
-        self.assertEqual(routine["night_end_hour"], 6)
-        self.assertEqual(routine["night_span_hours"], 7.0)
         self.assertEqual(routine["sleep_need_hours"], 8.0)
-        self.assertEqual(routine["wake_at"], "06:00", "日程里的起床点应该贴到夜间窗口结束")
+        self.assertEqual(routine["configured_night"], [23, 6], "配置窗口照样要说清是哪来的")
         self.assertTrue(routine["sleep_spans"], "契约里该看得到她今晚几点睡到几点")
+        self.assertEqual(routine["wake_at"], "09:00", "起床点就是她日程里那个点，不再被贴到配置窗口上")
+        # 导出的生物钟夜按她的日程算：日程里睡到 09:00，社交层就该按 09:00 判断她在不在睡。
+        self.assertEqual(routine["night_source"], "schedule")
+        self.assertEqual(routine["night_end_hour"], 9.0, f"她的生物钟夜该跟着日程走：{routine}")
+        self.assertLess(routine["night_start_hour"], 1.0)
+        self.assertGreater(routine["night_span_hours"], 7.0)
+
+    def install_schedule(self, slots) -> None:
+        """把一份日程装成「今天生效的那份」：走持久状态，不走模板兜底。"""
+        self.core.scope.set_self("daily_schedule", slots)
+        self.core.scope.set_self("today_date", self.core.clock.today_str())
+
+    def test_contract_follows_a_night_owl_persona(self):
+        """夜猫子人格：日程排凌晨睡，导出的窗口就得是凌晨，不能还是 23:00→06:00。"""
+        self.install_schedule([
+            {"start": "04:00", "end": "11:30", "event": "睡眠", "energy_rate": 0.18},
+            {"start": "11:30", "end": "24:00", "event": "白天活动", "energy_rate": -0.05},
+            {"start": "00:00", "end": "04:00", "event": "白天活动", "energy_rate": -0.05},
+        ])
+        routine = build_contract(self.core)["routine"]
+        self.assertEqual(routine["night_start_hour"], 4.0)
+        self.assertEqual(routine["night_end_hour"], 11.5)
+        self.assertEqual(routine["wake_at"], "11:30")
 
     def test_contract_is_written_into_state_and_only_on_change(self):
         first = self.core.refresh_contract()
@@ -193,14 +215,17 @@ class SignalsTest(unittest.TestCase):
         self.assertEqual(core.soma.snapshot()["social_desire"], 90.0, "旧信号被重复消费了")
 
     def test_ignored_streak_becomes_a_feeling(self):
+        """被冷落要变成她身体里的一件事，但不许变成「所以你别先开口」。"""
         harness = Harness()
         core = harness.roles.get_or_create("bot1")
+        cold = ("没回", "没接上话", "先开的口")
         core.soma.set_social_feedback(3)
         texts = [text for _, text in core.soma.feelings(70.0)]
-        self.assertTrue(any("没回" in text for text in texts), texts)
+        self.assertTrue(any(any(w in text for w in cold) for text in texts), texts)
+        self.assertFalse(any("不想先开口" in text for text in texts), f"又替她决定不说话了：{texts}")
         core.soma.set_social_feedback(0)
         texts = [text for _, text in core.soma.feelings(70.0)]
-        self.assertFalse(any("没回" in text for text in texts))
+        self.assertFalse(any(any(w in text for w in cold) for text in texts), texts)
 
 
 class InjectionBudgetTest(unittest.TestCase):
@@ -242,10 +267,15 @@ class InjectionBudgetTest(unittest.TestCase):
         for leak in ("weather_location", "timezone_city", "没配天气城市", "API Key"):
             self.assertNotIn(leak, text, f"配置提示漏进了模型上下文：{leak}")
 
-    def test_boundary_line_is_present_once(self):
+    def test_facts_block_carries_the_marker_once(self):
+        """事实块只带一次标记；「这些是什么、怎么读」在 system_prompt 里，不在这里重复。"""
+        from humanoid.prompt_builder import FRAMING_TEXT, MARK_PREFIX
+
         harness, core = self.build({"inject_activity_context": "low"})
         text = core.build_injection("42", is_group=False)
-        self.assertEqual(text.count("不是要你汇报的表格"), 1)
+        self.assertEqual(text.count(MARK_PREFIX), 1, text)
+        self.assertNotIn("处境", text, "框架句被复制进每条消息了")
+        self.assertIn(MARK_PREFIX, FRAMING_TEXT)
 
 
 class DiagnosticsTest(unittest.TestCase):
@@ -265,14 +295,38 @@ class DiagnosticsTest(unittest.TestCase):
         core = harness.roles.get_or_create("bot1")
         text = harness.engine.diagnostics_text(core)
         self.assertIn("【作息】", text)
-        self.assertIn("生物钟夜 23:00 → 06:00", text)
-        self.assertIn("今日日程里的起床时间：06:00", text)
+        self.assertIn("配置里的夜间窗口 23:00 → 06:00", text)
+        self.assertIn("她的生物钟夜（按今天的日程算）", text)
+        self.assertIn("今日日程里的起床时间：", text)
+        self.assertIn("几点睡由她是谁决定", text)
 
-    def test_report_flags_a_window_shorter_than_the_sleep_she_needs(self):
+    def test_report_flags_a_schedule_that_shortchanges_her_sleep(self):
+        """警告要对准她真的睡多久：日程只排 5 小时而一晚需要 8 小时才该提示，
+        配置窗口短而她自己排得到 9 小时不该再报警。"""
         harness = Harness({"timezone_city": "北京", "night_start_hour": 23, "night_end_hour": 5})
         core = harness.roles.get_or_create("bot1")
+        core.scope.set_self("daily_schedule", [
+            {"start": "01:00", "end": "06:00", "event": "睡眠", "energy_rate": 0.18},
+            {"start": "06:00", "end": "24:00", "event": "白天活动", "energy_rate": -0.05},
+            {"start": "00:00", "end": "01:00", "event": "白天活动", "energy_rate": -0.05},
+        ])
+        core.scope.set_self("today_date", core.clock.today_str())
+        core.soma.advance()
         text = harness.engine.diagnostics_text(core)
-        self.assertIn("窗口比她需要的睡眠短", text)
+        self.assertIn("比她需要的睡眠短", text)
+
+    def test_report_does_not_flag_the_config_window_alone(self):
+        harness = Harness({"timezone_city": "北京", "night_start_hour": 23, "night_end_hour": 5})
+        core = harness.roles.get_or_create("bot1")
+        core.scope.set_self("daily_schedule", [
+            {"start": "23:00", "end": "24:00", "event": "睡眠", "energy_rate": 0.18},
+            {"start": "00:00", "end": "08:00", "event": "睡眠", "energy_rate": 0.18},
+            {"start": "08:00", "end": "23:00", "event": "白天活动", "energy_rate": -0.05},
+        ])
+        core.scope.set_self("today_date", core.clock.today_str())
+        core.soma.advance()
+        text = harness.engine.diagnostics_text(core)
+        self.assertNotIn("比她需要的睡眠短", text)
 
     def test_report_says_so_when_body_disabled(self):
         harness = Harness({"timezone_city": "北京", "soma_enabled": False})

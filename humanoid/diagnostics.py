@@ -20,6 +20,12 @@ BAD_MARK = "✗"
 WARN_MARK = "⚠"
 
 
+def _hhmm(hour_of_day: float) -> str:
+    """21.0 → 21:00、21.5 → 21:30。日程推出来的窗口带分钟，配置里只有整点。"""
+    minutes = int(round(float(hour_of_day) * 60)) % (24 * 60)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
 def _routine_lines(
     cfg: HumanoidConfig,
     schedule_status: dict[str, Any],
@@ -27,35 +33,38 @@ def _routine_lines(
 ) -> list[str]:
     """作息：把「她几点起」这件事的三个参与方摊开说。"""
     lines: list[str] = []
+    night = (body_status or {}).get("biological_night")
     if not cfg.night_mode_enabled:
-        lines.append("- 生物钟夜已关闭：不会攒睡眠债，也不会有夜间语气；没日程时她永远不算在睡")
+        lines.append("- 生物钟夜已关闭：不会攒睡眠债，也没日程时她永远不算在睡")
     else:
-        start, end = cfg.night_start_hour, cfg.night_end_hour
+        start_h, end_h = cfg.night_start_hour, cfg.night_end_hour
         span = cfg.night_span_hours
         lines.append(
-            f"- 生物钟夜 {start:02d}:00 → {end:02d}:00（{span:g} 小时），"
+            f"- 配置里的夜间窗口 {start_h:02d}:00 → {end_h:02d}:00（{span:g} 小时），"
             f"一晚需要 {cfg.sleep_need_hours:g} 小时"
         )
-        if span and cfg.sleep_need_hours > span + 0.5:
+        if night:
+            n_start, n_end = night
+            n_span = n_end - n_start if n_end > n_start else (24.0 - n_start) + n_end
             lines.append(
-                f"  {WARN_MARK} 窗口比她需要的睡眠短 {cfg.sleep_need_hours - span:.1f} 小时："
-                "一夜睡不够，早上会带着没清完的困意起床（想赖床是必然的）"
+                f"- 她的生物钟夜（按今天的日程算）：{_hhmm(n_start)} → {_hhmm(n_end)}"
+                f"（{n_span:g} 小时）——昼夜低谷、睡眠债记账都跟着这一段走"
             )
+            if span and cfg.sleep_need_hours > n_span + 0.5:
+                lines.append(
+                    f"  {WARN_MARK} 这一段比她需要的睡眠短 {cfg.sleep_need_hours - n_span:.1f} 小时："
+                    "一夜睡不够，早上会带着没清完的困意起床"
+                )
+        else:
+            lines.append("  还没从日程里找到睡眠段，暂时按上面那个配置窗口算")
         lines.append(
-            f"- 日程贴合作息：{'开启（模型排的睡眠区间会被改到夜间窗口上）' if cfg.schedule_follow_night_window else '关闭（睡眠区间由模型自由发挥）'}"
+            f"- 日程贴合作息：{'开启（模型排的睡眠区间会被强制改到配置窗口上）' if cfg.schedule_follow_night_window else '关闭（几点睡由她是谁决定，身体跟着她的日程走）'}"
         )
 
     wake = str(schedule_status.get("wake_at") or "")
     spans = schedule_status.get("sleep_spans") or []
     if wake:
         lines.append(f"- 今日日程里的起床时间：{wake}；睡眠段：{'、'.join(spans) or '无'}")
-        if cfg.night_mode_enabled:
-            minutes = parse_time(wake)
-            if minutes is not None and abs(minutes - cfg.night_end_hour * 60) > 30:
-                lines.append(
-                    f"  {WARN_MARK} 与生物钟夜的结束点 {cfg.night_end_hour:02d}:00 不一致："
-                    "身体以日程为准，她真的会睡到那个点"
-                )
     elif spans:
         lines.append(f"- 今日日程里的睡眠段：{'、'.join(spans)}（凌晨没找到固定的起床点）")
     else:
@@ -339,7 +348,10 @@ def build_report(
             else "已关闭，不消耗模型调用"
         )
     )
-    lines.append("- 本插件不会为聊天回复额外调模型：上下文里只有时间/称呼/隔了多久，回复走 AstrBot 主链路。")
+    lines.append(
+        "- 本插件不会为聊天回复额外调模型：上下文里只有她的事实（时间/场景/称呼/身体/今天/"
+        "隔了多久/注意力三轴的措辞），回复走 AstrBot 主链路。"
+    )
 
     lines += [
         "",

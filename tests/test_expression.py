@@ -1,4 +1,4 @@
-"""表达层：体感显著度门控、说话形式倾向、夜间语气分档。
+"""表达层：体感显著度门控、夜间只给事实、措辞去模板感。
 
 这一层的价值全在「什么不该注入」上，所以断言大多是负向的。
 """
@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfo
 
 from humanoid.config import HumanoidConfig
 from humanoid.data.mood_map import get_mood_label
-from humanoid.prompt_builder import MOOD_TONE_HINTS, build_night_lines
+from humanoid.prompt_builder import MOOD_TONE_HINTS, PromptBuilder
+from humanoid.wording import FEELING_WORDS, pick, scale_word
 from humanoid.services.soma import SomaService
 from humanoid.role_scope import RoleScope
 
@@ -43,46 +44,89 @@ class MoodToneTableTest(unittest.TestCase):
         self.assertEqual(dead, [], f"这些 key 不在 get_mood_label 的输出里：{dead}")
 
 
-class NightLinesTest(unittest.TestCase):
-    """夜间 23:00–06:00、深睡比例 0.5 → 深睡 23/0/1/2 点，浅睡 3/4/5 点。"""
+class _StubCore:
+    """只给 `_night_lines` 用得着的三样：配置、她的钟、她的身体。"""
 
-    def test_force_sleep_is_the_stronger_variant(self):
-        """强弱的差别在「说得多硬」，不在「有没有台词」。"""
-        forced = " ".join(build_night_lines(cfg(night_mode_force_sleep=True), True, False))
-        free = " ".join(build_night_lines(cfg(night_mode_force_sleep=False), True, False))
-        self.assertIn("还在睡", forced)
-        self.assertNotIn("还在睡", free)
+    def __init__(self, config, night: bool, asleep: bool) -> None:
+        from types import SimpleNamespace
 
-    def test_no_script_and_no_ban(self):
-        """四档都不给插件替她说好的句子，也不写插件执行不了的禁令。"""
+        self.config = config
+        self.role_id = "bot1"
+        self.clock = SimpleNamespace(is_night=lambda: night, today_str=lambda: "2026-08-22")
+        self.soma = SimpleNamespace(snapshot=lambda: {"asleep": 1.0 if asleep else 0.0})
+
+
+def night_lines(**conf) -> list[str]:
+    night = conf.pop("night", True)
+    asleep = conf.pop("asleep", False)
+    builder = PromptBuilder.__new__(PromptBuilder)
+    builder._core = _StubCore(cfg(**conf), night, asleep)
+    return builder._night_lines()
+
+
+class NightFactsTest(unittest.TestCase):
+    """夜间与午睡：只报身体与日程的事实。
+
+    v2.16.3 那版写的是「你还在睡，是手机震醒的那种：眼睛睁不开，脑子没转，话到嘴边
+    只剩一两个字」——手机、眼睛、脑子都不是算出来的，是插件替她写的人设；「只剩一两个字」
+    是插件在管她说多长。这一组断言卡的就是这两样不许回来。
+    """
+
+    def test_sleep_window_is_a_fact(self):
+        text = " ".join(night_lines(night=True, asleep=False, soma_enabled=True))
+        self.assertIn("最该睡", text)
+
+    def test_asleep_is_said_once(self):
+        """她在睡这件事由体感那块说，夜间块不再重复一遍。"""
+        self.assertEqual(night_lines(night=True, asleep=True, soma_enabled=True), [])
+
+    def test_daytime_writes_nothing(self):
+        self.assertEqual(night_lines(night=False), [])
+
+    def test_toggle_hides_the_fact_only(self):
+        """关掉只是不提这条事实，不是让她少说话。"""
+        self.assertEqual(night_lines(show_sleep_window=False), [])
+
+    def test_no_invented_details_or_length_rules(self):
         banned = (
-            "「", "」", "不要", "不应回复", "必须", "回一句", "提一句", "明天再聊",
-            "简短回应", "控制在", "只说一两句",
+            "手机", "眼睛", "脑子", "字", "吵醒", "迷糊", "不要", "必须", "回一句",
+            "明天再聊", "简短", "控制在", "只说一两句", "语气",
         )
-        for force in (True, False):
-            for deep in (True, False):
-                for asleep in (True, False):
-                    text = " ".join(
-                        build_night_lines(cfg(night_mode_force_sleep=force), deep, asleep)
-                    )
-                    for word in banned:
-                        self.assertNotIn(word, text, f"夜间文案里不该有「{word}」：{text}")
+        for asleep in (True, False):
+            for force in (True, False):
+                text = " ".join(night_lines(asleep=asleep, show_sleep_window=force))
+                for word in banned:
+                    self.assertNotIn(word, text, f"夜间事实里不该有「{word}」：{text}")
 
-    def test_deep_and_light_differ(self):
-        deep = " ".join(build_night_lines(cfg(), True, False))
-        light = " ".join(build_night_lines(cfg(), False, False))
-        self.assertIn("迷糊", deep)
-        self.assertNotIn("迷糊", light)
+    def test_body_off_still_says_the_window(self):
+        text = " ".join(night_lines(soma_enabled=False))
+        self.assertIn("夜里", text)
 
-    def test_being_asleep_reads_as_deep_sleep(self):
-        text = " ".join(build_night_lines(cfg(), False, True))
-        self.assertIn("吵醒", text)
 
-    def test_no_unactionable_ban(self):
-        for force in (True, False):
-            for deep in (True, False):
-                text = " ".join(build_night_lines(cfg(night_mode_force_sleep=force), deep, False))
-                self.assertNotIn("不应回复", text, "插件拦不住回复，别让模型猜该不该回")
+class WordingTest(unittest.TestCase):
+    """措辞层：同一状态多套说法，按天抽签稳定。"""
+
+    def test_feelings_have_variants(self):
+        for kind, ladder in FEELING_WORDS.items():
+            for floor, options in ladder:
+                self.assertGreaterEqual(len(options), 1, f"{kind} 的 {floor} 档没词了")
+
+    def test_draw_is_stable_within_a_day_and_swaps_next_day(self):
+        seed_a = ["bot1", "2026-08-22", "42"]
+        seed_b = ["bot1", "2026-08-23", "42"]
+        options = scale_word(90, FEELING_WORDS["sleepy"])
+        self.assertIsInstance(options, tuple)
+        self.assertEqual(pick("sleepy", seed_a, options), pick("sleepy", seed_a, options))
+        # 只有一档一种说法时换不了，所以挑一个确实有多套说法的档位卡这件事
+        self.assertGreater(len(set(options)), 1)
+
+    def test_different_days_may_read_differently(self):
+        options = scale_word(90, FEELING_WORDS["sleepy"])
+        seen = {pick("sleepy", ["bot1", f"2026-08-{day:02d}", "42"], options) for day in range(1, 20)}
+        self.assertGreater(len(seen), 1, "换了一天措辞还一个字不变，那就是预制菜")
+
+    def test_degree_comes_from_the_number(self):
+        self.assertNotEqual(scale_word(20, FEELING_WORDS["hunger"]), scale_word(95, FEELING_WORDS["hunger"]))
 
 
 class SomaFixture:

@@ -167,8 +167,23 @@ class EnergyTest(unittest.TestCase):
         self.assertEqual(service3.cycle_description(), "")
 
     def test_describe_energy_bands(self):
-        self.assertIn("充沛", describe_energy(95))
-        self.assertIn("疲惫", describe_energy(5))
+        """档位要对得上，但措辞按天抽签，所以不能钉死某一句。"""
+        from humanoid.services.energy import ENERGY_WORDS
+
+        def tier_words(value):
+            floor, options = max(
+                (entry for entry in ENERGY_WORDS if value >= entry[0]), key=lambda entry: entry[0]
+            )
+            return options
+
+        high = describe_energy(95)
+        low = describe_energy(5)
+        self.assertIn(high, tier_words(95))
+        self.assertIn(low, tier_words(5))
+        self.assertNotEqual(high, low)
+        # 「语气轻快/语气低落」那半句是在教她怎么说话，不许再出现在精力描述里。
+        for text in (describe_energy(v) for v in (95, 75, 50, 25, 5)):
+            self.assertNotIn("语气", text, text)
 
 
 class MoodTest(unittest.IsolatedAsyncioTestCase):

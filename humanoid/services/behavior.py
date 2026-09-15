@@ -2,13 +2,36 @@
 
 只保存短期、运行时事件；持久状态仍由 RoleScope 管理。
 数据流：事件 -> 注意力 -> 行为倾向 -> PromptBuilder。
+
+注意力是三条独立的轴（v2.16.4）：
+
+* `care` —— 在意度：对**这个人**。慢变量，每用户一个自己的基线（由好感度、脾气、
+  以及一个按用户 ID 稳锚的错位推出来），往目标值指数逼近。以前所有人第一面都是
+  同一个 50 分，那正是「数值全是单一的」的根源。
+* `focus` —— 上心程度：对**TA正在讲的这件事**。不算不写盘，每条消息现推：问句、
+  长度、是否推到她今天在做的事、是否推到她自己记着的事、心情好不好。
+* `spare` —— 注意力余量：**她自己手里还剩多少**。从身体的困/难受/唤醒与手上在做的
+  事推。这一轴跟 TA 无关，只跟她自己有关——真人不是随时都能接住话的。
+
+三轴只进 `interest_state()`，写进上下文的是措辞（见 `wording.py`），数值只进
+`/她的状态` 与 `/拟人诊断`。
 """
 
 from __future__ import annotations
 
+import hashlib
+import math
 from typing import Any, Dict, List, Optional
 
 from ..config import HumanoidConfig
+from ..slots import is_meal_event, is_sleep_event
+
+
+# 在意度往目标值逼近的半衰期（小时）。太快的话一句好话就能把关系拉满，不像人。
+CARE_HALF_LIFE_HOURS = 72.0
+# 每用户基线错位幅度（±）：同一份好感度下，她对不同人的默认上心度本来就不一样。
+CARE_SEED_SPAN = 0.22
+CARE_EMA_MIN_GAP_SECONDS = 600.0
 
 
 # (下界, 上界, 事件类型, 间隔档位, 基础重要性)
@@ -268,3 +291,187 @@ class BehaviorService:
         key = self._key(user_id)
         self._events.pop(key, None)
         self._active_event.pop(key, None)
+
+    # ------------------------------------------------------------------
+    # 注意力三轴（v2.16.4）
+    # ------------------------------------------------------------------
+
+    def _seed_offset(self, user_id: str) -> float:
+        """按（角色, 用户）稳锚的基线错位：同一份好感度，她对不同人的默认上心度不同。"""
+        raw = f"{self._core.role_id}:{user_id}"
+        digest = hashlib.blake2b(raw.encode("utf-8"), digest_size=4).digest()
+        return (int.from_bytes(digest, "big") / 4294967295.0 - 0.5) * 2.0 * CARE_SEED_SPAN
+
+    def _care_target(self, user_id: str, profile: Dict[str, Any]) -> float:
+        """目标在意度：好感度为主，脾气与“她本来对这个人是什么缘分”为辅。"""
+        try:
+            affection = float(profile.get("affection", 50.0))
+            aggression = float(profile.get("aggression", 15.0))
+        except (TypeError, ValueError):
+            affection, aggression = 50.0, 15.0
+        value = affection / 100.0 * 0.78 + 0.11
+        value -= min(0.22, max(0.0, aggression - 25.0) / 100.0 * 0.6)
+        value += self._seed_offset(user_id) * 0.5
+        return max(0.0, min(1.0, value))
+
+    def care(self, user_id: str, now: float, persist: bool = True) -> float:
+        """在意度：惰性积分，不每条消息写盘。
+
+        `persist=False` 用于群聊里没开成员情绪档案的场合：那种模式下连 mood 档案都不该
+        建（旧版有一条测试专门卡这个），在意度更不能顺手把用户条目写出来。
+        """
+        scope = self._core.scope
+        record = scope.get_user(user_id, "attention") or {}
+        try:
+            current = float(record.get("care", 0.0))
+            at = float(record.get("care_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            current, at = 0.0, 0.0
+        try:
+            profile = self._core.mood.profile(user_id)
+        except Exception:
+            profile = {}
+        target = self._care_target(user_id, profile)
+        if current <= 0.0 or at <= 0.0:
+            # 第一面直接落在目标上（含基线错位）：这一轴不该从 0 慢慢爬。
+            value = target
+        else:
+            hours = max(0.0, (now - at) / 3600.0)
+            decay = math.pow(0.5, hours / CARE_HALF_LIFE_HOURS) if hours > 0 else 1.0
+            value = target + (current - target) * decay
+        value = round(max(0.0, min(1.0, value)), 4)
+        if persist and (abs(value - current) >= 0.01 or (now - at) >= CARE_EMA_MIN_GAP_SECONDS):
+            scope.set_user(user_id, "attention", {"care": value, "care_at": now})
+        return value
+
+    def _focus(self, user_id: str, text: str, profile: Dict[str, Any]) -> float:
+        """上心程度：对TA这句活本身。每条现算，不存。"""
+        body = (text or "").strip()
+        if not body:
+            return 0.20
+        value = 0.34
+        # 很多人打字不带问号，但「…吗」「…呢」就是在问她。
+        if any(ch in body for ch in "?？") or body[-1] in ("吗", "呢", "吧", "啊", "呀"):
+            value += 0.18
+        if len(body) >= 24:
+            value += 0.12
+        elif len(body) >= 10:
+            value += 0.06
+        if any(ch in body for ch in "!！😭😡❤️"):
+            value += 0.06
+        # 推到她今天正在做的事上：这是最强的上心信号。
+        if self._touches_her_day(body):
+            value += 0.20
+        # 推到 TA 自己之前说过、她记着的事。
+        if self._touches_recalled(user_id, body):
+            value += 0.16
+        try:
+            aggression = float(profile.get("aggression", 15.0))
+            libido = float(profile.get("libido", 25.0))
+        except (TypeError, ValueError):
+            aggression, libido = 15.0, 25.0
+        value -= min(0.20, max(0.0, aggression - 30.0) / 100.0 * 0.7)
+        value += min(0.10, max(0.0, libido - 35.0) / 100.0 * 0.4)
+        return round(max(0.0, min(1.0, value)), 3)
+
+    def _her_today_keywords(self) -> List[str]:
+        """她今天日程里的事件名（呷掉“睡眠/吃饭”这类不算话题的）。"""
+        words: List[str] = []
+        try:
+            slots = self._core.schedule.current_slots()
+        except Exception:
+            return words
+        for slot in slots or []:
+            event = str(slot.get("event") or "").strip()
+            if not event or is_sleep_event(event) or is_meal_event(event):
+                continue
+            words.extend(_chunks(event))
+        return words[:60]
+
+    def _touches_her_day(self, body: str) -> bool:
+        return any(word and word in body for word in self._her_today_keywords())
+
+    def _touches_recalled(self, user_id: str, body: str) -> bool:
+        try:
+            lines = self._core.mood.recall_lines(user_id, 6)
+        except Exception:
+            return False
+        for line in lines:
+            text = str(line)
+            for word in _chunks(text):
+                if word and word in body:
+                    return True
+        return False
+
+    def _spare(self, now: float) -> float:
+        """注意力余量：身体与手上在做的事给她剩多少。"""
+        core = self._core
+        value = 0.85
+        try:
+            body = core.soma.snapshot()
+        except Exception:
+            body = {}
+        if body:
+            value -= max(0.0, float(body.get("sleep_pressure", 0.0)) - 45.0) / 100.0 * 0.9
+            value -= max(0.0, float(body.get("discomfort", 0.0)) - 40.0) / 100.0 * 0.6
+            value -= max(0.0, float(body.get("hunger", 0.0)) - 65.0) / 100.0 * 0.3
+            if float(body.get("asleep", 0.0)) >= 1.0:
+                value -= 0.45
+        try:
+            proc = core.process.current()
+        except Exception:
+            proc = {}
+        name = str(proc.get("name") or "").strip()
+        phase = str(proc.get("phase") or "").strip()
+        busy = any(word in f"{name}{phase}" for word in ("会", "通勤", "开车", "上课", "上班", "做饭", "排队", "加班", "考试", "开会"))
+        if busy:
+            value -= 0.30
+        try:
+            value -= max(0.0, 40.0 - float(core.energy.energy)) / 100.0 * 0.5
+        except Exception:
+            pass
+        return round(max(0.0, min(1.0, value)), 3)
+
+    def interest_state(self, user_id: str, now: float, text: str = "", is_group: bool = False) -> Dict[str, float]:
+        """三轴汇总。拿不到子服务时全部给中性值，不抛错。
+
+        群聊里没开成员情绪档案时返回空：那条路上连关系都不记，注意力更不该去建用户条目。
+        """
+        cfg = self.config
+        if cfg.mood_enabled and is_group and not cfg.mood_enabled_in_group:
+            return {}
+        if not cfg.mood_enabled:
+            return {"care": 0.5, "focus": self._focus(user_id, text, {}), "spare": self._spare(now)}
+        try:
+            profile = self._core.mood.profile(user_id)
+        except Exception:
+            profile = {}
+        try:
+            care_value = self.care(user_id, now)
+        except Exception:
+            care_value = 0.5
+        try:
+            focus_value = self._focus(user_id, text, profile)
+        except Exception:
+            focus_value = 0.4
+        try:
+            spare_value = self._spare(now)
+        except Exception:
+            spare_value = 0.7
+        return {"care": care_value, "focus": focus_value, "spare": spare_value}
+
+
+# 中文没分词：从一段话里抽 2~4 字的滑窗当作关键词，只用于“这句话里有没有提到它”。
+_CHUNK_SKIP = set("，。、；！？…~（）()【】“”" + '"\' ')
+
+
+def _chunks(text: str) -> List[str]:
+    cleaned = "".join(ch for ch in text if ch not in _CHUNK_SKIP)[:40]
+    if len(cleaned) < 2:
+        return []
+    out: List[str] = []
+    for size in (4, 3, 2):
+        for start in range(0, max(0, len(cleaned) - size + 1)):
+            out.append(cleaned[start:start + size])
+    return out
+

@@ -9,6 +9,17 @@ from typing import Any
 
 from ..clock import format_state_timestamp, parse_state_timestamp
 from ..config import HumanoidConfig
+from ..wording import pick, scale_word
+
+
+# 精力五档，每档几套等价说法（同一状态不必每次同一句）。
+ENERGY_WORDS: list[tuple[float, tuple[str, ...]]] = [
+    (90, ("精力充沛", "身上有劲", "精神足")),
+    (70, ("状态挺好", "精力够用", "不算累")),
+    (40, ("状态一般", "有点消耗", "平平的")),
+    (20, ("有点累", "提不起多少劲", "累了")),
+    (0, ("很疲惫", "身上没劲", "累得不想动")),
+]
 from ..role_scope import RoleScope
 from ..slots import Slot, clamp_rate, parse_time
 
@@ -26,16 +37,11 @@ PHASE_NOTES = (
 )
 
 
-def describe_energy(energy: float) -> str:
-    if energy >= 90:
-        return "精力充沛，语气轻快"
-    if energy >= 70:
-        return "状态良好，语气正常"
-    if energy >= 40:
-        return "状态一般，语气平和"
-    if energy >= 20:
-        return "有点累，语气慵懒"
-    return "很疲惫，语气低落"
+def describe_energy(energy: float, seed=None) -> str:
+    """精力档位词。**只说身体，不说语气**——「精力充沛，语气轻快」那半句是在教她怎么说话。"""
+    ladder = ENERGY_WORDS
+    word = scale_word(energy, ladder)
+    return pick("energy", list(seed or []) + [round(energy / 10.0)], word) if word else ""
 
 
 class EnergyService:
@@ -74,7 +80,11 @@ class EnergyService:
         return max(1.0, float(self.config.max_energy))
 
     def describe(self, energy: float | None = None) -> str:
-        return describe_energy(self.energy if energy is None else energy)
+        try:
+            seed = [self._scope.role_id, self._clock.today_str()]
+        except Exception:
+            seed = None
+        return describe_energy(self.energy if energy is None else energy, seed)
 
     @property
     def cycle_day(self) -> int:

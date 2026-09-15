@@ -203,9 +203,10 @@ class HumanoidConfig:
     night_mode_enabled: bool = True
     night_start_hour: int = 23
     night_end_hour: int = 6
-    # 睡着时把身体状态说得多硬：开着=直接讲她还在睡、是被震醒的；关着=只讲夜已深。
-    # 这一项不写台词也不下禁令（插件拦不住回复），只调节注入里那句状态描述的强度。
-    night_mode_force_sleep: bool = False
+    # 上下文里要不要写「这会儿在她的睡眠时段/最该睡的时候」这条事实。
+    # 旧名 night_mode_force_sleep 的语义是「睡着时把状态说得多硬」——那已经是替她决定
+    # 怎么开口了。现在只有给不给这条事实两种选择，给什么都是同一句身体描述。
+    show_sleep_window: bool = True
     night_deep_sleep_ratio: float = 0.5
 
     debug_mode: bool = False
@@ -231,7 +232,7 @@ class HumanoidConfig:
     contract_enabled: bool = True
 
     # v2.14.2：让「她几点起」只由夜间窗口一处决定
-    schedule_follow_night_window: bool = True
+    schedule_follow_night_window: bool = False
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any] | None) -> HumanoidConfig:
@@ -333,7 +334,7 @@ class HumanoidConfig:
             night_mode_enabled=b("night_mode_enabled"),
             night_start_hour=i("night_start_hour", 0, 23),
             night_end_hour=i("night_end_hour", 0, 23),
-            night_mode_force_sleep=b("night_mode_force_sleep"),
+            show_sleep_window=b("show_sleep_window"),
             night_deep_sleep_ratio=f("night_deep_sleep_ratio", 0.1, 1.0),
             debug_mode=b("debug_mode"),
             holidays=_as_mapping_tuple(pick("holidays")),
@@ -513,6 +514,14 @@ def plan_default_migrations(raw: Mapping[str, Any] | None) -> dict[str, Any]:
         # 她改了所在城市却没改天气城市（也改不了，以前没人提示这两处要对上）：
         # 清空天气城市，让它跟着所在城市走。
         changes["weather_location"] = ""
+    # v2.16.4：作息由人设决定，身体跟着她的日程走。只动「从没碰过作息设置」的人
+    # （窗口还是出厂那对 23/6 且对齐开着）——真去改过夜间窗口的人大概正是要锁作息，不碰。
+    if (
+        src.get("schedule_follow_night_window") is True
+        and src.get("night_start_hour") == 23
+        and src.get("night_end_hour") == 6
+    ):
+        changes["schedule_follow_night_window"] = False
     return changes
 
 
