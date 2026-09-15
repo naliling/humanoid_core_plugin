@@ -187,6 +187,83 @@ class BehaviorService:
         )
         return [item]
 
+    def compute_agency(
+        self,
+        user_id: str,
+        events: List[Dict[str, Any]],
+        social_energy: float,
+        mood_profile: Dict[str, Any],
+        energy: float,
+    ) -> Dict[str, float]:
+        """根据长期状态 + 短期注意力形成行为倾向。
+
+        这些值不是回复命令，只是 LLM 的决策背景。
+        """
+        agency = {
+            "initiative": 0.42,
+            "curiosity": 0.32,
+            "care": 0.48,
+            "social_willingness": 0.60,
+            "continuation": 0.52,
+        }
+
+        social_energy = float(social_energy)
+        energy = float(energy)
+        affection = float(mood_profile.get("affection", 50.0))
+
+        if social_energy < 30:
+            agency["social_willingness"] *= 0.45
+            agency["initiative"] *= 0.70
+        elif social_energy < 60:
+            agency["social_willingness"] *= 0.78
+            agency["initiative"] *= 0.88
+        elif social_energy > 85:
+            agency["social_willingness"] += 0.06
+
+        if energy < 20:
+            agency["initiative"] *= 0.55
+            agency["continuation"] *= 0.75
+        elif energy < 50:
+            agency["initiative"] *= 0.78
+            agency["continuation"] *= 0.90
+        elif energy > 80:
+            agency["initiative"] += 0.04
+
+        if affection >= 70:
+            agency["care"] += 0.12
+            agency["curiosity"] += 0.08
+        elif affection <= 30:
+            agency["care"] -= 0.10
+            agency["social_willingness"] -= 0.08
+
+        for event in events:
+            typ = event.get("type")
+            bucket = event.get("data", {}).get("gap_bucket")
+            attention = max(0.0, min(1.0, float(event.get("attention", 0.0))))
+            if attention <= 0:
+                continue
+
+            if typ == "conversation_started":
+                agency["curiosity"] += 0.08 * attention
+                agency["care"] += 0.04 * attention
+            elif typ == "conversation_resumed":
+                agency["curiosity"] += 0.12 * attention
+                agency["continuation"] += 0.10 * attention
+            elif typ == "user_returned":
+                agency["curiosity"] += 0.18 * attention
+                agency["care"] += 0.12 * attention
+                agency["initiative"] += 0.08 * attention
+                if bucket == "long_return":
+                    agency["curiosity"] += 0.05 * attention
+            elif typ == "long_gap":
+                agency["curiosity"] += 0.22 * attention
+                agency["care"] += 0.15 * attention
+                agency["initiative"] += 0.10 * attention
+
+        for key, value in agency.items():
+            agency[key] = max(0.0, min(1.0, float(value)))
+        return agency
+
     def clear_user_events(self, user_id: str) -> None:
         key = self._key(user_id)
         self._events.pop(key, None)

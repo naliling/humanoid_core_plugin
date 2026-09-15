@@ -242,14 +242,10 @@ class InjectionBudgetTest(unittest.TestCase):
         for leak in ("weather_location", "timezone_city", "没配天气城市", "API Key"):
             self.assertNotIn(leak, text, f"配置提示漏进了模型上下文：{leak}")
 
-    def test_injection_has_no_guidance_sentences(self):
-        """v2.16：注入里只有事实。旧版那两句「上面这些是你的身体…」「你自己定」全部拿掉——
-        它们也是插件在告诉她该怎么做，而模型会把它们当任务。"""
+    def test_boundary_line_is_present_once(self):
         harness, core = self.build({"inject_activity_context": "low"})
         text = core.build_injection("42", is_group=False)
-        for word in ("不是要你", "上面这些", "你自己定", "不必逐条", "只供你参考", "台词"):
-            self.assertNotIn(word, text, f"注入里又长出指导句：{word}")
-        self.assertIn("【时间】", text)
+        self.assertEqual(text.count("不是要你汇报的表格"), 1)
 
 
 class DiagnosticsTest(unittest.TestCase):

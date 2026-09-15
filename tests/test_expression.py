@@ -1,8 +1,6 @@
-"""身体层：soma 的多轴怎么动。
+"""表达层：体感显著度门控、说话形式倾向、夜间语气分档。
 
-v2.16 起这些轴**不再进聊天上下文**（体感句、说话形式、夜间语气全被删了），它们留在
-state.json 里驱动她的一天，并通过联动契约交给社交层。所以这里只测「身体算得对不对」，
-注入里该有什么由 tests/test_v216_facts.py 看着。
+这一层的价值全在「什么不该注入」上，所以断言大多是负向的。
 """
 
 from __future__ import annotations
@@ -14,6 +12,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from humanoid.config import HumanoidConfig
+from humanoid.data.mood_map import get_mood_label
+from humanoid.prompt_builder import MOOD_TONE_HINTS, build_night_lines
 from humanoid.services.soma import SomaService
 from humanoid.role_scope import RoleScope
 
@@ -24,6 +24,65 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 def cfg(**overrides) -> HumanoidConfig:
     return HumanoidConfig.from_raw({"timezone_city": "北京", **overrides})
+
+
+def reachable_labels() -> set[str]:
+    return {
+        get_mood_label(affection, libido, aggression)
+        for affection in range(0, 101)
+        for libido in range(0, 51)
+        for aggression in range(0, 51)
+    }
+
+
+class MoodToneTableTest(unittest.TestCase):
+    def test_every_hint_key_is_a_reachable_label(self):
+        """写成近义词的 key 永远命中不到，等于白加一条语气提示。"""
+        labels = reachable_labels()
+        dead = sorted(key for key in MOOD_TONE_HINTS if key not in labels)
+        self.assertEqual(dead, [], f"这些 key 不在 get_mood_label 的输出里：{dead}")
+
+
+class NightLinesTest(unittest.TestCase):
+    """夜间 23:00–06:00、深睡比例 0.5 → 深睡 23/0/1/2 点，浅睡 3/4/5 点。"""
+
+    def test_force_sleep_is_the_stronger_variant(self):
+        """强弱的差别在「说得多硬」，不在「有没有台词」。"""
+        forced = " ".join(build_night_lines(cfg(night_mode_force_sleep=True), True, False))
+        free = " ".join(build_night_lines(cfg(night_mode_force_sleep=False), True, False))
+        self.assertIn("还在睡", forced)
+        self.assertNotIn("还在睡", free)
+
+    def test_no_script_and_no_ban(self):
+        """四档都不给插件替她说好的句子，也不写插件执行不了的禁令。"""
+        banned = (
+            "「", "」", "不要", "不应回复", "必须", "回一句", "提一句", "明天再聊",
+            "简短回应", "控制在", "只说一两句",
+        )
+        for force in (True, False):
+            for deep in (True, False):
+                for asleep in (True, False):
+                    text = " ".join(
+                        build_night_lines(cfg(night_mode_force_sleep=force), deep, asleep)
+                    )
+                    for word in banned:
+                        self.assertNotIn(word, text, f"夜间文案里不该有「{word}」：{text}")
+
+    def test_deep_and_light_differ(self):
+        deep = " ".join(build_night_lines(cfg(), True, False))
+        light = " ".join(build_night_lines(cfg(), False, False))
+        self.assertIn("迷糊", deep)
+        self.assertNotIn("迷糊", light)
+
+    def test_being_asleep_reads_as_deep_sleep(self):
+        text = " ".join(build_night_lines(cfg(), False, True))
+        self.assertIn("吵醒", text)
+
+    def test_no_unactionable_ban(self):
+        for force in (True, False):
+            for deep in (True, False):
+                text = " ".join(build_night_lines(cfg(night_mode_force_sleep=force), deep, False))
+                self.assertNotIn("不应回复", text, "插件拦不住回复，别让模型猜该不该回")
 
 
 class SomaFixture:

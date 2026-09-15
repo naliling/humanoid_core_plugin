@@ -328,7 +328,18 @@ class HumanoidCoreInstance:
         # 时间间隔由 Core.on_message 统一记账。这里严格只读取并构建注入内容。
         # v2.16：注入里只有事实（时间/称呼/间隔），行为倾向不再参与——那会被模型当成任务。
         events = self.behavior.consume_relevant_events(user_id, now)
-        return self.prompt_builder.build(user_id, is_group, events=events)
+        agency = {}
+        if events:
+            agency = self.behavior.compute_agency(
+                user_id=user_id,
+                events=events,
+                social_energy=self.social.value,
+                mood_profile=self.mood.profile(user_id),
+                energy=self.energy.energy,
+            )
+        return self.prompt_builder.build(
+            user_id, is_group, events=events, agency=agency
+        )
 
     def refresh_contract(self) -> dict | None:
         """重算并落盘导出给社交层的身体快照。

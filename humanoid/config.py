@@ -203,6 +203,9 @@ class HumanoidConfig:
     night_mode_enabled: bool = True
     night_start_hour: int = 23
     night_end_hour: int = 6
+    # 睡着时把身体状态说得多硬：开着=直接讲她还在睡、是被震醒的；关着=只讲夜已深。
+    # 这一项不写台词也不下禁令（插件拦不住回复），只调节注入里那句状态描述的强度。
+    night_mode_force_sleep: bool = False
     night_deep_sleep_ratio: float = 0.5
 
     debug_mode: bool = False
@@ -330,6 +333,7 @@ class HumanoidConfig:
             night_mode_enabled=b("night_mode_enabled"),
             night_start_hour=i("night_start_hour", 0, 23),
             night_end_hour=i("night_end_hour", 0, 23),
+            night_mode_force_sleep=b("night_mode_force_sleep"),
             night_deep_sleep_ratio=f("night_deep_sleep_ratio", 0.1, 1.0),
             debug_mode=b("debug_mode"),
             holidays=_as_mapping_tuple(pick("holidays")),

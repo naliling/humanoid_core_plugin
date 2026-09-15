@@ -1,13 +1,16 @@
 """v2.16 的两条底线。
 
-一、聊天上下文里只放事实（时间、称呼、隔了多久没说话，以及 full 档的生活事实）。
-身体数值、体感句、"这一轮说多长"、情绪态度句、语气提示、夜间禁令——一律不进上下文。
-写进去的东西模型不会当参考，只会当任务；插件的职责是给身体与生活，不是替她说话。
+一、上下文里给的是她的身体、处境与生活，但**不能是台词、禁令与读数**：插件不替她把
+话说完（「我现在需要休息，明天再聊吧」），不规定她怎么回（「不要接着聊」「这一轮控制在
+20字」），也不把体检单端给她看（好感 46.0/100、社交能量 100%、UTC+08:00）。
 
 二、时区不许静默退化：她说在哪个城市，就得按那个城市的钟点过日子，做不到要说出来。
 
 这两类毛病共同点是不会报错：前者让她的话变成插件写的句子，后者让她说的时间与配置里的
 城市差几个小时。所以断言基本都是负向的。
+
+「有内容但没有命令与台词」这件事本身由 `tests/test_v2151_freedom.py` 守：它把身体推到
+极端后渲染三档注入，逐项断言不含命令式句子与台词。本文件只守技术量与上下文形状。
 """
 
 from __future__ import annotations
@@ -33,36 +36,8 @@ TZ = ZoneInfo("Asia/Shanghai")
 MOMENT = datetime(2026, 8, 22, 15, 20, tzinfo=TZ)
 TODAY = MOMENT.strftime("%Y-%m-%d")
 
-# 模型不该在上下文里读到的说法：台词、禁令、形式要求、身体指标、情绪解释、元指令。
-BANNED = (
-    "不要",
-    "不应回复",
-    "必须",
-    "控制在",
-    "别超过",
-    "别展开",
-    "别念",
-    "回一句",
-    "提一句",
-    "明天再聊",
-    "简短回应",
-    "只说一两句",
-    "字上下",
-    "这一轮",
-    "语气",
-    "眼皮很沉",
-    "迷迷糊糊",
-    "积了点火",
-    "精力",
-    "社交能量",
-    "/100",
-    "上面这些",
-    "你自己定",
-    "不是要你",
-)
-
-# 关系信息只在 mood_only 档出现，low / full 不该有。
-RELATION_ONLY_IN_MOOD = ("对TA的感觉",)
+# 上下文里不该出现的读数与调试形式：那些是给主人核对用的，不是她说话时的形式。
+TECHNICAL = ("UTC+", "UTC-", "%", "/100", "Asia/", "Europe/", "→")
 
 
 def cfg(**overrides) -> HumanoidConfig:
@@ -108,44 +83,29 @@ def wrecked_body(core) -> HumanoidCoreInstance:
     return core
 
 
-class FactsOnlyTest(unittest.TestCase):
-    def test_every_tier_is_facts_only(self):
+class ContextShapeTest(unittest.TestCase):
+    """上下文该有她的身体与处境，但不该有读数与调试形式。"""
+
+    def test_no_debug_format_leaks_into_context(self):
+        """UTC 偏移、百分比、/100、IANA 时区代码都不该出现在她眼前。"""
         for mode in ("low", "full", "mood_only"):
             core = wrecked_body(core_with(mode=mode))
             text = core.build_injection("42", is_group=False)
             with self.subTest(mode=mode):
-                for word in BANNED:
-                    self.assertNotIn(word, text, f"{mode} 档把「{word}」塞进了上下文：\n{text}")
-                if mode != "mood_only":
-                    for word in RELATION_ONLY_IN_MOOD:
-                        self.assertNotIn(word, text, f"{mode} 档不该给关系解释")
-
-    def test_group_tier_is_facts_only(self):
-        core = wrecked_body(core_with(mood_enabled_in_group=True))
-        text = core.build_injection("42", is_group=True)
-        for word in BANNED + RELATION_ONLY_IN_MOOD:
-            self.assertNotIn(word, text, f"群聊注入里出现了「{word}」：\n{text}")
-
-    def test_no_debug_format_leaks_into_context(self):
-        """UTC 偏移、百分比、IANA 时区代码都是给主人核对用的，不该出现在她眼前。"""
-        for mode in ("low", "full"):
-            core = core_with(mode=mode)
-            text = core.build_injection("42", is_group=False)
-            with self.subTest(mode=mode):
-                for word in ("UTC+", "UTC-", "%", "Asia/", "Europe/", "→"):
+                for word in TECHNICAL:
                     self.assertNotIn(word, text, f"{mode} 档把调试形式塞进了上下文：{text}")
 
-    def test_sleeping_body_does_not_change_the_reply_contract(self):
-        """她在睡觉：插件不压字数、不赶人、也不替她说「我要睡了」。
-
-        身体照旧在攒债、日程照旧写着睡眠，但聊天上下文里只有钟点。
-        """
+    def test_body_and_mood_still_computed_even_though_not_reported_as_numbers(self):
+        """不进上下文不等于不算：身体与情绪照旧在跑，契约照旧导出。"""
         core = wrecked_body(core_with())
-        text = core.build_injection("42", is_group=False)
-        self.assertIn("【时间】", text)
-        self.assertIn("15:20", text)
-        self.assertEqual(core.soma.snapshot()["asleep"], 1.0, "身体该知道她在睡")
-        self.assertNotIn("睡", text, "上下文里不该出现「她在睡觉」这种会被她念出来的话")
+        snap = core.soma.snapshot()
+        self.assertGreater(float(snap["sleep_pressure"]), 90.0, "身体照旧在攒困意")
+        self.assertGreater(float(snap["hunger"]), 90.0)
+        self.assertAlmostEqual(float(core.mood.profile("42")["aggression"]), 45.0)
+        contract = core.refresh_contract()
+        self.assertTrue(contract, "契约还得照常导出，主动社交靠它")
+        self.assertIn("body", contract)
+        self.assertIsNotNone(contract["form"].get("max_chars"), "形式倾向仍给社交层")
 
     def test_default_tier_carries_time_gap_and_nickname(self):
         core = core_with()
@@ -155,26 +115,22 @@ class FactsOnlyTest(unittest.TestCase):
             "data": {"gap_seconds": 11520.0, "previous_message": "我猫今天吐了"},
         })
         text = core.build_injection("42", is_group=False)
-        self.assertIn("【时间】", text)
+        self.assertIn("2026-08-22 15:20", text)
         self.assertIn("小鱼", text)
         self.assertIn("距上次说话 3 小时 12 分", text)
         self.assertIn("我猫今天吐了", text)
 
-    def test_full_tier_adds_life_not_body(self):
-        core = wrecked_body(core_with(mode="full"))
+    def test_interval_is_an_exact_duration_not_a_bucket_phrase(self):
+        """「对方隔了约2～6小时重新出现」把一件客观事描成情境，报准就好。"""
+        core = core_with()
+        core.behavior.add_event("42", {
+            "type": "long_gap", "timestamp": core.soma.now, "importance": 0.9,
+            "data": {"gap_seconds": 9000.0},
+        })
         text = core.build_injection("42", is_group=False)
-        self.assertIn("【时间】", text)
-        self.assertIn("【称呼】", text)
-        self.assertNotIn("【我的感觉】", text)
-        self.assertNotIn("【话的份量】", text)
-
-    def test_no_injected_block_tells_her_what_to_do(self):
-        """整块扫一遍：注入里出现的每个字都该是名词性的事实。"""
-        for mode in ("low", "full", "mood_only"):
-            core = wrecked_body(core_with(mode=mode))
-            text = core.build_injection("42", is_group=False)
-            for verb in ("记住", "记得要", "请", "应该", "务必", "试着", "不妨"):
-                self.assertNotIn(verb, text, f"{mode} 档在给她下指令（{verb}）：{text}")
+        self.assertIn("距上次说话 2 小时 30 分", text)
+        for vague in ("约2～6小时", "约30分钟～2小时", "6小时以上"):
+            self.assertNotIn(vague, text)
 
 
 class CityTableTest(unittest.TestCase):
