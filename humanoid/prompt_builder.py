@@ -1,18 +1,22 @@
-"""把身体状态编译成模型能「感觉到」的上下文。
+"""把她此刻的处境交给模型：只给事实，不给台词，也不给规矩。
 
-v2.13.x 的做法是把状态拼成一行标签卡（`精力状态一般；情绪调皮；社交能量低`）塞进
-用户消息，模型看到的是一堆**数据**，于是只能再补一句「禁止提及任何具体数据」去堵它
-的复述冲动。这一版改成三段：
+v2.16 起这个模块只输出**客观事实**，一条指导句都没有：
 
-1. **体感**：第一人称的生理感受短句，由 soma 的轴 + 显著度门控产生。多数轴多数时候
-   不出现——真人也不会每条消息都报告自己的状态。
-2. **说话形式**：身体对这一轮的硬约束建议（期望长度、提问倾向、适不适合长回复）。
-   这比「语气慵懒」有效得多，因为它改变的是形式而不是措辞风格。
-3. **场景与关系**：群聊还是私聊、时间地点天气、怎么称呼对方、对他的情绪标签。
+    【时间】2026-09-15 星期二 21:40 晚上，你在上海
+    【称呼】你管TA叫小鱼
+    【刚刚】距上次说话 3 小时 12 分；TA上一句说的是「我猫今天吐了」
 
-三档注入 `full / low / mood_only` 都真正区分开；v2.13.2 里 `mood_only` 与 `low` 走
-的是同一分支，`enable_chat_awareness`、`show_city_time_in_low_intrusion`、
-`night_mode_force_sleep`、`last_interaction_mode` 四个配置项则完全没有代码读。
+身体（困意、饥饿、睡眠债）、情绪三轴、"这一轮该说多长"这些**都不进上下文**。它们留在
+state.json 里驱动她的一天，并通过联动契约交给社交层。原因很直接：把「她此刻的感受」写成
+句子塞进去，模型只会照抄，而且会当成必须执行的任务——那就不是参考，是插件替她说话、
+替她决定回复多长。她困不困、要不要顶回去、说几句，是模型从「凌晨两点」「她刚跑完一整天」
+这些事实里自己幻想出来的。
+
+三档 `inject_activity_context` 只决定**给多少生活事实**：
+
+* `low`（默认）：时间 + 称呼 + 刚刚（隔了多久没说话）
+* `full`：再加 今天（日程里此刻在做什么、刚做过、接下来）、TA说过、天气
+* `mood_only`：只给称呼与一个关系标签词
 """
 
 from __future__ import annotations
@@ -30,10 +34,13 @@ from .services.schedule import day_lines, day_phrases
 
 _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 
-# 注入块的硬长度上限（字符）。每次聊天请求都追加这一条，所以它必须是个定值而不是
-# 「看拼出来多少」。v2.15 多给了两块生活细节（今天干了什么 / 你们聊到过什么），
-# 上限相应抬高了一点，仍然卡在一千 token 以内。
-INJECT_MAX_CHARS = {"low": 640, "full": 900, "mood_only": 330}
+# 注入块的硬长度上限（字符）。v2.16 把指导句全删了，剩下的都是事实，上限跟着收紧：
+# 注入每条聊天请求都追加一次，它越小越不像在给她下任务。
+INJECT_MAX_CHARS = {"low": 220, "full": 620, "mood_only": 60}
+
+# 「今天」与「记得」各给多少。这两块只在 full 档出现。
+DAY_ITEMS_FULL = 3
+TOPICS_FULL = 3
 
 
 def estimate_tokens(text: str) -> int:
@@ -46,65 +53,22 @@ def estimate_tokens(text: str) -> int:
     cjk = len(_CJK_RANGES.findall(text))
     return int(math.ceil(cjk + (len(text) - cjk) / 3.5))
 
-# 情绪标签 → 语气。v2.13.2 这份表放在已死的 humanoid/prompt.py 里，没有任何调用方。
-MOOD_TONE_HINTS = {
-    "亲密": "语气温柔，带一点亲昵",
-    "依恋": "语气柔和，略带撒娇",
-    "信赖": "语气坚定，充满信任",
-    "热情": "语气活泼，表现出兴趣",
-    "友好": "语气友善，保持礼貌",
-    "平常": "语气自然，不刻意",
-    "疏远": "语气客气，保持距离",
-    "冷淡": "语气平淡，不热情",
-    "敌视": "语气冷硬，保持警惕",
-    "警惕": "语气谨慎，观察为主",
-}
 
-BOUNDARY_LINE = (
-    "这些是你的身体、今天过过的一天和你对TA的心气，不是要报告的数据：别念数值与百分比。"
-)
-# 上一句只是「别报数据」，没告诉她感觉可以表达出来，模型于是永远中性。这一句是许可。
-PERMISSION_LINE = (
-    "但困了、烦了、想说话、心里对TA有点意见，都直接体现在你怎么说话上"
-    "（短一点、淡一点、顶一句回去），不用永远热情得体。"
-)
+FIRST_CONTACT_LINE = "这是你和TA的第一次对话"
 
-# 低注入档下最多给几条体感：真人多数时候不觉得自己在报备身体。
-MAX_FEELINGS_LOW = 2
-MAX_FEELINGS_FULL = 5
-FEELING_THRESHOLD_LOW = 0.55
 
-# 注入块里「今天干了什么」与「记得的事」各给多少。这两块是新增的生活细节，
-# 但注入每条聊天请求都追加一次，必须控住体积。
-DAY_ITEMS_LOW = 2
-DAY_ITEMS_FULL = 3
-TOPICS_LOW = 2
-TOPICS_FULL = 4
-
-# 情绪偏到一定程度就直接用第一人称告诉她，而不是只贴一个标签词。
-AGGRAVATED_AGGRESSION = 28.0
-EAGER_LIBIDO = 32.0
-COLD_AFFECTION = 32.0
-WARM_AFFECTION = 72.0
-
-EVENT_TEXT = {
-    "conversation_started": "刚开始交流",
-    "conversation_resumed": "对方刚重新接上对话（约离开5～30分钟）",
-    "user_returned": {
-        "medium_return": "对方隔了约30分钟～2小时重新出现",
-        "long_return": "对方隔了约2～6小时重新出现",
-        "short_return": "对方刚回来",
-    },
-    "long_gap": "对方隔了6小时以上重新出现",
-}
-
-AGENCY_LABELS = {
-    "initiative": "主动",
-    "curiosity": "好奇",
-    "care": "关心",
-    "social_willingness": "社交意愿",
-    "continuation": "延续话题",
-}
+def humanize_gap(seconds: float) -> str:
+    """把秒数说成一句时长：12 分钟、3 小时 12 分、2 天 4 小时。"""
+    total = max(0, int(round(float(seconds))))
+    minutes, hours, days = total // 60, total // 3600, total // 86400
+    if hours >= 24:
+        rest_h = (minutes - days * 1440) // 60
+        return f"{days} 天{f' {rest_h} 小时' if rest_h else ''}"
+    if hours:
+        return f"{hours} 小时 {minutes % 60} 分" if minutes % 60 else f"{hours} 小时"
+    if minutes:
+        return f"{minutes} 分钟"
+    return "不到一分钟"
 
 
 class PromptBuilder:
@@ -122,33 +86,43 @@ class PromptBuilder:
         user_id: str,
         is_group: bool = False,
         events: Optional[List[Dict[str, Any]]] = None,
-        agency: Optional[Dict[str, float]] = None,
     ) -> str:
         cfg = self.config
         events = events or []
-        agency = agency or {}
         mode = cfg.inject_activity_context
 
         if mode == "mood_only":
-            parts = []
-            relation = self._block("关系", self._relation_lines(user_id, is_group, detailed=False))
-            if relation:
-                parts.append(relation)
-            feelings = self._block("感觉", self._feelings_lines(max_items=1, threshold=0.7))
-            if feelings:
-                parts.append(feelings)
-            memory = self._block("记得", self._memory_lines(user_id, detailed=False))
-            if memory:
-                parts.append(memory)
-            return self._finish("\n".join(parts), cfg)
+            parts = [self._block("你们", self._relation_lines(user_id, is_group))]
+            return self._finish("\n".join(p for p in parts if p), cfg)
+
+        snap = self._core.snapshot(refresh=False)
+        parts: List[str] = [self._block("时间", self._time_lines(snap, is_group))]
+
+        who = self._nickname_line(user_id, is_group)
+        if who:
+            parts.append(self._block("称呼", [who]))
+
+        situ = self._behavior_lines(
+            events, with_previous=cfg.last_interaction_mode == "with_last_msg"
+        )
+        if situ:
+            parts.append(self._block("刚刚", situ))
 
         if mode == "full":
-            return self._finish(self._build_full(user_id, is_group, events, agency), cfg)
+            day = self._block("今天", self._day_lines())
+            if day:
+                parts.append(day)
+            memory = self._block("TA说过", self._memory_lines(user_id))
+            if memory:
+                parts.append(memory)
+            weather = self._block("天气", self._weather_lines(snap))
+            if weather:
+                parts.append(weather)
 
-        return self._finish(self._build_low(user_id, is_group, events, agency), cfg)
+        return self._finish("\n".join(p for p in parts if p), cfg)
 
     # ------------------------------------------------------------------
-    # 分块
+    # 各块：全部是事实
     # ------------------------------------------------------------------
 
     def _block(self, title: str, lines: List[str]) -> str:
@@ -157,60 +131,36 @@ class PromptBuilder:
             return ""
         return f"【{title}】" + "；".join(lines) + "。"
 
-    def _feelings_lines(self, max_items: int, threshold: float) -> List[str]:
-        """按显著度挑体感。低于门槛的一律不注入。"""
-        core = self._core
-        if not self.config.soma_enabled:
-            return []
-        try:
-            feelings = core.soma.feelings(float(core.energy.energy))
-        except Exception:
-            return []
-        picked = [item for item in feelings if item[0] >= threshold]
-        picked.sort(key=lambda item: item[0], reverse=True)
-        return [text for _, text in picked[:max_items]]
-
-    def _form_lines(self) -> List[str]:
-        core = self._core
+    def _time_lines(self, snap: Dict[str, Any], is_group: bool) -> List[str]:
         cfg = self.config
-        if not cfg.soma_enabled:
-            return []
+        now = self._core.clock.now()
+        line = f"{snap['today']} 星期{snap['weekday']} {now.strftime('%H:%M')} {self._time_of_day(now.hour)}"
+        holiday = ""
         try:
-            policy = core.soma.form_policy(float(core.energy.energy), float(core.social.value))
+            holiday = self._core.clock.holiday(now)
         except Exception:
-            return []
-        lines: List[str] = []
-        max_chars = int(policy.get("max_chars", 120))
-        if max_chars <= 24:
-            lines.append(f"这一轮只说一两句，控制在{max_chars}字上下")
-        elif max_chars <= 60:
-            lines.append(f"话说得短，别超过{max_chars}字")
-        elif not policy.get("long_reply_ok", True):
-            lines.append("别展开成长篇")
-        question_bias = float(policy.get("question_bias", 0.35))
-        if question_bias <= 0.1:
-            lines.append("这一轮不追问，先接住对方说的")
-        elif question_bias >= 0.5:
-            lines.append("可以自然地问一句")
-        if policy.get("burst_ok"):
-            lines.append("想说的东西可以分成几条短消息发")
+            holiday = ""
+        if holiday:
+            line += f"，{holiday}"
+        lines = [line]
+        if cfg.show_city_time_in_low_intrusion:
+            # 只地名，不带 UTC±HH:MM：偏移量是给人看的东西，塞进上下文只会让她说话像仪表。
+            lines.append(f"你在{snap['city']}")
+        if cfg.enable_chat_awareness:
+            lines.append("这是群聊" if is_group else "这是私聊")
         return lines
 
-    def _night_lines(self) -> List[str]:
-        """夜间/睡眠：真正按 night_mode_force_sleep 分强弱。"""
-        cfg = self.config
-        core = self._core
-        if not cfg.night_mode_enabled or not core.clock.is_night():
+    def _weather_lines(self, snap: Dict[str, Any]) -> List[str]:
+        """天气只留一句能用的；没配好时直接不注入，而不是把配置说明书念给模型听。"""
+        env = str((snap.get("weather") or {}).get("env", "")).strip()
+        if not env:
             return []
-        asleep = False
-        if cfg.soma_enabled:
-            try:
-                asleep = core.soma.snapshot().get("asleep", 0.0) >= 1.0
-            except Exception:
-                asleep = False
-        return build_night_lines(cfg, core.clock.is_deep_sleep(), asleep)
+        if any(word in env for word in ("未填", "未开启", "获取中", "没配天气")):
+            return []
+        return [env.replace("当前城市", "这边")[:26]]
 
-    def _relation_lines(self, user_id: str, is_group: bool, detailed: bool) -> List[str]:
+    def _relation_lines(self, user_id: str, is_group: bool) -> List[str]:
+        """`mood_only` 档：只给一个关系标签词，不给数值、不给态度句、不给语气提示。"""
         cfg = self.config
         core = self._core
         if not (cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group)):
@@ -218,77 +168,12 @@ class PromptBuilder:
         lines: List[str] = []
         try:
             data = core.mood.profile(user_id)
-            label = get_mood_label(data["affection"], data["libido"], data["aggression"])
+            lines.append(f"对TA的感觉：{get_mood_label(data['affection'], data['libido'], data['aggression'])}")
         except Exception:
             return []
-        if detailed:
-            lines.append(
-                f"当前情绪数值：好感{float(data['affection']):.1f}/100，"
-                f"亲近{float(data['libido']):.1f}/50"
-            )
-        hint = MOOD_TONE_HINTS.get(label)
-        lines.append(f"对TA的感觉：{label}" + (f"（{hint}）" if hint else ""))
-        lines.extend(self._emotion_lines(data))
-        tag = core.mood.tag(user_id)
-        if tag and cfg.mood_tag_enabled:
-            lines.append(f"心情标签：{tag}")
-        return lines
-
-    @staticmethod
-    def _emotion_lines(data: Dict[str, Any]) -> List[str]:
-        """把三个情绪轴翻成第一人称的态度句。
-
-        光贴一个「敌视/小脾气」的标签词，模型多半看一眼就过；换成「你现在对她有意见，
-        说话会短、会顶回去」才是能执行的东西。只挑最突出的两条，不拼成情绪清单。
-        """
-        try:
-            affection = float(data.get("affection", 50.0))
-            libido = float(data.get("libido", 25.0))
-            aggression = float(data.get("aggression", 15.0))
-            base_affection = float(data.get("base_affection", affection))
-            base_aggression = float(data.get("base_aggression", aggression))
-        except (TypeError, ValueError):
-            return []
-        lines: List[str] = []
-        if aggression >= AGGRAVATED_AGGRESSION:
-            if aggression >= base_aggression + 8:
-                lines.append("你这两天积了点火，现在对TA有意见，说话会短、会顶回去")
-            else:
-                lines.append("你对TA本来就没多少耐心，不想绕着说")
-        elif libido >= EAGER_LIBIDO and aggression < 15:
-            lines.append("你今天挺想跟TA多聊两句的")
-        if affection <= COLD_AFFECTION:
-            lines.append("还没熟到什么都想说，保持距离就好")
-        elif affection >= WARM_AFFECTION and aggression < 12:
-            lines.append("TA说的话你愿意接，语气自然会软下来")
-        if base_affection - affection >= 6:
-            lines.append("你对TA比前阵子淡了，之前不是这个态度")
-        return lines[:2]
-
-    def _day_lines(self, detailed: bool, include_doing: bool = True) -> List[str]:
-        """今天到这会她干了什么。只从日程算，不额外调任何东西。"""
-        core = self._core
-        try:
-            now = core.clock.now()
-            phrases = day_phrases(
-                core.schedule.current_slots(),
-                now.hour * 60 + now.minute,
-                past_limit=DAY_ITEMS_FULL if detailed else DAY_ITEMS_LOW,
-            )
-        except Exception:
-            return []
-        return day_lines(
-            phrases,
-            DAY_ITEMS_FULL if detailed else DAY_ITEMS_LOW,
-            include_doing=include_doing,
-        )
-
-    def _memory_lines(self, user_id: str, detailed: bool) -> List[str]:
-        """TA 之前说过什么。没记过就不注入，而不是编一个。"""
-        try:
-            lines = self._core.mood.recall_lines(user_id, TOPICS_FULL if detailed else TOPICS_LOW)
-        except Exception:
-            return []
+        nickname = self._nickname_line(user_id, is_group)
+        if nickname:
+            lines.append(nickname)
         return lines
 
     def _nickname_line(self, user_id: str, is_group: bool) -> str:
@@ -298,157 +183,49 @@ class PromptBuilder:
         nickname = self._core.mood.nickname(user_id)
         return f"你管TA叫{nickname}" if nickname else ""
 
-    def _scene_lines(self, snap: Dict[str, Any], is_group: bool) -> List[str]:
-        cfg = self.config
-        lines: List[str] = []
-        if cfg.enable_chat_awareness:
-            lines.append("群聊里，周围还有人看着" if is_group else "只有你和TA两个人在聊")
-        now = self._core.clock.now()
-        lines.append(f"{snap['today']} {self._time_of_day(now.hour)}")
-        if cfg.show_city_time_in_low_intrusion:
-            lines.append(f"你在{snap['city']}")
-        weather = snap.get("weather") or {}
-        temp = _short_weather(weather)
-        if temp:
-            lines.append(temp)
-        return lines
+    def _day_lines(self) -> List[str]:
+        """今天到这会她干了什么。只从日程算，不额外调任何东西。"""
+        core = self._core
+        try:
+            now = core.clock.now()
+            phrases = day_phrases(
+                core.schedule.current_slots(),
+                now.hour * 60 + now.minute,
+                past_limit=DAY_ITEMS_FULL,
+                future_limit=1,
+            )
+        except Exception:
+            return []
+        return day_lines(phrases, DAY_ITEMS_FULL)
 
-    def _state_lines(self, snap: Dict[str, Any], detailed: bool) -> List[str]:
-        """传统状态行。
-
-        开了生理层之后，low 档不再注入「精力状态良好」这类标签：体感已经把它说得更准，
-        同时出现两份只会让模型去调和问题。关掉 soma 时仍需要它兜底。
-        """
-        lines: List[str] = []
-        if detailed or not self.config.soma_enabled:
-            lines.append(f"精力{snap['energy']['text']}")
-        cycle = str(snap.get("cycle") or "").strip()
-        if cycle and detailed:
-            lines.append(cycle)
-        proc = self._core.process.current()
-        name = str(proc.get("name", "")).strip()
-        phase = str(proc.get("phase", "")).strip()
-        if name and name not in {"休息", "自由活动"}:
-            lines.append(f"手上在做的：{name}/{phase}" if phase and phase != name else f"手上在做的：{name}")
-        return lines
+    def _memory_lines(self, user_id: str) -> List[str]:
+        """TA 之前说过什么。没记过就不注入，而不是编一个。"""
+        try:
+            return self._core.mood.recall_lines(user_id, TOPICS_FULL)
+        except Exception:
+            return []
 
     def _behavior_lines(
-        self, events: List[Dict[str, Any]], agency: Dict[str, float], with_previous: bool
+        self, events: List[Dict[str, Any]], with_previous: bool
     ) -> List[str]:
+        """间隔就报准确时长。旧版报的是「对方隔了约2~6小时重新出现」这类档位话术，
+        那是把一件客观事描述成一种情境。"""
         if not events:
             return []
         top = events[0]
-        event_type = str(top.get("type", ""))
         data = top.get("data") or {}
-        mapped = EVENT_TEXT.get(event_type, "")
-        if isinstance(mapped, dict):
-            event_text = mapped.get(str(data.get("gap_bucket", "")), "对方隔了一段时间重新出现")
+        lines: List[str] = []
+        seconds = data.get("gap_seconds")
+        if seconds is None:
+            lines.append(FIRST_CONTACT_LINE)
         else:
-            event_text = mapped or "最近出现了交流变化"
-        lines = [event_text]
+            lines.append(f"距上次说话 {humanize_gap(float(seconds))}")
         previous = data.get("previous_message") if with_previous else None
         if previous:
             previous = str(previous).replace("\n", " ").strip()[:60]
             if previous:
-                lines.append(f"TA离开前说的是「{previous}」")
-        if agency:
-            strong = [
-                AGENCY_LABELS[key]
-                for key, value in sorted(agency.items(), key=lambda item: float(item[1]), reverse=True)
-                if key in AGENCY_LABELS and float(value) >= 0.62
-            ]
-            if strong:
-                lines.append("更" + "、更".join(strong[:2]))
+                lines.append(f"TA上一句说的是「{previous}」")
         return lines
-
-    # ------------------------------------------------------------------
-    # 两档组装
-    # ------------------------------------------------------------------
-
-    def _build_low(self, user_id: str, is_group: bool, events, agency) -> str:
-        snap = self._core.snapshot(refresh=False)
-        parts: List[str] = [self._block("此刻", self._scene_lines(snap, is_group))]
-
-        feelings = self._feelings_lines(MAX_FEELINGS_LOW, FEELING_THRESHOLD_LOW)
-        night = self._night_lines()
-        body = feelings + night
-        if body:
-            parts.append(self._block("我的感觉", body))
-
-        form = self._form_lines()
-        if form:
-            parts.append(self._block("这一轮", form))
-
-        relation = self._relation_lines(user_id, is_group, detailed=False)
-        nickname = self._nickname_line(user_id, is_group)
-        if nickname:
-            relation = relation + [nickname]
-        if relation:
-            parts.append(self._block("对TA", relation))
-
-        situ = self._behavior_lines(
-            events, agency, with_previous=self.config.last_interaction_mode == "with_last_msg"
-        )
-        if situ:
-            parts.append(
-                self._block("刚刚", situ + ["这个背景参考一次就好，别反复追问同件事"])
-            )
-
-        hands = self._state_lines(snap, detailed=False)
-        if hands:
-            parts.append(self._block("身边", hands))
-
-        # 「手上在做的」已经说了此刻，今天这条就别再说一遍，只补前面和后面。
-        day = self._block("今天", self._day_lines(detailed=False, include_doing=not hands))
-        if day:
-            parts.append(day)
-        memory = self._block("记得", self._memory_lines(user_id, detailed=False))
-        if memory:
-            parts.append(memory)
-
-        return "\n".join(part for part in parts if part)
-
-    def _build_full(self, user_id: str, is_group: bool, events, agency) -> str:
-        snap = self._core.snapshot(refresh=False)
-        lines: List[str] = []
-        lines += self._scene_lines(snap, is_group)
-        lines += self._state_lines(snap, detailed=True)
-        lines += [f"社交能量{int(float(snap['social_energy']['value']))}%" if snap.get("social_energy") else ""]
-        lines += self._feelings_lines(MAX_FEELINGS_FULL, 0.0)
-        lines += self._night_lines()
-        lines += self._form_lines()
-        lines += self._relation_lines(user_id, is_group, detailed=True)
-        nickname = self._nickname_line(user_id, is_group)
-        if nickname:
-            lines.append(nickname)
-        lines += self._behavior_lines(
-            events, agency, with_previous=self.config.last_interaction_mode == "with_last_msg"
-        )
-        lines += self._day_lines(detailed=True, include_doing=not any("手上在做的" in x for x in lines))
-        lines += self._memory_lines(user_id, detailed=True)
-        recent = self._core.process.recent()
-        if recent:
-            lines.append("最近做过：" + "、".join(recent))
-        return ("【拟人状态】" + "；".join(line for line in lines if line) + "。")
-
-    def _finish(self, text: str, cfg: HumanoidConfig) -> str:
-        if not text:
-            return ""
-        full = text + "\n" + BOUNDARY_LINE + "\n" + PERMISSION_LINE
-        limit = INJECT_MAX_CHARS.get(cfg.inject_activity_context, 520)
-        if len(full) > limit:
-            # 按块切而不是按字硬截：截到半句上模型会自己补下去。
-            kept: List[str] = []
-            used = 0
-            for line in full.split("\n"):
-                cost = len(line) + 1
-                if used + cost > limit:
-                    break
-                kept.append(line)
-                used += cost
-            kept.append("（以上只供你参考，不必逐条回应。）")
-            full = "\n".join(kept)
-        return full
 
     @staticmethod
     def _time_of_day(hour: int) -> str:
@@ -466,27 +243,19 @@ class PromptBuilder:
             return "晚上"
         return "深夜"
 
-
-def build_night_lines(cfg: HumanoidConfig, is_deep: bool, asleep: bool) -> List[str]:
-    """夜间语气：纯函数，调用方负责保证现在确实落在夜间窗口里。
-
-    `night_mode_force_sleep` 必须是「更严格」的那一档：开着时直接要求只回一句要休息，
-    关着时只是把话说短。插件拦不住回复，所以不写「不应回复」这类模型无法执行的禁令。
-    """
-    if cfg.night_mode_force_sleep:
-        if is_deep or asleep:
-            return ["你在睡觉，被吵醒就回一句「我现在需要休息，明天再聊吧」，不要接着聊"]
-        return ["夜已深，简短回应并提一句想睡了"]
-    if is_deep or asleep:
-        return ["刚被吵醒，迷迷糊糊、句子断续，说不长"]
-    return ["夜里慵懒，说话轻、短"]
-
-
-def _short_weather(weather: Dict[str, Any]) -> str:
-    """天气只留一句能用的；没配好时直接不注入，而不是把配置说明书念给模型听。"""
-    env = str(weather.get("env", "")).strip()
-    if not env:
-        return ""
-    if any(word in env for word in ("未填", "未开启", "获取中", "没配天气")):
-        return ""
-    return env.replace("当前城市", "这边")[:26]
+    def _finish(self, text: str, cfg: HumanoidConfig) -> str:
+        if not text:
+            return ""
+        limit = INJECT_MAX_CHARS.get(cfg.inject_activity_context, 220)
+        if len(text) > limit:
+            # 按块切而不是按字硬截：截到半句上模型会自己把半句补下去。
+            kept: List[str] = []
+            used = 0
+            for line in text.split("\n"):
+                cost = len(line) + 1
+                if used + cost > limit:
+                    break
+                kept.append(line)
+                used += cost
+            text = "\n".join(kept)
+        return text

@@ -102,4 +102,4 @@ def recall_lines(
     if not fresh:
         return []
     quotes = "、".join(f"「{x['said']}」" for x in fresh[: max(0, int(max_items))])
-    return [f"TA之前说过{quotes}，这些还没听TA说完下文"]
+    return [f"TA之前说过{quotes}"]

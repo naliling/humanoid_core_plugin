@@ -261,6 +261,19 @@ class FrozenClock:
     def is_night(self, moment=None) -> bool:
         return False
 
+    def zone_state(self):
+        """与真实 Clock 对齐：固定时刻带 tzinfo 时报告它的偏移，否则当成机器时间。"""
+        from humanoid.clock import ZoneState, resolve_zone_name
+
+        offset = self.moment.utcoffset()
+        name = getattr(self.moment.tzinfo, "key", "") or resolve_zone_name(self.city) or ""
+        return ZoneState(
+            city=self.city,
+            zone_name=name if offset is not None else "",
+            offset_minutes=int(offset.total_seconds() // 60) if offset else 0,
+            note="",
+        )
+
     def is_deep_sleep(self, moment=None) -> bool:
         return False
 
@@ -332,3 +345,19 @@ class ScopeStore:
 
     async def flush(self) -> bool:
         return await self.store.flush()
+
+
+def freeze(core, moment):
+    """把角色的所有服务换成同一个假时钟。
+
+    各服务在构造时就捕获了 clock 对象，只换 `core.clock` 会让它们各看各的时间：
+    身体会把她的钟点按宿主机小时算，「她在睡觉」「该不该说话」全部错一个偏移量。
+    城市沿用真 Clock 已经算好的显示名（IANA 名会翻成中文），否则测试里看到的
+    「你在北京」其实与配置无关。
+    """
+    clock = FrozenClock(moment, city=getattr(core.clock, "display_city", "北京"))
+    core.clock = clock
+    for service in (core.schedule, core.soma, core.energy, core.process, core.mood,
+                    core.social, core.weather):
+        service._clock = clock
+    return core

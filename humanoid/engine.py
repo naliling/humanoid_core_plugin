@@ -69,7 +69,10 @@ class HumanoidEngine:
         result = lookup_city_time(city)
         if result is None:
             return None
-        return f"📍 {result.display_city} 当前时间: {result.text}（星期{result.weekday}）"
+        text = f"📍 {result.display_city} 当前时间: {result.text}（星期{result.weekday}）"
+        if result.note:
+            text += f"\n⚠ {result.note}"
+        return text
 
     def diagnostics_text(self, core=None) -> str:
         if core is None:
@@ -110,8 +113,20 @@ class HumanoidEngine:
             process_status=process_status,
             body_status=body_status,
             inject_estimate=self._inject_estimate(core),
+            zone_status=self._zone_status(core),
             version=__version__,
         )
+
+    @staticmethod
+    def _zone_status(core) -> dict:
+        clock = getattr(core, "clock", None)
+        state = getattr(clock, "zone_state", None)
+        if state is None:
+            return {}
+        try:
+            return {"zone": state(), "moment": clock.now()}
+        except Exception:
+            return {}
 
     @staticmethod
     def _inject_estimate(core) -> dict:

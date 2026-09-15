@@ -3,41 +3,79 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, tzinfo
+from functools import lru_cache
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import HumanoidConfig
 from .data.cities import (
     CITY_TO_TIMEZONE,
     DEFAULT_CITY_PLACEHOLDER,
-    lookup_timezone,
+    display_city_name,
     lookup_city_time,
+    resolve_zone_name,
 )
 from .data.holidays import resolve_holiday
 
 WEEKDAY_NAMES = ("一", "二", "三", "四", "五", "六", "日")
-FALLBACK_TIMEZONE = "Asia/Shanghai"
 
 
 def weekday_cn(moment: datetime) -> str:
     return WEEKDAY_NAMES[moment.weekday()]
 
 
-def resolve_tzinfo(city: str) -> tzinfo | None:
-    tz_name = lookup_timezone(city)
-    if not tz_name:
-        return None
+@dataclass(frozen=True, slots=True)
+class ZoneState:
+    """她此刻按哪个钟过日子，以及为什么。"""
+
+    city: str
+    zone_name: str      # 生效的 IANA 名；"" = 没时区，用宿主机
+    offset_minutes: int
+    note: str           # 退化原因；"" = 正常
+
+
+def resolve_zone(city: str) -> tuple[tzinfo | None, str]:
+    """城市 → (tzinfo 或 None, 说明)。None 表示用宿主机时钟。
+
+    v2.15.1 删掉了旧版静默退回 `Asia/Shanghai` 那一手：机器上没有 tzdata 时，
+    设成东京的她其实按北京时间过一天，而注入里还写着「你在东京」——错得看不出来。
+    现在宁可退回宿主机时间，也要把原因说清楚（诊断与 /时间 都看得到）。
+    """
+    name = resolve_zone_name(city)
+    if not name:
+        raw = (city or "").strip()
+        if raw and raw != DEFAULT_CITY_PLACEHOLDER:
+            return None, f"认不出城市「{raw}」，她现在按这台机器的时间过日子（可填表内城市，或直接填 Asia/Shanghai 这类时区名）"
+        return None, ""
     try:
-        return ZoneInfo(tz_name)
+        return ZoneInfo(name), ""
     except (ZoneInfoNotFoundError, ValueError, OSError):
-        try:
-            return ZoneInfo(FALLBACK_TIMEZONE)
-        except Exception:
-            return None
+        if _tzdata_usable():
+            return None, f"「{name}」这个时区名用不了（可能拼错了），她现在按这台机器的时间过日子"
+        return None, f"这台机器缺时区数据库（tzdata），{name} 用不了，她现在按这台机器的时间过日子"
+
+
+@lru_cache(maxsize=1)
+def _tzdata_usable() -> bool:
+    """区分「机器没时区库」与「她填错了名字」：两者的改法完全不同。"""
+    try:
+        ZoneInfo("UTC")
+        return True
+    except Exception:
+        return False
+
+
+# 城市名在每条消息上都会被查（ZoneInfo 本身有缓存，但正则与字典型查找仍不必重做）。
+resolve_zone = lru_cache(maxsize=64)(resolve_zone)
+
+
+def resolve_tzinfo(city: str) -> tzinfo | None:
+    return resolve_zone(city)[0]
 
 
 def now_in_city(city: str) -> datetime:
-    tz = resolve_tzinfo(city)
+    tz, _ = resolve_zone(city)
     if tz is None:
         return datetime.now().astimezone()
     return datetime.now(tz)
@@ -78,10 +116,27 @@ class Clock:
     @property
     def display_city(self) -> str:
         city = self.city
-        return system_timezone_city() if city == DEFAULT_CITY_PLACEHOLDER else city
+        if city == DEFAULT_CITY_PLACEHOLDER:
+            return system_timezone_city()
+        # 填的是 IANA 名时翻成中文城市名：「你在雷克雅未克」，不是「你在Atlantic/Reykjavik」。
+        return display_city_name(city, resolve_zone_name(city))
 
     def now(self) -> datetime:
         return now_in_city(self.city)
+
+    def zone_state(self) -> ZoneState:
+        """当前配置生效的时区与退化原因（诊断用）。"""
+        city = self.city
+        tz, note = resolve_zone(city)
+        name = resolve_zone_name(city) or ""
+        moment = self.now()
+        offset = moment.utcoffset()
+        return ZoneState(
+            city=city,
+            zone_name=name if tz is not None else "",
+            offset_minutes=int(offset.total_seconds() // 60) if offset else 0,
+            note=note,
+        )
 
     def today_str(self) -> str:
         return self.now().strftime("%Y-%m-%d")

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .config import HumanoidConfig
+from .clock import DEFAULT_CITY_PLACEHOLDER, weekday_cn, format_offset
 from .slots import parse_time
 from .llm import (
     GLOBAL_LABEL,
@@ -75,6 +76,65 @@ def _routine_lines(
     return lines
 
 
+def _timezone_lines(cfg: HumanoidConfig, zone: Any, moment: Any) -> list[str]:
+    """时间与时区：她按哪个钟过日子，以及时在哪一步退化了。
+
+    这一节存在的原因：以前时区只能从注入里那句「你在东京」间接推，而插件在缺 tzdata
+    时会静默拿另一个城市的钟替她过日子，从聊天里根本看不出来。
+    """
+    from datetime import datetime
+
+    lines: list[str] = []
+    if zone is None:
+        return ["- 拿不到时区状态（角色还没创建）"]
+    host = datetime.now().astimezone()
+    host_offset = int(host.utcoffset().total_seconds() // 60)
+    city = str(zone.city or "").strip()
+    degraded = not zone.zone_name
+    if zone.zone_name:
+        lines.append(
+            f"- {city} → {zone.zone_name}（{format_offset(moment)}），此刻她那边 "
+            f"{moment.strftime('%H:%M')} 星期{weekday_cn(moment)}"
+        )
+    else:
+        label = city or "未填城市"
+        lines.append(
+            f"- 「{label}」没拿到可用时区 → 她此刻按这台机器的时间过日子："
+            f"{format_offset(moment)}，{moment.strftime('%H:%M')}"
+        )
+    if host_offset != zone.offset_minutes:
+        diff = (zone.offset_minutes - host_offset) / 60
+        lines.append(
+            f"- 机器本地时间 {host.strftime('%H:%M')}（{format_offset(host)}）："
+            f"{OK_MARK} 两者差 {diff:+g} 小时，这是预期的（她过的不是机器时间）"
+        )
+    else:
+        lines.append(f"- 机器本地时间与她的钟一致（{format_offset(host)}）")
+    if zone.note:
+        lines.append(f"  {WARN_MARK} {zone.note}")
+        if "tzdata" in zone.note:
+            lines.append("  → 在这台机器里装一份时区数据库（或 `pip install tzdata`）然后 /重载配置")
+    elif not city or city == DEFAULT_CITY_PLACEHOLDER:
+        lines.append(
+            f"  {WARN_MARK} 还没定所在城市（`timezone_city` 仍是默认的「{DEFAULT_CITY_PLACEHOLDER}」）："
+            "她住在哪个城市会直接改变她说出口的时间、作息、天气与日程"
+        )
+    weather_city = (cfg.weather_location or "").strip() or city
+    if not cfg.weather_enabled:
+        lines.append("- 天气：已关闭")
+    elif not weather_city or weather_city == DEFAULT_CITY_PLACEHOLDER:
+        lines.append(f"  {WARN_MARK} 天气城市没配（weather_location 为空且所在城市未定）：她不会报天气")
+    else:
+        same = "与时间城市同一处" if not (cfg.weather_location or "").strip() else "单独指定"
+        lines.append(f"- 天气城市：{weather_city}（{same}）")
+    lines.append(
+        "- 日程、夜间窗口、睡眠债记账都按她那个城市的钟点算，不按机器时间"
+        if not degraded
+        else "- 现在日程、夜间窗口、睡眠债记账全部按这台机器的时间排（她拿不到自己城市的钟）"
+    )
+    return lines
+
+
 def _resolve_line(
     resolver: ProviderResolver,
     label: str,
@@ -127,6 +187,7 @@ def build_report(
     version: str,
     body_status: dict[str, Any] | None = None,
     inject_estimate: dict[str, int] | None = None,
+    zone_status: dict[str, Any] | None = None,
 ) -> str:
     available = resolver.available_ids()
     lines = [f"〖拟人诊断〗v{version}", "", "【AstrBot 可用对话模型 id】"]
@@ -190,6 +251,8 @@ def build_report(
         lines.append(f"- 上次尝试: {last.summary()}")
     if schedule_status.get("last_error"):
         lines.append(f"- 上次失败原因: {schedule_status['last_error']}")
+
+    lines += ["", "【时间与时区】", *_timezone_lines(cfg, (zone_status or {}).get("zone"), (zone_status or {}).get("moment"))]
 
     lines += ["", "【作息】", *_routine_lines(cfg, schedule_status, body_status)]
 
@@ -276,7 +339,7 @@ def build_report(
             else "已关闭，不消耗模型调用"
         )
     )
-    lines.append("- 本插件自身不会为聊天回复额外调模型：状态都靠注入，回复走 AstrBot 主链路。")
+    lines.append("- 本插件不会为聊天回复额外调模型：上下文里只有时间/称呼/隔了多久，回复走 AstrBot 主链路。")
 
     lines += [
         "",

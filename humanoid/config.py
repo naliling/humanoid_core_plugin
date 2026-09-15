@@ -203,7 +203,6 @@ class HumanoidConfig:
     night_mode_enabled: bool = True
     night_start_hour: int = 23
     night_end_hour: int = 6
-    night_mode_force_sleep: bool = False
     night_deep_sleep_ratio: float = 0.5
 
     debug_mode: bool = False
@@ -331,7 +330,6 @@ class HumanoidConfig:
             night_mode_enabled=b("night_mode_enabled"),
             night_start_hour=i("night_start_hour", 0, 23),
             night_end_hour=i("night_end_hour", 0, 23),
-            night_mode_force_sleep=b("night_mode_force_sleep"),
             night_deep_sleep_ratio=f("night_deep_sleep_ratio", 0.1, 1.0),
             debug_mode=b("debug_mode"),
             holidays=_as_mapping_tuple(pick("holidays")),

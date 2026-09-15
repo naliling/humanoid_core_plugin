@@ -35,6 +35,7 @@ from .fakes import (
     RecordingLogger,
     fake_persona,
 )
+from .fakes import freeze as _freeze
 
 TZ = ZoneInfo("Asia/Shanghai")
 MOMENT = datetime(2026, 8, 22, 15, 20, tzinfo=TZ)
@@ -67,15 +68,8 @@ GOOD_SCHEDULE = json.dumps(
 
 
 def freeze(core, moment=MOMENT):
-    """把角色的所有服务换成同一个假时钟。
-
-    各服务在构造时就捕获了 clock 对象，只换 core.clock 会让它们各看各的时间。
-    """
-    clock = FrozenClock(moment)
-    core.clock = clock
-    for service in (core.schedule, core.soma, core.energy, core.process, core.mood, core.social, core.weather):
-        service._clock = clock
-    return core
+    """把角色换成假时钟（实现收拢在 fakes.freeze，各服务都要看到同一个「现在」）。"""
+    return _freeze(core, moment)
 
 
 def cfg(**overrides) -> HumanoidConfig:
@@ -345,7 +339,7 @@ class DayNarrativeTest(unittest.TestCase):
 
         store = StateStore(Path(tempfile.mkdtemp()) / "state.json", lambda: 0.01)
         store.load(TODAY, 28)
-        conf = cfg(inject_activity_context="low", timezone_city="北京")
+        conf = cfg(inject_activity_context="full", timezone_city="北京")
         core = HumanoidCoreInstance(
             role_id="bot1",
             state_store=store,
@@ -363,7 +357,7 @@ class DayNarrativeTest(unittest.TestCase):
         self.assertIn("跟客户过方案", text)
         # 此刻那一件事只说一次：过程与日程各说一遍会互相打脸
         self.assertNotIn("现在在跟客户过方案；手上在做的：跟客户过方案", text)
-        self.assertIn("手上在做的：跟客户过方案", text)
+        self.assertIn("现在在跟客户过方案", text)
 
 
 class RecallTest(unittest.TestCase):
@@ -417,7 +411,7 @@ class RecallTest(unittest.TestCase):
         async def go():
             store = StateStore(Path(tempfile.mkdtemp()) / "state.json", lambda: 0.01)
             store.load(TODAY, 28)
-            conf = cfg(inject_activity_context="low", timezone_city="北京")
+            conf = cfg(inject_activity_context="full", timezone_city="北京")
             core = HumanoidCoreInstance(
                 role_id="bot1",
                 state_store=store,
@@ -492,16 +486,16 @@ class RecallTest(unittest.TestCase):
 
 
 class EmotionLineTest(unittest.TestCase):
-    """情绪该改变说话，而不是只贴一个标签词。"""
+    """情绪不再进上下文：它驱动她的行为与契约，不该被插件翻成句子塞给模型。"""
 
-    def core_with_mood(self, **mood):
+    def core_with_mood(self, mode: str = "low", **mood):
         import asyncio
         import tempfile
         from pathlib import Path
 
         store = StateStore(Path(tempfile.mkdtemp()) / "state.json", lambda: 0.01)
         store.load(TODAY, 28)
-        conf = cfg(inject_activity_context="low", timezone_city="北京")
+        conf = cfg(inject_activity_context=mode, timezone_city="北京")
         core = HumanoidCoreInstance(
             role_id="bot1",
             state_store=store,
@@ -515,21 +509,33 @@ class EmotionLineTest(unittest.TestCase):
         record.update(mood)
         return core
 
-    def test_still_angry_changes_the_tone_line(self):
-        core = self.core_with_mood(affection=55.0, libido=10.0, aggression=40.0, base_aggression=28.0)
-        text = core.build_injection("42", is_group=False)
-        self.assertIn("有意见", text)
+    ANGRY = dict(affection=55.0, libido=10.0, aggression=40.0, base_aggression=28.0)
 
-    def test_neutral_mood_adds_no_attitude_line(self):
-        core = self.core_with_mood(affection=50.0, libido=25.0, aggression=20.0)
-        text = core.build_injection("42", is_group=False)
-        self.assertNotIn("说话会短、会顶回去", text)
+    def test_angry_mood_never_becomes_a_sentence_for_the_model(self):
+        """三档注入里都不该出现情绪解释、态度句、语气提示或数值。"""
+        for mode in ("low", "full", "mood_only"):
+            core = self.core_with_mood(mode=mode, **self.ANGRY)
+            text = core.build_injection("42", is_group=False)
+            with self.subTest(mode=mode):
+                for word in ("积了点火", "有意见", "没多少耐心", "说话会短", "顶回去",
+                             "/100", "当前情绪数值", "语气"):
+                    self.assertNotIn(word, text, f"{mode} 档把情绪塑给了模型：{text}")
 
-    def test_permission_line_survives_truncation(self):
-        """只说「别报数值」会把情绪一起压掉，许可那句必须在。"""
-        core = self.core_with_mood(affection=50.0)
+    def test_mood_only_gives_one_label_and_nothing_else(self):
+        """mood_only 就只是一个关系档位词，时线/生活/数值一概不给。"""
+        core = self.core_with_mood(mode="mood_only", **self.ANGRY)
         text = core.build_injection("42", is_group=False)
-        self.assertIn("不用永远热情得体", text)
+        self.assertIn("对TA的感觉", text)
+        for word in ("【时间】", "【今天】", "【天气】", "/100", "%"):
+            self.assertNotIn(word, text)
+
+    def test_mood_still_drives_the_contract(self):
+        """不进上下文不等于不算：情绪依旧在算、依旧写进契约供社交层用。"""
+        core = self.core_with_mood(**self.ANGRY)
+        snap = core.snapshot(user_id="42", refresh=False)
+        self.assertAlmostEqual(float(snap["mood"]["aggression"]), 40.0)
+        contract = core.refresh_contract()
+        self.assertTrue(contract, "契约还得照常导出，主动社交靠它")
 
 
 class ContractDayTest(unittest.TestCase):

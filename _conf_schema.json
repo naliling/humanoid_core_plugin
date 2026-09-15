@@ -148,14 +148,15 @@
     "default": 60
   },
   "inject_activity_context": {
-    "description": "【聊天模式】注入程度（下拉选择：full=完整注入，low=低侵入，mood_only=纯情绪）",
+    "description": "【聊天上下文】每轮往模型那边放多少事实（下拉：low=只给时间/称呼/隔了多久，full=再加今天在做的事与天气，mood_only=只给一个关系词）",
     "type": "string",
     "default": "low",
     "options": [
       "full",
       "low",
       "mood_only"
-    ]
+    ],
+    "hint": "v2.16 起这三档给的都是客观事实，不再有任何「她此刻的感受」「这一轮该说多长」这类句子：写进上下文的句子模型不会当参考，只会当任务。身体、情绪、形式倾向照旧在算，只是留在 state.json 与联动契约里。"
   },
   "environment_mode": {
     "description": "【环境】生效范围（下拉选择：both=全部，private=仅私聊，group=仅群聊）",
@@ -173,12 +174,14 @@
     "default": true
   },
   "show_city_time_in_low_intrusion": {
-    "description": "【低侵入】低侵入模式下是否显示当前城市时间",
+    "description": "【聊天上下文】要不要把「你在某城市」这句话也放进去（关掉只剩日期与钟点）",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "地名会按 IANA_DISPLAY_NAMES 翻成中文；UTC±HH:MM 这类偏移量只出现在 /时间 与 /拟人诊断 里，不进上下文。"
   },
   "timezone_city": {
-    "description": "【时间】默认时区城市（用于 /时间 指令，同时作为AI感知的所在城市），如：北京、莫斯科、东京",
+    "description": "【时间】她所在的城市（她感知的当地时区，也是 /时间 的默认城市），如：北京、莫斯科、东京",
+    "hint": "表里没收录的城市可以直接填 IANA 时区名（如 Asia/Ho_Chi_Minh、America/New_York）。填了但生效不了时，/拟人诊断 的【时间与时区】会直说她现在按 AstrBot 这台机器的时间过日子——以前这里会静默退回北京时间，说在东京却过着北京的一天。",
     "type": "string",
     "default": "河源（记得改~）"
   },
@@ -253,9 +256,10 @@
     "default": 120
   },
   "mood_tag_enabled": {
-    "description": "【心情标签】是否启用可读的心情标签（如\"疲惫但开心\"）",
+    "description": "【心情标签】是否生成可读的心情标签（如「疲惫但开心」），显示在 /情绪详情 里",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "这个标签给人看，不进聊天上下文——v2.16 起上下文里只有时间、称呼与隔了多久。"
   },
   "mood_use_llm_for_delta": {
     "description": "【情绪】是否用大模型分析单次对话的情绪变化（关闭后仅用本地词典规则，更可控、零额外调用）",
@@ -332,8 +336,8 @@
     "default": 60
   },
   "night_mode_enabled": {
-    "description": "【夜间模式】是否启用「生物钟夜」。关掉后不再有夜间语气，也不再记睡眠债",
-    "hint": "这一组时间说的是她的昼夜节律（哪段时间算夜里），不是「她实际在睡的那几个小时」——后者由日程决定。两者靠下面的「日程贴合作息」对齐。",
+    "description": "【夜间模式】是否启用「生物钟夜」。关掉后不再记睡眠债，昼夜低谷也失去位置",
+    "hint": "这一组时间说的是她的昼夜节律（哪段时间算夜里），不是「她实际在睡的那几个小时」——后者由日程决定。v2.16 起夜间不再往聊天里注入任何句子：她睡着时被吵到怎么回，是她自己的事。",
     "type": "bool",
     "default": true
   },
@@ -348,11 +352,6 @@
     "hint": "开着「日程贴合作息」时，今天的睡眠区间会被要求排到这个点结束；关掉则由模型自由发挥，诊断里会提示两者不一致。",
     "type": "int",
     "default": 6
-  },
-  "night_mode_force_sleep": {
-    "description": "【夜间模式】是否强制回复睡眠提示（否则仅缩短回复）",
-    "type": "bool",
-    "default": false
   },
   "night_deep_sleep_ratio": {
     "description": "【夜间模式】深度睡眠占整个夜间时长的比例（0.1~1.0），剩下的是浅睡/半醒",

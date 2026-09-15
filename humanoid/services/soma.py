@@ -466,7 +466,7 @@ class SomaService:
         return out
 
     def form_policy(self, energy: float, social_energy: float) -> dict[str, Any]:
-        """身体对「这一轮怎么说话」的硬约束建议，不限制内容。"""
+        """身体这一轮够得着多大份量：只算状态，不是给她的规矩，也不碰内容。"""
         snap = self.snapshot()
         max_chars = 120
         if snap["sleep_pressure"] >= 88 or snap["asleep"] >= 1.0:

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import time
+from collections.abc import Callable
 from typing import Any, Optional
 
 from .state import seed_cycle_day
 from . import __version__
-from .clock import Clock
+from .clock import Clock, format_state_timestamp
 from .config import HumanoidConfig
 from .link import SocialSignals, build_contract
 from .llm import LLMGateway, ProviderResolver
@@ -68,7 +68,6 @@ class HumanoidCoreInstance:
         self._stop_event = stop_event
         self._fetch_json = fetch_json
         self.persona_source = persona_source
-        self.last_activity: Optional[float] = None
 
         self.resolver = resolver
         self.gateway = gateway
@@ -77,6 +76,10 @@ class HumanoidCoreInstance:
         self._scope.set_mark_dirty(state_store.mark_dirty)
 
         self.clock = Clock(lambda: self.config)
+        # 一个角色只有一个「现在」：身体、情绪、事件记账共用一个时间源，仿真与诊断才
+        # 对得上。生产环境下 `clock.now().timestamp()` 就是标准 epoch（绝对时刻与时区
+        # 无关），但换城市时它跟着她的钟走，测试里也能被假时钟控住。
+        self._epoch: Callable[[], float] = lambda: self.clock.now().timestamp()
 
         # 新角色的生理周期不能永远从第 1 天（经期）开始：按创建当天错开一个起点，
         # 否则多角色下每一个都是同一个人同一天，且 v2.13.2 从未推进过周期。
@@ -107,6 +110,7 @@ class HumanoidCoreInstance:
             self.clock,
             schedule_provider=lambda: self.schedule.current_slots(),
             weather_provider=lambda: self.weather.snapshot(),
+            time_source=self._epoch,
         )
         self.schedule.on_install = self._on_schedule_installed
 
@@ -131,6 +135,7 @@ class HumanoidCoreInstance:
             self._spawn_background,
             gateway=self.gateway,
             logger=logger,
+            time_source=self._epoch,
         )
         self.social = SocialEnergyService(self._scope, config_provider, self.clock)
         self.weather = WeatherService(
@@ -145,8 +150,35 @@ class HumanoidCoreInstance:
         self.prompt_builder = PromptBuilder(self)
         self.engine_compat = _EngineCompat(self)
 
+        self._rebase_after_move()
+
         self._tasks: set[asyncio.Task] = set()
         self._started = False
+
+    def _rebase_after_move(self) -> None:
+        """换了城市 = 换了时区：把那些按旧城市钟点记的量重新起算。
+
+        `last_update` 与 `_last_weather_fetch` 存的是 `%Y-%m-%d %H:%M:%S` 这样的墙上时间，
+        读回来时附的是**当前**时区（`parse_state_timestamp`）。于是从北京改到东京会把
+        15:20 读成东京的 15:20，凭空多出/少掉几个小时：精力会按不存在的区间重算一遍，
+        天气可能提前或延后一小时重取。量不大，但错得看不见，所以当场抹平。
+        """
+        current = self.config.timezone_city
+        stored = str(self._scope.get_self("tz_city", "") or "")
+        if stored == current:
+            return
+        if stored:
+            now = self.clock.now()
+            self._scope.update_self(
+                last_update=format_state_timestamp(now),
+                _last_weather_fetch="",
+            )
+            if self._log:
+                self._log.info(
+                    f"{LOG_PREFIX} 角色 {self.role_id} 所在城市由「{stored}」改为「{current}」："
+                    "精力与天气的计时已按新时区重新起算"
+                )
+        self._scope.set_self("tz_city", current)
 
     @property
     def config(self) -> HumanoidConfig:
@@ -226,8 +258,7 @@ class HumanoidCoreInstance:
         return task
 
     def on_message(self, user_id: str, text: str, is_group: bool = False, umo: str = "") -> None:
-        self.last_activity = time.time()
-        now = time.time()
+        now = self._epoch()
         cfg = self.config
 
         self.note_umo(umo)
@@ -295,27 +326,13 @@ class HumanoidCoreInstance:
 
     def build_injection(self, user_id: str, is_group: bool = False) -> str:
         # 查询阶段只读取短期事件和当前状态，不更新 last_interaction 等持久字段。
-        now = time.time()
+        now = self._epoch()
         if self.config.soma_enabled:
             self.soma.advance(now)
         # 时间间隔由 Core.on_message 统一记账。这里严格只读取并构建注入内容。
-        # v2.13.0：事件是一次性短期上下文。没有事件时，不再计算并注入整套行为倾向。
+        # v2.16：注入里只有事实（时间/称呼/间隔），行为倾向不再参与——那会被模型当成任务。
         events = self.behavior.consume_relevant_events(user_id, now)
-        agency = {}
-        if events:
-            agency = self.behavior.compute_agency(
-                user_id=user_id,
-                events=events,
-                social_energy=self.social.value,
-                mood_profile=self.mood.profile(user_id),
-                energy=self.energy.energy,
-            )
-        return self.prompt_builder.build(
-            user_id,
-            is_group,
-            events=events,
-            agency=agency,
-        )
+        return self.prompt_builder.build(user_id, is_group, events=events)
 
     def refresh_contract(self) -> dict | None:
         """重算并落盘导出给社交层的身体快照。

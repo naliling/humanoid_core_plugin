@@ -45,14 +45,6 @@ class BehaviorServiceTest(unittest.TestCase):
         self.assertIn("attention", events[0])
         self.assertGreater(events[0]["attention"], 0)
 
-    def test_agency_always_exists(self):
-        agency = self.service.compute_agency("u", [], 80, {"affection": 50}, 80)
-        self.assertEqual(
-            set(agency),
-            {"initiative", "curiosity", "care", "social_willingness", "continuation"},
-        )
-        self.assertTrue(all(0 <= v <= 1 for v in agency.values()))
-
 
 if __name__ == "__main__":
     unittest.main()

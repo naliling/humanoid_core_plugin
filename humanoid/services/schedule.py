@@ -268,9 +268,9 @@ def day_phrases(
         if lo - now_minutes <= DAY_UPCOMING_MINUTES:
             phrase = _event_phrase(event)
             if phrase:
-                # 「夜里的睡眠」读着像日程表条目；说「夜里该睡了」才是人话
+                # 说「夜里要睡了」而不是「夜里就该睡了」：后者听着像谁在管她。
                 upcoming.append(
-                    f"{period_of(lo)}就该睡了" if is_sleep_event(event)
+                    f"{period_of(lo)}要睡了" if is_sleep_event(event)
                     else f"{period_of(lo)}还要{phrase}"
                 )
 

@@ -57,6 +57,7 @@ def build_contract(core: Any) -> dict[str, Any]:
         except Exception:
             feelings = []
     offset = now.utcoffset()
+    zone = getattr(now.tzinfo, "key", "") or ""
     return {
         "v": CONTRACT_VERSION,
         "core_version": getattr(core, "version", "") or "",
@@ -70,7 +71,10 @@ def build_contract(core: Any) -> dict[str, Any]:
             "is_deep_sleep": bool(cfg.night_mode_enabled and core.clock.is_deep_sleep(now)),
             # 社交层跟 Core 跑在同一台机器上，但它自己的时段判断用的是本机时钟。
             # 给出偏移量比给出一个时刻更可靠：拿它把 epoch 换算成她的本地小时即可。
-            "utc_offset_minutes": int(offset.total_seconds() // 60) if offset else 0,
+            # 算不出来时必须是 None 而不是 0：当成 0 等于把她的城市当 UTC，错得静悄悄。
+            "utc_offset_minutes": int(offset.total_seconds() // 60) if offset is not None else None,
+            # 生效的 IANA 名；空串意味着她其实没拿到真时区（缺 tzdata 或城市认不出）。
+            "tz": zone,
         },
         "body": {
             "energy": round(float(snap["energy"]["value"]), 1),
