@@ -103,6 +103,8 @@ class HumanoidEngine:
                     "last_proactive_age": max(0.0, now - at) if at > 0 else -1.0,
                     "last_target_uid": target,
                     "ignored_streak": core.signals.ignored_streak(),
+                    # 对接到底卡在哪一步（没装 / 没写过 / 过期 / 在用）与它去看的路径。
+                    **{k: v for k, v in core.signals.status().items() if k != "payload"},
                 },
             }
 

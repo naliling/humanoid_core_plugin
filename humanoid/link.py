@@ -155,11 +155,21 @@ def _routine_block(core, cfg, slots) -> dict:
     }
 
 
-def signals_path(data_root: str | os.PathLike[str] | None) -> Path | None:
+def signals_path(data_root: str | os.PathLike[str] | None, must_exist: bool = True) -> Path | None:
     if not data_root:
         return None
     path = Path(data_root).joinpath("plugin_data", SOCIAL_PLUGIN_DIR_NAME, SIGNALS_FILE_NAME)
-    return path if path.exists() else None
+    # must_exist=True（所有旧调用方的口径）：文件不在就当没有这个对接。
+    if not must_exist or path.exists():
+        return path
+    return None
+
+
+def social_data_dir(data_root: str | os.PathLike[str] | None) -> Path | None:
+    """社交层自己的数据目录。拿它区分「没装那个插件」与「装了但还没写过信号」。"""
+    if not data_root:
+        return None
+    return Path(data_root).joinpath("plugin_data", SOCIAL_PLUGIN_DIR_NAME)
 
 
 class SocialSignals:
@@ -219,3 +229,33 @@ class SocialSignals:
             return max(0, int(self.read().get("ignored_streak", 0) or 0))
         except (TypeError, ValueError):
             return 0
+
+    def status(self) -> dict[str, Any]:
+        """对接到底卡在哪一步。只说「没读到」会把三种完全不同的情况当成一种。
+
+        * `not_installed` —— 连社交层的数据目录都没有：那个插件没装（这不是故障）。
+        * `never_written` —— 装了，但 `humanoid_signals.json` 还不存在。
+        * `stale` —— 文件在，但超过 TTL 没刷新：社交层停了、被禁用，或卡住了。
+        * `fresh` —— 读到并使用中。
+        每种都带上它去看的那个路径，排查时不用再猜目录名。
+        """
+        now = self._time()
+        try:
+            root = self._root()
+        except Exception:
+            root = None
+        path = signals_path(root, must_exist=False)
+        if path is None:
+            return {"state": "no_data_root", "path": "", "age": None, "payload": {}}
+        if not path.exists():
+            directory = social_data_dir(root)
+            state = "never_written" if (directory and directory.exists()) else "not_installed"
+            return {"state": state, "path": str(path), "age": None, "payload": {}}
+        payload = self.read()
+        try:
+            age = max(0.0, now - path.stat().st_mtime)
+        except OSError:
+            age = None
+        if not payload and age is not None and age > SIGNALS_TTL_SECONDS:
+            return {"state": "stale", "path": str(path), "age": age, "payload": {}}
+        return {"state": "fresh", "path": str(path), "age": age, "payload": payload}

@@ -20,6 +20,37 @@ BAD_MARK = "✗"
 WARN_MARK = "⚠"
 
 
+def _signals_line(signals: dict) -> str:
+    """社交层信号那一行：把「没读到」拆成三种完全不同的情况说。"""
+    state = str(signals.get("state") or "")
+    path = str(signals.get("path") or "")
+    tail = f"（看的是 {path}）" if path else ""
+    if state == "fresh":
+        age = signals.get("age")
+        proactive = signals.get("last_proactive_age", -1)
+        extra = (
+            f"上次刷新 {age:.0f}s 前；上次主动开口 {proactive:.0f}s 前、"
+            f"冷落计数 {signals.get('ignored_streak', 0)}"
+            if proactive and proactive >= 0
+            else f"上次刷新 {age:.0f}s 前；还没主动开过口"
+        )
+        return f"- 社交层信号：读到并在用。{extra}{tail}"
+    if state == "stale":
+        age = float(signals.get("age") or 0.0)
+        return (
+            f"- 社交层信号：文件在，但已经 {age / 60:.1f} 分钟没刷新（超过 15 分钟不采信）："
+            f"社交层被停用、后台循环卡住，或刚重启还没跑一轮{tail}"
+        )
+    if state == "never_written":
+        return (
+            f"- 社交层信号：装了自主拟人社交（它的目录在），但还没写过信号文件。"
+            f"v1.8.2 起它在启动时就会写一份；用旧版的话要等它跑完一轮（2~9 分钟）{tail}"
+        )
+    if state == "not_installed":
+        return "- 社交层信号：没装「自主拟人社交」插件。这不是故障——本插件单独也能跑。"
+    return f"- 社交层信号：读不到（拿不到 data 目录）{tail}"
+
+
 def _hhmm(hour_of_day: float) -> str:
     """21.0 → 21:00、21.5 → 21:30。日程推出来的窗口带分钟，配置里只有整点。"""
     minutes = int(round(float(hour_of_day) * 60)) % (24 * 60)
@@ -313,22 +344,23 @@ def build_report(
             f"- 身体推进间隔 {cfg.body_tick_seconds}s；周期第 {body_status.get('cycle_day', 1)} 天"
             f"；精力 {body_status.get('energy', 0):.0f}"
         )
+        signals = body_status.get("signals") or {}
         contract = body_status.get("contract")
         if isinstance(contract, dict) and contract:
             lines.append(
                 f"- 联动契约 v{contract.get('v')} 已导出（{len(contract.get('feelings') or [])} 条体感、"
-                f"max_chars {contract.get('form', {}).get('max_chars')}）"
+                f"max_chars {contract.get('form', {}).get('max_chars')}）；写在她自己的 state.json 里"
             )
+        elif not cfg.contract_enabled:
+            lines.append("- 联动契约：配置里关着（contract_enabled=false），不会导出")
+        elif not cfg.soma_enabled:
+            lines.append("- 联动契约：生理层关着时不导出（轴全是初始值，社交层读到会误判）")
         else:
-            lines.append("- 联动契约：尚未生成（contract_enabled 关着，或身体还没推进过）")
-        signals = body_status.get("signals") or {}
-        if signals.get("found"):
             lines.append(
-                f"- 社交层信号：读到（上次主动开口 {signals.get('last_proactive_age', -1):.0f}s 前、"
-                f"冷落计数 {signals.get('ignored_streak', 0)}）"
+                f"- 联动契约：还没写出（身体 tick 每 {cfg.body_tick_seconds}s 一次，"
+                "启动后等一轮再看；角色还没收到过任何消息也不会有）"
             )
-        else:
-            lines.append("- 社交层信号：没读到 humanoid_signals.json（未装自主拟人社交，或它还没写过）")
+        lines.append(_signals_line(signals))
     else:
         lines.append("- 生理层已开启，但还没有角色实例")
 

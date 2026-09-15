@@ -460,6 +460,17 @@ class HumanoidCoreInstance:
             )
         else:
             lines.append("- 联动契约：未生成（身体还没推进过，或 contract_enabled 关着）")
+        try:
+            state = self.signals.status()
+        except Exception:
+            state = {}
+        # 对接成不成在这就能看出来：没装、没写过、过期、在用，四种说法不一样。
+        lines.append({
+            "fresh": "- 自主拟人社交：已对接（信号在读）",
+            "stale": "- 自主拟人社交：信号超时未刷新，暂不采信",
+            "never_written": "- 自主拟人社交：装了但还没写过信号（等它跑一轮）",
+            "not_installed": "- 自主拟人社交：未安装（本插件单独也能跑）",
+        }.get(str(state.get("state")), "- 自主拟人社交：状态未知"))
         return lines
 
     def status_lines(self, user_id: str) -> list[str]:

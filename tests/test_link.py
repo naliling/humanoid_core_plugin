@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -21,6 +22,7 @@ from humanoid.link import (
     SOCIAL_PLUGIN_DIR_NAME,
     build_contract,
     signals_path,
+    social_data_dir,
 )
 from humanoid.llm import LLMGateway, ProviderResolver
 from humanoid.role_manager import RoleManager
@@ -151,6 +153,65 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(
             signals_path(self.harness.root), social_dir / SIGNALS_FILE_NAME
         )
+
+
+class SignalsStatusTest(unittest.TestCase):
+    """`/拟人诊断` 那行不许把三种不同的情况说成同一种「没读到」。"""
+
+    def build(self, raw=None) -> tuple:
+        harness = Harness(raw or {"timezone_city": "北京"})
+        core = harness.roles.get_or_create("bot1")
+        return harness, core
+
+    def test_not_installed_says_so(self):
+        harness, core = self.build()
+        status = core.signals.status()
+        self.assertEqual(status["state"], "not_installed")
+        self.assertTrue(status["path"].endswith(SIGNALS_FILE_NAME), status["path"])
+        text = harness.engine.diagnostics_text(core)
+        self.assertIn("没装「自主拟人社交」", text)
+        self.assertIn("这不是故障", text)
+
+    def test_never_written_when_the_dir_exists(self):
+        harness, core = self.build()
+        social_data_dir(harness.root).mkdir(parents=True, exist_ok=True)
+        status = core.signals.status()
+        self.assertEqual(status["state"], "never_written")
+        self.assertIn("装了自主拟人社交", harness.engine.diagnostics_text(core))
+
+    def test_stale_is_reported_as_stale(self):
+        harness, core = self.build()
+        directory = social_data_dir(harness.root)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / SIGNALS_FILE_NAME
+        path.write_text(json.dumps({"last_proactive_at": time.time() - 4000}), encoding="utf-8")
+        old = path.stat().st_mtime - 2000
+        os.utime(path, (old, old))
+        status = core.signals.status()
+        self.assertEqual(status["state"], "stale", status)
+        self.assertGreater(status["age"], 1900)
+        self.assertIn("分钟没刷新", harness.engine.diagnostics_text(core))
+
+    def test_fresh_carries_age_and_path(self):
+        harness, core = self.build()
+        directory = social_data_dir(harness.root)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / SIGNALS_FILE_NAME).write_text(
+            json.dumps({"last_proactive_at": time.time() - 30, "ignored_streak": 2}),
+            encoding="utf-8",
+        )
+        status = core.signals.status()
+        self.assertEqual(status["state"], "fresh", status)
+        self.assertLess(status["age"], 60)
+        text = harness.engine.diagnostics_text(core)
+        self.assertIn("读到并在用", text)
+
+    def test_status_command_shows_the_linkage(self):
+        """`/你的状态` 里也得一眼看出对接成没成，不能只有诊断有。"""
+        harness, core = self.build()
+        lines = "\n".join(core.body_lines())
+        self.assertIn("自主拟人社交", lines)
+        self.assertIn("未安装", lines)
 
 
 class SignalsTest(unittest.TestCase):
