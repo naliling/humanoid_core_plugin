@@ -364,31 +364,67 @@ class HumanoidCoreInstance:
         「刚聊完不想说话」而长期压住主动消息。不导出，社交层就退回旧字段，行为与 v1.7.4 一致。
         """
         if not self.config.contract_enabled or not self.config.soma_enabled:
+            # 契约关闭时清空已有契约，避免社交层读到过期数据
+            previous = self._scope.get_self("contract")
+            if previous is not None:
+                try:
+                    self._scope.set_self("contract", None)
+                except Exception:
+                    pass
             return None
         try:
             contract = build_contract(self)
         except Exception as exc:
-            self._log.warning(f"{LOG_PREFIX} 契约生成失败: {exc}")
+            if self._log:
+                self._log.warning(f"{LOG_PREFIX} 契约生成失败: {exc}")
+            return None
+        if not isinstance(contract, dict) or not contract:
+            if self._log:
+                self._log.warning(f"{LOG_PREFIX} 契约生成返回空字典")
             return None
         previous = self._scope.get_self("contract")
         keys = ("body", "feelings", "form", "activity")
-        if isinstance(previous, dict) and all(previous.get(key) == contract.get(key) for key in keys):
-            return previous
-        self._scope.set_self("contract", contract)
+        try:
+            if isinstance(previous, dict) and all(previous.get(key) == contract.get(key) for key in keys):
+                return previous
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 契约比较失败: {exc}")
+        try:
+            self._scope.set_self("contract", contract)
+        except Exception as exc:
+            if self._log:
+                self._log.warning(f"{LOG_PREFIX} 契约写入失败: {exc}")
+            return None
         return contract
 
     def _apply_social_signals(self) -> None:
         """把社交层写回的信号并入身体。没装社交层时什么都没发生。"""
         if not self.config.soma_enabled:
             return
-        _, at = self.signals.last_proactive()
-        self.soma.set_social_feedback(self.signals.ignored_streak())
+        try:
+            _, at = self.signals.last_proactive()
+            streak = self.signals.ignored_streak()
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 读取社交信号失败: {exc}")
+            return
+        try:
+            self.soma.set_social_feedback(streak)
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 应用冷落计数失败: {exc}")
         if at <= 0:
             return
-        if at <= float(self._scope.get_self("_last_signal_proactive", 0.0) or 0.0):
-            return
-        self._scope.set_self("_last_signal_proactive", at)
-        self.soma.note_proactive(at)
+        try:
+            last_at = float(self._scope.get_self("_last_signal_proactive", 0.0) or 0.0)
+            if at <= last_at:
+                return
+            self._scope.set_self("_last_signal_proactive", at)
+            self.soma.note_proactive(at)
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 应用主动消息反馈失败: {exc}")
 
     def snapshot(self, user_id: Optional[str] = None, refresh: bool = True) -> dict:
         if refresh:

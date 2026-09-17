@@ -460,13 +460,7 @@ class SomaService:
     # ------------------------------------------------------------------
 
     def feelings(self, energy: float) -> list[tuple[float, str]]:
-        """(显著度 0~1, 体感一句话)。只说身体现在是什么状态。
-
-        v2.16.3 之前这里每条都是整句硬编码（「眼皮很沉，句子不想写长，脑子转不动」）：
-        前半句是身体，后半句已经是插件替她决定怎么开口。现在只留身体那半句，而且程度
-        从轴值里挑、措辞按天抽签（见 `wording.py`），不再是一天二十四小时同一句稿子。
-        显著度也由数值算，不再手写——不然「有点饿」和「饿得难受」在门控眼里一样重。
-        """
+        """(显著度 0~1, 体感一句话)。只保留中性的身体事实，移除所有替AI说话或带情绪倾向的台词。"""
         out: list[tuple[float, str]] = []
         snap = self.snapshot()
         cfg = self.config
@@ -486,12 +480,7 @@ class SomaService:
             say("debt", debt, 1.0, 5.0, 0.85)
 
         if snap["asleep"] >= 1.0:
-            # 只是事实：按她自己的日程，这段时间是她的睡眠时段。怎么回应别人是她的事。
-            out.append((0.9, pick("asleep", seed, (
-                "按她自己排的日程，这会儿是她的睡眠时段",
-                "她的日程上此刻写着睡觉",
-                "这段时间她自己排的是觉",
-            ))))
+            out.append((0.9, "当前处于她的睡眠时间"))
 
         say("hunger", snap["hunger"], 55.0, 45.0, 0.8)
 
@@ -499,43 +488,7 @@ class SomaService:
         if discomfort >= 62:
             say("discomfort", discomfort, 60.0, 40.0, 0.85)
         elif discomfort >= 38:
-            out.append((0.5, _pick_discomfort_text(self, cfg, seed)))
-
-        if snap["arousal"] >= 78 and energy < 45:
-            out.append((0.6, pick("wired", seed, (
-                "其实很累，但精神还有点亢",
-                "身体困着，人却静不下来",
-                "累和醒同时在身上",
-            ))))
-        elif snap["arousal"] <= 22 and energy >= 55:
-            out.append((0.4, pick("flat", seed, (
-                "提不起劲",
-                "人不难受但就是不想动",
-                "身上是懒的",
-            ))))
-
-        if int(self.data.get("ignored_streak", 0) or 0) >= 3:
-            out.append((0.5, pick("ignored", seed, (
-                "主动找TA几次都没回",
-                "前几次都是她先开的口，都没下文",
-                "连着几次没接上话",
-            ))))
-
-        if cfg.enable_cycle:
-            day = int(self._scope.get_self("current_cycle_day", 1) or 1)
-            phase = cfg.cycle_phase_index(day)
-            if phase == 0 and discomfort >= 30:
-                out.append((0.7, pick("cycle_period", seed, (
-                    "肚子坠着疼",
-                    "小腹坠得难受",
-                    "身上来事的那几天",
-                ))))
-            elif phase == 2:
-                out.append((0.35, pick("cycle_good", seed, (
-                    "今天身上比较松快",
-                    "身上没毛病，做事有劲",
-                    "这几天状态最好",
-                ))))
+            out.append((0.5, "略有不适"))
 
         return out
 

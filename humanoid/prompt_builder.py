@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 from .config import HumanoidConfig
 from .data.mood_map import get_mood_label
 from .services.schedule import day_lines, day_phrases, done_between
-from .wording import CARE_WORDS, FOCUS_WORDS, SPARE_WORDS, SINCE_WORDS, pick, scale_word
+from .wording import CARE_WORDS, SINCE_WORDS, pick, scale_word
 
 _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 
@@ -40,11 +40,7 @@ MARK_VERSION = "v4"
 # 给 system_prompt 的那段话：说明下面这些是什么、按什么方式读它。稳定文本，不含事实。
 FRAMING_TEXT = (
     "\n\n【她的身体与生活】\n"
-    "接下来标着「" + MARK_PREFIX + "」的那几小块，是这个人的真实处境：一副会困会饿的身体、"
-    "一份今天已经在过的日子、以及你面前这个人在她心里的位置。\n"
-    "人说话的时候这些一直在起作用，但没有人会把它们念出来——它们是她说话时的处境，"
-    "不是要逐条回应的任务，也不是照着发的稿子。上面写她困、写她手上正忙着，说的是身体，"
-    "不是规定她该回几个字、该不该回。说什么、说多长、接不接得下去，由她自己判断。"
+    "以下是她当前的真实处境与身体状态。这些是背景事实，自然融入对话即可，无需刻意提及或逐条回应。"
 )
 
 # 注入块的硬长度上限（字符）。每条聊天请求都追加一次，所以它必须是个定值而不是
@@ -66,16 +62,16 @@ def estimate_tokens(text: str) -> int:
 # 情绪标签 → 她此刻对TA的心气。写的是心里怎么样，不是「语气要怎样」：
 # 怎么说由她自己定。每个标签备几条等价说法，按天抽一条（见 wording.pick）。
 MOOD_TONE_HINTS = {
-    "亲密": ("跟TA没什么防备", "在TA面前不端着"),
-    "依恋": ("想黏着TA一点", "想多跟TA说两句"),
-    "信赖": ("TA说的话你愿意当真", "TA讲的事你信"),
-    "热情": ("对TA讲的事有兴趣", "TA说什么你都想接"),
-    "友好": ("愿意搭理TA", "对TA挺和气的"),
+    "亲密": ("态度亲昵",),
+    "依恋": ("带有依恋",),
+    "信赖": ("充满信任",),
+    "热情": ("态度热情",),
+    "友好": ("态度友善",),
     "平常": ("",),
-    "疏远": ("不想跟TA多说", "跟TA有点距离"),
-    "冷淡": ("没什么想说的", "话到嘴边也懒得多说"),
-    "敌视": ("看TA有点不顺眼", "对TA带着点火"),
-    "警惕": ("先看看TA怎么讲", "对TA留着一手"),
+    "疏远": ("略显疏远",),
+    "冷淡": ("态度冷淡",),
+    "敌视": ("带有敌意",),
+    "警惕": ("保持警惕",),
 }
 
 # 低注入档下最多给几条体感：真人多数时候不觉得自己在报备身体。
@@ -119,15 +115,6 @@ def humanize_gap(seconds: float) -> str:
     if minutes:
         return f"{minutes} 分钟"
     return "不到一分钟"
-
-
-AGENCY_LABELS = {
-    "initiative": "主动",
-    "curiosity": "好奇",
-    "care": "关心",
-    "social_willingness": "社交意愿",
-    "continuation": "延续话题",
-}
 
 
 class PromptBuilder:
@@ -223,11 +210,10 @@ class PromptBuilder:
             except Exception:
                 snap = {}
             if float(snap.get("asleep", 0.0)) >= 1.0:
-                # 体感那块已经说了「这段时间她自己排的是觉」，同一件事不必在两个块里各说一遍。
                 return []
-            lines.append("按她自己的节律，现在是这一天里最该睡的时候")
+            lines.append("当前处于她的睡眠时间")
         else:
-            lines.append("按她自己的作息，这会儿算夜里")
+            lines.append("当前处于她的夜间作息")
         return lines
 
     def _relation_lines(
@@ -246,11 +232,8 @@ class PromptBuilder:
         except Exception:
             data, label = {}, ""
         care = float(interest.get("care", 0.5))
-        focus = float(interest.get("focus", 0.4))
-        spare = float(interest.get("spare", 0.7))
         care_word = pick("care", seed, scale_word(care, CARE_WORDS) or "")
-        focus_word = pick("focus", seed, scale_word(focus, FOCUS_WORDS) or "")
-        # 心气括号与「在意度」说的是同一件事，两个都上就变成报两遍。三轴在的时候只留标签。
+
         if label and not care_word:
             hint = pick(f"tone:{label}", seed, MOOD_TONE_HINTS.get(label) or ("",))
             lines.append(f"对TA的感觉：{label}" + (f"（{hint}）" if hint else ""))
@@ -258,10 +241,6 @@ class PromptBuilder:
             lines.append(f"对TA的感觉：{label}")
         if care_word:
             lines.append(care_word)
-        if focus_word:
-            lines.append(focus_word)
-        if spare < 0.45:
-            lines.append(pick("spare", seed, scale_word(spare, SPARE_WORDS) or ""))
         lines.extend(self._emotion_lines(data, seed))
         tag = ""
         if cfg.mood_tag_enabled:
@@ -279,73 +258,14 @@ class PromptBuilder:
 
         只说心里怎么样，不说「所以要短看、要顶回去」——后者是插件替她决定怎么开口。
         措辞按天抽，同一状态一天里不换说法，隔天换一套。"""
-        try:
-            affection = float(data.get("affection", 50.0))
-            libido = float(data.get("libido", 25.0))
-            aggression = float(data.get("aggression", 15.0))
-            base_affection = float(data.get("base_affection", affection))
-            base_aggression = float(data.get("base_aggression", aggression))
-        except (TypeError, ValueError):
-            return []
-        lines: List[str] = []
-        if aggression >= AGGRAVATED_AGGRESSION:
-            if aggression >= base_aggression + 8:
-                lines.append(pick("angry_recent", seed, (
-                    "你这两天积了点火，现在对TA有点意见",
-                    "攒着点事，这会儿说话不太耐烦",
-                    "火压在底下，对TA没那么耐听",
-                )))
-            else:
-                lines.append(pick("angry_always", seed, (
-                    "你对TA本来就没多少耐心",
-                    "跟TA说话你一直懒得绕弯",
-                )))
-        elif libido >= EAGER_LIBIDO and aggression < 15:
-            lines.append(pick("eager", seed, (
-                "你今天挺想跟TA多聊两句的",
-                "今天话头顺，跟TA聊得动",
-            )))
-        if affection <= COLD_AFFECTION:
-            lines.append(pick("cold", seed, ("还没熟到什么都想说", "跟TA还隔着层东西")))
-        elif affection >= WARM_AFFECTION and aggression < 12:
-            lines.append(pick("warm", seed, ("TA说的话你愿意接", "TA的事你肯上心")))
-        if base_affection - affection >= 6:
-            lines.append(pick("cooled", seed, (
-                "你对TA比前阵子淡了，之前不是这个态度",
-                "前阵子不是这个态度的，这段时间淡下来了",
-            )))
-        return lines[:2]
+        """移除第一人称情绪台词，避免替AI说话或导致情绪极端。"""
+        return []
 
     def _day_lines(
         self, detailed: bool, include_doing: bool = True, exclude: Optional[List[str]] = None
     ) -> List[str]:
-        """今天到这会她干了什么。只从日程算，不额外调任何东西。
-
-        `exclude` 是【刚刚】那块已经说过的「这期间她做了什么」——同一份日程的两个切法，
-        两处各说一遍模型会当成两件事。"""
-        core = self._core
-        try:
-            now = core.clock.now()
-            phrases = day_phrases(
-                core.schedule.current_slots(),
-                now.hour * 60 + now.minute,
-                past_limit=DAY_ITEMS_FULL if detailed else DAY_ITEMS_LOW,
-            )
-        except Exception:
-            return []
-        lines = day_lines(
-            phrases,
-            DAY_ITEMS_FULL if detailed else DAY_ITEMS_LOW,
-            include_doing=include_doing,
-        )
-        if exclude and lines:
-            # day_lines 拼出来是「今天到这会做过：A；B」，先按「：」把前缀切掉再逐条比，
-            # 不然第一条永远留在【今天】里，【刚刚】和它就重复了。
-            prefix, sep, tail = lines[0].partition("：")
-            items = [part for part in tail.split("；") if part]
-            kept = [part for part in items if not any(part == x or part.endswith(x) for x in exclude)]
-            lines = [prefix + sep + "；".join(kept)] if kept else []
-        return lines
+        """移除日程流水账注入，避免过程约束导致AI念稿子。"""
+        return []
 
     def _memory_lines(self, user_id: str, detailed: bool) -> List[str]:
         """TA 之前说过什么。没记过就不注入，而不是编一个。"""
@@ -416,11 +336,6 @@ class PromptBuilder:
         cycle = str(snap.get("cycle") or "").strip()
         if cycle and detailed:
             lines.append(cycle)
-        proc = self._core.process.current()
-        name = str(proc.get("name", "")).strip()
-        phase = str(proc.get("phase", "")).strip()
-        if name and name not in {"休息", "自由活动"}:
-            lines.append(f"手上在做的：{name}/{phase}" if phase and phase != name else f"手上在做的：{name}")
         return lines
 
     def _behavior_lines(
@@ -450,45 +365,12 @@ class PromptBuilder:
             lines.append(pick("since", seed, SINCE_WORDS).format(gap=gap))
         else:
             lines.append(EVENT_TEXT.get(event_type) or "最近出现了交流变化")
-        previous = data.get("previous_message") if with_previous else None
-        if previous:
-            previous = str(previous).replace("\n", " ").strip()[:60]
-            if previous:
-                lines.append(f"TA离开前说的是「{previous}」")
-        during = self._during_gap_lines(seconds)
-        if during:
-            lines.append("这期间她" + "；她".join(during))
-        if agency:
-            strong = [
-                AGENCY_LABELS[key]
-                for key, value in sorted(agency.items(), key=lambda item: float(item[1]), reverse=True)
-                if key in AGENCY_LABELS and float(value) >= 0.62
-            ]
-            if strong:
-                lines.append("你现在更" + "、更".join(strong[:2]))
+        # 只报时间间隔，不注入离开前原话，避免干扰正常话题走向
         return lines
 
     def _during_gap_lines(self, seconds: Any) -> List[str]:
-        """她这期间在自己过日子：TA上一条消息到现在，她做完的那几件事。
-
-        只说事实，不猜TA去干嘛了——「TA是不是去忙了」这种念头该是她自己从这些事实里
-        生出来的；插件替她想好就等于替她说话。"""
-        try:
-            gap_seconds = float(seconds)
-        except (TypeError, ValueError):
-            return []
-        if gap_seconds < 1800:
-            return []
-        core = self._core
-        try:
-            now = core.clock.now()
-            minutes_now = now.hour * 60 + now.minute
-            started = max(0, minutes_now - int(gap_seconds // 60))
-            return done_between(
-                core.schedule.current_slots(), started, minutes_now, DAY_ITEMS_FULL
-            )
-        except Exception:
-            return []
+        """移除间隔期间的过程注入，避免替AI编造行为限制。"""
+        return []
 
 
     # ------------------------------------------------------------------
@@ -513,11 +395,6 @@ class PromptBuilder:
             parts.append(self._block("对TA", relation))
 
         hands = self._state_lines(snap, detailed=False)
-        during = self._during_gap_lines((events[0].get("data") or {}).get("gap_seconds") if events else None)
-        # 「手上在做的」已经说了此刻，今天这块就别再说一遍「现在在…」。
-        day = self._block(
-            "今天", self._day_lines(detailed=False, include_doing=not hands, exclude=during)
-        )
 
         situ = self._behavior_lines(
             user_id, events, agency,
@@ -528,8 +405,6 @@ class PromptBuilder:
 
         if hands:
             parts.append(self._block("身边", hands))
-        if day:
-            parts.append(day)
         memory = self._block("记得", self._memory_lines(user_id, detailed=False))
         if memory:
             parts.append(memory)
@@ -555,25 +430,15 @@ class PromptBuilder:
             relation = relation + [nickname]
         if relation:
             parts.append(self._block("对TA", relation))
-        during = self._during_gap_lines((events[0].get("data") or {}).get("gap_seconds") if events else None)
-        day = self._block("今天", self._day_lines(detailed=True, include_doing=False, exclude=during))
         situ = self._behavior_lines(
             user_id, events, agency,
             with_previous=self.config.last_interaction_mode == "with_last_msg",
         )
         if situ:
             parts.append(self._block("刚刚", situ))
-        if day:
-            parts.append(day)
         memory = self._block("记得", self._memory_lines(user_id, detailed=True))
         if memory:
             parts.append(memory)
-        try:
-            recent = self._core.process.recent()
-        except Exception:
-            recent = []
-        if recent:
-            parts.append(self._block("最近", ["最近做过：" + "、".join(recent)]))
         return "\n".join(part for part in parts if part)
 
     def _finish(self, text: str, cfg: HumanoidConfig) -> str:

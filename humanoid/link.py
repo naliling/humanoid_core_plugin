@@ -186,7 +186,8 @@ class SocialSignals:
         now = self._time()
         try:
             path = signals_path(self._root())
-        except Exception:
+        except Exception as exc:
+            # 获取 data_root 失败时返回空，避免抛出异常中断调用方
             return {}
         if path is None:
             self._fingerprint = None
@@ -195,6 +196,7 @@ class SocialSignals:
         try:
             stat = path.stat()
         except OSError:
+            # 文件不存在或无法访问时返回空
             return {}
         if now - stat.st_mtime > SIGNALS_TTL_SECONDS:
             # 社交层停了：它写的那份「刚主动找过谁」不该继续影响身体。
@@ -205,7 +207,11 @@ class SocialSignals:
             return self._payload
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            # JSON 解析失败或读取错误时保持上一次的有效数据
+            return self._payload or {}
+        except Exception:
+            # 其他未预期异常也返回上一次的有效数据
             return self._payload or {}
         if not isinstance(payload, dict):
             return self._payload or {}

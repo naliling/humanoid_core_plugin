@@ -38,17 +38,17 @@ class SocialEnergyService:
         return "较低"
 
     def hint(self) -> str:
-        """社交能量对应的说话意愿，供注入层翻译成语气，不报告数值。"""
+        """社交能量对应的意愿状态，仅作状态描述，不指令模型回复长度或语气。"""
         value = self.value
         if value > 85:
-            return "想多聊几句，话也说得完整"
+            return "社交意愿高"
         if value > 60:
-            return "愿意正常地聊，也会接住对方的话头"
+            return "社交意愿良好"
         if value > 40:
-            return "能聊，但不太想展开长话题"
+            return "社交意愿平稳"
         if value > 20:
-            return "想少说几句，回复偏简短"
-        return "不太想说话，回得简短甚至敷衍"
+            return "社交意愿偏低"
+        return "倾向独处"
 
     def consume_for_message(self) -> float:
         cfg = self.config
