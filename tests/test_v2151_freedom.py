@@ -137,7 +137,8 @@ class InjectionFreedomTest(unittest.TestCase):
         for word in ("不要", "必须", "别", "控制在", "只说", "回一句"):
             self.assertNotIn(word, FRAMING_TEXT, f"框架句里出现了「{word}」")
         self.assertIn("处境", FRAMING_TEXT)
-        self.assertIn(MARK_PREFIX, FRAMING_TEXT, "框架句要指得清它说的是哪几块")
+        self.assertIn("身体与生活", FRAMING_TEXT, "框架句要指得清它说的是哪几块")
+        self.assertIn("由她自己判断", FRAMING_TEXT, "参考边界要说清：插件不替她决定怎么开口")
         for digit in ("%", "UTC+"):
             self.assertNotIn(digit, FRAMING_TEXT)
 
@@ -148,29 +149,29 @@ class InjectionFreedomTest(unittest.TestCase):
             self.assertNotIn(word, text, f"体检单读数又进上下文了：{word}\n{text}")
 
     def test_interest_axes_read_as_states_not_numbers(self):
-        """三轴要变成状态词，而且不同用户、不同话，词不一样。"""
+        """在意度要变成状态词，而且不同用户词不一样；数值不上下文。"""
         core = self.core()
         builder = PromptBuilder(core)
         mine = builder._relation_lines("42", False, detailed=False,
                                        interest={"care": 0.9, "focus": 0.9, "spare": 0.9})
         cold = builder._relation_lines("43", False, detailed=False,
                                        interest={"care": 0.05, "focus": 0.05, "spare": 0.05})
-        self.assertTrue(any("要紧" in line or "不一样" in line or "记得住" in line for line in mine), mine)
-        self.assertTrue(
-            any(word in line for line in cold for word in ("不想搭理", "有点意见", "隔着")) or
-            any(word in line for line in cold for word in ("客气", "没那么熟", "端着")),
-            f"低在意度没说出距离感：{cold}")
+        self.assertTrue(any("亲密" in line or "在意" in line for line in mine), mine)
+        # 措辞按天抽签：0.00 档有「关系疏远」「缺乏交集」两套说法，都得认。
+        self.assertTrue(any(word in line for line in cold for word in ("疏远", "缺乏交集")),
+                        f"低在意度没说出距离感：{cold}")
         self.assertNotEqual(mine, cold)
         for line in mine + cold:
             self.assertNotIn("0.", line, f"三轴把数值端上来了：{line}")
 
-    def test_mood_hints_describe_the_heart_not_the_tone(self):
-        from humanoid.prompt_builder import MOOD_TONE_HINTS
-
-        for label, hints in MOOD_TONE_HINTS.items():
-            joined = " ".join(hints)
-            self.assertNotIn("语气", joined, f"{label} 的心气提示又在教她说话：{joined}")
-            self.assertNotIn("必须", joined)
+    def test_mood_label_comes_bare_without_tone_hints(self):
+        """情绪只给标签本身（如「亲密」），不附「态度亲昵」这类语气括号。"""
+        core = self.core()
+        core.mood.profile("42").update({"affection": 90.0, "libido": 40.0, "aggression": 5.0})
+        text = core.build_injection("42", is_group=False)
+        self.assertIn("对TA的感觉：", text)
+        for word in ("态度", "语气", "带有敌意", "保持警惕", "充满信任"):
+            self.assertNotIn(word, text, f"语气提示又回来了：{word}\n{text}")
 
     def test_truncation_keeps_whole_blocks_and_the_marker(self):
         """撑到上限时按块丢：截在半句上模型会自己把那半句补下去。"""
@@ -183,7 +184,7 @@ class InjectionFreedomTest(unittest.TestCase):
         self.assertNotIn("不必逐条回应", text, "兜底话该在 system_prompt 里，不该每条消息重复")
 
     def test_gap_is_an_experience_not_a_stopwatch(self):
-        """间隔三段：隔了多久 + TA那句原话 + 她这期间干了什么。"""
+        """间隔两段：隔了多久 + TA离开前那句原话。都是事实，不带「要主动问起」。"""
         core = self.core()
         core.behavior.add_event("42", {
             "type": "user_returned", "timestamp": time.time(), "importance": 0.7,
@@ -191,9 +192,10 @@ class InjectionFreedomTest(unittest.TestCase):
         })
         text = core.build_injection("42", is_group=False)
         self.assertIn("3 小时 12 分", text)
-        self.assertIn("我先去开会", text)
-        self.assertIn("这期间她", text, "她这期间在自己过日子，这一条才是「这么久了」的凭据")
+        self.assertIn("我先去开会", text, "离开前原话是间隔实用性的另一半")
         self.assertNotIn("这是一次性的背景", text)
+        for word in ("要主动", "问问他", "接上话头"):
+            self.assertNotIn(word, text, f"间隔又变成了指令：{word}")
 
 
 class ZoneNameTest(unittest.TestCase):

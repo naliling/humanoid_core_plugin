@@ -7,7 +7,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from ..clock import Clock
+from ..clock import Clock, parse_state_timestamp
 from ..config import HumanoidConfig
 from ..data.schedule_templates import get_fallback_schedule
 from ..jsonx import extract_json_array
@@ -47,8 +47,8 @@ def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
     if not cfg.night_mode_enabled or not cfg.schedule_follow_night_window:
         return (
             f"{first_index}. 几点睡、几点起由她是谁决定：从人设里读她的年纪感、工作或学业、"
-            "生活习惯。夜猫子就排凌晨睡晚起，早起的就排晚上九点困。"
-            "别把所有人都排成 00:00→08:00，也别因为「正常人应该这样」就改掉人设里写着的作息。\n"
+            "生活习惯，结合当前的身体数值（困意、睡眠债）由你判断；"
+            "人设里写着的作息保持不动。\n"
         )
     start, end = cfg.night_start_hour, cfg.night_end_hour
     if start == end:
@@ -371,43 +371,92 @@ def persona_block(persona: Persona | None) -> str:
     )
 
 
+def body_reference_block(body: dict[str, Any] | None, now_text: str) -> str:
+    """把身体参考数值写进日程 prompt。
+
+    这些是活值：每次重排时从 soma/energy 现取，随时间真实变化。措辞上必须说清
+    「是参考，不是条件」——写成「她很困，必须安排午睡」就是在替模型做决定，
+    数值本身才是模型该拿到的东西。
+    """
+    if not body:
+        return ""
+    lines = [
+        "【她此刻的身体参考数值】（会随时间真实变化；是参考，不是必须满足的条件，怎么权衡由你决定）",
+        f"- 当前时间：{now_text}",
+    ]
+    if "energy" in body:
+        lines.append(f"- 精力：{body['energy']}/100")
+    if "hunger" in body:
+        lines.append(f"- 饥饿：{body['hunger']}/100（越高越饿）")
+    if "sleep_pressure" in body:
+        lines.append(f"- 睡眠压力：{body['sleep_pressure']}/100（越高越困）")
+    if "sleep_debt" in body:
+        lines.append(f"- 睡眠债：{body['sleep_debt']} 小时（连续缺觉累积，越高越需要补觉）")
+    if "last_sleep_hours" in body:
+        lines.append(f"- 昨晚睡了：{body['last_sleep_hours']} 小时")
+    if body.get("cycle"):
+        lines.append(f"- 生理周期：{body['cycle']}")
+    return "\n".join(lines) + "\n\n"
+
+
 def build_prompt(
     cfg: HumanoidConfig,
     today: str,
     weekday: str,
     persona: Persona | None = None,
+    body: dict[str, Any] | None = None,
+    now_text: str = "",
 ) -> str:
+    """让模型自己填表：给身份、身体数值与格式，不给内容提示。
+
+    v2.16.7 之前这里写着「要有真的会打断聊天的事」「别排成每分钟都在做有意义的
+    事」这类内容提示——那是插件在替模型思考。现在只递三样东西：她是谁、她此刻
+    身体各项参考数值、表格长什么样；每个时段做什么、多长、粒度多细，由模型自己
+    结合人设与身体状态决定。
+    """
     max_slots = cfg.schedule_max_slots
-    min_slots = max(4, min(max_slots, max_slots // 2))
     step = cfg.granularity_minutes
     if step > 1:
-        align_hint = f"所有 start / end 必须对齐到 {step} 分钟的整数倍。"
+        cells = DAY_MINUTES // step
+        align_hint = (
+            f"全天按 {step} 分钟分成 {cells} 格，所有 start / end 必须对齐到 {step} 分钟的整数倍，"
+            "把 24 小时每一格都填满。"
+        )
+        merge_hint = (
+            f"可以逐格填，也可以把连续几格合并成一个时段（全天最多 {max_slots} 个时段），"
+            "粒度由你决定。"
+        )
     else:
         align_hint = "时间点可以自然决定，不必对齐。"
+        merge_hint = f"全天最多 {max_slots} 个时段，粒度由你决定。"
 
     extra = cfg.schedule_prompt_extra.strip()
-    extra_line = f"额外的偏好：{extra}\n" if extra else ""
+    extra_block = (
+        "【可选偏好】（用户补充，仅供参考，可与她的人设和身体状态权衡，不必逐字执行）\n"
+        f"{extra}\n\n"
+        if extra
+        else ""
+    )
 
     return (
         persona_block(persona)
-        + f"\n请为她规划 {today}（星期{weekday}）这一整天的生活日程。\n"
-        + f"{extra_line}"
-        + "\n排日程的要求：\n"
-        "1. 写她真的会去做的一件件事，不要写「工作」「休息」这种笼统标签："
-        "「改第三季度的报表」比「上班」有用，「楼下便利店买饭团」比「吃饭」有用。\n"
-        "2. 时段要能让她说得出自己此刻在干什么，location 与 emotion 跟着事件走，"
-        "不要一整天都填同一个值。\n"
-        "3. 一天里要有真的会打断聊天的事（开会、通勤、排队、跟人吃饭），"
-        "也要有闲下来的空档；不要排成每分钟都在做有意义的事。\n"
-        "4. 只输出一个 JSON 数组，不要 Markdown 代码块。\n"
-        "5. 每个元素："
-        "{\"start\": \"00:00\", \"end\": \"07:30\", \"event\": \"睡眠休息\", "
+        + f"\n请为她填 {today}（星期{weekday}）这一天的日程表。"
+        "这张表由你来排：下面是她此刻的身体参考数值与表格格式，"
+        "每个时段做什么、做多长，由你结合她是谁自行决定。\n\n"
+        + body_reference_block(body, now_text or "未知")
+        + extra_block
+        + "【表格格式】\n"
+        "1. 只输出一个 JSON 数组，不要 Markdown 代码块，不要解释文字。\n"
+        "2. 每个元素："
+        "{\"start\": \"00:00\", \"end\": \"07:30\", \"event\": \"睡眠\", "
         "\"location\": \"卧室\", \"emotion\": \"平静\", \"energy_rate\": 0.15}\n"
-        f"6. 总共输出 {min_slots}~{max_slots} 个时段，把连续同类活动合并。\n"
-        "7. 时段必须首尾相连：00:00 开始，24:00 结束，不重叠。\n"
-        f"8. {align_hint}\n"
-        "9. energy_rate：睡眠/休息为正（0.05~0.2），工作/外出/社交为负（-0.05~-0.15）。\n"
-        + routine_prompt(cfg, 10)
+        "3. 时段首尾相连：00:00 开始，24:00 结束，不重叠、不留空隙。\n"
+        f"4. {align_hint}\n"
+        f"5. {merge_hint}\n"
+        "6. energy_rate 是这个时段对精力的作用：睡眠/休息为正（0.05~0.2），"
+        "工作/外出/社交为负（-0.05~-0.15）。\n"
+        "\n"
+        + routine_prompt(cfg, 7)
     )
 
 
@@ -421,6 +470,7 @@ class ScheduleService:
         logger=None,
         monotonic: Callable[[], float] | None = None,
         persona_provider=None,
+        body_provider=None,
     ):
         self._scope = scope
         self._config = config_provider
@@ -439,6 +489,8 @@ class ScheduleService:
         self._pending_slots: list[Slot] | None = None
         # 日程得按她是谁来排：递一个 async () -> Persona 进来，不递就不读人设。
         self._persona = persona_provider
+        # 身体参考数值的来源：递一个 () -> dict 进来，每次重排现取活值。
+        self._body = body_provider
         self.last_persona = ""
 
         self.resolver = None
@@ -498,6 +550,33 @@ class ScheduleService:
     def retry_after(self) -> float:
         return max(0.0, self._retry_after - self._monotonic())
 
+    def refresh_due(self) -> bool:
+        """上一份大模型日程是否到了该重排的时候。
+
+        动态日程不是一天排一次就定死：身体在变（困了、饿了、欠觉了），每隔
+        `schedule_refresh_minutes` 就该让模型看着新的身体数值重排一次。只在上一份
+        确实是大模型生成的时候才计时，模板/失败状态交给跨天与退避逻辑处理。
+        """
+        if self.source != SOURCE_LLM:
+            return False
+        interval = max(1.0, float(self.config.schedule_refresh_minutes) * 60.0)
+        raw = str(self._scope.get_self("schedule_generated_at", "") or "")
+        if not raw:
+            return True
+        generated = parse_state_timestamp(raw, self._clock.now())
+        if generated is None:
+            return True
+        return (self._clock.now() - generated).total_seconds() >= interval
+
+    def _body_snapshot(self) -> dict[str, Any]:
+        if self._body is None:
+            return {}
+        try:
+            snapshot = self._body()
+        except Exception:
+            return {}
+        return snapshot if isinstance(snapshot, dict) else {}
+
     def _template_slots(self, today: str) -> list[Slot]:
         cfg = self.config
         raw = get_fallback_schedule(today)
@@ -543,13 +622,17 @@ class ScheduleService:
 
         today = self._clock.today_str()
         date_changed = self._today_changed(today)
-        # 新的一天必须尝试生成，即使上一天的 provider 失败冷却还没结束。
-        effective_force = bool(force or date_changed)
+        # 新的一天必须尝试生成，即使上一天的 provider 失败冷却还没结束；
+        # 到了重排间隔也一样：身体变了，日程该跟着变。
+        due = self.refresh_due()
+        effective_force = bool(force or date_changed or due)
         effective_ignore = bool(ignore_cooldown or date_changed)
 
         if not effective_force and self._scope.get_self("schedule_source") == SOURCE_LLM:
             return False
-        if not effective_force and self.retry_after > 0:
+        # 到点重排不能绕过失败退避：模型挂掉时 due 会一直为真，不挡就退回每 30 秒
+        # 一次的永久重试。只有用户强制或跨天才允许硬闯。
+        if not (force or date_changed) and self.retry_after > 0:
             return False
 
         coro = self.ensure_fresh(force=effective_force, ignore_cooldown=effective_ignore)
@@ -578,6 +661,7 @@ class ScheduleService:
             not force
             and str(self._scope.get_self("today_date", "") or "") == today
             and self._scope.get_self("schedule_source") == SOURCE_LLM
+            and not self.refresh_due()
         ):
             return False
         if not force and self.retry_after > 0:
@@ -588,7 +672,12 @@ class ScheduleService:
 
         async with self._lock:
             stored_date = str(self._scope.get_self("today_date", "") or "")
-            if not force and stored_date == today and self._scope.get_self("schedule_source") == SOURCE_LLM:
+            if (
+                not force
+                and stored_date == today
+                and self._scope.get_self("schedule_source") == SOURCE_LLM
+                and not self.refresh_due()
+            ):
                 return False
             return await self._generate(cfg, today, ignore_cooldown)
 
@@ -611,7 +700,14 @@ class ScheduleService:
             return False
 
         persona = await self._resolve_persona()
-        prompt = build_prompt(cfg, today, self._clock.weekday(), persona)
+        prompt = build_prompt(
+            cfg,
+            today,
+            self._clock.weekday(),
+            persona,
+            body=self._body_snapshot(),
+            now_text=self._clock.now().strftime("%H:%M"),
+        )
         if self._log and cfg.debug_mode:
             self._log.debug(
                 f"[humanoid_core] 日程生成提示词（人设："

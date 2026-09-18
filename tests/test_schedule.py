@@ -194,11 +194,18 @@ class JsonExtractionTest(unittest.TestCase):
 class PromptTest(unittest.TestCase):
     def test_prompt_limits_slot_count(self):
         prompt = build_prompt(cfg(schedule_max_slots=16), "2026-08-22", "六")
-        self.assertIn("8~16 个时段", prompt)
+        self.assertIn("最多 16 个时段", prompt)
         self.assertIn("对齐到 15 分钟", prompt)
         self.assertIn("00:00 开始", prompt)
-        # 绝不能再出现「按 15 分钟逐格切分」那种要求
+        # 绝不能回到「逐格切出时段样例」那种写法
         self.assertNotIn("00:15-00:30", prompt)
+
+    def test_default_prompt_fills_all_96_cells(self):
+        """默认 96 格：模型可以逐格填，也可以合并，但 24 小时每一格都得有安排。"""
+        prompt = build_prompt(cfg(), "2026-08-22", "六")
+        self.assertIn("96 格", prompt)
+        self.assertIn("最多 96 个时段", prompt)
+        self.assertIn("把 24 小时每一格都填满", prompt)
 
     def test_flexible_granularity_drops_alignment(self):
         prompt = build_prompt(cfg(schedule_time_granularity="flexible"), "2026-08-22", "六")
@@ -210,7 +217,49 @@ class PromptTest(unittest.TestCase):
 
     def test_empty_extra_is_omitted(self):
         prompt = build_prompt(cfg(schedule_prompt_extra=""), "2026-08-22", "六")
-        self.assertNotIn("额外偏好", prompt)
+        self.assertNotIn("可选偏好", prompt)
+
+    def test_extra_is_a_reference_not_an_order(self):
+        """补充偏好要明说「仅供参考」，不能写成必须执行的指令。"""
+        prompt = build_prompt(cfg(schedule_prompt_extra="偏爱户外"), "2026-08-22", "六")
+        self.assertIn("偏爱户外", prompt)
+        self.assertIn("仅供参考", prompt)
+        self.assertNotIn("必须", prompt.split("【可选偏好】")[1].split("【表格格式】")[0])
+
+    def test_body_values_are_references(self):
+        """身体数值进 prompt 时必须标明是参考，且不带「所以该安排什么」的结论。"""
+        body = {
+            "energy": 42.0,
+            "hunger": 77.0,
+            "sleep_pressure": 81.0,
+            "sleep_debt": 3.5,
+            "last_sleep_hours": 5.5,
+            "cycle": "处于【经期】，身体能量消耗较大",
+        }
+        prompt = build_prompt(cfg(), "2026-08-22", "六", body=body, now_text="14:30")
+        self.assertIn("【她此刻的身体参考数值】", prompt)
+        self.assertIn("是参考，不是必须满足的条件", prompt)
+        self.assertIn("精力：42", prompt)
+        self.assertIn("饥饿：77", prompt)
+        self.assertIn("睡眠债：3.5 小时", prompt)
+        self.assertIn("当前时间：14:30", prompt)
+        for conclusion in ("必须安排", "应该早点睡", "需要补觉安排", "务必"):
+            self.assertNotIn(conclusion, prompt)
+
+    def test_no_body_values_still_works(self):
+        prompt = build_prompt(cfg(), "2026-08-22", "六")
+        self.assertNotIn("【她此刻的身体参考数值】", prompt)
+        self.assertIn("【表格格式】", prompt)
+
+    def test_prompt_carries_no_content_hints(self):
+        """v2.16.7 起不再替模型思考：内容提示一律不进 prompt。"""
+        prompt = build_prompt(cfg(), "2026-08-22", "六")
+        for hint in (
+            "要有真的会打断聊天的事",
+            "不要排成每分钟都在做有意义的事",
+            "「改第三季度的报表」比「上班」有用",
+        ):
+            self.assertNotIn(hint, prompt)
 
 
 class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
@@ -275,6 +324,95 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         await service.ensure_fresh()
         await service.ensure_fresh()
         self.assertEqual(provider.calls, 1)
+
+    async def test_refresh_interval_regenerates(self):
+        """动态日程：到了重排间隔就重排，没到就不动。"""
+        provider = FakeProvider("p", reply=GOOD_SCHEDULE)
+        service, _, _ = self.build(
+            cfg(schedule_provider_name="p", schedule_refresh_minutes=15), [provider]
+        )
+        await service.ensure_fresh()
+        self.assertEqual(provider.calls, 1)
+        self.assertFalse(service.refresh_due(), "同一时刻不该判为到期待重排")
+
+        await service.ensure_fresh()
+        self.assertEqual(provider.calls, 1, "没到间隔不应重排")
+
+        service._clock.advance(minutes=15)
+        self.assertTrue(service.refresh_due(), "过了一个重排间隔就该判到期")
+        await service.ensure_fresh()
+        self.assertEqual(provider.calls, 2, "到期后应重新生成")
+
+    async def test_due_refresh_respects_backoff(self):
+        """到点重排不能绕过失败退避：模型挂掉时 due 恒为真，不挡会退回每 30 秒一次的永久重试。"""
+        clock = FakeClock()
+        provider = FakeProvider("p", reply=GOOD_SCHEDULE)
+        service, _, _ = self.build(
+            cfg(
+                schedule_provider_name="p",
+                schedule_refresh_minutes=15,
+                schedule_provider_cooldown_minutes=30,
+                schedule_retry_interval_seconds=0,
+            ),
+            [provider],
+            monotonic=clock,
+        )
+        await service.ensure_fresh()
+        self.assertEqual(service.source, SOURCE_LLM)
+
+        provider.error = RuntimeError("down")
+        service._clock.advance(minutes=15)
+        self.assertTrue(service.refresh_due(), "过了一个重排间隔就该判到期")
+        self.assertTrue(service.request_refresh(), "还没有退避时，到点重排应该尝试")
+        await service._task
+        self.assertGreater(service.retry_after, 0, "失败后应进入退避窗口")
+        calls = provider.calls
+
+        for _ in range(10):
+            self.assertFalse(
+                service.request_refresh(),
+                "退避窗口内，哪怕 due 一直为真也不该再投递",
+            )
+        self.assertEqual(provider.calls, calls, "退避窗口内不应再调用模型")
+
+        # 退避到期后，到点重排恢复尝试；用户强制（/重置日程）则随时可硬闯。
+        clock.advance(30 * 60 + 1)
+        self.assertEqual(service.retry_after, 0)
+        self.assertTrue(service.request_refresh())
+        await service._task
+        self.assertGreater(provider.calls, calls)
+
+    async def test_body_values_travel_into_the_prompt(self):
+        """重排时身体参考数值要进 prompt，且每次现取活值。"""
+        provider = FakeProvider("p", reply=GOOD_SCHEDULE)
+        readings = {"energy": 55.0, "hunger": 60.0, "sleep_pressure": 70.0, "sleep_debt": 2.0}
+        conf = cfg(schedule_provider_name="p", schedule_refresh_minutes=15)
+        self.conf = conf
+        tmp = Path(tempfile.mkdtemp()) / "state.json"
+        store = ScopeStore(tmp)
+        store.load("2026-08-22", conf.cycle_length)
+        log = RecordingLogger()
+        ctx = FakeContext(chat_providers=[provider])
+        resolver = ProviderResolver(ctx, log)
+        gateway = LLMGateway(resolver, lambda: self.conf, log)
+        clock = FrozenClock(FIXED_MOMENT)
+        service = ScheduleService(
+            store.scope, lambda: self.conf, clock, logger=log, body_provider=lambda: dict(readings)
+        )
+        service.set_resolver_gateway(resolver, gateway)
+        await service.ensure_fresh()
+        prompt = provider.last_kwargs.get("prompt") or ""
+        self.assertIn("【她此刻的身体参考数值】", prompt)
+        self.assertIn("精力：55", prompt)
+        self.assertIn("饥饿：60", prompt)
+        self.assertIn("是参考，不是必须满足的条件", prompt)
+
+        readings.update({"energy": 20.0, "hunger": 90.0})
+        clock.advance(minutes=15)
+        await service.ensure_fresh()
+        prompt = provider.last_kwargs.get("prompt") or ""
+        self.assertIn("精力：20", prompt, "重排时该拿到新的活值")
+        self.assertIn("饥饿：90", prompt)
 
     async def test_force_regenerates(self):
         provider = FakeProvider("p", reply=GOOD_SCHEDULE)

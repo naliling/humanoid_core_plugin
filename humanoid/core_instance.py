@@ -95,6 +95,7 @@ class HumanoidCoreInstance:
             self._spawn_background,
             logger,
             persona_provider=self._persona_for_schedule,
+            body_provider=self._schedule_body,
         )
         self.schedule.set_resolver_gateway(resolver, gateway)
         # 重启后、第一条消息到来之前也要能按人设生成日程：把上次记账的代表会话先恢复。
@@ -201,6 +202,37 @@ class HumanoidCoreInstance:
         if self.persona_source is None:
             return None
         return await self.persona_source.persona(self.role_id)
+
+    def _schedule_body(self) -> dict:
+        """日程重排用的身体参考数值：每次重排现取的活值，不是静态设定。
+
+        只给数值与周期描述，不带任何「所以该安排什么」的结论——怎么权衡是模型的事。
+        """
+        body: dict[str, Any] = {"now": self.clock.now().strftime("%H:%M")}
+        try:
+            body["energy"] = round(float(self.energy.energy), 1)
+        except Exception:
+            pass
+        if self.config.soma_enabled:
+            try:
+                snap = self.soma.snapshot()
+                body.update(
+                    {
+                        "hunger": snap["hunger"],
+                        "sleep_pressure": snap["sleep_pressure"],
+                        "sleep_debt": snap["sleep_debt"],
+                        "last_sleep_hours": snap["last_sleep_hours"],
+                    }
+                )
+            except Exception:
+                pass
+        try:
+            cycle = self.energy.cycle_description()
+        except Exception:
+            cycle = ""
+        if cycle:
+            body["cycle"] = cycle
+        return body
 
     def note_umo(self, umo: str) -> bool:
         """记下该角色最近互动的会话来源，日程靠它去解析「她是谁」。
@@ -685,7 +717,7 @@ class HumanoidCoreInstance:
                 pass
 
     async def _schedule_loop(self):
-        """持续维护每日 LLM 日程，并在跨天时立即触发新一天的生成。"""
+        """持续维护动态日程：跨天立即生成，平时到了重排间隔就按新身体数值重排。"""
         last_checked_date = ""
         while not self._stop_event.is_set():
             try:
@@ -696,6 +728,8 @@ class HumanoidCoreInstance:
                     # 跨天是最高优先级：绕过上一天失败造成的冷却，立即尝试今天。
                     self.schedule.request_refresh(force=True, ignore_cooldown=True)
                 else:
+                    # 平时得问一句「到没到重排间隔」：refresh_due 在里面，
+                    # 没到间隔且已有大模型日程时它自己会直接返回。
                     self.schedule.request_refresh()
             except Exception as exc:
                 self._log.warning(f"{LOG_PREFIX} 日程后台检查失败: {exc}")

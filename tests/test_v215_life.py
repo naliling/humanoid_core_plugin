@@ -338,7 +338,8 @@ class DayNarrativeTest(unittest.TestCase):
         self.assertEqual(day_lines({"doing": "", "done": [], "next": []}), [])
         self.assertEqual(day_lines(day_phrases([], 600)), [])
 
-    def test_injection_contains_the_day_line(self):
+    def test_injection_does_not_narrate_the_day(self):
+        """日程流水账不进上下文：今天干了什么留在状态与契约里，不让她念稿子。"""
         import asyncio
         import tempfile
         from pathlib import Path
@@ -359,11 +360,11 @@ class DayNarrativeTest(unittest.TestCase):
         slots = normalize_slots(DAY_SCHEDULE, max_slots=16)
         core.schedule._install(slots, TODAY, SOURCE_LLM)
         text = core.build_injection("42", is_group=False)
-        self.assertIn("今天到这会", text)
-        self.assertIn("跟客户过方案", text)
-        # 此刻那一件事只说一次：过程与日程各说一遍会互相打脸
-        self.assertNotIn("现在在跟客户过方案；手上在做的：跟客户过方案", text)
-        self.assertIn("手上在做的：跟客户过方案", text)
+        self.assertNotIn("今天到这会", text)
+        self.assertNotIn("跟客户过方案", text)
+        # 数据源还在：day_phrases 照常能算出今天干了什么（契约/诊断用）。
+        got = day_phrases(slots, 15 * 60 + 20)
+        self.assertIn("跟客户过方案", got["doing"])
 
 
 class RecallTest(unittest.TestCase):
@@ -515,10 +516,15 @@ class EmotionLineTest(unittest.TestCase):
         record.update(mood)
         return core
 
-    def test_still_angry_changes_the_tone_line(self):
+    def test_still_angry_shows_in_the_label_not_a_script(self):
+        """情绪信到标签为止：状态照给，怎么开口不由插件写。"""
         core = self.core_with_mood(affection=55.0, libido=10.0, aggression=40.0, base_aggression=28.0)
         text = core.build_injection("42", is_group=False)
-        self.assertTrue(any(w in text for w in ("积了点火", "攒着点事", "火压在底下")), text)
+        self.assertIn("对TA的感觉：", text)
+        # 攻击性偏高的那一档，标签本身就得能看出不对劲（如「不讲理」「较劲」）。
+        self.assertTrue(any(w in text for w in ("不讲理", "较劲", "炸毛", "嘴硬", "别扭")), text)
+        for script in ("积了点火", "攒着点事", "火压在底下", "说话会短", "顶回去"):
+            self.assertNotIn(script, text)
 
     def test_attitude_line_stops_at_the_feeling(self):
         """插件只说她心里怎么样，不替她决定这句话怎么说出口。"""

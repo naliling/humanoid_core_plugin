@@ -53,7 +53,7 @@ NO_PERMISSION = "❌ 权限不足，该指令仅管理员可用。"
 
 # 默认值一次性迁移的标记文件。AstrBot 更新配置只补缺不覆盖，不调这一手的话老用户
 # 会永远停在装插件那一版的行为上。
-DEFAULTS_MIGRATION_MARK = ".defaults-migrated-v2.16.4"
+DEFAULTS_MIGRATION_MARK = ".defaults-migrated-v2.16.7"
 
 
 def _arg_after(text: str, command: str) -> str:
@@ -470,10 +470,10 @@ class HumanoidCore(Star):
 
     def _settings_summary(self) -> str:
         cfg = self._config
-        lines = [f"⚙️ 常用设置（共 82 项，其余标了【进阶】，在面板里改）"]
+        lines = [f"⚙️ 常用设置（共 83 项，其余标了【进阶】，在面板里改）"]
         lines.append(f"- 城市：{cfg.timezone_city or '（未定）'}　→ /拟人设置 城市 大阪")
         lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人设置 人设 开")
-        lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}")
+        lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（每 {cfg.schedule_refresh_minutes} 分钟按身体数值重排）")
         lines.append(f"- 日程额外偏好：{cfg.schedule_prompt_extra or '（空）'}")
         lines.append(f"- 上下文详略：{cfg.inject_activity_context}（low/full/mood_only）")
         lines.append(f"- 参与环境：{cfg.environment_mode}（private/group/both）")
@@ -510,7 +510,9 @@ class HumanoidCore(Star):
                 slots = core.schedule.current_slots()
                 logger.debug(f"[humanoid_core] 新日程: {len(slots)} 个时段")
         else:
-            yield event.plain_result(f"❌ 生成失败：{core.schedule.last_error}")
+            yield event.plain_result(
+                f"❌ 生成失败：{core.schedule.last_error}（可用 /拟人诊断 查看模型配置）"
+            )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("重置状态")
@@ -566,7 +568,13 @@ class HumanoidCore(Star):
             return
         core = self._core(event)
         applied = core.mood.set_affection_batch(pairs)
-        yield event.plain_result(f"✅ 已批量设置 {applied} 个用户。")
+        skipped = len(pairs) - applied
+        if skipped:
+            yield event.plain_result(
+                f"✅ 已批量设置 {applied} 个用户，跳过 {skipped} 个（数值需在 0-100 之间）。"
+            )
+        else:
+            yield event.plain_result(f"✅ 已批量设置 {applied} 个用户。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("查看所有昵称")

@@ -12,8 +12,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from humanoid.config import HumanoidConfig
-from humanoid.data.mood_map import get_mood_label
-from humanoid.prompt_builder import MOOD_TONE_HINTS, PromptBuilder
+from humanoid.prompt_builder import PromptBuilder
 from humanoid.wording import FEELING_WORDS, pick, scale_word
 from humanoid.services.soma import SomaService
 from humanoid.role_scope import RoleScope
@@ -25,23 +24,6 @@ TZ = ZoneInfo("Asia/Shanghai")
 
 def cfg(**overrides) -> HumanoidConfig:
     return HumanoidConfig.from_raw({"timezone_city": "北京", **overrides})
-
-
-def reachable_labels() -> set[str]:
-    return {
-        get_mood_label(affection, libido, aggression)
-        for affection in range(0, 101)
-        for libido in range(0, 51)
-        for aggression in range(0, 51)
-    }
-
-
-class MoodToneTableTest(unittest.TestCase):
-    def test_every_hint_key_is_a_reachable_label(self):
-        """写成近义词的 key 永远命中不到，等于白加一条语气提示。"""
-        labels = reachable_labels()
-        dead = sorted(key for key in MOOD_TONE_HINTS if key not in labels)
-        self.assertEqual(dead, [], f"这些 key 不在 get_mood_label 的输出里：{dead}")
 
 
 class _StubCore:
@@ -74,7 +56,7 @@ class NightFactsTest(unittest.TestCase):
 
     def test_sleep_window_is_a_fact(self):
         text = " ".join(night_lines(night=True, asleep=False, soma_enabled=True))
-        self.assertIn("最该睡", text)
+        self.assertIn("她的睡眠时间", text)
 
     def test_asleep_is_said_once(self):
         """她在睡这件事由体感那块说，夜间块不再重复一遍。"""
@@ -100,7 +82,7 @@ class NightFactsTest(unittest.TestCase):
 
     def test_body_off_still_says_the_window(self):
         text = " ".join(night_lines(soma_enabled=False))
-        self.assertIn("夜里", text)
+        self.assertIn("夜间作息", text)
 
 
 class WordingTest(unittest.TestCase):

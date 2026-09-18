@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 _LIBIDO_AGGRESSION_BUCKETS = (0.0, 12.5, 25.0, 37.5, 50.0)
 
 
@@ -30,7 +32,7 @@ AFFECTION_MAP: dict[int, dict[tuple[float, float], str]] = {
         (37.5, 0.0): "冷淡", (37.5, 12.5): "避让", (37.5, 25.0): "嫌弃", (37.5, 37.5): "恼火", (37.5, 50.0): "厌恶",
         (25.0, 0.0): "客气", (25.0, 12.5): "距离", (25.0, 25.0): "隔阂", (25.0, 37.5): "抵触", (25.0, 50.0): "反感",
         (12.5, 0.0): "礼貌", (12.5, 12.5): "陌生", (12.5, 25.0): "谨慎", (12.5, 37.5): "不安", (12.5, 50.0): "警惕",
-        (0.0, 0.0): "无视", (0.0, 12.5): "透明", (0.0, 25.0): "无视", (0.0, 37.5): "排斥", (0.0, 50.0): "驱逐",
+        (0.0, 0.0): "无视", (0.0, 12.5): "透明", (0.0, 25.0): "无视", (0.0, 37.5): "排斥", (0.0, 50.0): "抗拒",
     },
     25: {
         (50.0, 0.0): "留意", (50.0, 12.5): "好奇", (50.0, 25.0): "琢磨", (50.0, 37.5): "在意", (50.0, 50.0): "纠结",
@@ -54,8 +56,8 @@ AFFECTION_MAP: dict[int, dict[tuple[float, float], str]] = {
         (0.0, 0.0): "安静", (0.0, 12.5): "沉默", (0.0, 25.0): "独处", (0.0, 37.5): "冷淡", (0.0, 50.0): "冷处理",
     },
     100: {
-        (50.0, 0.0): "信赖", (50.0, 12.5): "依恋", (50.0, 25.0): "痴迷", (50.0, 37.5): "占有", (50.0, 50.0): "热烈",
-        (37.5, 0.0): "眷恋", (37.5, 12.5): "深爱", (37.5, 25.0): "宠溺", (37.5, 37.5): "痴缠", (37.5, 50.0): "虐恋",
+        (50.0, 0.0): "信赖", (50.0, 12.5): "依恋", (50.0, 25.0): "着迷", (50.0, 37.5): "独占", (50.0, 50.0): "热烈",
+        (37.5, 0.0): "眷恋", (37.5, 12.5): "深爱", (37.5, 25.0): "宠溺", (37.5, 37.5): "难舍", (37.5, 50.0): "浓烈",
         (25.0, 0.0): "温柔", (25.0, 12.5): "呵护", (25.0, 25.0): "娇惯", (25.0, 37.5): "吃醋", (25.0, 50.0): "心疼",
         (12.5, 0.0): "安稳", (12.5, 12.5): "恬静", (12.5, 25.0): "安心", (12.5, 37.5): "委屈", (12.5, 50.0): "赌气",
         (0.0, 0.0): "默契", (0.0, 12.5): "平和", (0.0, 25.0): "淡然", (0.0, 37.5): "难过", (0.0, 50.0): "失落",
@@ -69,30 +71,37 @@ def get_mood_label(affection: float, libido: float, aggression: float) -> str:
 
 
 def generate_mood_tag(affection: float, libido: float, aggression: float, energy: float) -> str:
+    """心情标签：给人看的短语（如「有点疲惫，开心，想贴贴」），不进聊天上下文。
+
+    每档多条等价说法随机抽：同一个状态不该每次都念同一句。措辞都是状态词，
+    不带「所以该怎么说话」的指令。
+    """
     parts: list[str] = []
 
     if energy >= 70:
-        parts.append("精力充沛")
+        parts.append(random.choice(("精力充沛", "精神饱满", "状态在线", "劲头很足")))
     elif energy >= 40:
-        parts.append("状态平稳")
+        parts.append(random.choice(("状态平稳", "还算有精神", "不咸不淡", "情绪平稳")))
     else:
-        parts.append("有点疲惫")
+        parts.append(random.choice(("有点疲惫", "犯困", "电量不足", "身上发沉")))
 
     if affection >= 70:
-        parts.append("开心")
+        parts.append(random.choice(("开心", "心情不错", "愉快", "心里挺亮堂")))
     elif affection >= 40:
-        parts.append("平静")
+        parts.append(random.choice(("平静", "心平气和", "淡淡的", "没什么波澜")))
     else:
-        parts.append("冷淡")
+        parts.append(random.choice(("冷淡", "提不起劲", "闷闷的", "兴致不高")))
 
-    if libido >= 30 and aggression < 20:
-        parts.append("亲切")
-    elif aggression >= 30 and libido < 20:
-        parts.append("疏离")
-    elif aggression >= 30 and libido >= 30:
-        parts.append("矛盾")
+    if aggression >= 30 and libido >= 30:
+        parts.append(random.choice(("矛盾", "拧巴", "又气又想靠近")))
+    elif aggression >= 30:
+        parts.append(random.choice(("有点烦躁", "压着火气", "憋着不痛快", "气鼓鼓")))
+    elif libido >= 30:
+        parts.append(random.choice(("想贴贴", "想找人说话", "软乎乎", "亲切")))
+    elif aggression <= 8 and libido <= 8:
+        parts.append(random.choice(("松弛", "自在", "没什么心事")))
     else:
-        parts.append("自然")
+        parts.append(random.choice(("自然", "随性", "平常心")))
 
     unique: list[str] = []
     for part in parts:

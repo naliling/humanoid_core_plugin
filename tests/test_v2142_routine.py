@@ -271,7 +271,10 @@ class RoutinePromptTest(unittest.TestCase):
         self.assertNotIn("必须遵守", free)
         self.assertNotIn("23:00 上床", free)
         self.assertIn("由她是谁决定", free)
-        self.assertIn("夜猫子", free)
+        # 作息怎么定要结合身体数值（困意、睡眠债）由模型判断，但不给「夜猫子该几点睡」
+        # 这类内容提示——那是替模型做决定。
+        self.assertIn("身体数值", free)
+        self.assertNotIn("夜猫子", free)
         # 关掉夜间模式只是不算生物钟夜，「几点睡由她自己定」这句照样该给模型——
         # 不给的话模型会退回直觉，把所有人都排成 00:00→08:00。
         self.assertIn("由她是谁决定", routine_prompt(cfg(night_mode_enabled=False)))

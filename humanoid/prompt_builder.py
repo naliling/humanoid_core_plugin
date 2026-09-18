@@ -38,9 +38,11 @@ MARK_PREFIX = "〔她的身体与生活"
 MARK_VERSION = "v4"
 
 # 给 system_prompt 的那段话：说明下面这些是什么、按什么方式读它。稳定文本，不含事实。
+# 只划参考边界，不下指令：说什么、怎么说、说多长，都由她自己判断。
 FRAMING_TEXT = (
     "\n\n【她的身体与生活】\n"
-    "以下是她当前的真实处境与身体状态。这些是背景事实，自然融入对话即可，无需刻意提及或逐条回应。"
+    "以下是她当前的真实处境与身体状态，作为背景参考。"
+    "自然融入即可，无需刻意提及或逐条回应；如何回应、说什么、说多长，由她自己判断。"
 )
 
 # 注入块的硬长度上限（字符）。每条聊天请求都追加一次，所以它必须是个定值而不是
@@ -59,20 +61,8 @@ def estimate_tokens(text: str) -> int:
     return int(math.ceil(cjk + (len(text) - cjk) / 3.5))
 
 
-# 情绪标签 → 她此刻对TA的心气。写的是心里怎么样，不是「语气要怎样」：
-# 怎么说由她自己定。每个标签备几条等价说法，按天抽一条（见 wording.pick）。
-MOOD_TONE_HINTS = {
-    "亲密": ("态度亲昵",),
-    "依恋": ("带有依恋",),
-    "信赖": ("充满信任",),
-    "热情": ("态度热情",),
-    "友好": ("态度友善",),
-    "平常": ("",),
-    "疏远": ("略显疏远",),
-    "冷淡": ("态度冷淡",),
-    "敌视": ("带有敌意",),
-    "警惕": ("保持警惕",),
-}
+# 情绪标签逆映射已删（v2.16.7）：「态度亲昵」「带有敌意」这类括号注释是在教她用什么
+# 语气开口，属于限制发言。现在只给标签本身（如「亲密」），怎么说出来由她自己定。
 
 # 低注入档下最多给几条体感：真人多数时候不觉得自己在报备身体。
 MAX_FEELINGS_LOW = 2
@@ -234,10 +224,7 @@ class PromptBuilder:
         care = float(interest.get("care", 0.5))
         care_word = pick("care", seed, scale_word(care, CARE_WORDS) or "")
 
-        if label and not care_word:
-            hint = pick(f"tone:{label}", seed, MOOD_TONE_HINTS.get(label) or ("",))
-            lines.append(f"对TA的感觉：{label}" + (f"（{hint}）" if hint else ""))
-        elif label:
+        if label:
             lines.append(f"对TA的感觉：{label}")
         if care_word:
             lines.append(care_word)
@@ -345,12 +332,12 @@ class PromptBuilder:
         agency: Dict[str, float],
         with_previous: bool,
     ) -> List[str]:
-        """隔了多久 + TA离开前那句原话 + 她这期间自己干了什么。
+        """隔了多久 + TA离开前那句原话。
 
         这一块的目的是让她**感觉到那段间隔**：真人看到「三小时十二分」不会有反应，
-        看到「TA有 3 小时 12 分没吭声了，离开前说的是『我先去开会』，这期间我把方案
-        改完了一版」才会自己想「这人是真忙还是不想理我」。所以三段都是事实，
-        一句指导话都不写（旧版那句「这是一次性的背景，不是每天要重新问候的事」删了）。
+        看到「TA有 3 小时 12 分没吭声了，离开前说的是『我先去开会』」才会自己想
+        「这人是真忙还是不想理我」。所以只给事实，一句指导话都不写（旧版那句
+        「这是一次性的背景，不是每天要重新问候的事」删了）。
         """
         if not events:
             return []
@@ -365,7 +352,12 @@ class PromptBuilder:
             lines.append(pick("since", seed, SINCE_WORDS).format(gap=gap))
         else:
             lines.append(EVENT_TEXT.get(event_type) or "最近出现了交流变化")
-        # 只报时间间隔，不注入离开前原话，避免干扰正常话题走向
+        # 离开前那句原话是实用性的一半：没有它，「隔了三小时」只是一个秒表读数；
+        # 有了它，模型自己就能接上「并会开完了吗」。只给事实，不写「要主动问起」。
+        if with_previous:
+            previous = str(data.get("previous_message") or "").strip()
+            if previous:
+                lines.append(f"TA离开前说的最后一句：「{previous[:60]}」")
         return lines
 
     def _during_gap_lines(self, seconds: Any) -> List[str]:

@@ -366,7 +366,10 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
         service, _, _ = self.build(cfg(mood_sensitivity=100))
         service.profile("1")["last_interaction"] = self.time_value
         await service.update_from_message("1", "你好棒", 90.0, 8)
-        self.assertIn("精力充沛", service.tag("1"))
+        # 同一档多条等价说法随机抽，断言得认全该档的词。
+        high_energy = ("精力充沛", "精神饱满", "状态在线", "劲头很足")
+        tag = service.tag("1")
+        self.assertTrue(any(w in tag for w in high_energy), tag)
 
     async def test_admin_operations(self):
         service, _, _ = self.build()
@@ -532,14 +535,14 @@ class SocialEnergyTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(service.value, 0.0, "第一轮就应该恢复过一次")
 
     async def test_hint_bands(self):
-        """语气提示必须随能量单调变淡，而且不能出现数值。"""
+        """意愿描述随能量单调变淡，而且不能出现数值。"""
         service, store, _ = self.build()
         store.data["social_energy"] = 95.0
         talkative = service.hint()
         store.data["social_energy"] = 10.0
         terse = service.hint()
-        self.assertIn("聊", talkative)
-        self.assertIn("简短", terse)
+        self.assertIn("意愿高", talkative)
+        self.assertIn("独处", terse)
         self.assertNotIn("95", talkative)
         self.assertEqual(service.text, "较低")
 

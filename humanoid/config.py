@@ -146,9 +146,14 @@ class HumanoidConfig:
     schedule_retry_interval_seconds: int = 2
     schedule_llm_timeout_seconds: int = 60
     schedule_generation_max_attempts: int = 2
-    schedule_max_slots: int = 16
+    schedule_max_slots: int = 96
+    # 日程重排间隔（分钟）：动态日程每隔这段时长就按当前身体状态重排一次。
+    # 15 分钟 = 一天最多 96 次重排，与 15 分钟粒度对齐；调大可省模型额度。
+    schedule_refresh_minutes: int = 15
     schedule_provider_cooldown_minutes: int = 30
-    schedule_prompt_extra: str = "休闲日常，愉快的生活。"
+    # 均衡参考偏好：会作为「仅供参考」的偏好递给模型，与人设和身体状态一起权衡，
+    # 不是必须服从的指令。
+    schedule_prompt_extra: str = "劳逸结合，有动有静，节奏均衡。"
     # 自由文本配置项，必须卡长度：它逐字进入日程生成 prompt，有人能往里面粘一整篇设定。
     SCHEDULE_PROMPT_EXTRA_MAX = 300
     schedule_time_granularity: str = "15min"
@@ -287,7 +292,8 @@ class HumanoidConfig:
             schedule_retry_interval_seconds=i("schedule_retry_interval_seconds", 0, 600),
             schedule_llm_timeout_seconds=i("schedule_llm_timeout_seconds", 10, 300),
             schedule_generation_max_attempts=i("schedule_generation_max_attempts", 1, 5),
-            schedule_max_slots=i("schedule_max_slots", 6, 48),
+            schedule_max_slots=i("schedule_max_slots", 6, 96),
+            schedule_refresh_minutes=i("schedule_refresh_minutes", 1, 1440),
             schedule_provider_cooldown_minutes=i("schedule_provider_cooldown_minutes", 0, 1440),
             schedule_prompt_extra=s_opt("schedule_prompt_extra")[
                 : cls.SCHEDULE_PROMPT_EXTRA_MAX
@@ -497,6 +503,9 @@ DEFAULTS = HumanoidConfig()
 # 但 AstrBot 更新配置只补缺不覆盖，老用户会永远停在 Heyuan,CN 上——于是「她在北京」
 # 但「她那边天气是河源」。
 LEGACY_WEATHER_LOCATION = "Heyuan,CN"
+# v2.16.7 之前的日程默认：时段数 16、旧偏好文案。只迁移仍停在旧默认值的用户。
+LEGACY_SCHEDULE_MAX_SLOTS = 16
+LEGACY_SCHEDULE_PROMPT_EXTRA = "休闲日常，愉快的生活。"
 
 
 def plan_default_migrations(raw: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -522,6 +531,11 @@ def plan_default_migrations(raw: Mapping[str, Any] | None) -> dict[str, Any]:
         and src.get("night_end_hour") == 6
     ):
         changes["schedule_follow_night_window"] = False
+    # v2.16.7：日程改为 15 分钟粒度、模型填表覆盖全天的默认。只动仍停在旧默认的项。
+    if src.get("schedule_max_slots") == LEGACY_SCHEDULE_MAX_SLOTS:
+        changes["schedule_max_slots"] = 96
+    if str(src.get("schedule_prompt_extra") or "").strip() == LEGACY_SCHEDULE_PROMPT_EXTRA:
+        changes["schedule_prompt_extra"] = DEFAULTS.schedule_prompt_extra
     return changes
 
 

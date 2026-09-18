@@ -16,7 +16,11 @@ import types
 import unittest
 from pathlib import Path
 
+from .astrbot_stub import install as install_astrbot_stub
 from .fakes import FakeContext, FakeProvider
+
+# 真实环境里 AstrBot 自己会把这些模块准备好；只有在缺框架的机器上才需要补。
+install_astrbot_stub()
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 PKG_NAME = "_humanoid_plugin_under_test"
@@ -133,8 +137,8 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
     async def test_status_command(self):
         out = await collect(self.star.cmd_status(FakeEvent("/你的状态")))
         self.assertEqual(len(out), 1)
-        self.assertIn("当前状态", out[0])
         self.assertIn("精力", out[0])
+        self.assertIn("城市", out[0])
 
     async def test_help_lists_diagnose(self):
         out = await collect(self.star.cmd_help(FakeEvent("/拟人帮助")))
@@ -152,14 +156,15 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         out = await collect(self.star.cmd_time(FakeEvent("/时间 上海")))
         self.assertIn("上海", out[0])
         bad = await collect(self.star.cmd_time(FakeEvent("/时间 火星")))
-        self.assertIn("暂不支持", bad[0])
+        self.assertIn("认不出城市", bad[0])
         default = await collect(self.star.cmd_time(FakeEvent("/时间")))
         self.assertIn("北京", default[0])
 
     async def test_nickname_command(self):
         out = await collect(self.star.cmd_set_nickname(FakeEvent("/叫我 小灵")))
         self.assertIn("小灵", out[0])
-        self.assertEqual(self.star.engine.nickname("10001"), "小灵")
+        core = self.star._core(FakeEvent("/你的状态"))
+        self.assertEqual(core.mood.nickname("10001"), "小灵")
         missing = await collect(self.star.cmd_set_nickname(FakeEvent("/叫我")))
         self.assertIn("用法", missing[0])
         too_long = await collect(self.star.cmd_set_nickname(FakeEvent("/叫我 " + "长" * 40)))
@@ -195,26 +200,23 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.star.engine.config.inject_activity_context, "full")
 
     async def test_reset_schedule_reports_result(self):
-        event = FakeEvent("/重置日程")
-        out = await collect(self.star.cmd_reset_schedule(event))
-        self.assertIn("已开始在后台", out[0])
-        self.assertTrue(event.sent, "生成结束后应追加一条结果消息")
-        self.assertIn("日程已更新", event.sent[-1])
+        out = await collect(self.star.cmd_reset_schedule(FakeEvent("/重置日程")))
+        self.assertIn("正在后台", out[0])
+        self.assertIn("日程已更新", out[-1])
 
     async def test_reset_schedule_reports_failure(self):
         self.provider.error = RuntimeError("connection refused")
         self.raw["schedule_allow_global_fallback"] = False
         self.star.engine.reload_config(self.raw)
-        event = FakeEvent("/重置日程")
-        await collect(self.star.cmd_reset_schedule(event))
-        self.assertIn("失败", event.sent[-1])
-        self.assertIn("拟人诊断", event.sent[-1])
+        out = await collect(self.star.cmd_reset_schedule(FakeEvent("/重置日程")))
+        self.assertIn("失败", out[-1])
+        self.assertIn("拟人诊断", out[-1])
 
     async def test_reset_state_and_mood(self):
         out = await collect(self.star.cmd_reset_state(FakeEvent("/重置状态")))
-        self.assertIn("已重置状态", out[0])
+        self.assertIn("已重置", out[0])
         out2 = await collect(self.star.cmd_reset_mood(FakeEvent("/重置情绪")))
-        self.assertIn("已重置情绪", out2[0])
+        self.assertIn("好感度", out2[0])
 
     async def test_set_and_batch_affection(self):
         out = await collect(self.star.cmd_set_affection(FakeEvent("/设置好感度 88")))
@@ -231,8 +233,9 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_list_nicknames(self):
         empty = await collect(self.star.cmd_list_nicknames(FakeEvent("/查看所有昵称")))
-        self.assertIn("没有任何用户", empty[0])
-        self.star.engine.set_nickname("555", "阿五")
+        self.assertIn("暂无昵称", empty[0])
+        core = self.star._core(FakeEvent("/你的状态"))
+        core.mood.set_nickname("555", "阿五")
         out = await collect(self.star.cmd_list_nicknames(FakeEvent("/查看所有昵称")))
         self.assertIn("阿五", out[0])
 
@@ -242,7 +245,7 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         req = FakeProviderRequest("你是一个助手。")
         await self.star.inject_context(FakeEvent("你好", private=False), req)
         self.assertIn("你是一个助手。", req.system_prompt)
-        self.assertIn("系统暗示", req.system_prompt)
+        self.assertIn("【她的身体与生活】", req.system_prompt)
         self.assertIn("群聊", req.system_prompt)
 
     async def test_injection_creates_prompt_when_empty(self):
@@ -270,19 +273,20 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.system_prompt, "", "私聊在 group 模式下不应被注入")
 
     async def test_on_message_bookkeeping(self):
-        before = self.star.engine.social.value
+        core = self.star._core(FakeEvent("/你的状态"))
+        before = core.social.value
         await self.star.on_message(FakeEvent("你好呀"))
         await asyncio.sleep(0.05)
-        self.assertLessEqual(self.star.engine.social.value, before)
+        self.assertLessEqual(core.social.value, before)
 
     async def test_on_message_ignores_self_and_empty(self):
-        engine = self.star.engine
-        engine.mood.profile("99999")
-        turns = engine.mood.profile("99999").get("turn_count")
+        core = self.star._core(FakeEvent("/你的状态"))
+        core.mood.profile("99999")
+        turns = core.mood.profile("99999").get("turn_count")
         await self.star.on_message(FakeEvent("你好", sender="99999"))
         await self.star.on_message(FakeEvent("   "))
         await asyncio.sleep(0.02)
-        self.assertEqual(engine.mood.profile("99999").get("turn_count"), turns)
+        self.assertEqual(core.mood.profile("99999").get("turn_count"), turns)
 
     async def test_terminate_is_idempotent_and_closes_session(self):
         await self.star._ensure_session()
@@ -293,10 +297,15 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await self.star.terminate()  # 再来一次不应抛异常
 
     async def test_state_file_written_on_terminate(self):
-        self.star.engine.set_nickname("10001", "落盘测试")
+        core = self.star._core(FakeEvent("/你的状态"))
+        core.mood.set_nickname("10001", "落盘测试")
         await self.star.terminate()
-        saved = json.loads(self.star.engine.state.path.read_text(encoding="utf-8"))
-        self.assertEqual(saved["nicknames"]["10001"], "落盘测试")
+        state_files = list(Path(self.tmp).rglob("state.json"))
+        self.assertTrue(state_files, "终止时应把状态写到 state.json")
+        saved = json.loads(state_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(
+            saved["roles"]["99999"]["users"]["10001"]["nickname"], "落盘测试"
+        )
 
 
 if __name__ == "__main__":

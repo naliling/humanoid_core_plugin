@@ -68,6 +68,23 @@ def core_with(mode: str = "low", **conf) -> HumanoidCoreInstance:
 
 def wrecked_body(core) -> HumanoidCoreInstance:
     """困到极点、饿、难受、被吵醒、刚被冷落：这些最容易让插件又开始下命令。"""
+    # 「她在睡」得有一份此刻写着睡的日程撑着：soma.advance 会把没有日程支撑的
+    # asleep_since 当成醒了清掉，而 snapshot(refresh=False) 也会跑 advance。
+    # 直写 today_date/daily_schedule，绕开 _install 的夜间窗口重切。
+    moment = datetime.fromtimestamp(core.soma.now, TZ)
+    core.schedule._scope.update_self(
+        today_date=moment.strftime("%Y-%m-%d"),
+        daily_schedule=[
+            {
+                "start": "00:00",
+                "end": "24:00",
+                "event": "睡眠休息",
+                "location": "卧室",
+                "emotion": "平静",
+                "energy_rate": 0.1,
+            }
+        ],
+    )
     core.soma.data.update(
         {
             "sleep_pressure": 99.0,
@@ -76,7 +93,7 @@ def wrecked_body(core) -> HumanoidCoreInstance:
             "discomfort": 80.0,
             "arousal": 10.0,
             "social_desire": 0.0,
-            "asleep": 1.0,
+            "asleep_since": core.soma.now - 3600.0,
             "ignored_streak": 4,
         }
     )
@@ -123,8 +140,7 @@ class ContextShapeTest(unittest.TestCase):
         self.assertIn("2026-08-22 15:20", text)
         self.assertIn("小鱼", text)
         self.assertIn("3 小时 12 分", text)
-        self.assertIn("这期间她", text)
-        self.assertIn("我猫今天吐了", text)
+        self.assertIn("我猫今天吐了", text, "离开前原话是间隔实用性的另一半")
 
     def test_interval_is_an_exact_duration_not_a_bucket_phrase(self):
         """「对方隔了约2～6小时重新出现」把一件客观事描成情境，报准就好。"""

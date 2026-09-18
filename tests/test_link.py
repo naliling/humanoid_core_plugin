@@ -77,10 +77,10 @@ class ContractTest(unittest.TestCase):
         ):
             self.assertIn(key, contract["body"], f"契约 body 少了 {key}")
         self.assertEqual(contract["body"]["sleep_pressure"], 78.0)
-        # 措辞按天抽签（wording.pick），断言只能认「这一档说的就是困」而不是某一句原话。
+        # 措辞按天抽签（wording.pick），断言只能认「这一档说的是困/饿」而不是某一句原话。
         joined = " ".join(contract["feelings"])
-        self.assertTrue(any(w in joined for w in ("困意上来", "犯困", "眼皮", "发懵", "蒙了一层")), joined)
-        self.assertTrue(any(w in joined for w in ("饿", "肚子")), joined)
+        self.assertTrue(any("困" in text or "疲惫" in text for text in contract["feelings"]), joined)
+        self.assertTrue(any("饿" in text for text in contract["feelings"]), joined)
         self.assertLessEqual(contract["form"]["max_chars"], 60, "困成这样还允许长篇说明 form 没联动")
 
     def test_contract_carries_clock_offset_and_routine(self):
@@ -275,18 +275,18 @@ class SignalsTest(unittest.TestCase):
         core._apply_social_signals()
         self.assertEqual(core.soma.snapshot()["social_desire"], 90.0, "旧信号被重复消费了")
 
-    def test_ignored_streak_becomes_a_feeling(self):
-        """被冷落要变成她身体里的一件事，但不许变成「所以你别先开口」。"""
+    def test_ignored_streak_is_recorded_but_never_scripted(self):
+        """被冷落要记进身体（给契约/诊断用），但不许变成台词或「所以别先开口」。"""
         harness = Harness()
         core = harness.roles.get_or_create("bot1")
-        cold = ("没回", "没接上话", "先开的口")
         core.soma.set_social_feedback(3)
+        self.assertEqual(int(core.soma.data["ignored_streak"]), 3, "计数得记下来，好给社交层看")
         texts = [text for _, text in core.soma.feelings(70.0)]
-        self.assertTrue(any(any(w in text for w in cold) for text in texts), texts)
-        self.assertFalse(any("不想先开口" in text for text in texts), f"又替她决定不说话了：{texts}")
+        for text in texts:
+            for banned in ("不想先开口", "没回", "没接上话", "先开的口", "别开口"):
+                self.assertNotIn(banned, text, f"又替她决定怎么回应冷落了：{text}")
         core.soma.set_social_feedback(0)
-        texts = [text for _, text in core.soma.feelings(70.0)]
-        self.assertFalse(any(any(w in text for w in cold) for text in texts), texts)
+        self.assertEqual(int(core.soma.data["ignored_streak"]), 0)
 
 
 class InjectionBudgetTest(unittest.TestCase):
@@ -335,8 +335,9 @@ class InjectionBudgetTest(unittest.TestCase):
         harness, core = self.build({"inject_activity_context": "low"})
         text = core.build_injection("42", is_group=False)
         self.assertEqual(text.count(MARK_PREFIX), 1, text)
-        self.assertNotIn("处境", text, "框架句被复制进每条消息了")
-        self.assertIn(MARK_PREFIX, FRAMING_TEXT)
+        self.assertNotIn("由她自己判断", text, "框架句被复制进每条消息了")
+        self.assertIn("由她自己判断", FRAMING_TEXT, "怎么读这些事实，得在 system_prompt 里说清")
+        self.assertIn("身体与生活", FRAMING_TEXT)
 
 
 class DiagnosticsTest(unittest.TestCase):
