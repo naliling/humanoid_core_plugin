@@ -67,7 +67,9 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
         await engine.role_manager.start()
         core = engine.role_manager.get_or_create("default")
         await core.start()
-        self.assertTrue(coverage_is_complete(core.schedule.current_slots()))
+        # 滚动分段：开机种下第一段，覆盖「现在」，但不预排未来
+        self.assertTrue(core.schedule.segments())
+        self.assertIsNotNone(core.schedule.active_segment())
         await engine.role_manager.stop()
         self.assertIn("角色 default 已停止", log.text("info"))
         # 落盘检查

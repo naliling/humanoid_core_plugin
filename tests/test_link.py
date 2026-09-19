@@ -28,9 +28,18 @@ from humanoid.llm import LLMGateway, ProviderResolver
 from humanoid.role_manager import RoleManager
 from humanoid.state import StateStore
 
-from .fakes import FakeContext, RecordingLogger
+from .fakes import FakeContext, FrozenClock, RecordingLogger
+
+def freeze(core, moment=None):
+    """把角色的所有服务换成同一个假时钟：滚动日程按「现在」截段，测试必须定住现在。"""
+    clock = FrozenClock(moment or FROZEN)
+    core.clock = clock
+    for service in (core.schedule, core.soma, core.energy, core.process, core.mood, core.social, core.weather):
+        service._clock = clock
+    return core
 
 TZ = ZoneInfo("Asia/Shanghai")
+FROZEN = datetime(2026, 8, 22, 15, 0, tzinfo=TZ)
 
 
 class Harness:
@@ -85,6 +94,11 @@ class ContractTest(unittest.TestCase):
 
     def test_contract_carries_clock_offset_and_routine(self):
         """社交层跟 Core 跑在同一台机器上：不导出偏移，它就只能拿本机时钟判断作息。"""
+        freeze(self.core)
+        self.install_schedule([
+            {"start": "00:00", "end": "09:00", "event": "睡眠", "energy_rate": 0.15},
+            {"start": "09:00", "end": "24:00", "event": "白天活动", "energy_rate": -0.05},
+        ])
         contract = build_contract(self.core)
         self.assertEqual(contract["time"]["utc_offset_minutes"], 8 * 60)
         routine = contract["routine"]
@@ -105,6 +119,7 @@ class ContractTest(unittest.TestCase):
 
     def test_contract_follows_a_night_owl_persona(self):
         """夜猫子人格：日程排凌晨睡，导出的窗口就得是凌晨，不能还是 23:00→06:00。"""
+        freeze(self.core)
         self.install_schedule([
             {"start": "04:00", "end": "11:30", "event": "睡眠", "energy_rate": 0.18},
             {"start": "11:30", "end": "24:00", "event": "白天活动", "energy_rate": -0.05},
@@ -354,7 +369,12 @@ class DiagnosticsTest(unittest.TestCase):
 
     def test_report_shows_routine_and_wake_time(self):
         harness = Harness()
-        core = harness.roles.get_or_create("bot1")
+        core = freeze(harness.roles.get_or_create("bot1"))
+        core.scope.set_self("daily_schedule", [
+            {"start": "00:00", "end": "09:00", "event": "睡眠", "energy_rate": 0.15},
+            {"start": "09:00", "end": "24:00", "event": "白天活动", "energy_rate": -0.05},
+        ])
+        core.scope.set_self("today_date", core.clock.today_str())
         text = harness.engine.diagnostics_text(core)
         self.assertIn("【作息】", text)
         self.assertIn("配置里的夜间窗口 23:00 → 06:00", text)
@@ -366,7 +386,7 @@ class DiagnosticsTest(unittest.TestCase):
         """警告要对准她真的睡多久：日程只排 5 小时而一晚需要 8 小时才该提示，
         配置窗口短而她自己排得到 9 小时不该再报警。"""
         harness = Harness({"timezone_city": "北京", "night_start_hour": 23, "night_end_hour": 5})
-        core = harness.roles.get_or_create("bot1")
+        core = freeze(harness.roles.get_or_create("bot1"))
         core.scope.set_self("daily_schedule", [
             {"start": "01:00", "end": "06:00", "event": "睡眠", "energy_rate": 0.18},
             {"start": "06:00", "end": "24:00", "event": "白天活动", "energy_rate": -0.05},
@@ -379,7 +399,7 @@ class DiagnosticsTest(unittest.TestCase):
 
     def test_report_does_not_flag_the_config_window_alone(self):
         harness = Harness({"timezone_city": "北京", "night_start_hour": 23, "night_end_hour": 5})
-        core = harness.roles.get_or_create("bot1")
+        core = freeze(harness.roles.get_or_create("bot1"))
         core.scope.set_self("daily_schedule", [
             {"start": "23:00", "end": "24:00", "event": "睡眠", "energy_rate": 0.18},
             {"start": "00:00", "end": "08:00", "event": "睡眠", "energy_rate": 0.18},

@@ -147,9 +147,12 @@ class HumanoidConfig:
     schedule_llm_timeout_seconds: int = 60
     schedule_generation_max_attempts: int = 2
     schedule_max_slots: int = 96
-    # 日程重排间隔（分钟）：动态日程每隔这段时长就按当前身体状态重排一次。
-    # 15 分钟 = 一天最多 96 次重排，与 15 分钟粒度对齐；调大可省模型额度。
+    # 决策窗间隔（分钟）：动态日程每隔这么久掷一次骰子决定「生成或不生成」。
+    # 15 分钟与默认粒度对齐；调大可省模型额度。
     schedule_refresh_minutes: int = 15
+    # 每个决策窗在「这一段还没做完、身体也没报警」时仍然重新排一段的概率（%）：
+    # 她临时改主意的频率。0 = 只在到期/身体报警时才排；100 = 每个窗都重排。
+    schedule_change_chance: int = 30
     schedule_provider_cooldown_minutes: int = 30
     # 均衡参考偏好：会作为「仅供参考」的偏好递给模型，与人设和身体状态一起权衡，
     # 不是必须服从的指令。
@@ -294,6 +297,7 @@ class HumanoidConfig:
             schedule_generation_max_attempts=i("schedule_generation_max_attempts", 1, 5),
             schedule_max_slots=i("schedule_max_slots", 6, 96),
             schedule_refresh_minutes=i("schedule_refresh_minutes", 1, 1440),
+            schedule_change_chance=i("schedule_change_chance", 0, 100),
             schedule_provider_cooldown_minutes=i("schedule_provider_cooldown_minutes", 0, 1440),
             schedule_prompt_extra=s_opt("schedule_prompt_extra")[
                 : cls.SCHEDULE_PROMPT_EXTRA_MAX

@@ -44,6 +44,9 @@ class FrozenClock:
     def weekday(self):
         return "三"
 
+    def is_night(self, moment=None):
+        return False
+
 
 GOOD = '[{"start":"00:00","end":"08:00","event":"睡眠","location":"卧室","emotion":"平静","energy_rate":0.1},{"start":"08:00","end":"18:00","event":"工作","location":"书房","emotion":"专注","energy_rate":-0.1},{"start":"18:00","end":"24:00","event":"休闲","location":"客厅","emotion":"轻松","energy_rate":0.05}]'
 
@@ -75,20 +78,21 @@ class ScheduleRegressionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.current_slots()[0]["event"], "已保存的大模型日程")
         self.assertEqual(self.scope.get_self("schedule_source"), "llm")
 
-    async def test_new_day_template_is_transient_until_llm_succeeds(self):
+    async def test_new_day_starts_fresh_until_llm_decides(self):
+        """跨天：昨天的段不算今天的；今天的第一段由模型现决定，不拿模板凑一整天。"""
         self.clock.dt = datetime(2026, 9, 10, 0, 1, tzinfo=timezone.utc)
         service = ScheduleService(self.scope, lambda: self.cfg, self.clock, logger=FakeLog())
-        temporary = service.current_slots()
-        self.assertNotEqual(temporary[0]["event"], "已保存的大模型日程")
-        self.assertEqual(self.scope.get_self("today_date"), "2026-09-09")
+        self.assertEqual(service.current_slots(), [], "跨天没有结转：没有段就是没有段")
+        self.assertEqual(self.scope.get_self("today_date"), "2026-09-09", "读路径不落盘")
         self.assertEqual(self.scope.get_self("schedule_source"), "llm")
+        self.assertTrue(service.refresh_due())
 
         service.gateway = FakeGateway(GOOD)
         changed = await service.ensure_fresh()
         self.assertTrue(changed)
         self.assertEqual(self.scope.get_self("today_date"), "2026-09-10")
         self.assertEqual(self.scope.get_self("schedule_source"), "llm")
-        self.assertEqual(service.current_slots()[0]["event"], "睡眠")
+        self.assertEqual(service.segments()[0]["event"], "睡眠")
 
 
 class BehaviorRegressionTest(unittest.TestCase):

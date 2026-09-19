@@ -30,7 +30,7 @@ DATA_SUBDIR = ("plugin_data", "humanoid_core")
 HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 
 /你的状态 - 查看精力、身体轴（困意/睡眠债/饥饿/不适…）、生理、天气、日程、过程
-/查看日程 - 查看今日完整日程
+/查看日程 - 看她今天过出来的日程（动态，一段一段现排，不预排未来）
 /时间 城市 - 查看指定城市当前时间
 /叫我 昵称 - 设置 AI 对你的称呼
 /好感度 - 查看情绪档案
@@ -41,7 +41,7 @@ HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 管理员指令：
 /拟人设置 - 看常用项；写成「/拟人设置 城市 大阪」就改一项，立即生效
 /拟人诊断 - 排查模型选择、时区是否真的生效、上下文多大
-/重置日程 - 立即重新生成今日日程
+/重置日程 - 立即重新决定她当前这一段在做什么
 /重置状态 - 重置精力、社交能量与生理周期
 /重置情绪 - 重置自己的情绪至初始值
 /设置好感度 数值 - 手动设置好感度（0-100）
@@ -364,8 +364,10 @@ class HumanoidCore(Star):
 
     @filter.command("时间")
     async def cmd_time(self, event: AstrMessageEvent):
-        """查看指定城市（或默认城市）的当前时间、星期和节日。"""
-        city = _arg_after(event.message_str, "时间") or self._config.timezone_city
+        """查看指定城市（或当前机器人生效城市）的当前时间、星期和节日。"""
+        # 默认用当前 bot 的生效城市（含角色级时区覆盖），而不是全局配置：
+        # 两个机器人各自「/时间」得到的是各自城市的时间。
+        city = _arg_after(event.message_str, "时间") or self._core(event).clock.city
         if not city:
             yield event.plain_result("请指定城市名，或在配置中设置默认时区城市。")
             return
@@ -430,8 +432,9 @@ class HumanoidCore(Star):
             return
         raw = event.message_str or ""
         argument = _arg_after(raw, "拟人设置")
+        core = self._core(event)
         if not argument:
-            yield event.plain_result(self._settings_summary())
+            yield event.plain_result(self._settings_summary(core))
             return
         parts = argument.replace("=", " ").replace("：", " ").split(None, 1)
         key_word = parts[0] if parts else ""
@@ -442,6 +445,26 @@ class HumanoidCore(Star):
                 "不认识这一项。能改的：" + "、".join(self.SETTINGS_ALIASES)
                 + "\n例：/拟人设置 城市 大阪"
             )
+            return
+        # 城市按机器人分离：写当前这个 bot 自己的覆盖，不动全局配置。
+        # 两个机器人各发各的 /拟人设置 城市，互不影响（以前共一份全局，改一个另一个也变）。
+        if key == "timezone_city":
+            if not value:
+                yield event.plain_result(
+                    "用法：/拟人设置 城市 大阪（只改当前这个机器人）；"
+                    "写「/拟人设置 城市 默认」可取消单独设置、回到跟随全局。"
+                )
+                return
+            effective = core.set_city_override(value)
+            follow = str(core.scope.get_self("tz_city_override", "") or "")
+            if follow:
+                yield event.plain_result(
+                    f"✅ 当前机器人的城市已单独设为 {effective!r}（只影响这个 bot，其他机器人不变）。"
+                )
+            else:
+                yield event.plain_result(
+                    f"✅ 已取消当前机器人的单独城市，回到跟随全局配置（{effective!r}）。"
+                )
             return
         raw_config = self._config_box.raw
         if not isinstance(raw_config, dict):
@@ -468,12 +491,19 @@ class HumanoidCore(Star):
             + ("（未能写入配置文件，重启后会回到旧值）" if not saved else "")
         )
 
-    def _settings_summary(self) -> str:
+    def _settings_summary(self, core=None) -> str:
         cfg = self._config
-        lines = [f"⚙️ 常用设置（共 83 项，其余标了【进阶】，在面板里改）"]
-        lines.append(f"- 城市：{cfg.timezone_city or '（未定）'}　→ /拟人设置 城市 大阪")
+        lines = [f"⚙️ 常用设置（共 84 项，其余标了【进阶】，在面板里改）"]
+        # 城市是每个机器人独立的：优先显示当前 bot 生效城市，并标明是否单独设。
+        if core is not None:
+            override = str(core.scope.get_self("tz_city_override", "") or "")
+            effective = core.clock.city or "（未定）"
+            tag = "当前 bot 单独设" if override else f"跟随全局 {cfg.timezone_city or '（未定）'}"
+            lines.append(f"- 城市：{effective}（{tag}）　→ /拟人设置 城市 大阪")
+        else:
+            lines.append(f"- 城市（全局默认）：{cfg.timezone_city or '（未定）'}　→ /拟人设置 城市 大阪")
         lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人设置 人设 开")
-        lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（每 {cfg.schedule_refresh_minutes} 分钟按身体数值重排）")
+        lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（每 {cfg.schedule_refresh_minutes} 分钟决定一次要不要排下一段，变动概率 {cfg.schedule_change_chance}%）")
         lines.append(f"- 日程额外偏好：{cfg.schedule_prompt_extra or '（空）'}")
         lines.append(f"- 上下文详略：{cfg.inject_activity_context}（low/full/mood_only）")
         lines.append(f"- 参与环境：{cfg.environment_mode}（private/group/both）")
@@ -494,7 +524,7 @@ class HumanoidCore(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("重置日程")
     async def cmd_reset_schedule(self, event: AstrMessageEvent):
-        """立即强制重新生成今日日程（绕过冷却）。"""
+        """立即强制重新决定当前这一段（绕过冷却）。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -502,13 +532,17 @@ class HumanoidCore(Star):
             yield event.plain_result("⚠️ 未启用大模型日程。")
             return
         core = self._core(event)
-        yield event.plain_result("⏳ 正在后台重新生成…")
+        yield event.plain_result("⏳ 正在决定下一段…")
         changed = await core.schedule.ensure_fresh(force=True, ignore_cooldown=True)
         if changed:
-            yield event.plain_result("✅ 日程已更新。")
-            if self._config.debug_mode:
-                slots = core.schedule.current_slots()
-                logger.debug(f"[humanoid_core] 新日程: {len(slots)} 个时段")
+            if core.schedule.source == "llm":
+                activity = core.schedule.current_activity()
+                what = activity.get("name", "")
+                until = activity.get("expected_end", "")
+                detail = f"：{what}（到 {until}）" if what else ""
+                yield event.plain_result(f"✅ 新的一段已排好{detail}。")
+            else:
+                yield event.plain_result("✅ 已按身体现排一段（模型不可用，可用 /拟人诊断 查看配置）。")
         else:
             yield event.plain_result(
                 f"❌ 生成失败：{core.schedule.last_error}（可用 /拟人诊断 查看模型配置）"

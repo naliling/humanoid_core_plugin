@@ -267,8 +267,11 @@ def build_report(
     lines.append(f"- 日期: {schedule_status.get('date') or '未生成'}")
     lines.append(
         f"- 来源: {schedule_status.get('source_text', '')}"
-        f"，共 {schedule_status.get('slots', 0)} 个时段"
+        f"，今天已过出 {schedule_status.get('slots', 0)} 段（滚动分段，未来不预排）"
     )
+    active = str(schedule_status.get("active") or "")
+    if active:
+        lines.append(f"- 当前段: {active}")
     who = str(schedule_status.get("persona") or "")
     if not cfg.schedule_use_persona:
         lines.append("- 排日程用的人设：已关掉（schedule_use_persona=false），只按额外偏好排")
@@ -282,7 +285,7 @@ def build_report(
     if schedule_status.get("generated_at"):
         lines.append(f"- 生成时间: {schedule_status['generated_at']}")
     if schedule_status.get("generating"):
-        lines.append("- 状态: 正在后台向模型请求新日程")
+        lines.append("- 状态: 正在向模型请求下一段")
     retry_after = float(schedule_status.get("retry_after") or 0.0)
     if retry_after > 0:
         lines.append(f"- 自动重试: {retry_after / 60:.0f} 分钟后（/重置日程 可立即重试）")
@@ -369,7 +372,9 @@ def build_report(
         parts = "，".join(f"{mode} ≈ {tok}" for mode, tok in inject_estimate.items())
         lines.append(f"- 聊天时追加的上下文：{parts} token")
     lines.append(
-        f"- 日程生成：每角色每天 1 次，输入约 240 + 输出按 {cfg.schedule_max_slots} 个时段计"
+        f"- 日程生成：滚动分段，一次只决定下一段（输入约 240 + 输出一个小 JSON）；"
+        f"决策窗 {cfg.schedule_refresh_minutes} 分钟，变动概率 {cfg.schedule_change_chance}%，"
+        "没到期没报警没掷中就不调模型"
     )
     lines.append(
         "- 情绪分析："
@@ -391,7 +396,7 @@ def build_report(
         f"- 单次生成超时 {cfg.schedule_llm_timeout_seconds}s"
         f"，每个模型尝试 {cfg.schedule_generation_max_attempts} 次"
         f"，重试间隔 {cfg.schedule_retry_interval_seconds}s",
-        f"- 时段上限 {cfg.schedule_max_slots}，时间对齐 {cfg.schedule_time_granularity}",
+        f"- 当天最多保留 {cfg.schedule_max_slots} 段，时间对齐 {cfg.schedule_time_granularity}",
         f"- 日程失败冷却 {cfg.schedule_provider_cooldown_minutes} 分钟"
         f"，情绪失败冷却 {cfg.mood_provider_cooldown_minutes} 分钟（两者各自记账）",
         f"- 大模型日程 {'开启' if cfg.use_llm_schedule else '关闭'}"

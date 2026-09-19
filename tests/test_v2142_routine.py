@@ -12,16 +12,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from humanoid.config import HumanoidConfig
-from humanoid.data.schedule_templates import FALLBACK_TEMPLATES
 from humanoid.services.schedule import (
-    align_sleep_to_night,
-    build_prompt,
     routine_prompt,
     schedule_wake_minute,
     schedule_wake_text,
+    segment_prompt,
 )
 from humanoid.services.soma import SomaService
-from humanoid.slots import coverage_is_complete, find_slot, is_sleep_event, normalize_slots
+from humanoid.slots import find_slot, is_sleep_event, normalize_slots
 
 from .fakes import FrozenClock, ScopeStore
 
@@ -193,70 +191,9 @@ class SleepKeywordTest(unittest.TestCase):
         self.assertTrue(fixture.soma.is_sleep_time(datetime(2026, 8, 22, 13, 0, tzinfo=TZ)))
 
 
-class AlignSleepToNightWindowTest(unittest.TestCase):
-    def test_template_sleep_moves_to_the_window(self):
-        config = cfg()
-        for template in FALLBACK_TEMPLATES:
-            base = normalize_slots(template, max_slots=16)
-            aligned = align_sleep_to_night(base, config)
-            self.assertTrue(coverage_is_complete(aligned), f"对齐后不闭合：{aligned}")
-            minutes = schedule_wake_minute(aligned)
-            self.assertEqual(minutes, 5 * 60, f"起床点没贴到 05:00：{aligned}")
-            slot = find_slot(aligned, 6 * 60)
-            self.assertFalse(
-                any(w in str(slot.get("event", "")) for w in ("睡", "眠", "懒觉", "小憩")),
-                f"6 点还在睡：{slot}",
-            )
-
-    def test_model_schedule_that_ignores_the_constraint_is_fixed(self):
-        config = cfg()
-        late = normalize_slots(
-            [
-                {"start": "00:00", "end": "08:00", "event": "睡眠休息", "energy_rate": 0.18},
-                {"start": "08:00", "end": "12:00", "event": "工作", "energy_rate": -0.1},
-                {"start": "12:00", "end": "18:00", "event": "下午做事", "energy_rate": -0.05},
-                {"start": "18:00", "end": "24:00", "event": "晚间休闲", "energy_rate": 0.0},
-            ],
-            max_slots=16,
-        )
-        aligned = align_sleep_to_night(late, config)
-        self.assertEqual(schedule_wake_text(aligned), "05:00")
-        self.assertTrue(coverage_is_complete(aligned))
-        # 5-8 点这段从睡眠里切出来，不能再带「睡」字，否则身体以为她还在睡
-        self.assertEqual(find_slot(aligned, 6 * 60)["event"], "赖床与洗漱")
-
-    def test_alignment_is_idempotent(self):
-        config = cfg()
-        once = align_sleep_to_night(
-            normalize_slots(FALLBACK_TEMPLATES[0], max_slots=16), config
-        )
-        twice = align_sleep_to_night(once, config)
-        self.assertEqual(once, twice)
-
-    def test_nap_outside_the_window_keeps_its_name(self):
-        """午休在窗口外：它是午休，不该被改名成「赖床」。"""
-        config = cfg()
-        aligned = align_sleep_to_night(normalize_slots(FALLBACK_TEMPLATES[0], max_slots=16), config)
-        events = " ".join(str(s["event"]) for s in aligned)
-        self.assertIn("午餐与午休发呆", events)
-
-    def test_off_switch_leaves_the_schedule_alone(self):
-        config = cfg(schedule_follow_night_window=False)
-        base = normalize_slots(FALLBACK_TEMPLATES[0], max_slots=16)
-        self.assertEqual(align_sleep_to_night(base, config), base)
-
-    def test_evening_routine_before_bedtime_is_named_after_itself(self):
-        """睡前那一格叫「洗漱与护肤」就该保持这个名字：它不是觉，别被改名、更别被当成在睡。"""
-        config = cfg()
-        aligned = align_sleep_to_night(normalize_slots(FALLBACK_TEMPLATES[0], max_slots=16), config)
-        slot = find_slot(aligned, 22 * 60 + 30)
-        self.assertEqual(slot["event"], "夜间洗漱与护肤")
-        self.assertFalse(is_sleep_event(slot["event"]), "把睡前流程算成睡眠，她就 22 点起再没醒过")
-
-
 class RoutinePromptTest(unittest.TestCase):
     def test_prompt_carries_bedtime_and_wake_time(self):
-        prompt = build_prompt(cfg(), "2026-08-22", "六")
+        prompt = segment_prompt(cfg(), now_text="22:30", weekday="六")
         self.assertIn("23:00 上床", prompt)
         self.assertIn("05:00 结束", prompt)
         self.assertIn("睡眠", prompt)

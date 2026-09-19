@@ -303,17 +303,46 @@ class ProcessService:
         if "slot_start" not in proc:
             proc["slot_start"] = ""
 
-    def note_schedule_changed(self) -> None:
-        """日程被整份换掉（跨天重生成、/重置日程、认出新人设）后，旧过程就不属于今天了。
+    def note_segment_changed(self, slot: Slot) -> None:
+        """日程换了一段之后，过程跟着换锚点。
 
-        不等它自然到期：一个过程最长能挂 90 分钟，那段时间里注入会一边说「手上在做的：
-        通勤与买菜」一边说日程里的另一件事，自己跟自己矛盾。
+        同一件事续了一段（比如模型让她接着做）时过程不重开，只把锚点与结束
+        时间对到新的一段上；换了事情就把旧过程收进历史，下一次读取时按当前
+        时段现生成——过程始终描述的是「她此刻这段日程」的详细行为。
         """
         proc = self._scope.get_self("current_process")
-        if isinstance(proc, dict) and proc:
-            self._push_history(proc)
-            self._scope.set_self("current_process", {})
+        if not isinstance(proc, dict) or not proc:
+            self._pending_update = True
+            return
+        event = str((slot or {}).get("event") or "").strip()
+        if event and proc.get("slot_event") == event:
+            proc["slot_start"] = str((slot or {}).get("start", ""))
+            seg_end = self._slot_end_dt(slot)
+            if seg_end is not None:
+                end = self._parse_dt(proc.get("expected_end"))
+                if end is not None and end > seg_end:
+                    proc["expected_end"] = seg_end.isoformat()
+            self._scope.set_self("current_process", proc)
+            return
+        self._push_history(proc)
+        self._scope.set_self("current_process", {})
         self._pending_update = True
+
+    def _slot_end_dt(self, slot: Slot) -> datetime | None:
+        """段的 end（"HH:MM"）换算成今天的 datetime；24:00 记作 23:59。"""
+        text = str((slot or {}).get("end") or "")
+        try:
+            parts = text.split(":")
+            end_minutes = int(parts[0]) * 60 + int(parts[1])
+        except (ValueError, IndexError):
+            return None
+        if end_minutes >= 24 * 60:
+            end_minutes = 24 * 60 - 1
+        now = self._clock.now()
+        return now.replace(
+            hour=(end_minutes // 60) % 24, minute=end_minutes % 60,
+            second=0, microsecond=0,
+        )
 
     def _generate_process_for_slot(self, now: datetime, slot: Slot) -> dict:
         minutes = now.hour * 60 + now.minute
@@ -331,7 +360,8 @@ class ProcessService:
         elif remaining > 0:
             duration = max(5, remaining)
         else:
-            duration = random.randint(min_duration, min(max_duration, max(30, min_duration + 15)))
+            # 段与段之间的空档：只排一小段过渡，不凭空编一个几十分钟的大过程
+            duration = random.randint(5, max(5, min(15, max_duration)))
 
         duration = max(5, int(duration * random.uniform(0.9, 1.1)))
         duration = min(duration, max_duration)

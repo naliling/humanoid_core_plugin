@@ -49,14 +49,17 @@ class WeatherService:
     def effective_location(self) -> str:
         """天气要查哪个城市。
 
-        `weather_location` 留空时用 `timezone_city`：她感知的所在城市和报天气的城市对不上，
-        比不报天气更奇怪。中文城市名 OpenWeather 认不了，那种情况直接算未配置。
+        `weather_location` 留空时用**这个角色生效的城市**（`clock.city`，含角色级时区
+        覆盖）：她感知的所在城市和报天气的城市对不上，比不报天气更奇怪；多个机器人各设
+        各的城市时，天气也得跟着各自的城市走，不能都用全局那一个。
+        中文城市名 OpenWeather 认不了，那种情况直接算未配置。
         """
         cfg = self.config
         explicit = cfg.weather_location.strip()
         if explicit:
             return explicit
-        city = cfg.timezone_city.strip()
+        # 生效城市优先取 clock（含角色级时区覆盖）；拿不到时回退全局配置。
+        city = (getattr(self._clock, "city", "") or cfg.timezone_city or "").strip()
         if city and city.isascii():
             return city
         return ""

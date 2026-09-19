@@ -18,9 +18,9 @@ from humanoid.persona import Persona, PersonaSource, resolve_persona, truncate
 from humanoid.services.schedule import (
     SOURCE_LLM,
     ScheduleService,
-    build_prompt,
     day_lines,
     day_phrases,
+    segment_prompt,
 )
 from humanoid.slots import normalize_slots
 from humanoid.state import StateStore
@@ -198,20 +198,19 @@ class SchedulePersonaTest(unittest.TestCase):
         return service, scope
 
     def test_prompt_carries_the_persona_not_a_personality_label(self):
-        prompt = build_prompt(cfg(), TODAY, "六", Persona("林小满", PERSONA_TEXT, "会话生效人格"))
+        prompt = segment_prompt(cfg(), now_text="15:20", weekday="六", persona=Persona("林小满", PERSONA_TEXT, "会话生效人格"))
         self.assertIn("林小满", prompt)
         self.assertIn("饭团", prompt)
         self.assertIn("她是「林小满」", prompt)
         # 旧版那句「请为「温柔体贴」这个人设规划今天」不该再以另一种形式回来
         self.assertNotIn("温柔体贴", prompt)
-        self.assertIn("同一天里她不能今天在读大学、明天在上班", prompt)
+        self.assertIn("每天都沿用同一个答案", prompt)
 
     def test_prompt_without_persona_stays_sane(self):
         for persona in (None, Persona(), Persona(name="空壳", prompt="", source="未取到人设")):
-            prompt = build_prompt(cfg(), TODAY, "六", persona)
+            prompt = segment_prompt(cfg(), now_text="15:20", weekday="六", persona=persona)
             self.assertIn("有自己生活的普通人", prompt)
-            self.assertIn("00:00", prompt)
-            self.assertIn("只输出一个 JSON 数组", prompt)
+            self.assertIn("只输出一个 JSON 对象", prompt)
 
     def test_giant_persona_is_clamped_by_the_prompt_builder(self):
         """日程一天要跑 1~2 次，不能因为谁把人设写成一万字就撑成七千 token 的请求。
@@ -225,25 +224,25 @@ class SchedulePersonaTest(unittest.TestCase):
         huge = Persona("小娜", unit * 360, "会话生效人格")        # ~9000 字
         bigger = Persona("小娜", unit * 4000, "会话生效人格")     # ~10 万字
         self.assertGreater(len(huge.prompt), 5000, "构造的样本本身要够长才有意义")
-        prompt = build_prompt(cfg(), TODAY, "六", huge)
+        prompt = segment_prompt(cfg(), now_text="15:20", weekday="六", persona=huge)
         # 真正要保证的是「不随输入膨胀」：再大十倍，请求不该跟着变大
-        self.assertLessEqual(estimate_tokens(build_prompt(cfg(), TODAY, "六", bigger)),
+        self.assertLessEqual(estimate_tokens(segment_prompt(cfg(), now_text="15:20", weekday="六", persona=bigger)),
                              estimate_tokens(prompt) + 50)
         # 绝对量：日程一天只跑 1~2 次，输入留在两千 token 内就够安全
         self.assertLessEqual(estimate_tokens(prompt), 2000, f"实测 {estimate_tokens(prompt)}")
         # 人设最多只能把 prompt 撑大它自己那点上界，超出部分该被截掉
-        self.assertLessEqual(len(prompt) - len(build_prompt(cfg(), TODAY, "六", None)),
+        self.assertLessEqual(len(prompt) - len(segment_prompt(cfg(), now_text="15:20", weekday="六")),
                              PERSONA_PROMPT_MAX + 120)
         self.assertIn("以上是完整人设的开头部分", prompt)
         # 带换行的人设也要按行边界切，不能把一句话砍一半
         lines = Persona("小娜", "\n".join(["第%d行人设内容" % i for i in range(2000)]), "x")
-        cut = build_prompt(cfg(), TODAY, "六", lines)
-        self.assertLessEqual(len(cut) - len(build_prompt(cfg(), TODAY, "六", None)),
+        cut = segment_prompt(cfg(), now_text="15:20", weekday="六", persona=lines)
+        self.assertLessEqual(len(cut) - len(segment_prompt(cfg(), now_text="15:20", weekday="六")),
                              PERSONA_PROMPT_MAX + 120)
         self.assertFalse(cut.rstrip().endswith("内容写"), "不该切在一句话中间")
 
     def test_extra_preference_still_applies(self):
-        prompt = build_prompt(cfg(schedule_prompt_extra="最近在准备考研"), TODAY, "六", None)
+        prompt = segment_prompt(cfg(schedule_prompt_extra="最近在准备考研"), now_text="15:20", weekday="六")
         self.assertIn("最近在准备考研", prompt)
 
     def test_generation_asks_with_persona_and_records_it(self):
@@ -358,7 +357,7 @@ class DayNarrativeTest(unittest.TestCase):
         )
         freeze(core)
         slots = normalize_slots(DAY_SCHEDULE, max_slots=16)
-        core.schedule._install(slots, TODAY, SOURCE_LLM)
+        core.scope.update_self(today_date=TODAY, daily_schedule=slots, schedule_source=SOURCE_LLM)
         text = core.build_injection("42", is_group=False)
         self.assertNotIn("今天到这会", text)
         self.assertNotIn("跟客户过方案", text)
@@ -572,7 +571,7 @@ class ContractDayTest(unittest.TestCase):
         )
         freeze(core)
         slots = normalize_slots(DAY_SCHEDULE, max_slots=16)
-        core.schedule._install(slots, TODAY, SOURCE_LLM)
+        core.scope.update_self(today_date=TODAY, daily_schedule=slots, schedule_source=SOURCE_LLM)
         return core
 
     def test_contract_carries_day_and_persona(self):

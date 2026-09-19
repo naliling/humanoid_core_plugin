@@ -172,7 +172,8 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_view_schedule(self):
         out = await collect(self.star.cmd_view_schedule(FakeEvent("/查看日程")))
-        self.assertIn("日程表", out[0])
+        self.assertIn("日程", out[0])
+        self.assertIn("动态日程", out[0], "要说明只排到当前这段，不预排未来")
 
     # ---------- 权限 ----------
 
@@ -201,15 +202,16 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_reset_schedule_reports_result(self):
         out = await collect(self.star.cmd_reset_schedule(FakeEvent("/重置日程")))
-        self.assertIn("正在后台", out[0])
-        self.assertIn("日程已更新", out[-1])
+        self.assertIn("正在决定下一段", out[0])
+        self.assertIn("新的一段已排好", out[-1])
 
     async def test_reset_schedule_reports_failure(self):
+        """模型挂了也不失败：按身体现排一段，并指路诊断。"""
         self.provider.error = RuntimeError("connection refused")
         self.raw["schedule_allow_global_fallback"] = False
         self.star.engine.reload_config(self.raw)
         out = await collect(self.star.cmd_reset_schedule(FakeEvent("/重置日程")))
-        self.assertIn("失败", out[-1])
+        self.assertIn("按身体现排", out[-1])
         self.assertIn("拟人诊断", out[-1])
 
     async def test_reset_state_and_mood(self):

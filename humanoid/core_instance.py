@@ -22,6 +22,7 @@ from .services.social import SocialEnergyService
 from .services.weather import WeatherService
 from .services.behavior import BehaviorService
 from .services.soma import SomaService
+from .slots import is_sleep_event
 
 LOG_PREFIX = "[humanoid_core]"
 
@@ -76,7 +77,9 @@ class HumanoidCoreInstance:
         self._scope = RoleScope(state_store.data, role_id)
         self._scope.set_mark_dirty(state_store.mark_dirty)
 
-        self.clock = Clock(lambda: self.config)
+        # 时区按角色分离：这个 bot 单独设过城市就用它自己的，没设过才用全局配置。
+        # 两个机器人各改各的，互不影响。
+        self.clock = Clock(lambda: self.config, self._city_override)
 
 
         # 新角色的生理周期不能永远从第 1 天（经期）开始：按创建当天错开一个起点，
@@ -152,6 +155,10 @@ class HumanoidCoreInstance:
         self._tasks: set[asyncio.Task] = set()
         self._started = False
 
+    def _city_override(self) -> str:
+        """这个机器人单独设的城市（空 = 没单独设，跟全局配置）。Clock 靠它实现时区分离。"""
+        return str(self._scope.get_self("tz_city_override", "") or "")
+
     def _rebase_after_move(self) -> None:
         """换了城市 = 换了时区：把那些按旧城市钟点记的量重新起算。
 
@@ -159,8 +166,11 @@ class HumanoidCoreInstance:
         读回来时附的是**当前**时区（`parse_state_timestamp`）。于是从北京改到东京会把
         15:20 读成东京的 15:20，凭空多出/少掉几个小时：精力会按不存在的区间重算一遍，
         天气可能提前或延后一小时重取。量不大，但错得看不见，所以当场抹平。
+
+        这里取的是**生效城市**（`clock.city`）：角色单独设了就是它自己的，没设才是全局。
+        因此只改某一个机器人的城市时，只有它会 rebase，另一个不受影响。
         """
-        current = self.config.timezone_city
+        current = self.clock.city
         stored = str(self._scope.get_self("tz_city", "") or "")
         if stored == current:
             return
@@ -177,6 +187,20 @@ class HumanoidCoreInstance:
                 )
         self._scope.set_self("tz_city", current)
 
+    def set_city_override(self, city: str) -> str:
+        """单独设这个机器人的城市（`/拟人设置 城市` 走这里）。
+
+        传空串或「默认/清除」意思的词 = 取消单独设置，回到跟随全局配置。
+        写完立即 rebase，让精力与天气计时按新时区起算。返回生效城市（展示用）。
+        """
+        value = str(city or "").strip()
+        if value in ("", "默认", "清除", "跟随全局", "全局"):
+            self._scope.set_self("tz_city_override", "")
+        else:
+            self._scope.set_self("tz_city_override", value)
+        self._rebase_after_move()
+        return self.clock.city
+
     @property
     def config(self) -> HumanoidConfig:
         return self._config_provider()
@@ -186,14 +210,22 @@ class HumanoidCoreInstance:
         """服务层读写自己那份数据的唯一入口（不递 `self._scope` 那个私名）。"""
         return self._scope
 
-    def _on_schedule_installed(self) -> None:
-        """新日程装上后的一次性回调：身体要重置「在睡」的起点，过程要离开旧日程那件事。"""
+    def _on_schedule_installed(self, previous, current) -> None:
+        """新的一段装上后的一次性回调。
+
+        身体只在「睡着→醒着」真的翻转时重置睡眠计时：接着睡的一段不该把这一觉
+        劈成两半（昨晚睡了多久会少算）；醒着→睡着由积分自己记起点。过程跟着
+        新的一段换锚点：同一件事续了就接着排阶段，换了事就现开一个新过程。
+        """
         try:
-            self.soma.note_schedule_changed()
+            was_sleep = is_sleep_event(str((previous or {}).get("event") or ""))
+            now_sleep = is_sleep_event(str((current or {}).get("event") or ""))
+            if was_sleep and not now_sleep:
+                self.soma.note_schedule_changed()
         except Exception:
             pass
         try:
-            self.process.note_schedule_changed()
+            self.process.note_segment_changed(current or {})
         except Exception:
             pass
 
@@ -222,6 +254,8 @@ class HumanoidCoreInstance:
                         "sleep_pressure": snap["sleep_pressure"],
                         "sleep_debt": snap["sleep_debt"],
                         "last_sleep_hours": snap["last_sleep_hours"],
+                        "discomfort": snap["discomfort"],
+                        "asleep": snap["asleep"],
                     }
                 )
             except Exception:
@@ -575,28 +609,41 @@ class HumanoidCoreInstance:
         return lines
 
     def schedule_text(self) -> str:
-        s = self.snapshot()
+        """她今天过出来的日程：已过完的段 + 当前段，没有预排的未来。"""
+        now = self.clock.now()
+        segs = self.schedule.segments()
         who = self.persona_label()
-        head = f"📅 {s['today']} 日程表（{s['schedule']['source']}"
-        head += f"，人设：{who}）：" if who else "，未用人设）："
+        head = f"📅 {now.strftime('%Y-%m-%d')} 她今天过出来的日程（{self.schedule.source_text}"
+        head += f"，人设：{who}）：" if who else "）："
         lines = [head]
-        for slot in s['schedule']['slots']:
+        if not segs:
+            lines.append("（今天还没有排出来的时段）")
+        active = self.schedule.active_segment()
+        for slot in segs:
+            mark = "▶" if active is not None and slot.get("start") == active.get("start") else " "
             lines.append(
-                f"{slot.get('start', '')} - {slot.get('end', '')}  "
+                f"{mark} {slot.get('start', '')}-{slot.get('end', '')}  "
                 f"【{slot.get('event', '')}】@{slot.get('location', '')}"
             )
+        carry_end = self.schedule.carry_end_text()
+        if carry_end:
+            lines.append(f"（当前这段觉会睡到明天 {carry_end}）")
+        lines.append("（动态日程：只排到当前这段，之后的事到了再决定）")
         if self.schedule.generating:
-            lines.append("（正在后台生成新日程…）")
+            lines.append("（正在决定下一段…）")
         return "\n".join(lines)
 
     def process_text(self) -> str:
+        """过程的详细状况：当前时段 + 过程 + 行为阶段。"""
         p = self.process.current()
-        phase = p.get("phase", "")
-        style = p.get("style", "")
+        slot = self.schedule.current_slot() or {}
         lines = [
-            f"📋 当前过程：{p.get('name', '休息')}",
-            f"当前阶段：{phase or '自然进行中'}",
+            f"📋 当前时段：{slot.get('start', '')}-{slot.get('end', '')} "
+            f"【{slot.get('event', '')}】@{slot.get('location', '')}",
+            f"当前过程：{p.get('name', '休息')}",
+            f"行为阶段：{p.get('phase') or '自然进行中'}",
         ]
+        style = p.get("style", "")
         if style:
             lines.append(f"过程风格：{style}")
         lines.extend([
@@ -618,6 +665,7 @@ class HumanoidCoreInstance:
         self._spawn_background(self._body_loop(), "body-tick")
         self._spawn_background(self._maintenance_loop(), "data-maintenance")
         self.schedule.current_slots()
+        self.schedule.seed_first_segment()
         self.process.current()
         self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 已启动")
 
@@ -716,21 +764,16 @@ class HumanoidCoreInstance:
             except asyncio.TimeoutError:
                 pass
 
-    async def _schedule_loop(self):
-        """持续维护动态日程：跨天立即生成，平时到了重排间隔就按新身体数值重排。"""
-        last_checked_date = ""
+    async def _schedule_loop(self) -> None:
+        """动态日程：每 30 秒问一句「该不该决定下一段」。
+
+        该不该由日程服务自己判断：这一段过完了、身体跟手上的事打架、或掷中了
+        变动概率才生成，其余时候她接着做手上的事，一次模型都不调。跨天与跨夜
+        结转也在服务里处理——睡着的那一段会原样接到明天，零点不需要再问模型。
+        """
         while not self._stop_event.is_set():
             try:
-                today = self.clock.today_str()
-                date_changed = today != last_checked_date
-                if date_changed:
-                    last_checked_date = today
-                    # 跨天是最高优先级：绕过上一天失败造成的冷却，立即尝试今天。
-                    self.schedule.request_refresh(force=True, ignore_cooldown=True)
-                else:
-                    # 平时得问一句「到没到重排间隔」：refresh_due 在里面，
-                    # 没到间隔且已有大模型日程时它自己会直接返回。
-                    self.schedule.request_refresh()
+                self.schedule.request_refresh()
             except Exception as exc:
                 self._log.warning(f"{LOG_PREFIX} 日程后台检查失败: {exc}")
 

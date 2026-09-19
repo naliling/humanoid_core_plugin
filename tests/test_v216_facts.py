@@ -519,6 +519,69 @@ class MovedCityTest(unittest.TestCase):
         self.assertEqual(str(self.self_state(store).get("last_update")), stamp, "没搬家就别动计时")
 
 
+class PerRoleTimezoneTest(unittest.TestCase):
+    """时区按机器人分离：两个 bot 共一份全局配置，但各自可以设自己的城市，互不影响。
+
+    以前只有全局 `timezone_city`，改一个机器人另一个也跟着变——这里盯住这个 bug。
+    """
+
+    def make_core(self, store, role_id, config_box):
+        return HumanoidCoreInstance(
+            role_id=role_id,
+            state_store=store,
+            config_provider=config_box,
+            logger=RecordingLogger(),
+            stop_event=asyncio.Event(),
+            resolver=FakeContext(),
+            gateway=None,
+        )
+
+    def test_two_bots_keep_independent_cities(self):
+        store = StateStore(Path(tempfile.mkdtemp()) / "state.json", lambda: 0.01)
+        store.load(TODAY, 28)
+        box = lambda: cfg(timezone_city="北京")  # noqa: E731  共享的全局配置
+        bot_a = self.make_core(store, "botA", box)
+        bot_b = self.make_core(store, "botB", box)
+
+        # 默认两个都跟全局
+        self.assertEqual(bot_a.clock.city, "北京")
+        self.assertEqual(bot_b.clock.city, "北京")
+
+        # 只给 A 设大阪
+        bot_a.set_city_override("大阪")
+        self.assertEqual(bot_a.clock.city, "大阪", "A 单独设的城市要生效")
+        self.assertEqual(bot_b.clock.city, "北京", "B 不该跟着变——这就是用户报的 bug")
+
+        # A 与 B 的时区确实不同（大阪 UTC+9，北京 UTC+8）
+        self.assertEqual(bot_a.clock.now().utcoffset().total_seconds(), 9 * 3600)
+        self.assertEqual(bot_b.clock.now().utcoffset().total_seconds(), 8 * 3600)
+
+        # 全局配置本身没被动
+        self.assertEqual(box().timezone_city, "北京")
+
+    def test_override_can_be_cleared_back_to_global(self):
+        store = StateStore(Path(tempfile.mkdtemp()) / "state.json", lambda: 0.01)
+        store.load(TODAY, 28)
+        box = lambda: cfg(timezone_city="北京")  # noqa: E731
+        bot = self.make_core(store, "botA", box)
+        bot.set_city_override("东京")
+        self.assertEqual(bot.clock.city, "东京")
+        # 传「默认」取消单独设置，回到跟随全局
+        effective = bot.set_city_override("默认")
+        self.assertEqual(effective, "北京")
+        self.assertEqual(bot.clock.city, "北京")
+        self.assertEqual(str(bot.scope.get_self("tz_city_override", "")), "")
+
+    def test_display_city_and_weather_follow_the_override(self):
+        store = StateStore(Path(tempfile.mkdtemp()) / "state.json", lambda: 0.01)
+        store.load(TODAY, 28)
+        box = lambda: cfg(timezone_city="北京", weather_location="")  # noqa: E731
+        bot = self.make_core(store, "botA", box)
+        bot.set_city_override("Osaka,JP")
+        # 天气的生效城市跟随角色级覆盖（weather_location 留空时）
+        self.assertEqual(bot.weather.effective_location(), "Osaka,JP")
+
+
 class RegionBulkTest(unittest.TestCase):
     """v2.16.4：批量地名表 + 俄罗斯 85 个联邦主体。她说得出地名就必须对得上钟点。"""
 

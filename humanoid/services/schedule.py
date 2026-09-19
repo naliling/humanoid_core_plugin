@@ -1,48 +1,72 @@
-"""日程服务 - 使用 RoleScope 版本。"""
+"""日程服务 - 滚动分段：一次只决定「从现在起的这一段」。
+
+与旧版整表日程的区别：未来不预排。她的下一段做什么、做多久，到了时候看着她
+当时的身体与人设现决定；每天每 15 分钟一个决策窗，生成或不生成都可能——这一段
+过完了、身体跟手上的事明显打架、或掷中了变动概率，才会重新问一次模型，其余
+时候她接着做手上的事，一次模型都不调。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
-from ..clock import Clock, parse_state_timestamp
+from ..clock import Clock
 from ..config import HumanoidConfig
-from ..data.schedule_templates import get_fallback_schedule
-from ..jsonx import extract_json_array
+from ..jsonx import extract_json_array, extract_json_object
 from ..llm import LLMGateway, LLMResult, ProviderResolver
-from ..persona import EMPTY as EMPTY_PERSONA, PERSONA_PROMPT_MAX, Persona, truncate
+from ..persona import PERSONA_PROMPT_MAX, Persona, truncate
 from ..role_scope import RoleScope
 from ..slots import (
     DAY_MINUTES,
     Slot,
-    coverage_is_complete,
-    find_slot,
+    clamp_rate,
     format_time,
+    is_meal_event,
     is_sleep_event,
-    normalize_slots,
     parse_time,
     sleep_window_minutes,
 )
+from ..wording import pick
 
 PURPOSE = "日程生成"
 SOURCE_TEMPLATE = "template"
 SOURCE_LLM = "llm"
 MIN_RETRY_BACKOFF_SECONDS = 60.0
 
-
 SLEEP_EVENT = "睡眠"
-WAKE_SIDE_EVENT = "赖床与洗漱"     # 起床点后、日程还写着睡的那截零头
-BEDSIDE_EVENT = "夜间洗漱"         # 入睡点前、日程已写着睡的那截零头
+
+# 一段的时长边界：最短一刻钟；清醒的事最长 3 小时；一觉最长 12 小时（跨午夜）。
+SEGMENT_MIN_MINUTES = 15
+SEGMENT_MAX_MINUTES = 180
+SEGMENT_SLEEP_MAX_MINUTES = 720
+SEGMENT_DEFAULT_MINUTES = 60
+# 一天最多留这么多段（超出丢最早的：三十段之前的事她自己也记不清）。
+SEGMENTS_DAY_CAP = 48
+# prompt 里带多少段「已经过完的时段」。
+SEGMENTS_PROMPT_HISTORY = 8
+# 上一段结束到新一段之间隔了这么久以内，才把它顺延补上；隔得更久说明插件停机了，
+# 那段时间她做了什么没人知道，不能拿旧事件把窟窿填上。
+SEGMENT_GAP_MERGE_MINUTES = 30
+
+# 身体越线：不等这一段结束，当场重新决定（饿到发慌还在做事、困到不行还醒着）。
+CHANGE_TRIGGER_HUNGER = 78.0
+CHANGE_TRIGGER_SLEEP_PRESSURE = 88.0
+# 本地兜底里「夜里该睡了」的困意门槛：比模型路径宽，因为没有模型替她权衡。
+LOCAL_NIGHT_SLEEP_PRESSURE = 70.0
+
+# 睡觉跨午夜时，今天这半截之后接到明天的那一截。
+CARRY_KEY = "segment_carry"
 
 
 def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
-    """作息那一条怎么写进日程 prompt。
+    """作息那一条怎么写进分段 prompt。
 
-    v2.16.3 之前这里无条件写「她的作息必须遵守：23:00 上床，生物钟夜到 6:00 结束」——
-    那等于一个写死的窗口替所有人决定几点睡，夜猫子人格根本排不出来。现在默认让模型从
-    人设里读她几点睡；只有用户显式打开「日程贴合夜间窗口」时，才把它当成硬约束递进去。
+    默认让模型从人设里读她几点睡；只有用户显式打开「日程贴合夜间窗口」时，才把
+    夜间窗口当成硬约束递进去（分段生成时同样生效：到了点就该排睡眠）。
     """
     if not cfg.night_mode_enabled or not cfg.schedule_follow_night_window:
         return (
@@ -56,9 +80,8 @@ def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
     span = cfg.night_span_hours
     lines = [
         f"{first_index}. 用户把她的作息锁定了：{start:02d}:00 上床，生物钟夜到 {end:02d}:00 结束。",
-        f"   睡眠排成首尾相接的两段：{start:02d}:00→24:00 与 00:00→{end:02d}:00，"
-        "这两段的 event 里要带「睡眠」二字；",
-        f"   {end:02d}:00 往后从起床、洗漱开始排。",
+        f"   到了 {start:02d}:00 就该排睡眠（event 里带「睡眠」二字），一觉睡到 {end:02d}:00；"
+        f"   {end:02d}:00 之后从起床、洗漱开始。",
     ]
     if cfg.sleep_need_hours > span + 0.5:
         lines.append(
@@ -68,121 +91,13 @@ def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _intersect(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int] | None:
-    lo, hi = max(a[0], b[0]), min(a[1], b[1])
-    return (lo, hi) if hi > lo else None
-
-
-def _subtract(seg: tuple[int, int], spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    parts = [seg]
-    for span in spans:
-        nxt: list[tuple[int, int]] = []
-        for part in parts:
-            overlap = _intersect(part, span)
-            if overlap is None:
-                nxt.append(part)
-                continue
-            if part[0] < overlap[0]:
-                nxt.append((part[0], overlap[0]))
-            if overlap[1] < part[1]:
-                nxt.append((overlap[1], part[1]))
-        parts = nxt
-    return parts
-
-
-def align_sleep_to_night(slots: list[Slot], cfg: HumanoidConfig) -> list[Slot]:
-    """把一份日程里的睡眠区间挪到夜间窗口上。
-
-    默认不再跑这一步（`schedule_follow_night_window` 默认关）：作息该由人设决定，身体
-    反过来跟着她的日程走。留着这一手是因为确实有人希望「她的夜就是 23:00→06:00」，
-    开了就是显式覆盖：模型不听 prompt 也能对上。
-    """
-    if not cfg.night_mode_enabled or not cfg.schedule_follow_night_window:
-        return slots
-    start, end = cfg.night_start_hour * 60, cfg.night_end_hour * 60
-    if start == end:
-        return slots
-    spans = [(start, DAY_MINUTES), (0, end)] if start > end else [(start, end)]
-
-    pieces: list[Slot] = []
-    for slot in slots:
-        lo = parse_time(slot.get("start"))
-        hi = parse_time(slot.get("end"))
-        if lo is None or hi is None or hi <= lo:
-            pieces.append(slot)
-            continue
-        was_sleep = is_sleep_event(slot.get("event"))
-        covered = [span for span in spans if _intersect((lo, hi), span) is not None]
-        if not covered:
-            # 完全落在夜间窗口外：原样保留。午休就是午休，不该被改名。
-            pieces.append(dict(slot))
-            continue
-        rest = _subtract((lo, hi), covered)
-        if not rest:
-            # 整段都在窗口内，没有被切开，事件名也不用动。
-            pieces.append(_sleep_piece((lo, hi), slot, was_sleep))
-            continue
-        for span in covered:
-            overlap = _intersect((lo, hi), span)
-            if overlap is not None:
-                pieces.append(_sleep_piece(overlap, slot, was_sleep))
-        for part in rest:
-            pieces.append(_awake_piece(part, slot, was_sleep, start, end))
-
-    aligned = normalize_slots(
-        pieces,
-        max_slots=max(8, cfg.schedule_max_slots),
-        align_minutes=cfg.granularity_minutes,
-    )
-    return aligned or slots
-
-
-def _sleep_piece(seg: tuple[int, int], slot: Slot, was_sleep: bool) -> Slot:
-    piece = dict(slot)
-    piece["start"], piece["end"] = format_time(seg[0]), format_time(seg[1])
-    if not was_sleep:
-        # 本来不是睡眠的时段落进了夜间窗口：改成真睡，否则身体不会把它当觉。
-        piece["event"] = SLEEP_EVENT
-        piece["location"] = "卧室"
-        piece["emotion"] = "沉睡"
-        piece["energy_rate"] = 0.15
-    return piece
-
-
-def _awake_piece(
-    seg: tuple[int, int],
-    slot: Slot,
-    was_sleep: bool,
-    night_start: int,
-    night_end: int,
-) -> Slot:
-    piece = dict(slot)
-    piece["start"], piece["end"] = format_time(seg[0]), format_time(seg[1])
-    if was_sleep:
-        # 从睡眠里切出来的零头：名字里不能再带「睡」，否则身体会把它当成还在睡。
-        # 紧贴起床点之后的是赖床，紧贴入睡点之前的是睡前洗漱，两者不是一回事。
-        if seg[0] == night_end:
-            piece["event"] = WAKE_SIDE_EVENT
-            piece["emotion"] = "慢慢清醒"
-        elif seg[1] == night_start:
-            piece["event"] = BEDSIDE_EVENT
-            piece["emotion"] = "困倦"
-        else:
-            piece["event"] = WAKE_SIDE_EVENT
-            piece["emotion"] = "慢慢清醒"
-    return piece
-
-
 def sleep_spans(slots: list[Slot]) -> list[Slot]:
     """日程里算「她在睡」的时段（与身体层同一套判定）。"""
     return [slot for slot in slots if is_sleep_event(slot.get("event"))]
 
 
 def schedule_wake_minute(slots: list[Slot]) -> int | None:
-    """从日程里读出她的起床时间：最长那段觉的结束点。
-
-    以前只认「从 00:00 开始的那段」，于是夜猫子（04:00→11:30）根本没有起床时间，
-    诊断与契约里那一格永远空着。现在与身体层同一个窗口来源。"""
+    """从日程里读出她的起床时间：最长那段觉的结束点。"""
     window = sleep_window_minutes(slots)
     return window[1] if window else None
 
@@ -237,9 +152,8 @@ def day_phrases(
 ) -> dict[str, Any]:
     """把日程拆成她能直接说出口的三段：刚做过什么 / 正在做什么 / 接下来做什么。
 
-    这是「说得出今天干了什么」的数据源。拿的不是当前时段那一个孤零零的标签，而是
-    一条时线：模型可以说「上午一直在弄那个报表，刚坐下，等下还得去趟银行」，
-    而不是只能说「我在休息」。
+    滚动分段日程里没有预排的未来，所以「接下来」通常只有正在做的这一段的自然
+    结束；她不会提前宣布等下要去哪——那本来就是排出来之前不知道的事。
     """
     doing = ""
     done: list[str] = []
@@ -289,12 +203,7 @@ def day_phrases(
 def done_between(
     slots: list[Slot], start_minutes: int, end_minutes: int, limit: int = 2
 ) -> list[str]:
-    """落在 [start, end) 之间结束掉的时段，说成「上午在改海报」这种能接进句子里的话。
-
-    【刚刚】那块要的是「TA不在的这段时间她自己在干什么」，而【今天】要的是「今天到这会
-    过了什么」——同一份日程的两个切法。两处都直接取 done 会撞出完全一样的句子，所以这里
-    按时间窗取，调用方再把这些从【今天】里挑掉。
-    """
+    """落在 [start, end) 之间结束掉的时段，说成「上午在改海报」这种能接进句子里的话。"""
     out: list[str] = []
     for slot in slots or []:
         lo = parse_time(slot.get("start"))
@@ -317,14 +226,8 @@ def day_lines(
     max_items: int = 2,
     include_doing: bool = True,
 ) -> list[str]:
-    """把 day_phrases 的结果拼成一句第一人称的话。没内容时返回空列表（不注入）。
-
-    `include_doing=False` 用于「手上在做的」已经由过程系统说过一次的场合：同一份注入里
-    两处各说一遍此刻在干什么，模型会以为那是两件事。
-    """
+    """把 day_phrases 的结果拼成一句第一人称的话。没内容时返回空列表（不注入）。"""
     doing = str(phrases.get("doing") or "")
-    # day_phrases 给的是「最近做过的排在最前」；说出来要按时间顺序，
-    # 「上午在改海报、中午在吃饭」才像回忆，反过来像在做清单核对。
     done = [x for x in (phrases.get("done") or []) if x]
     done = list(reversed(done[-max_items:])) if max_items else []
     upcoming = [x for x in (phrases.get("next") or []) if x][:1]
@@ -344,15 +247,7 @@ def day_lines(
 
 
 def persona_block(persona: Persona | None) -> str:
-    """把 AstrBot 人格设定写成日程 prompt 的开头：她是谁，先立住再排一天。
-
-    没接到人设时给一段中性身份，而不是回退到插件里那个十二选一的标签——标签会把她
-    压成「温柔体贴」这种形容词，排出来的日程没有职业、没有住处、没有来往的人。
-
-    长度在这里再卡一道：`resolve_persona` 已经截过，但日程生成不该信任调用方递进来的
-    东西——有人把 AstrBot 人设写成 5000 字时，不卡这一道会把一个每天要跑的请求撑到
-    七千 token。
-    """
+    """把 AstrBot 人格设定写成分段 prompt 的开头：她是谁，先立住再决定这一段。"""
     if persona is not None and persona.usable:
         prompt = truncate(persona.prompt, PERSONA_PROMPT_MAX)
         return (
@@ -361,8 +256,7 @@ def persona_block(persona: Persona | None) -> str:
             f"{prompt}\n\n"
             "先从这里读出她的身份、年纪感、职业或在读状态、住在哪里、独居还是跟人住、"
             "平时跟谁来往、喜欢什么讨厌什么、花钱和精力的习惯。\n"
-            "设定里没写的，按最合理、最省心的方式补一个出来，然后每天都沿用同一个答案："
-            "这份日程每天都会重排，但同一天里她不能今天在读大学、明天在上班。\n"
+            "设定里没写的，按最合理、最省心的方式补一个出来，并且每天都沿用同一个答案。\n"
         )
     return (
         "她是一个有自己生活的普通人，没有现成的人设资料可读。\n"
@@ -372,16 +266,15 @@ def persona_block(persona: Persona | None) -> str:
 
 
 def body_reference_block(body: dict[str, Any] | None, now_text: str) -> str:
-    """把身体参考数值写进日程 prompt。
+    """把身体参考数值写进分段 prompt。
 
-    这些是活值：每次重排时从 soma/energy 现取，随时间真实变化。措辞上必须说清
-    「是参考，不是条件」——写成「她很困，必须安排午睡」就是在替模型做决定，
-    数值本身才是模型该拿到的东西。
+    这些是活值：每次决策现从 soma/energy 取，随时间真实变化。措辞上必须说清
+    「是参考，不是条件」——数值本身才是模型该拿到的东西，怎么权衡由它决定。
     """
     if not body:
         return ""
     lines = [
-        "【她此刻的身体参考数值】（会随时间真实变化；是参考，不是必须满足的条件，怎么权衡由你决定）",
+        "【她此刻的身体参考数值】（会随时间真实变化；是决策输入，不是必须满足的条件，怎么权衡由你决定）",
         f"- 当前时间：{now_text}",
     ]
     if "energy" in body:
@@ -399,36 +292,47 @@ def body_reference_block(body: dict[str, Any] | None, now_text: str) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def build_prompt(
+def segment_prompt(
     cfg: HumanoidConfig,
-    today: str,
+    *,
+    now_text: str,
     weekday: str,
     persona: Persona | None = None,
     body: dict[str, Any] | None = None,
-    now_text: str = "",
+    prev: Slot | None = None,
+    elapsed_minutes: int = 0,
+    history: list[Slot] | None = None,
+    history_note: str = "",
+    is_night: bool = False,
 ) -> str:
-    """让模型自己填表：给身份、身体数值与格式，不给内容提示。
+    """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
 
-    v2.16.7 之前这里写着「要有真的会打断聊天的事」「别排成每分钟都在做有意义的
-    事」这类内容提示——那是插件在替模型思考。现在只递三样东西：她是谁、她此刻
-    身体各项参考数值、表格长什么样；每个时段做什么、多长、粒度多细，由模型自己
-    结合人设与身体状态决定。
+    把「上一段在做什么、做了多久」和「今天已经过完的时段」连同身体读数一起递
+    进去，让她自己判断是接着做还是换一件事；生成或不生成本身由调用方按身体与
+    概率决定，这里只负责把「要决定」的那一次问对。
     """
-    max_slots = cfg.schedule_max_slots
-    step = cfg.granularity_minutes
-    if step > 1:
-        cells = DAY_MINUTES // step
-        align_hint = (
-            f"全天按 {step} 分钟分成 {cells} 格，所有 start / end 必须对齐到 {step} 分钟的整数倍，"
-            "把 24 小时每一格都填满。"
-        )
-        merge_hint = (
-            f"可以逐格填，也可以把连续几格合并成一个时段（全天最多 {max_slots} 个时段），"
-            "粒度由你决定。"
+    prev_event = str((prev or {}).get("event") or "").strip()
+    if prev_event:
+        prev_line = (
+            f"她这一段从 {(prev or {}).get('start', '')} 开始在做「{prev_event}」"
+            f"（{(prev or {}).get('location', '')}），到现在已经 {int(elapsed_minutes)} 分钟。\n"
         )
     else:
-        align_hint = "时间点可以自然决定，不必对齐。"
-        merge_hint = f"全天最多 {max_slots} 个时段，粒度由你决定。"
+        prev_line = "这是今天的第一次决定，手上还没有正在做的事。\n"
+
+    rows = []
+    for slot in (history or [])[-SEGMENTS_PROMPT_HISTORY:]:
+        if not isinstance(slot, dict):
+            continue
+        rows.append(
+            f"{slot.get('start', '')}-{slot.get('end', '')} "
+            f"{slot.get('event', '')}（{slot.get('location', '')}）"
+        )
+    history_block = ""
+    if rows:
+        history_block = (
+            f"【{history_note or '今天到这会她已经过完的时段'}】\n" + "\n".join(rows) + "\n\n"
+        )
 
     extra = cfg.schedule_prompt_extra.strip()
     extra_block = (
@@ -437,30 +341,275 @@ def build_prompt(
         if extra
         else ""
     )
+    night_line = "现在正处在她的生物钟夜里。\n\n" if is_night else ""
 
     return (
         persona_block(persona)
-        + f"\n请为她填 {today}（星期{weekday}）这一天的日程表。"
-        "这张表由你来排：下面是她此刻的身体参考数值与表格格式，"
-        "每个时段做什么、做多长，由你结合她是谁自行决定。\n\n"
-        + body_reference_block(body, now_text or "未知")
+        + f"\n现在是 {now_text}（星期{weekday}）。请决定她【从现在开始的这一段】在做什么——"
+        "只这一段：之后的事到了时候会再决定，现在不要排。\n\n"
+        + prev_line
+        + "\n"
+        + body_reference_block(body, now_text)
+        + history_block
         + extra_block
-        + "【表格格式】\n"
-        "1. 只输出一个 JSON 数组，不要 Markdown 代码块，不要解释文字。\n"
-        "2. 每个元素："
-        "{\"start\": \"00:00\", \"end\": \"07:30\", \"event\": \"睡眠\", "
-        "\"location\": \"卧室\", \"emotion\": \"平静\", \"energy_rate\": 0.15}\n"
-        "3. 时段首尾相连：00:00 开始，24:00 结束，不重叠、不留空隙。\n"
-        f"4. {align_hint}\n"
-        f"5. {merge_hint}\n"
-        "6. energy_rate 是这个时段对精力的作用：睡眠/休息为正（0.05~0.2），"
+        + night_line
+        + "【怎么决定】\n"
+        "1. 身体读数是决策输入：饿到不行就去吃，困到不行就去睡——怎么权衡由你决定。\n"
+        "2. 一件事做到一半接着做很正常（continue=true）；做很久了、或身体不允许时就换。\n"
+        "\n"
+        "【输出格式】\n"
+        "1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释文字。\n"
+        '2. 形如：{"continue": false, "event": "去超市买菜", "location": "超市", '
+        '"emotion": "随性", "energy_rate": -0.05, "minutes": 85}\n'
+        "3. continue：true = 接着做手上这件事（event/location/emotion 留空，速率沿用）；"
+        "false = 换一件事。\n"
+        f"4. minutes：这一段做多久。最短 {SEGMENT_MIN_MINUTES} 分钟，一般的事最长 "
+        f"{SEGMENT_MAX_MINUTES} 分钟；睡觉可以睡一整夜（最长 {SEGMENT_SLEEP_MAX_MINUTES // 60} 小时，"
+        "跨过半夜也没关系）。\n"
+        "5. energy_rate 是这一段对精力的作用：睡眠/休息为正（0.05~0.2），"
         "工作/外出/社交为负（-0.05~-0.15）。\n"
         "\n"
-        + routine_prompt(cfg, 7)
+        + routine_prompt(cfg, 6)
     )
 
 
+def _pick_from_array(raw: Any, now_minute: int) -> Mapping[str, Any] | None:
+    """模型偶尔会包一层数组（旧版整表的习惯）：取覆盖现在或之后的第一格。"""
+    if not isinstance(raw, list):
+        return None
+    upcoming = None
+    last = None
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        lo = parse_time(item.get("start"))
+        hi = parse_time(item.get("end"))
+        if lo is None or hi is None or hi <= lo:
+            continue
+        last = item
+        if lo <= now_minute < hi:
+            return item
+        if upcoming is None and lo > now_minute:
+            upcoming = item
+    return upcoming or last
+
+
+def _segment_minutes(raw: Mapping[str, Any], now_minute: int, sleeping: bool) -> int:
+    """这一段做多久：minutes 与 end 两种写法都认，睡觉的 end 可以写在明天。"""
+    minutes: int | None = None
+    try:
+        minutes = int(float(raw.get("minutes")))
+    except (TypeError, ValueError):
+        minutes = None
+    if minutes is None:
+        end = parse_time(raw.get("end"))
+        if end is not None:
+            if end <= now_minute:
+                if not sleeping:
+                    # 清醒段把结束点写在过去：没法用，按默认时长接上
+                    end = now_minute + SEGMENT_DEFAULT_MINUTES
+                else:
+                    # 睡觉跨午夜：end 写的是明天醒来的时间
+                    end += DAY_MINUTES
+            minutes = end - now_minute
+    if minutes is None:
+        minutes = SEGMENT_DEFAULT_MINUTES
+    cap = SEGMENT_SLEEP_MAX_MINUTES if sleeping else SEGMENT_MAX_MINUTES
+    return max(SEGMENT_MIN_MINUTES, min(cap, minutes))
+
+
+def parse_segment(
+    raw: Any,
+    *,
+    now_minute: int,
+    step: int = 1,
+    prev: Slot | None = None,
+) -> Slot | None:
+    """把模型返回的这一段规范化成一个 slot。
+
+    `continue=true` 时沿用上一件事的名字与地点，只往前延长——这是「她决定再做
+    一会儿」，不是插件替她改主意。睡觉可以跨过午夜：今天这半截截到 24:00，
+    剩下的写进 `carry_end`，由 `_append_segment` 结转到明天。
+    """
+    if isinstance(raw, list):
+        raw = _pick_from_array(raw, now_minute)
+    if not isinstance(raw, Mapping):
+        return None
+    prev = prev or {}
+    want_continue = raw.get("continue")
+    if isinstance(want_continue, str):
+        want_continue = want_continue.strip().lower() in ("true", "1", "yes", "是", "继续")
+    want_continue = bool(want_continue) and bool(str(prev.get("event") or "").strip())
+
+    event = str(raw.get("event") or "").strip()[:24]
+    if want_continue:
+        event = str(prev.get("event") or "").strip()[:24]
+    if not event:
+        return None
+
+    location = (
+        str(raw.get("location") or "").strip()[:16]
+        or str(prev.get("location") or "").strip()[:16]
+        or "家中"
+    )
+    emotion = (
+        str(raw.get("emotion") or "").strip()[:12]
+        or str(prev.get("emotion") or "").strip()[:12]
+        or "平常"
+    )
+
+    sleeping = is_sleep_event(event)
+    minutes = _segment_minutes(raw, now_minute, sleeping)
+    start = segment_start(now_minute, step)
+    end = start + minutes
+    rate_raw = raw.get("energy_rate", prev.get("energy_rate", 0.0) if want_continue else 0.0)
+
+    slot: Slot = {
+        "start": format_time(start),
+        "end": format_time(min(DAY_MINUTES, end)),
+        "event": event,
+        "location": location,
+        "emotion": emotion,
+        "energy_rate": clamp_rate(rate_raw),
+    }
+    if end > DAY_MINUTES:
+        slot["carry_end"] = format_time(end - DAY_MINUTES)
+    return slot
+
+
+def segment_start(now_minute: int, step: int) -> int:
+    """这一段从哪一刻开始：向下对齐到刻度，绝不越过「现在」。
+
+    用四舍五入会把起点推到未来（20:40 对齐成 20:45），那一段就罩不住此刻，
+    她明明在做这件事，却说不出口。
+    """
+    step = max(1, int(step))
+    return (max(0, int(now_minute)) // step) * step
+
+
+def _in_window(minutes: int, start: int, end: int) -> bool:
+    """分钟数是否落在 [start, end) 窗口内；start > end 表示跨午夜。"""
+    if start == end:
+        return False
+    if start < end:
+        return start <= minutes < end
+    return minutes >= start or minutes < end
+
+
+def dynamic_segment(
+    cfg: HumanoidConfig,
+    body: dict[str, Any] | None,
+    *,
+    now_minute: int,
+    step: int = 1,
+    prev: Slot | None = None,
+    seed: list[Any] | None = None,
+) -> Slot:
+    """没有可用模型时的兜底：按身体读数与钟点当场决定这一段。
+
+    不是查表也不是预制模板——饥饿、困意、当前钟点共同决定，且措辞按天抽签，
+    同一时刻不会每天给出同一个答案。身体越线时它自己会换成吃饭或睡觉；夜里
+    会一直睡到生物钟夜结束（跨午夜就结转到明天）。
+    """
+    body = body or {}
+    prev = prev or {}
+    hunger = float(body.get("hunger", 0.0) or 0.0)
+    pressure = float(body.get("sleep_pressure", 0.0) or 0.0)
+    energy = float(body.get("energy", 60.0) or 60.0)
+    discomfort = float(body.get("discomfort", 0.0) or 0.0)
+    asleep = float(body.get("asleep", 0.0) or 0.0) >= 1.0
+
+    night_start = int(cfg.night_start_hour) * 60
+    night_end = int(cfg.night_end_hour) * 60
+    if not cfg.night_mode_enabled or night_start == night_end:
+        night_start, night_end = 23 * 60, 7 * 60
+    in_night = _in_window(now_minute, night_start, night_end)
+
+    seed_key = list(seed or []) + [now_minute // 60]
+
+    # 身体优先：饿到线就吃，困到线或在夜里就睡，不等哪张表写着。
+    if asleep or (in_night and pressure >= LOCAL_NIGHT_SLEEP_PRESSURE):
+        if in_night:
+            # 睡到生物钟夜结束；跨午夜的部分由结转接到明天
+            logical_end = night_end if night_end > now_minute else night_end + DAY_MINUTES
+            minutes = max(SEGMENT_MIN_MINUTES, min(SEGMENT_SLEEP_MAX_MINUTES, logical_end - now_minute))
+        else:
+            minutes = 120
+        event, location, emotion, rate = "睡一觉", "卧室", "沉睡", 0.15
+    elif hunger >= CHANGE_TRIGGER_HUNGER:
+        event = pick("seg_eat", seed_key, (
+            "弄点吃的", "下楼买饭团", "煮碗面", "叫了份外卖", "热昨天剩的饭",
+        ))
+        location = pick("seg_eat_where", seed_key, ("厨房", "楼下便利店", "餐桌"))
+        emotion, rate, minutes = "饿了", 0.08, 40
+    elif discomfort >= 62:
+        event = pick("seg_rest", seed_key, ("躺一会儿", "热敷一下", "停下来缓缓"))
+        location, emotion, rate, minutes = "家中", "不太舒服", 0.05, 45
+    elif in_night:
+        # 夜里还醒着、困意又没到线：低刺激地待着，等困意上来
+        event = pick("seg_night_idle", seed_key, ("躺在床上刷手机", "半梦半醒地待着", "起来喝口水再躺回去"))
+        location, emotion, rate, minutes = "卧室", "迷糊", 0.02, 45
+    elif energy <= 30:
+        event = pick("seg_low", seed_key, ("靠着发会儿呆", "闭眼歇一会儿", "起来倒杯水"))
+        location, emotion, rate, minutes = "家中", "有点累", 0.05, 30
+    else:
+        hour = (now_minute // 60) % 24
+        if 7 <= hour < 9:
+            event = pick("seg_morning", seed_key, (
+                "收拾出门", "边吃早饭边看手机", "洗漱完整理包",
+            ))
+            location = pick("seg_morning_where", seed_key, ("家中", "通勤路上"))
+            emotion, rate, minutes = "清醒中", -0.05, 60
+        elif 9 <= hour < 12:
+            event = pick("seg_forenoon", seed_key, (
+                "处理上午的事", "回消息和对进度", "写点东西", "看书做笔记",
+            ))
+            location = pick("seg_forenoon_where", seed_key, ("工位", "书房", "教室"))
+            emotion, rate, minutes = "专注", -0.07, 90
+        elif 12 <= hour < 14:
+            event = pick("seg_noon", seed_key, ("吃午饭", "热饭吃", "出去吃点"))
+            location, emotion, rate, minutes = "餐厅", "放松", 0.08, 45
+        elif 14 <= hour < 18:
+            event = pick("seg_afternoon", seed_key, (
+                "接着弄手头的活", "整理桌面和文件", "跑一趟外面", "开个小会",
+            ))
+            location = pick("seg_afternoon_where", seed_key, ("工位", "外面", "家中"))
+            emotion, rate, minutes = "平稳", -0.06, 90
+        elif 18 <= hour < 20:
+            event = pick("seg_evening_meal", seed_key, ("做晚饭", "出去吃", "点外卖"))
+            location, emotion, rate, minutes = "厨房", "惬意", 0.06, 60
+        else:
+            event = pick("seg_evening", seed_key, (
+                "刷会儿手机", "看一集剧", "洗澡收拾", "跟人聊两句", "翻两页书",
+            ))
+            location, emotion, rate, minutes = "家中", "轻松", -0.02, 75
+
+    start = segment_start(now_minute, step)
+    end = start + minutes
+    slot: Slot = {
+        "start": format_time(start),
+        "end": format_time(min(DAY_MINUTES, end)),
+        "event": event,
+        "location": location,
+        "emotion": emotion,
+        "energy_rate": clamp_rate(rate),
+    }
+    if end > DAY_MINUTES:
+        slot["carry_end"] = format_time(end - DAY_MINUTES)
+    return slot
+
+
 class ScheduleService:
+    """滚动分段日程：未来不预排，每 15 分钟一个「生成或不生成」的决策窗。
+
+    - 到期（这一段过完了 / 今天还没有段）必须生成；
+    - 身体跟手上的事明显打架（饿到发慌还在做事、困到不行还醒着）当场生成；
+    - 其余时候按 `schedule_change_chance` 的概率掷骰子：掷中才生成（她临时改
+      主意），没掷中就接着做手上的事，一次模型都不调；
+    - 睡着的那一段不重掷：一觉睡到这段结束为止，夜里不会被打扰；跨午夜的
+      一觉由结转（carry）原样接到明天，零点不需要再问一次模型。
+    """
+
     def __init__(
         self,
         scope: RoleScope,
@@ -471,7 +620,8 @@ class ScheduleService:
         monotonic: Callable[[], float] | None = None,
         persona_provider=None,
         body_provider=None,
-    ):
+        random_source: Callable[[], float] | None = None,
+    ) -> None:
         self._scope = scope
         self._config = config_provider
         self._clock = clock
@@ -484,18 +634,19 @@ class ScheduleService:
         self._retry_after = 0.0
         # 失败退避的计时源：必须可注入，否则测试无法验证「退避窗口内不再投递」。
         self._monotonic = monotonic or time.monotonic
-        # 跨天时先保留上一份有效日程，等待新日程成功生成；绝不把持久化的 LLM 日程覆盖成模板。
-        self._pending_date = ""
-        self._pending_slots: list[Slot] | None = None
         # 日程得按她是谁来排：递一个 async () -> Persona 进来，不递就不读人设。
         self._persona = persona_provider
-        # 身体参考数值的来源：递一个 () -> dict 进来，每次重排现取活值。
+        # 身体参考数值的来源：递一个 () -> dict 进来，每次决策现取活值。
         self._body = body_provider
         self.last_persona = ""
+        # 概率重估的骰子：每个决策窗只掷一次，掷完的结果本窗内保持不变。
+        self._random = random_source or random.random
+        self._roll_window = -1
+        self._roll_hit = False
 
         self.resolver = None
         self.gateway = None
-        # 新日程装上后的一次性回调：身体需要知道「睡眠区间换了」，不能把它当成真的醒了。
+        # 新的一段装上后的一次性回调 (previous, current)：身体与过程要跟着换。
         self.on_install = None
 
     def set_resolver_gateway(self, resolver, gateway):
@@ -506,33 +657,134 @@ class ScheduleService:
     def config(self) -> HumanoidConfig:
         return self._config()
 
-    def current_slots(self) -> list[Slot]:
-        """返回今天可用的日程。
+    # ------------------------------------------------------------------
+    # 读取
+    # ------------------------------------------------------------------
 
-        重要：跨天/升级时不能把上一份已生成日程直接覆盖成内置模板。
-        模板只作为“等待今天 LLM 日程生成”的临时兜底，不写入持久状态。
+    def _stored_slots(self) -> list[Slot]:
+        stored = self._scope.get_self("daily_schedule")
+        if not isinstance(stored, list):
+            return []
+        return [slot for slot in stored if isinstance(slot, dict)]
+
+    def segments(self) -> list[Slot]:
+        """今天她已经过出来的段（含当前段），按时间升序；未来不在里面。
+
+        旧版整表日程存的是 00:00→24:00 的预制表：读的时候把还没到的时段丢掉，
+        剩下的就是她今天真实过出来的段——升级当天无缝切到分段模式。
         """
         today = self._clock.today_str()
-        data = self._scope.self_state
-        slots = data.get("daily_schedule")
-        stored_date = str(data.get("today_date") or "")
+        self._migrate_new_day(today)
+        if str(self._scope.get_self("today_date", "") or "") != today:
+            return []
+        now = self._clock.now()
+        minutes = now.hour * 60 + now.minute
+        out: list[Slot] = []
+        for slot in self._stored_slots():
+            lo = parse_time(slot.get("start"))
+            hi = parse_time(slot.get("end"))
+            if lo is None or hi is None or hi <= lo:
+                continue
+            if lo > minutes:
+                continue
+            out.append(slot)
+        return out
 
-        if stored_date == today and isinstance(slots, list) and slots:
-            self._pending_date = ""
-            self._pending_slots = None
-            return slots
+    def _carry_slot(self) -> Slot | None:
+        """跨夜结转的那一截（今天 00:00 起、明天醒来的那段觉）。"""
+        if str(self._scope.get_self("today_date", "") or "") != self._clock.today_str():
+            return None
+        carry = self._scope.get_self(CARRY_KEY)
+        if not isinstance(carry, dict) or not carry:
+            return None
+        end = parse_time(carry.get("end"))
+        if end is None or end <= 0:
+            return None
+        return {
+            "start": "00:00",
+            "end": format_time(end),
+            "event": str(carry.get("event") or SLEEP_EVENT),
+            "location": str(carry.get("location") or "卧室"),
+            "emotion": str(carry.get("emotion") or "沉睡"),
+            "energy_rate": clamp_rate(carry.get("energy_rate", 0.15)),
+        }
 
-        if self._pending_date != today or not self._pending_slots:
-            self._pending_date = today
-            self._pending_slots = self._template_slots(today)
+    def current_slots(self) -> list[Slot]:
+        """兼容旧接口：身体、精力、契约都从这里拿她的段。
 
-        return self._pending_slots
+        跨夜结转的那一截也并进来：睡眠窗口、起床点要按完整的一觉算，不然
+        半夜之后身体会把「23:00→24:00 + 00:00→07:00」拆成两觉分别记账。
+        """
+        segs = self.segments()
+        carry = self._carry_slot()
+        if carry is not None:
+            segs = segs + [carry]
+        return segs
 
-    def current_slot(self, minutes: int | None = None) -> Slot:
+    def _covering(self, segs: list[Slot], minutes: int) -> Slot | None:
+        for slot in segs:
+            lo = parse_time(slot.get("start"))
+            hi = parse_time(slot.get("end"))
+            if lo is None or hi is None:
+                continue
+            if lo <= minutes < hi:
+                return slot
+        return None
+
+    def active_segment(self, minutes: int | None = None) -> Slot | None:
+        """覆盖「现在」这一段。没决定过就是 None——她此刻在做的事还没被问出来。"""
         if minutes is None:
             now = self._clock.now()
             minutes = now.hour * 60 + now.minute
-        return find_slot(self.current_slots(), minutes)
+        return self._covering(self.segments(), minutes)
+
+    def last_segment(self) -> Slot | None:
+        segs = self.segments()
+        return segs[-1] if segs else None
+
+    def current_slot(self, minutes: int | None = None) -> Slot:
+        """旧接口：拿不到段时给一个中性「自由活动」，不编造她在做什么。"""
+        slot = self.active_segment(minutes)
+        if slot is not None:
+            return slot
+        now = self._clock.now()
+        stamp = now.hour * 60 + now.minute
+        return {
+            "start": format_time(segment_start(stamp, self.config.granularity_minutes)),
+            "end": format_time(min(DAY_MINUTES, stamp + SEGMENT_DEFAULT_MINUTES)),
+            "event": "自由活动",
+            "location": "家中",
+            "emotion": "随意",
+            "energy_rate": 0.0,
+        }
+
+    def current_activity(self) -> dict[str, Any]:
+        """她这会儿在做什么（含做了多久、还剩多久），给状态与过程展示用。"""
+        now = self._clock.now()
+        minutes = now.hour * 60 + now.minute
+        slot = self.active_segment(minutes)
+        if slot is None:
+            return {}
+        lo = parse_time(slot.get("start"))
+        hi = parse_time(slot.get("end"))
+        elapsed = max(0, minutes - lo) if lo is not None else 0
+        remaining = max(0, hi - minutes) if hi is not None else 0
+        return {
+            "name": str(slot.get("event") or "").strip(),
+            "location": str(slot.get("location") or "").strip(),
+            "emotion": str(slot.get("emotion") or "").strip(),
+            "started_at": str(slot.get("start") or ""),
+            "expected_end": str(slot.get("end") or ""),
+            "duration_minutes": elapsed,
+            "remaining_minutes": remaining,
+        }
+
+    def carry_end_text(self) -> str:
+        """这一觉会睡到明天几点（没有跨夜结转时为空）。"""
+        carry = self._carry_slot()
+        if carry is None:
+            return ""
+        return str(carry.get("end") or "")
 
     @property
     def source(self) -> str:
@@ -540,7 +792,7 @@ class ScheduleService:
 
     @property
     def source_text(self) -> str:
-        return "大模型生成" if self.source == SOURCE_LLM else "内置模板"
+        return "大模型现排" if self.source == SOURCE_LLM else "按身体现算"
 
     @property
     def generating(self) -> bool:
@@ -549,24 +801,6 @@ class ScheduleService:
     @property
     def retry_after(self) -> float:
         return max(0.0, self._retry_after - self._monotonic())
-
-    def refresh_due(self) -> bool:
-        """上一份大模型日程是否到了该重排的时候。
-
-        动态日程不是一天排一次就定死：身体在变（困了、饿了、欠觉了），每隔
-        `schedule_refresh_minutes` 就该让模型看着新的身体数值重排一次。只在上一份
-        确实是大模型生成的时候才计时，模板/失败状态交给跨天与退避逻辑处理。
-        """
-        if self.source != SOURCE_LLM:
-            return False
-        interval = max(1.0, float(self.config.schedule_refresh_minutes) * 60.0)
-        raw = str(self._scope.get_self("schedule_generated_at", "") or "")
-        if not raw:
-            return True
-        generated = parse_state_timestamp(raw, self._clock.now())
-        if generated is None:
-            return True
-        return (self._clock.now() - generated).total_seconds() >= interval
 
     def _body_snapshot(self) -> dict[str, Any]:
         if self._body is None:
@@ -577,65 +811,139 @@ class ScheduleService:
             return {}
         return snapshot if isinstance(snapshot, dict) else {}
 
-    def _template_slots(self, today: str) -> list[Slot]:
-        cfg = self.config
-        raw = get_fallback_schedule(today)
-        base = normalize_slots(raw, max_slots=max(8, cfg.schedule_max_slots)) or raw
-        return align_sleep_to_night(base, cfg)
+    def _seed(self) -> list[Any]:
+        try:
+            return [self._scope.role_id, self._clock.today_str()]
+        except Exception:
+            return [self._scope.role_id]
 
-    def _install(self, slots: list[Slot], today: str, source: str) -> list[Slot]:
-        # 模型不一定听约束（也常见它把睡眠写成 00:00–08:00），装上去之前再按夜间窗口切一次。
-        slots = align_sleep_to_night(slots, self.config)
-        self._scope.update_self(
-            today_date=today,
-            daily_schedule=slots,
-            schedule_source=source,
-            schedule_generated_at=self._clock.now().strftime("%Y-%m-%d %H:%M:%S"),
-            schedule_persona=self.last_persona,
-        )
-        if self.on_install is not None:
-            try:
-                self.on_install()
-            except Exception:
-                pass
-        if self._log and self.config.debug_mode:
-            self._log.debug(f"[humanoid_core] 日程写入存储: source={source}, slots={len(slots)}")
-        return slots
+    # ------------------------------------------------------------------
+    # 跨天与结转
+    # ------------------------------------------------------------------
 
-    def _today_changed(self, today: str) -> bool:
-        """今天是否还没有一份属于今天的日程，且今天还没试过生成。
+    def _migrate_new_day(self, today: str) -> None:
+        """跨天：把结转到今天的那截觉接成今天的第一段。
 
-        不能只看 `today_date`：它只在生成成功时写入。若只看它，模型持续不可用（配错
-        provider、超时）时 `today_date` 永远不是今天，于是每个后台周期都被当成「跨天」
-        而绕过退避与冷却，变成每 30 秒一次永久重试。因此「今天试过但没有结果」不算跨天。
+        没有结转时不在这里生成——今天的第一段由后台循环按到期规则现决定，
+        昨天那份留在原地当 prompt 的上下文（「昨天的收尾」）。
         """
         if str(self._scope.get_self("today_date", "") or "") == today:
+            return
+        carry = self._scope.get_self(CARRY_KEY)
+        if not isinstance(carry, dict) or not carry:
+            return
+        end = parse_time(carry.get("end"))
+        if end is None or end <= 0:
+            self._scope.set_self(CARRY_KEY, None)
+            return
+        slot = {
+            "start": "00:00",
+            "end": format_time(end),
+            "event": str(carry.get("event") or SLEEP_EVENT),
+            "location": str(carry.get("location") or "卧室"),
+            "emotion": str(carry.get("emotion") or "沉睡"),
+            "energy_rate": clamp_rate(carry.get("energy_rate", 0.15)),
+        }
+        self._scope.update_self(
+            today_date=today,
+            daily_schedule=[slot],
+            **{CARRY_KEY: None},
+        )
+
+    def _history_for_prompt(self) -> tuple[list[Slot], str]:
+        """生成 prompt 用的「最近过完的段」：今天的不够看就接昨天的收尾。"""
+        now = self._clock.now()
+        minutes = now.hour * 60 + now.minute
+        today = self._clock.today_str()
+        if str(self._scope.get_self("today_date", "") or "") == today:
+            segs = self.segments()
+            note = "今天到这会她已经过完的时段"
+            done = [
+                slot for slot in segs
+                if (parse_time(slot.get("end")) or 0) <= minutes
+            ]
+            return done, note
+        stored = self._stored_slots()
+        return stored, "昨天的收尾（刚跨过零点）"
+
+    # ------------------------------------------------------------------
+    # 何时该重新决定
+    # ------------------------------------------------------------------
+
+    def refresh_due(self) -> bool:
+        """该不该决定下一段：没段/这一段过完了/身体打架/还没排上大模型/掷中骰子。"""
+        cfg = self.config
+        segs = self.segments()
+        if not segs:
+            return True
+        now = self._clock.now()
+        minutes = now.hour * 60 + now.minute
+        active = self._covering(segs, minutes)
+        if active is None:
+            return True
+        event = str(active.get("event") or "")
+        if is_sleep_event(event):
+            # 睡着：这一觉睡到这段结束为止，夜里不重掷、不越线打断。
             return False
-        return str(self._scope.get_self("schedule_attempt_date", "") or "") != today
+        body = self._body_snapshot()
+        if body:
+            hunger = float(body.get("hunger", 0.0) or 0.0)
+            pressure = float(body.get("sleep_pressure", 0.0) or 0.0)
+            if hunger >= CHANGE_TRIGGER_HUNGER and not is_meal_event(event):
+                return True
+            if pressure >= CHANGE_TRIGGER_SLEEP_PRESSURE:
+                return True
+        if cfg.use_llm_schedule and self.source != SOURCE_LLM:
+            # 本地兜底段还占着位：尽快让大模型接手（退避会挡住砸模型的频率）。
+            return True
+        return self._roll_change()
+
+    def _roll_change(self) -> bool:
+        """概率重估：每个决策窗掷一次骰子，本窗内结果保持不变。"""
+        interval = max(60, int(self.config.schedule_refresh_minutes) * 60)
+        window = int(self._clock.now().timestamp() // interval)
+        if window < self._roll_window:
+            # 时钟回拨/重装：重置后重新掷
+            self._roll_window = window
+            self._roll_hit = False
+            return self._roll_hit
+        if window == self._roll_window:
+            return self._roll_hit
+        self._roll_window = window
+        chance = min(100.0, max(0.0, float(self.config.schedule_change_chance))) / 100.0
+        self._roll_hit = self._random() < chance
+        return self._roll_hit
+
+    def seed_first_segment(self) -> bool:
+        """开机时按身体当场种下第一段，不等模型。
+
+        插件刚装好、或重启后的那几分钟里，问「你在干嘛」不该得到「还没决定」。
+        这一段之后会被后台循环换成大模型排的（退避窗口一过就换）。
+        """
+        if self.segments():
+            return False
+        now = self._clock.now()
+        minutes = now.hour * 60 + now.minute
+        slot = dynamic_segment(
+            self.config, self._body_snapshot(), now_minute=minutes,
+            step=self.config.granularity_minutes, seed=self._seed(),
+        )
+        self._append_segment(slot, self._clock.today_str())
+        return True
+
+    # ------------------------------------------------------------------
+    # 生成
+    # ------------------------------------------------------------------
 
     def request_refresh(self, force: bool = False, ignore_cooldown: bool = False) -> bool:
+        """投递一次后台决定。到点（到期/越线/掷中）才真的投。"""
         if self._task and not self._task.done():
             return False
-        cfg = self.config
-        if not cfg.use_llm_schedule:
+        if self._generating:
             return False
-
-        today = self._clock.today_str()
-        date_changed = self._today_changed(today)
-        # 新的一天必须尝试生成，即使上一天的 provider 失败冷却还没结束；
-        # 到了重排间隔也一样：身体变了，日程该跟着变。
-        due = self.refresh_due()
-        effective_force = bool(force or date_changed or due)
-        effective_ignore = bool(ignore_cooldown or date_changed)
-
-        if not effective_force and self._scope.get_self("schedule_source") == SOURCE_LLM:
+        if not force and not self.refresh_due():
             return False
-        # 到点重排不能绕过失败退避：模型挂掉时 due 会一直为真，不挡就退回每 30 秒
-        # 一次的永久重试。只有用户强制或跨天才允许硬闯。
-        if not (force or date_changed) and self.retry_after > 0:
-            return False
-
-        coro = self.ensure_fresh(force=effective_force, ignore_cooldown=effective_ignore)
+        coro = self.ensure_fresh(force=force, ignore_cooldown=ignore_cooldown)
         name = f"humanoid-schedule-refresh-{self._scope.role_id}"
         if self._spawn:
             self._task = self._spawn(coro, name)
@@ -644,113 +952,218 @@ class ScheduleService:
         return True
 
     async def ensure_fresh(self, force: bool = False, ignore_cooldown: bool = False) -> bool:
+        """决定（并装上）下一段。
+
+        模型不可用、未配置或还在退避期时：手上没有能接着做的段就按身体现算一段
+        （不留白）；有段就先做着手上的事，等退避过去再让模型接手。
+        """
         cfg = self.config
-        if not cfg.use_llm_schedule:
-            return False
-
+        now = self._clock.now()
+        minutes = now.hour * 60 + now.minute
         today = self._clock.today_str()
-        if self._today_changed(today):
-            force = True
-            ignore_cooldown = True
-        # 先把「今天试过」记下来：失败时 today_date 不会变，不记这一笔的话下一次调用
-        # 仍然被当成跨天，退避窗口形同不存在。
-        if str(self._scope.get_self("schedule_attempt_date", "") or "") != today:
-            self._scope.set_self("schedule_attempt_date", today)
-
-        if (
-            not force
-            and str(self._scope.get_self("today_date", "") or "") == today
-            and self._scope.get_self("schedule_source") == SOURCE_LLM
-            and not self.refresh_due()
-        ):
-            return False
-        if not force and self.retry_after > 0:
-            return False
-
-        # 只在需要时创建临时模板，不落盘。
-        self.current_slots()
 
         async with self._lock:
-            stored_date = str(self._scope.get_self("today_date", "") or "")
-            if (
-                not force
-                and stored_date == today
-                and self._scope.get_self("schedule_source") == SOURCE_LLM
-                and not self.refresh_due()
-            ):
+            # 拿锁期间可能已被别的路径决定过：再确认一次。
+            if not force and not self.refresh_due():
                 return False
-            return await self._generate(cfg, today, ignore_cooldown)
+            segs = self.segments()
+            active = self._covering(segs, minutes)
+            prev = segs[-1] if segs else None
+            elapsed = 0
+            if prev is not None:
+                lo = parse_time(prev.get("start"))
+                if lo is not None:
+                    elapsed = max(0, minutes - lo)
 
-    async def _generate(self, cfg: HumanoidConfig, today: str, ignore_cooldown: bool) -> bool:
-        self._generating = True
-        try:
-            ok = await self._generate_inner(cfg, today, ignore_cooldown)
-        finally:
-            self._generating = False
-        if ok:
-            self._retry_after = 0.0
-        else:
-            backoff = max(MIN_RETRY_BACKOFF_SECONDS, float(cfg.schedule_provider_cooldown_minutes) * 60)
-            self._retry_after = self._monotonic() + backoff
-        return ok
+            slot: Slot | None = None
+            if cfg.use_llm_schedule and self.gateway is not None:
+                if force or ignore_cooldown or self.retry_after <= 0:
+                    slot = await self._generate_segment(
+                        cfg, now, minutes, prev, elapsed, ignore_cooldown
+                    )
+            if slot is None and (active is None or force or not cfg.use_llm_schedule):
+                slot = dynamic_segment(
+                    cfg, self._body_snapshot(), now_minute=minutes,
+                    step=cfg.granularity_minutes, prev=prev, seed=self._seed(),
+                )
+                self._set_source(SOURCE_TEMPLATE)
+            if slot is None:
+                return False
+            self._append_segment(slot, today)
+            return True
 
-    async def _generate_inner(self, cfg: HumanoidConfig, today: str, ignore_cooldown: bool) -> bool:
+    def _fail_backoff(self, cfg: HumanoidConfig) -> None:
+        backoff = max(MIN_RETRY_BACKOFF_SECONDS, float(cfg.schedule_provider_cooldown_minutes) * 60)
+        self._retry_after = self._monotonic() + backoff
+
+    async def _generate_segment(
+        self,
+        cfg: HumanoidConfig,
+        now,
+        minutes: int,
+        prev: Slot | None,
+        elapsed: int,
+        ignore_cooldown: bool,
+    ) -> Slot | None:
         if self.gateway is None:
             self.last_error = "LLM Gateway 未初始化"
-            return False
+            return None
 
         persona = await self._resolve_persona()
-        prompt = build_prompt(
+        history, history_note = self._history_for_prompt()
+        prompt = segment_prompt(
             cfg,
-            today,
-            self._clock.weekday(),
-            persona,
+            now_text=now.strftime("%H:%M"),
+            weekday=self._clock.weekday(),
+            persona=persona,
             body=self._body_snapshot(),
-            now_text=self._clock.now().strftime("%H:%M"),
+            prev=prev,
+            elapsed_minutes=elapsed,
+            history=history,
+            history_note=history_note,
+            is_night=self._clock.is_night(),
         )
         if self._log and cfg.debug_mode:
             self._log.debug(
-                f"[humanoid_core] 日程生成提示词（人设："
+                f"[humanoid_core] 下一段提示词（人设："
                 f"{persona.label if persona else '未读'}）:\n{prompt}"
             )
 
-        result: LLMResult = await self.gateway.generate(
-            prompt=prompt,
-            chain=cfg.schedule_provider_ids,
-            allow_global=cfg.schedule_allow_global_fallback,
-            timeout=float(cfg.schedule_llm_timeout_seconds),
-            attempts_per_provider=cfg.schedule_generation_max_attempts,
-            retry_interval=float(cfg.schedule_retry_interval_seconds),
-            purpose=PURPOSE,
-            ignore_cooldown=ignore_cooldown,
-        )
+        self._generating = True
+        try:
+            result: LLMResult = await self.gateway.generate(
+                prompt=prompt,
+                chain=cfg.schedule_provider_ids,
+                allow_global=cfg.schedule_allow_global_fallback,
+                timeout=float(cfg.schedule_llm_timeout_seconds),
+                attempts_per_provider=cfg.schedule_generation_max_attempts,
+                retry_interval=float(cfg.schedule_retry_interval_seconds),
+                purpose=PURPOSE,
+                ignore_cooldown=ignore_cooldown,
+            )
+        except Exception as exc:
+            self.last_error = f"生成异常：{exc}"
+            self._fail_backoff(cfg)
+            return None
+        finally:
+            self._generating = False
+
         if not result.ok:
             self.last_error = result.summary()
+            self._fail_backoff(cfg)
             if self._log and cfg.debug_mode:
-                self._log.debug(f"[humanoid_core] 日程生成失败: {self.last_error}")
-            return False
+                self._log.debug(f"[humanoid_core] 下一段生成失败: {self.last_error}")
+            return None
 
-        parsed = extract_json_array(result.text)
-        slots = (
-            normalize_slots(parsed, max_slots=cfg.schedule_max_slots, align_minutes=cfg.granularity_minutes)
-            if parsed is not None
-            else None
+        raw = extract_json_object(result.text)
+        if raw is None:
+            raw = extract_json_array(result.text)
+        slot = parse_segment(
+            raw, now_minute=minutes, step=cfg.granularity_minutes, prev=prev
         )
-        if not slots or not coverage_is_complete(slots):
-            self.last_error = f"无法解析日程：{result.text[:160]}"
+        if slot is None:
+            # 解析失败同样进退避：不挡的话每个后台周期都会再砸一次模型。
+            self.last_error = f"无法解析这一段：{result.text[:160]}"
+            self._fail_backoff(cfg)
             if self._log and cfg.debug_mode:
-                self._log.debug(f"[humanoid_core] 日程解析失败: {self.last_error}")
-            return False
+                self._log.debug(f"[humanoid_core] 下一段解析失败: {self.last_error}")
+            return None
 
-        self._install(slots, today, SOURCE_LLM)
-        self._pending_date = ""
-        self._pending_slots = None
         self.last_error = ""
-        if self._log:
-            self._log.info(f"[humanoid_core] 日程生成成功，共 {len(slots)} 个时段")
-            if cfg.debug_mode:
-                self._log.debug(f"[humanoid_core] 新日程: {slots}")
-        return True
+        self._retry_after = 0.0
+        self._set_source(SOURCE_LLM)
+        return slot
+
+    def _set_source(self, source: str) -> None:
+        if str(self._scope.get_self("schedule_source", "") or "") != source:
+            self._scope.set_self("schedule_source", source)
+
+    def _append_segment(self, slot: Slot, today: str) -> None:
+        """把这一段接在今天后面，并处理与上一段的衔接。
+
+        - 上一段还没到点就被换掉（她提前结束去做别的）：end 收到新段起点，不留重叠；
+        - 上一段过完了、隔得不久：顺延到新段起点，不留窟窿（窟窿里 soma 读不到
+          「她在吃饭」，刚归零的饥饿会立刻又涨一格）；
+        - 隔得太久（插件停机）：不补，那段时间她做了什么没人知道。
+        - 睡觉跨午夜：今天截到 24:00，剩下的结转到明天（`segment_carry`）。
+        """
+        segs = self.segments()
+        minutes = self._clock.now().hour * 60 + self._clock.now().minute
+        previous = self._covering(segs, minutes) or (segs[-1] if segs else None)
+
+        carry_end = str(slot.pop("carry_end", "") or "")
+        new_start = parse_time(slot.get("start"))
+        if segs and new_start is not None:
+            last = dict(segs[-1])
+            hi = parse_time(last.get("end"))
+            lo = parse_time(last.get("start"))
+            if hi is not None and lo is not None:
+                if hi > new_start:
+                    # 她提前结束去做别的：收到新段起点，不留重叠。
+                    if new_start > lo:
+                        last["end"] = format_time(new_start)
+                        segs[-1] = last
+                    else:
+                        # 上一段刚开始就被换掉：它没有存在过，丢掉比留一条零长度记录干净。
+                        segs.pop()
+                elif hi < new_start and new_start - hi <= SEGMENT_GAP_MERGE_MINUTES:
+                    last["end"] = format_time(new_start)
+                    segs[-1] = last
+
+        # 接着做同一件事：并回上一段，不拆成两条「上午在改海报」
+        installed = slot
+        if segs and new_start is not None:
+            last = segs[-1]
+            if (
+                str(last.get("event") or "") == str(slot.get("event") or "")
+                and parse_time(last.get("end")) == new_start
+            ):
+                last["end"] = slot.get("end")
+                last["energy_rate"] = slot.get("energy_rate", last.get("energy_rate"))
+                segs[-1] = last
+                installed = last
+
+        if installed is not slot:
+            slot = None
+        else:
+            segs.append(slot)
+        cap = max(6, min(SEGMENTS_DAY_CAP, int(self.config.schedule_max_slots)))
+        if len(segs) > cap:
+            segs = segs[-cap:]
+        updates: dict[str, Any] = {
+            "daily_schedule": segs,
+            "today_date": today,
+            "schedule_generated_at": self._clock.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "schedule_persona": self.last_persona,
+        }
+        if carry_end:
+            carry = {
+                "end": carry_end,
+                "event": installed.get("event"),
+                "location": installed.get("location"),
+                "emotion": installed.get("emotion"),
+                "energy_rate": installed.get("energy_rate"),
+            }
+            updates[CARRY_KEY] = carry
+        elif str(self._scope.get_self(CARRY_KEY, "") or ""):
+            # 新的一段不是跨夜睡眠：旧的结转不该再留着
+            updates[CARRY_KEY] = None
+        self._scope.update_self(**updates)
+
+        # 本窗的骰子已经用掉了：刚装上的这一段，本窗内不再重掷。
+        self._roll_hit = False
+
+        if self.on_install is not None:
+            try:
+                self.on_install(previous, installed)
+            except Exception:
+                pass
+        if self._log and self.config.debug_mode:
+            self._log.debug(
+                f"[humanoid_core] 新的一段: {installed.get('start')}→{installed.get('end')} "
+                f"{installed.get('event')}"
+                + (f"（结转到明天 {carry_end}）" if carry_end else "")
+            )
 
     async def _resolve_persona(self) -> Persona | None:
         """取该角色当前生效的 AstrBot 人格。没接上人格源或显式关掉时返回 None。"""
@@ -767,27 +1180,30 @@ class ScheduleService:
 
     def status(self) -> dict:
         today = self._clock.today_str()
-        pending = str(self._scope.get_self("today_date", "") or "") != today
-        source = self.source
-        source_text = self.source_text
-        if pending and self.config.use_llm_schedule:
-            source_text = "等待大模型生成（临时模板仅作过渡）"
+        segs = self.segments()
+        active = self.active_segment()
         return {
             "date": today,
             "stored_date": self._scope.get_self("today_date", ""),
-            "slots": len(self.current_slots()),
+            "slots": len(segs),
+            "active": (
+                f"{active.get('start')}-{active.get('end')} {active.get('event')}"
+                if active else ""
+            ),
+            "activity": self.current_activity(),
             "sleep_spans": [
                 f"{s.get('start')}-{s.get('end')} {s.get('event')}" for s in sleep_spans(self.current_slots())
             ],
             "wake_at": schedule_wake_text(self.current_slots()),
-            "source": source,
-            "source_text": source_text,
+            "source": self.source,
+            "source_text": self.source_text,
             "persona": str(self._scope.get_self("schedule_persona", "") or "") or self.last_persona,
             "generated_at": self._scope.get_self("schedule_generated_at", ""),
             "last_error": self.last_error,
             "generating": self.generating,
             "retry_after": self.retry_after,
-            "pending_today": pending,
+            "due": self.refresh_due(),
+            "pending_today": str(self._scope.get_self("today_date", "") or "") != today,
         }
 
     async def aclose(self):

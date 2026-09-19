@@ -102,15 +102,32 @@ def format_offset(moment: datetime) -> str:
 
 
 class Clock:
-    """按当前配置提供「插件所在地」的时间视图。配置热重载后自动跟随。"""
+    """按当前配置提供「插件所在地」的时间视图。配置热重载后自动跟随。
 
-    __slots__ = ("_config",)
+    时区支持**角色级覆盖**：多个机器人跑在同一份全局配置上，但各自可以设自己的
+    城市。`city_provider` 返回这个角色单独设的城市（空则表示没单独设），Clock 优先
+    用它，没有才回退全局 `timezone_city`。不接 `city_provider` 时就是纯全局行为。
+    """
 
-    def __init__(self, config_provider: Callable[[], HumanoidConfig]) -> None:
+    __slots__ = ("_config", "_city_provider")
+
+    def __init__(
+        self,
+        config_provider: Callable[[], HumanoidConfig],
+        city_provider: Callable[[], str] | None = None,
+    ) -> None:
         self._config = config_provider
+        self._city_provider = city_provider
 
     @property
     def city(self) -> str:
+        if self._city_provider is not None:
+            try:
+                override = (self._city_provider() or "").strip()
+            except Exception:
+                override = ""
+            if override:
+                return override
         return self._config().timezone_city
 
     @property
