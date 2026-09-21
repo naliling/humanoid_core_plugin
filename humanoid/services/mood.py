@@ -12,10 +12,11 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from ..config import HumanoidConfig
-from ..data.mood_map import generate_mood_tag, get_mood_label
+from ..data.mood_map import generate_mood_tag, get_mood_label, mood_complex
 from ..jsonx import extract_json_object
 from ..llm import PURPOSE_MOOD, LLMGateway
 from ..recall import MAX_SNIPPETS, note_said, recall_lines
+from ..wording import pick
 from ..role_scope import RoleScope
 
 NEGATIVE_PATTERN = re.compile(
@@ -121,6 +122,7 @@ class MoodService:
             "base_affection": affection,
             "base_libido": float(cfg.mood_initial_libido),
             "base_aggression": float(cfg.mood_initial_aggression),
+            "first_met": self._time(),
             "last_interaction": self._time(),
             "last_decay": self._time(),
             "turn_count": 0,
@@ -146,6 +148,10 @@ class MoodService:
             if field not in record:
                 record[field] = 0 if field == "turn_count" else self._time()
                 changed = True
+        # 关系时长靠 first_met：老档案没有时用 last_interaction 补（不丢历史，只是少算一段）。
+        if "first_met" not in record:
+            record["first_met"] = record.get("last_interaction", self._time())
+            changed = True
         if changed:
             user_state["mood"] = record
             self._scope.mark_dirty()
@@ -178,6 +184,61 @@ class MoodService:
 
     def nickname(self, user_id: str) -> str:
         return self._scope.get_user(user_id, "nickname", "")
+
+    def first_met(self, user_id: str) -> float:
+        """第一次互动的时间。老档案由 _repair 用 last_interaction 补，不会缺。"""
+        record = self.profile(user_id)
+        try:
+            return float(record.get("first_met", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def last_emotional_event(self, user_id: str) -> tuple[str, float] | None:
+        """最近一次情绪大波动，转成无数字的事实句 + 距今小时数。
+
+        logs 本来就只在波动超过阈值时才写，所以任何一条都是大波动。24 小时外的
+        不算「今天发生过的事」。拿不到方向或维度时返回 None，不编一个。
+        """
+        entries = self.logs(user_id, limit=1)
+        if not entries:
+            return None
+        entry = entries[0]
+        try:
+            at = datetime.strptime(
+                str(entry.get("time", "")), "%Y-%m-%d %H:%M:%S"
+            ).timestamp()
+        except (TypeError, ValueError):
+            return None
+        age_hours = (self._time() - at) / 3600.0
+        if age_hours < 0 or age_hours > 24.0:
+            return None
+        event = str(entry.get("event", ""))
+        up = "上升" in event
+        if "攻击性" in event:
+            if up:
+                sentence = pick(
+                    "emo_ev_angry_up",
+                    [user_id, entry.get("time", "")],
+                    ("今天TA惹她不痛快了", "今天被TA气到了"),
+                )
+            else:
+                sentence = "今天气消了些"
+        elif "好感度" in event:
+            if up:
+                sentence = pick(
+                    "emo_ev_aff_up",
+                    [user_id, entry.get("time", "")],
+                    ("今天TA让她挺开心", "今天心情被TA弄好了"),
+                )
+            else:
+                sentence = "今天心里对TA凉了些"
+        else:
+            return None
+        if age_hours < 1.0:
+            sentence = "刚才" + sentence[2:]
+        elif age_hours > 20.0:
+            sentence = "昨天" + sentence[2:]
+        return sentence, age_hours
 
     def set_nickname(self, user_id: str, nickname: str) -> str:
         self._scope.set_user(user_id, "nickname", nickname)

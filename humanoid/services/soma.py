@@ -250,13 +250,17 @@ class SomaService:
 
         # --- 饥饿 ---
         interval = max(1.0, float(cfg.meal_interval_hours))
-        hunger_rate = 100.0 / interval
         if self.is_eating_time(moment):
             # 吃饭就是把这一顿吃了，不是“饱腹感慢慢回升”：一个用餐时段就该归零。
             self.data["hunger"] = 0.0
             self.data["last_meal_at"] = _rounded(moment.timestamp())
+        elif asleep:
+            # 睡着不进食，代谢也慢：饥饿缓慢回落，而不是整夜顶格饿到早餐。
+            self._set("hunger", self._get("hunger", 0.0) - 8.0 * hours)
         else:
-            self._set("hunger", self._get("hunger", 0.0) + hunger_rate * hours)
+            # 渐近趋向上限：越饿涨得越慢，不会线性堆到 100 后卡死一整晚。
+            remaining = 100.0 - self._get("hunger", 0.0)
+            self._set("hunger", self._get("hunger", 0.0) + remaining * hours / interval)
 
         # --- 久坐与躯体不适 ---
         sitting_limit = max(15.0, float(cfg.sitting_discomfort_minutes))
@@ -480,9 +484,27 @@ class SomaService:
             say("debt", debt, 1.0, 5.0, 0.85)
 
         if snap["asleep"] >= 1.0:
-            out.append((0.9, "当前处于她的睡眠时间"))
+            out.append((0.9, "这会儿她在睡"))
 
         say("hunger", snap["hunger"], 55.0, 45.0, 0.8)
+
+        # 状态降温：同一个饥饿值，刚起的和持续了几小时的不是一句话。
+        # 持续时间从 last_meal_at 算出来，是客观数，不是查表。
+        if snap["hunger"] >= 55.0:
+            last_meal = float(self.data.get("last_meal_at", 0.0) or 0.0)
+            if last_meal > 0:
+                hunger_hours = (self.now - last_meal) / 3600.0
+                if hunger_hours >= 2.5:
+                    out.append(
+                        (
+                            0.85,
+                            pick(
+                                "hunger_long",
+                                seed + [round(hunger_hours)],
+                                ("饿了好一阵了", "肚子空了有一阵", "饿了有一会儿了"),
+                            ),
+                        )
+                    )
 
         discomfort = snap["discomfort"]
         if discomfort >= 62:
@@ -610,16 +632,3 @@ def _extract_celsius(text: str) -> float | None:
             except ValueError:
                 return None
     return None
-
-
-def _pick_discomfort_text(soma: SomaService, cfg: HumanoidConfig, seed=None) -> str:
-    seed = list(seed or []) + ["discomfort"]
-    sitting = soma.data.get("sitting_since", 0.0)
-    thermal = soma._thermal_discomfort()
-    if thermal >= 18:
-        return pick("cold", seed, ("身上凉得慌，缩着", "冷，手有点冰", "身上发凉"))
-    if thermal >= 12:
-        return pick("hot", seed, ("有点热，闷得慌", "身上黏", "热得不太想动"))
-    if sitting:
-        return pick("sitting", seed, ("坐太久了，肩颈发僵", "坐得腰都硬了", "久坐着，身上发僵"))
-    return "身上不太得劲"

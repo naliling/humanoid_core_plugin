@@ -65,6 +65,17 @@ AFFECTION_MAP: dict[int, dict[tuple[float, float], str]] = {
 }
 
 
+def mood_complex(affection: float, libido: float, aggression: float) -> str:
+    """复合情绪：攻击性与亲近欲双高时，单字标签说不出的那种拧巴。
+
+    词表取自 generate_mood_tag 已有的说法，不新写台词。其余状态返回空串——
+    单字标签已经够用，硬加只会让注入变长。
+    """
+    if aggression >= 30.0 and libido >= 30.0:
+        return random.choice(("又气又想靠近", "拧巴"))
+    return ""
+
+
 def get_mood_label(affection: float, libido: float, aggression: float) -> str:
     table = AFFECTION_MAP.get(affection_rank(affection), {})
     return table.get((round_to_bucket(libido), round_to_bucket(aggression)), "普通")

@@ -134,16 +134,15 @@ class HumanoidEngine:
     @staticmethod
     def _inject_estimate(core) -> dict:
         """量一下当前角色实际会追加多大的上下文——拿真状态算，不拿常量猜。"""
-        from .prompt_builder import INJECT_MAX_CHARS, estimate_tokens
+        from .prompt_builder import estimate_tokens
 
         try:
             text = core.build_injection("status-probe", is_group=False)
         except Exception:
             return {}
-        mode = core.config.inject_activity_context
         return {
-            f"{mode}（实测）": estimate_tokens(text),
-            f"上限 {INJECT_MAX_CHARS.get(mode, 520)} 字": INJECT_MAX_CHARS.get(mode, 520),
+            f"{core.config.inject_activity_context}（实测）": estimate_tokens(text),
+            "Token 预算": int(core.config.inject_token_budget),
         }
 
     def parse_affection_batch(self, raw: str) -> list[tuple[str, float]]:

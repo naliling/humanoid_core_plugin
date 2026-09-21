@@ -56,7 +56,7 @@ class NightFactsTest(unittest.TestCase):
 
     def test_sleep_window_is_a_fact(self):
         text = " ".join(night_lines(night=True, asleep=False, soma_enabled=True))
-        self.assertIn("她的睡眠时间", text)
+        self.assertIn("她在睡", text)
 
     def test_asleep_is_said_once(self):
         """她在睡这件事由体感那块说，夜间块不再重复一遍。"""

@@ -38,15 +38,21 @@
     "default": "劳逸结合，有动有静，节奏均衡。"
   },
   "inject_activity_context": {
-    "description": "【聊天上下文】每轮往模型那边放多少事实（下拉：low=只给时间/称呼/隔了多久，full=再加今天在做的事与天气，mood_only=只给一个关系词）",
+    "description": "【聊天上下文】每轮往模型那边放多少事实（下拉：medium=默认，时间/称呼/身体/情绪/日程/记忆全给，full=再加详细日程与社交意愿，mood_only=只给最轻的一档）",
     "type": "string",
-    "default": "low",
+    "default": "medium",
     "options": [
       "full",
-      "low",
+      "medium",
       "mood_only"
     ],
-    "hint": "v2.16 起这三档给的都是客观事实，不再有任何「她此刻的感受」「这一轮该说多长」这类句子：写进上下文的句子模型不会当参考，只会当任务。身体、情绪、形式倾向照旧在算，只是留在 state.json 与联动契约里。"
+    "hint": "三档给的都是客观事实，没有任何「她此刻的感受」「这一轮该说多长」这类句子：写进上下文的句子模型不会当参考，只会当任务。身体、情绪、形式倾向照旧在算，只是留在 state.json 与联动契约里。"
+  },
+  "inject_token_budget": {
+    "description": "【进阶】注入的 Token 硬预算：超了按显著度从低到高丢句，时间/称呼/场景这些必需品永不丢。默认 3500，不调也完全正常",
+    "type": "int",
+    "default": 3500,
+    "hint": "按中日韩一字一 token 估算，与社交侧同口径。以后加维度也不会超预算——丢的永远是低显著度的句子。"
   },
   "environment_mode": {
     "description": "【环境】生效范围（下拉选择：both=全部，private=仅私聊，group=仅群聊）",

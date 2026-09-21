@@ -366,6 +366,17 @@ class HumanoidCoreInstance:
         self.energy.advance()
         self.energy.consume_for_message()
 
+        # 聊天频率感靠这个计数：TA今天话不少/很少，中间档不给。
+        today = self.clock.today_str()
+        if str(self._scope.get_self("daily_msg_date", "") or "") != today:
+            self._scope.update_self(daily_msg_date=today, daily_msg_count=1)
+        else:
+            try:
+                count = int(self._scope.get_self("daily_msg_count", 0) or 0)
+            except (TypeError, ValueError):
+                count = 0
+            self._scope.set_self("daily_msg_count", count + 1)
+
         if cfg.soma_enabled:
             self.soma.note_message()
 

@@ -173,7 +173,9 @@ class HumanoidConfig:
     weather_location: str = ""
     weather_refresh_minutes: int = 60
 
-    inject_activity_context: str = "low"
+    inject_activity_context: str = "medium"
+    # 注入的 Token 硬预算：超了按显著度从低到高丢句，必需品（时间/称呼/场景）永不丢。
+    inject_token_budget: int = 3500
     environment_mode: str = "both"
     enable_chat_awareness: bool = True
     show_city_time_in_low_intrusion: bool = True
@@ -540,6 +542,10 @@ def plan_default_migrations(raw: Mapping[str, Any] | None) -> dict[str, Any]:
         changes["schedule_max_slots"] = 96
     if str(src.get("schedule_prompt_extra") or "").strip() == LEGACY_SCHEDULE_PROMPT_EXTRA:
         changes["schedule_prompt_extra"] = DEFAULTS.schedule_prompt_extra
+    # v2.18.2：注入档位 low 升格为 medium（插件已不是轻量级）。只动仍停在旧默认的项，
+    # 用户自己改成 full/mood_only 的不碰。
+    if str(src.get("inject_activity_context") or "").strip() == "low":
+        changes["inject_activity_context"] = "medium"
     return changes
 
 

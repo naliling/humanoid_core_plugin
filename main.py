@@ -152,7 +152,7 @@ _BOOL_WORDS = {
     "true": True, "false": False, "1": True, "0": False, "要": True, "不要": False,
 }
 _ENUM_WORDS = {
-    "inject_activity_context": {"low", "full", "mood_only"},
+    "inject_activity_context": {"medium", "full", "mood_only"},
     "environment_mode": {"private", "group", "both"},
 }
 
@@ -505,7 +505,7 @@ class HumanoidCore(Star):
         lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人设置 人设 开")
         lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（每 {cfg.schedule_refresh_minutes} 分钟决定一次要不要排下一段，变动概率 {cfg.schedule_change_chance}%）")
         lines.append(f"- 日程额外偏好：{cfg.schedule_prompt_extra or '（空）'}")
-        lines.append(f"- 上下文详略：{cfg.inject_activity_context}（low/full/mood_only）")
+        lines.append(f"- 上下文详略：{cfg.inject_activity_context}（medium/full/mood_only）")
         lines.append(f"- 参与环境：{cfg.environment_mode}（private/group/both）")
         lines.append(f"- 管理员：{cfg.admin_qq or '（未设，靠 AstrBot 全局 admins_id）'}")
         lines.append(f"- 调试日志：{'开' if cfg.debug_mode else '关'}")

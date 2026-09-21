@@ -112,9 +112,9 @@ class InjectionFreedomTest(unittest.TestCase):
         """去掉禁令不等于去掉身体：她此刻的处境还得说得出。"""
         core = self.wrecked_body(self.core())
         text = core.build_injection("42", is_group=False)
-        self.assertIn("【感觉】", text)
-        self.assertIn("【对TA】", text)
-        self.assertIn("【此刻】", text)
+        self.assertIn("她很困", text)
+        self.assertIn("她对TA", text)
+        self.assertIn("私聊", text)
         # 但「这副身体这会儿只够说一两句，20字上下的量」那种形式限制不许回来：
         # 插件拦不住她说话，写出来只是让她猜规矩。
         for gone in ("字上下的量", "只够说一两句", "再多就散了", "展开不了一段长篇"):
@@ -169,7 +169,7 @@ class InjectionFreedomTest(unittest.TestCase):
         core = self.core()
         core.mood.profile("42").update({"affection": 90.0, "libido": 40.0, "aggression": 5.0})
         text = core.build_injection("42", is_group=False)
-        self.assertIn("对TA的感觉：", text)
+        self.assertIn("她对TA", text)
         for word in ("态度", "语气", "带有敌意", "保持警惕", "充满信任"):
             self.assertNotIn(word, text, f"语气提示又回来了：{word}\n{text}")
 

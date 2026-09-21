@@ -246,6 +246,30 @@ def day_lines(
     return [head + "；".join(bits)]
 
 
+def just_done(
+    slots: list[Slot], now_minutes: int, window_minutes: float = 45.0
+) -> str:
+    """刚结束的时段的动作名（不带时段词）。窗口内没有就是空串。
+
+    「余韵」用：刚在做什么和上午在什么是两句话，真人带着上一件事的余韵进对话。
+    """
+    best: tuple[float, str] | None = None
+    for slot in slots or []:
+        hi = parse_time(slot.get("end"))
+        if hi is None:
+            continue
+        ago = now_minutes - hi
+        if ago <= 0 or ago > window_minutes:
+            continue
+        event = str(slot.get("event") or "").strip()
+        if not event or is_sleep_event(event):
+            continue
+        phrase = _event_phrase(event)
+        if phrase and (best is None or ago < best[0]):
+            best = (ago, phrase)
+    return best[1] if best else ""
+
+
 def persona_block(persona: Persona | None) -> str:
     """把 AstrBot 人格设定写成分段 prompt 的开头：她是谁，先立住再决定这一段。"""
     if persona is not None and persona.usable:

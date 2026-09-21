@@ -338,7 +338,7 @@ class DayNarrativeTest(unittest.TestCase):
         self.assertEqual(day_lines(day_phrases([], 600)), [])
 
     def test_injection_does_not_narrate_the_day(self):
-        """日程流水账不进上下文：今天干了什么留在状态与契约里，不让她念稿子。"""
+        """日程进上下文的是事实（今天到这会过了什么），不带任何过程要求。"""
         import asyncio
         import tempfile
         from pathlib import Path
@@ -359,8 +359,11 @@ class DayNarrativeTest(unittest.TestCase):
         slots = normalize_slots(DAY_SCHEDULE, max_slots=16)
         core.scope.update_self(today_date=TODAY, daily_schedule=slots, schedule_source=SOURCE_LLM)
         text = core.build_injection("42", is_group=False)
-        self.assertNotIn("今天到这会", text)
-        self.assertNotIn("跟客户过方案", text)
+        self.assertIn("今天到这会", text)
+        self.assertIn("跟客户过方案", text)
+        # 只给事实，不给规矩：不出现「要/别/不要」这类过程指令。
+        self.assertNotIn("不要", text)
+        self.assertNotIn("接着聊", text)
         # 数据源还在：day_phrases 照常能算出今天干了什么（契约/诊断用）。
         got = day_phrases(slots, 15 * 60 + 20)
         self.assertIn("跟客户过方案", got["doing"])
@@ -519,7 +522,7 @@ class EmotionLineTest(unittest.TestCase):
         """情绪信到标签为止：状态照给，怎么开口不由插件写。"""
         core = self.core_with_mood(affection=55.0, libido=10.0, aggression=40.0, base_aggression=28.0)
         text = core.build_injection("42", is_group=False)
-        self.assertIn("对TA的感觉：", text)
+        self.assertIn("她对TA", text)
         # 攻击性偏高的那一档，标签本身就得能看出不对劲（如「不讲理」「较劲」）。
         self.assertTrue(any(w in text for w in ("不讲理", "较劲", "炸毛", "嘴硬", "别扭")), text)
         for script in ("积了点火", "攒着点事", "火压在底下", "说话会短", "顶回去"):

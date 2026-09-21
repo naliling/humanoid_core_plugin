@@ -108,7 +108,7 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("群聊", group_text)
             self.assertIn("只有你和TA", private_text)
             self.assertIn("小明", private_text)
-            self.assertIn("对TA的感觉", private_text)
+            self.assertIn("她对TA", private_text)
             self.assertLessEqual(len(private_text), 520)
             # 低注入档不摊数值：靠「禁止提及数据」堆补丁不如不给数据。
             for text in (group_text, private_text):
@@ -124,7 +124,7 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
         core = engine.role_manager.get_or_create("99999")
         try:
             full = core.build_injection("42", is_group=False)
-            self.assertIn("对TA的感觉", full)
+            self.assertIn("她对TA", full)
             self.assertNotIn("情绪数值", full)
             self.assertNotIn("/100", full)
             box.raw["inject_activity_context"] = "low"
@@ -133,7 +133,7 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
             box.raw["inject_activity_context"] = "mood_only"
             box.reload()
             mood_only = core.build_injection("42", is_group=False)
-            self.assertIn("对TA的感觉", mood_only)
+            self.assertIn("她对TA", mood_only)
             self.assertNotIn("群聊", mood_only)
         finally:
             await engine.role_manager.stop()
@@ -145,14 +145,14 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
         core = engine.role_manager.get_or_create("99999")
         await core.start()
         try:
-            self.assertNotIn("对TA的感觉", core.build_injection("42", is_group=True))
+            self.assertNotIn("她对TA", core.build_injection("42", is_group=True))
             core.on_message("42", "hi", is_group=True)
             users = core.mood._scope._root.get("users", {})
             self.assertNotIn("mood", users.get("42", {}), "群聊不该为成员建情绪档案")
             self.assertIn("last_interaction", users.get("42", {}), "但聊天间隔要记，群聊里靠它知道好久没聊")
             box.raw["mood_enabled_in_group"] = True
             box.reload()
-            self.assertIn("对TA的感觉", core.build_injection("42", is_group=True))
+            self.assertIn("她对TA", core.build_injection("42", is_group=True))
         finally:
             await engine.role_manager.stop()
 
