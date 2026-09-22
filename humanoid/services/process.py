@@ -151,24 +151,26 @@ class ProcessService:
         proc = self._advance_or_generate()
         self._scope.set_self("current_process", proc)
         self._pending_update = False
-        self._last_update_attempt = time.time()
+        self._last_update_attempt = time.monotonic()
         return proc
 
     async def update_async(self) -> dict:
         # 阶段更新无需频繁调用模型，因此只保留很短的防抖。
-        if time.time() - self._last_update_attempt < 2:
+        # 防抖计时用单调钟（schedule/llm 同款）：墙钟在系统对时或手动改时间时会
+        # 前跳/回拨，2 秒窗口跟着失真——要么连着生成几次，要么卡住不更新。
+        if time.monotonic() - self._last_update_attempt < 2:
             return self.current()
         proc = self._advance_or_generate()
         self._scope.set_self("current_process", proc)
         self._pending_update = False
-        self._last_update_attempt = time.time()
+        self._last_update_attempt = time.monotonic()
         return proc
 
     def force_update(self) -> dict:
         proc = self._advance_or_generate(force=True)
         self._scope.set_self("current_process", proc)
         self._pending_update = False
-        self._last_update_attempt = time.time()
+        self._last_update_attempt = time.monotonic()
         return proc
 
     def _create_initial_process(self) -> dict:

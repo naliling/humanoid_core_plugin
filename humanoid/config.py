@@ -173,6 +173,16 @@ class HumanoidConfig:
     weather_location: str = ""
     weather_refresh_minutes: int = 60
 
+    # 多消息合并（消息防抖）：短时间内连续触发机器人的多条消息，合并成一次模型请求、
+    # 只回一条。私聊合并同一用户连发；群聊合并多人连续 @。仅在防抖窗口内、且机器人
+    # 还没开始回复时才合并；命令、纯图片/语音消息不参与。
+    message_merge_enabled: bool = True
+    # 防抖窗口（秒）：收到一条会触发回复的消息后，等这么久看还有没有新消息一起并进来。
+    # 代价是每条回复都会晚这么久；默认 1.5 秒是抓连发与不拖沓之间的折中。
+    message_merge_window_seconds: float = 1.5
+    # 一批最多合并多少条：防刷屏把 prompt 撑爆，只保留最近这么多条。
+    message_merge_max_count: int = 6
+
     inject_activity_context: str = "medium"
     # 注入的 Token 硬预算：超了按显著度从低到高丢句，必需品（时间/称呼/场景）永不丢。
     inject_token_budget: int = 3500
@@ -311,6 +321,9 @@ class HumanoidConfig:
             weather_api_key=s_opt("weather_api_key"),
             weather_location=s_opt("weather_location"),
             weather_refresh_minutes=i("weather_refresh_minutes", 1, 1440),
+            message_merge_enabled=b("message_merge_enabled"),
+            message_merge_window_seconds=f("message_merge_window_seconds", 0.0, 30.0),
+            message_merge_max_count=i("message_merge_max_count", 1, 50),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
             environment_mode=c("environment_mode", ENVIRONMENT_MODES),
             enable_chat_awareness=b("enable_chat_awareness"),

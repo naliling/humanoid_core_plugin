@@ -112,7 +112,8 @@ class InjectionFreedomTest(unittest.TestCase):
         """去掉禁令不等于去掉身体：她此刻的处境还得说得出。"""
         core = self.wrecked_body(self.core())
         text = core.build_injection("42", is_group=False)
-        self.assertIn("她很困", text)
+        # 困意措辞按天抽签（很困/困得不行…），断言只能认「说的是困」而不是某一句原话。
+        self.assertTrue("困" in text or "疲惫" in text, f"她此刻的困意得说得出：\n{text}")
         self.assertIn("她对TA", text)
         self.assertIn("私聊", text)
         # 但「这副身体这会儿只够说一两句，20字上下的量」那种形式限制不许回来：

@@ -88,8 +88,6 @@ class MoodService:
         self._clock = clock
         self._spawn = spawn_fn
         self._time = time_source
-        self._gateway: LLMGateway | None = None
-        self._log = None
         self._gateway = gateway
         self._log = logger
         # 按用户细粒度锁，避免不同用户互相阻塞
@@ -204,11 +202,22 @@ class MoodService:
             return None
         entry = entries[0]
         try:
-            at = datetime.strptime(
+            parsed = datetime.strptime(
                 str(entry.get("time", "")), "%Y-%m-%d %H:%M:%S"
-            ).timestamp()
+            )
         except (TypeError, ValueError):
             return None
+        # 日志写的是她那个城市的墙上时间（见 _log_event），读回来必须附同一个时区：
+        # naive datetime 直接 .timestamp() 会按宿主机时区解释，城市与机器不在一个
+        # 时区时「今天/刚才/昨天」整体偏移几个小时。
+        if parsed.tzinfo is None and self._clock is not None:
+            try:
+                zone = self._clock.now().tzinfo
+            except Exception:
+                zone = None
+            if zone is not None:
+                parsed = parsed.replace(tzinfo=zone)
+        at = parsed.timestamp()
         age_hours = (self._time() - at) / 3600.0
         if age_hours < 0 or age_hours > 24.0:
             return None

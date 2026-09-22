@@ -245,6 +245,10 @@ class FrozenClock:
     def now(self):
         return self.moment
 
+    def timestamp(self) -> float:
+        """与真实 Clock 对齐的 epoch：身体/间隔计算共用这一台冻结的钟。"""
+        return self.moment.timestamp()
+
     def today_str(self) -> str:
         return self.moment.strftime("%Y-%m-%d")
 

@@ -141,6 +141,15 @@ class Clock:
     def now(self) -> datetime:
         return now_in_city(self.city)
 
+    def timestamp(self) -> float:
+        """当前时刻的 epoch 秒，与 `now()` 同一瞬。
+
+        身体积分、间隔计算这类「过了多久」的时间源统一从这里出：core 的钟被换掉
+        （测试冻结、角色换城市）时，身体与措辞跟着同一台钟走，不会出现场景写着
+        下午三点、身体却按另一台钟睡着的分叉。
+        """
+        return self.now().timestamp()
+
     def zone_state(self) -> ZoneState:
         """当前配置生效的时区与退化原因（诊断用）。"""
         city = self.city

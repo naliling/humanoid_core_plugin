@@ -66,6 +66,9 @@ class _Filter:
     def on_llm_request(self):
         return self._register("on_llm_request", "")
 
+    def on_waiting_llm_request(self):
+        return self._register("on_waiting_llm_request", "")
+
     def at(self, *a, **k):
         return self._register("at", a)
 
@@ -91,6 +94,7 @@ class ProviderRequest:
         self.system_prompt = system_prompt
         self.contexts = contexts if contexts is not None else []
         self.extra_user_content_parts: list = []
+        self.prompt: str = ""
 
 
 class Context:

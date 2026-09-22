@@ -70,6 +70,8 @@ class FakeEvent:
         self._admin = admin
         self.unified_msg_origin = f"aiocqhttp:{'private' if private else 'group'}:{sender}"
         self.sent: list[str] = []
+        self._extras: dict = {}
+        self._stopped = False
 
     def get_sender_id(self) -> str:
         return self._sender
@@ -92,10 +94,25 @@ class FakeEvent:
     async def send(self, result: FakeResult) -> None:
         self.sent.append(result.text)
 
+    def set_extra(self, key, value) -> None:
+        self._extras[key] = value
+
+    def get_extra(self, key=None, default=None):
+        if key is None:
+            return self._extras
+        return self._extras.get(key, default)
+
+    def stop_event(self) -> None:
+        self._stopped = True
+
+    def is_stopped(self) -> bool:
+        return self._stopped
+
 
 class FakeProviderRequest:
-    def __init__(self, system_prompt: str = "") -> None:
+    def __init__(self, system_prompt: str = "", prompt: str = "") -> None:
         self.system_prompt = system_prompt
+        self.prompt = prompt
 
 
 GOOD_SCHEDULE = json.dumps(
@@ -273,6 +290,68 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         req = FakeProviderRequest("")
         await self.star.inject_context(FakeEvent("你好", private=True), req)
         self.assertEqual(req.system_prompt, "", "私聊在 group 模式下不应被注入")
+
+    # ---------- 多消息合并（消息防抖） ----------
+
+    def _set_merge(self, **kw):
+        self.raw.update(kw)
+        self.star._config_box.reload(self.raw)
+
+    async def test_merge_lone_message_proceeds(self):
+        self._set_merge(message_merge_window_seconds=0.05)
+        ev = FakeEvent("你好", sender="555")
+        await self.star.debounce_merge(ev)
+        self.assertFalse(ev.is_stopped(), "孤消息不该被停，正常回复")
+        self.assertIsNone(ev.get_extra(main_module.MERGE_EXTRA_KEY), "只有一条时不挂合并块")
+
+    async def test_merge_two_messages_only_last_replies(self):
+        self._set_merge(message_merge_window_seconds=0.1)
+        e1 = FakeEvent("在吗", sender="556")
+        e2 = FakeEvent("帮我看个问题", sender="556")
+        t1 = asyncio.create_task(self.star.debounce_merge(e1))
+        await asyncio.sleep(0.03)  # e1 先进入窗口
+        t2 = asyncio.create_task(self.star.debounce_merge(e2))
+        await asyncio.gather(t1, t2)
+        self.assertTrue(e1.is_stopped(), "先到的被后到的取代，不单独回")
+        self.assertFalse(e2.is_stopped(), "后到的胜出，负责合并回复")
+        self.assertEqual(e2.get_extra(main_module.MERGE_EXTRA_KEY), ["在吗"])
+
+    async def test_merge_next_batch_starts_clean(self):
+        """胜出者清空缓冲：下一批不该带上一批的内容。"""
+        self._set_merge(message_merge_window_seconds=0.05)
+        first = FakeEvent("第一批", sender="559")
+        await self.star.debounce_merge(first)
+        self.assertFalse(first.is_stopped())
+        second = FakeEvent("第二批", sender="559")
+        await self.star.debounce_merge(second)
+        self.assertFalse(second.is_stopped())
+        self.assertIsNone(second.get_extra(main_module.MERGE_EXTRA_KEY), "新一批不带旧内容")
+
+    async def test_merge_prepends_earlier_into_prompt(self):
+        ev = FakeEvent("帮我看个问题", sender="557")
+        ev.set_extra(main_module.MERGE_EXTRA_KEY, ["在吗", "有空吗"])
+        req = FakeProviderRequest(prompt="帮我看个问题")
+        await self.star.inject_context(ev, req)
+        self.assertEqual(req.prompt, "在吗\n有空吗\n帮我看个问题", "更早几条按时间正序前置进 prompt")
+
+    async def test_merge_disabled_is_noop(self):
+        self._set_merge(message_merge_enabled=False, message_merge_window_seconds=0.05)
+        ev = FakeEvent("你好", sender="558")
+        await self.star.debounce_merge(ev)
+        self.assertFalse(ev.is_stopped())
+        self.assertIsNone(ev.get_extra(main_module.MERGE_EXTRA_KEY))
+
+    async def test_merge_skips_empty_text(self):
+        self._set_merge(message_merge_window_seconds=0.05)
+        ev = FakeEvent("   ", sender="560")
+        await self.star.debounce_merge(ev)
+        self.assertFalse(ev.is_stopped(), "纯图片/空文本消息不参与合并")
+
+    async def test_merge_respects_environment_mode(self):
+        self._set_merge(environment_mode="private", message_merge_window_seconds=0.05)
+        group_ev = FakeEvent("群里问", sender="561", private=False)
+        await self.star.debounce_merge(group_ev)
+        self.assertFalse(group_ev.is_stopped(), "仅私聊模式下不该对群消息做合并")
 
     async def test_on_message_bookkeeping(self):
         core = self.star._core(FakeEvent("/你的状态"))

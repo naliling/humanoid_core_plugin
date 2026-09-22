@@ -137,7 +137,7 @@ class ContextShapeTest(unittest.TestCase):
             "data": {"gap_seconds": 11520.0, "previous_message": "我猫今天吐了"},
         })
         text = core.build_injection("42", is_group=False)
-        self.assertIn("现在是下午15:20", text)
+        self.assertIn("现在是15:20", text)
         self.assertIn("小鱼", text)
         self.assertIn("3 小时 12 分", text)
         self.assertIn("我猫今天吐了", text, "离开前原话是间隔实用性的另一半")

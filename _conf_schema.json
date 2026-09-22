@@ -37,6 +37,24 @@
     "type": "string",
     "default": "劳逸结合，有动有静，节奏均衡。"
   },
+  "message_merge_enabled": {
+    "description": "【多消息合并】把短时间内连续触发机器人的多条消息合并成一次回复（默认开）",
+    "type": "bool",
+    "default": true,
+    "hint": "私聊把同一人的连发两三条合成一次回；群聊把多人连续 @ 机器人的消息合成一次回。只在防抖窗口内、且机器人还没开始回复时才合并；指令、纯图片/语音消息不受影响。合并后模型一次看到全部几条，回得更连贯，也省一部分模型请求。"
+  },
+  "message_merge_window_seconds": {
+    "description": "【进阶】合并防抖窗口（秒）：收到一条会回复的消息后等多久看还有没有新消息一起并进来，默认 1.5",
+    "type": "float",
+    "default": 1.5,
+    "hint": "代价是每条回复都会晚这么久（即使它是孤消息）。想多抓连发就调大一点（如 2~2.5），想回得快就调小（如 0.8）；设 0 等于关闭合并。"
+  },
+  "message_merge_max_count": {
+    "description": "【进阶】一批最多合并多少条：防刷屏把上下文撑爆，默认 6",
+    "type": "int",
+    "default": 6,
+    "hint": "超过这个条数时只保留最近的几条并进回复。"
+  },
   "inject_activity_context": {
     "description": "【聊天上下文】每轮往模型那边放多少事实（下拉：medium=默认，时间/称呼/身体/情绪/日程/记忆全给，full=再加详细日程与社交意愿，mood_only=只给最轻的一档）",
     "type": "string",

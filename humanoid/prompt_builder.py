@@ -36,7 +36,7 @@ _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef
 # 所以每次注入前要把历史里旧的块抹掉（`main.py` 负责），标记就是给这一步认路用的。
 # 换文案时把 v 后面的数字加一，老会话里的旧块会被当成不认识的内容直接清掉。
 MARK_PREFIX = "〔她的身体与生活"
-MARK_VERSION = "v8"
+MARK_VERSION = "v9"
 
 # 给 system_prompt 的那段话：说明下面这些是什么、按什么方式读它。稳定文本，不含事实。
 # 只划参考边界，不下指令：说什么、怎么说、说多长，都由她自己判断。
@@ -107,6 +107,15 @@ def humanize_gap(seconds: float) -> str:
     if minutes:
         return f"{minutes} 分钟"
     return "不到一分钟"
+
+
+def _core_epoch(core) -> float:
+    """从 core 的钟上取 epoch：注入里所有「过了多久」都得跟她的钟同源，
+    否则冻结/换城市的场合会出现身体按一台钟走、措辞按另一台钟算的分叉。"""
+    try:
+        return float(core.now_epoch())
+    except Exception:
+        return time.time()
 
 
 class PromptBuilder:
@@ -246,7 +255,7 @@ class PromptBuilder:
         # 关系时长：真人对「认识多久了」是有感觉的，措辞随天数自然变。
         first = self._core.mood.first_met(user_id)
         if first > 0:
-            days = (time.time() - first) / 86400.0
+            days = (_core_epoch(self._core) - first) / 86400.0
             if days < 2:
                 lines.append(pick("rel_new", seed, ("你们才认识没几天", "你们认识没几天")))
             elif days < 7:
@@ -319,7 +328,7 @@ class PromptBuilder:
             wake = float(core.soma.data.get("last_wake_at", 0.0) or 0.0)
             slept = float(snap.get("last_sleep_hours", 0.0) or 0.0)
             if wake > 0 and slept >= 0.5:
-                mins = (time.time() - wake) / 60.0
+                mins = (_core_epoch(self._core) - wake) / 60.0
                 if 0 < mins <= 90:
                     lines.append(
                         f"她刚睡醒，睡了{slept:.0f}小时" if slept >= 1.0 else "她刚睡醒"
@@ -406,7 +415,9 @@ class PromptBuilder:
             "群聊，周围还有人看着" if is_group else "私聊，只有你和TA"
         ]
         now = self._core.clock.now()
-        line = f"现在是{self._time_of_day(now.hour)}{now.strftime('%H:%M')}"
+        # 只报钟点，不报「上午/下午/晚上」这类时段词：时段词会被模型当成打招呼的
+        # 由头（无论几点都回一句「下午好呀」），钟点是一张随手可看的表，用不用由她。
+        line = f"现在是{now.strftime('%H:%M')}"
         try:
             today = self._core.snapshot(refresh=False).get("today") or ""
         except Exception:
@@ -569,11 +580,44 @@ class PromptBuilder:
     # 三档组装
     # ------------------------------------------------------------------
 
+    def _append_sleep_essentials(
+        self,
+        sents: List[tuple[str, float]],
+        user_id: str,
+        is_group: bool,
+        events: List[Dict[str, Any]],
+        agency: Dict[str, float],
+        interest: Dict[str, float],
+        detailed: bool,
+    ) -> None:
+        """睡着时也不能丢的必需品：她对TA、称呼、间隔、TA说过的话。
+
+        夜间精简省掉的只能是生活细节（今天做了什么、余韵、精力读数），不能是关系
+        本身——半夜被消息吵醒的真人照样知道这是谁、隔了多久没见、TA之前提过什么。
+        睡着 ≠ 失忆：把她变成一个不认识TA的梦游者，比多说两句生活细节更出戏。
+        """
+        relation = self._relation_lines(user_id, is_group, detailed=detailed, interest=interest)
+        nickname = self._nickname_line(user_id, is_group)
+        if nickname:
+            relation = relation + [nickname]
+        if relation:
+            sents.append((self._sentence(relation), 8.0))
+        situ = self._behavior_lines(
+            user_id, events, agency,
+            with_previous=self.config.last_interaction_mode == "with_last_msg",
+        )
+        if situ:
+            sents.append((self._sentence(situ), 7.0))
+        memory = self._sentence(self._memory_lines(user_id, detailed=detailed))
+        if memory:
+            sents.append((memory, 6.0))
+
     def _build_medium(
         self, user_id: str, is_group: bool, events, agency, text: str, interest: Dict[str, float]
     ) -> str:
         snap = self._core.snapshot(refresh=False)
-        # 夜间精简：睡着时她只是在睡，别的维度都不重要。
+        # 夜间精简：睡着时省掉生活细节，但必需品（关系/称呼/间隔/记忆）由
+        # `_append_sleep_essentials` 补上——睡着不是失忆。
         try:
             asleep = float((snap.get("soma") or {}).get("asleep", 0.0)) >= 1.0
         except (TypeError, ValueError):
@@ -585,6 +629,9 @@ class PromptBuilder:
             body = self._feelings_lines(MAX_FEELINGS_LOW, 0.0)
             if body:
                 sents.append((self._sentence(body), 9.0))
+            self._append_sleep_essentials(
+                sents, user_id, is_group, events, agency, interest, detailed=False
+            )
             return "。".join(s for s, _ in sents if s)
 
         body = self._feelings_lines(MAX_FEELINGS_LOW, FEELING_THRESHOLD_LOW) + self._night_lines()
@@ -646,6 +693,9 @@ class PromptBuilder:
             body = self._feelings_lines(MAX_FEELINGS_FULL, 0.0)
             if body:
                 sents.append((self._sentence(body), 9.0))
+            self._append_sleep_essentials(
+                sents, user_id, is_group, events, agency, interest, detailed=True
+            )
             return "。".join(s for s, _ in sents if s)
         state = self._state_lines(snap, detailed=True)
         if snap.get("social_energy"):
@@ -713,22 +763,6 @@ class PromptBuilder:
         if not body:
             return ""
         return header + "\n" + body + "。"
-
-    @staticmethod
-    def _time_of_day(hour: int) -> str:
-        if 5 <= hour < 8:
-            return "清晨"
-        if 8 <= hour < 12:
-            return "上午"
-        if 12 <= hour < 14:
-            return "中午"
-        if 14 <= hour < 18:
-            return "下午"
-        if 18 <= hour < 21:
-            return "傍晚"
-        if 21 <= hour < 24:
-            return "晚上"
-        return "深夜"
 
 
 def _uid_tag(role_id: str) -> str:

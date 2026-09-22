@@ -106,12 +106,15 @@ class HumanoidCoreInstance:
             persona_source.restore(role_id, self._scope.get_self("last_umo", ""))
 
         # 身体（生理层）的日程与天气都是惰性取数，避开构造顺序上的环形依赖。
+        # 时间源统一走 `now_epoch()`：身体积分跟她的钟（含角色级城市覆盖）同源，
+        # 不再各自读系统钟——否则冻结/换时区的场合会出现两台钟各走各的。
         self.soma = SomaService(
             self._scope,
             config_provider,
             self.clock,
             schedule_provider=lambda: self.schedule.current_slots(),
             weather_provider=lambda: self.weather.snapshot(),
+            time_source=self.now_epoch,
         )
         self.schedule.on_install = self._on_schedule_installed
 
@@ -136,6 +139,7 @@ class HumanoidCoreInstance:
             self._spawn_background,
             gateway=self.gateway,
             logger=logger,
+            time_source=self.now_epoch,
         )
         self.social = SocialEnergyService(self._scope, config_provider, self.clock)
         self.weather = WeatherService(
@@ -204,6 +208,18 @@ class HumanoidCoreInstance:
     @property
     def config(self) -> HumanoidConfig:
         return self._config_provider()
+
+    def now_epoch(self) -> float:
+        """整个 core 共用的 epoch 时间源：跟 `self.clock` 走。
+
+        soma 积分、间隔事件、`last_interaction`、措辞里「过了多久」全从这里出，
+        保证只有一台钟。生产里它与系统时间同一瞬；测试里换上 FrozenClock 后身体
+        与场景一起冻结。钟拿不出 epoch（老测试替身）时退回系统时间，不抛错。
+        """
+        try:
+            return float(self.clock.timestamp())
+        except Exception:
+            return time.time()
 
     @property
     def scope(self) -> RoleScope:
@@ -325,8 +341,8 @@ class HumanoidCoreInstance:
         return task
 
     def on_message(self, user_id: str, text: str, is_group: bool = False, umo: str = "") -> None:
-        self.last_activity = time.time()
-        now = time.time()
+        now = self.now_epoch()
+        self.last_activity = now
         cfg = self.config
 
         self.note_umo(umo)
@@ -409,7 +425,7 @@ class HumanoidCoreInstance:
         只读不写：时间间隔、情绪、注意力都在 `on_message` 里记过账，这里再记一次就会
         把「上一次说话」推到当前这一条上，间隔永远算不出来。
         """
-        now = time.time()
+        now = self.now_epoch()
         if self.config.soma_enabled:
             self.soma.advance(now)
         events = self.behavior.consume_relevant_events(user_id, now)
@@ -607,7 +623,7 @@ class HumanoidCoreInstance:
             lines.append(f"- 好感度：{s['mood']['affection']:.1f}（{s['mood']['label']}）")
             # 注意力三轴只在这个地方给人看数值：进上下文的是措辞，不是百分比。
             try:
-                axes = self.behavior.interest_state(user_id, time.time())
+                axes = self.behavior.interest_state(user_id, self.now_epoch())
             except Exception:
                 axes = {}
             if axes:
