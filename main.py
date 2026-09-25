@@ -33,7 +33,7 @@ HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 /你的状态 - 查看精力、身体轴（困意/睡眠债/饥饿/不适…）、生理、天气、日程、过程
 /查看日程 - 看她今天过出来的日程（动态，一段一段现排，不预排未来）
 /时间 城市 - 查看指定城市当前时间
-/叫我 昵称 - 设置 AI 对你的称呼
+/叫我 昵称 - 设置 AI 对你的称呼（没设过时 AI 会自动认一次，认过之后不再改）
 /好感度 - 查看情绪档案
 /情绪详情 - 查看详细情绪档案
 /情绪日志 - 查看情绪波动记录
@@ -84,6 +84,19 @@ def _is_private_chat(event: AstrMessageEvent) -> bool:
             pass
     message_obj = getattr(event, "message_obj", None)
     return not bool(getattr(message_obj, "group_id", None))
+
+
+def _sender_name(event: AstrMessageEvent) -> str:
+    """消息自带的发送者名字：群聊是群名片（没名片时是 QQ 昵称），私聊是 QQ 昵称。
+
+    AstrBot 的 get_sender_name() 在部分适配器下会拿不到，拿不到就当没有，不抛。"""
+    getter = getattr(event, "get_sender_name", None)
+    if not callable(getter):
+        return ""
+    try:
+        return str(getter() or "")
+    except Exception:
+        return ""
 
 
 def _append_framing(req: Any) -> None:
@@ -447,14 +460,22 @@ class HumanoidCore(Star):
     async def cmd_set_nickname(self, event: AstrMessageEvent):
         """设置 AI 对你的称呼（昵称）。"""
         nickname = _arg_after(event.message_str, "叫我")
+        core = self._core(event)
+        user_id = self._sender(event)
         if not nickname:
+            current = core.mood.nickname(user_id)
+            if current:
+                source = "你自己设的" if core.mood.nickname_source(user_id) == "user" else "AI 自动认的"
+                yield event.plain_result(
+                    f"现在叫你「{current}」（{source}）。要改就写：/叫我 新称呼"
+                )
+                return
             yield event.plain_result("用法：/叫我 昵称")
             return
         if len(nickname) > 32:
             yield event.plain_result("昵称太长了")
             return
-        core = self._core(event)
-        core.mood.set_nickname(self._sender(event), nickname)
+        core.mood.set_nickname(user_id, nickname, src="user")
         yield event.plain_result(f"✅ 记住了，以后叫你：{nickname}")
 
     @filter.command("拟人帮助")
@@ -474,7 +495,7 @@ class HumanoidCore(Star):
         core = self._core(event)
         yield event.plain_result(self.engine.diagnostics_text(core))
 
-    # 面板上 82 项、AstrBot 又不支持分组，改一个城市要翻半天。这一条命令只管常用那几项，
+    # 面板上 89 项、AstrBot 又不支持分组，改一个城市要翻半天。这一条命令只管常用那几项，
     # 进阶项仍然去面板改——两边改的是同一份配置文件。
     SETTINGS_ALIASES = {
         "城市": "timezone_city",
@@ -559,7 +580,7 @@ class HumanoidCore(Star):
 
     def _settings_summary(self, core=None) -> str:
         cfg = self._config
-        lines = [f"⚙️ 常用设置（共 84 项，其余标了【进阶】，在面板里改）"]
+        lines = [f"⚙️ 常用设置（共 89 项，其余标了【进阶】，在面板里改）"]
         # 城市是每个机器人独立的：优先显示当前 bot 生效城市，并标明是否单独设。
         if core is not None:
             override = str(core.scope.get_self("tz_city_override", "") or "")
@@ -573,7 +594,8 @@ class HumanoidCore(Star):
         lines.append(f"- 日程额外偏好：{cfg.schedule_prompt_extra or '（空）'}")
         lines.append(f"- 上下文详略：{cfg.inject_activity_context}（medium/full/mood_only）")
         lines.append(f"- 参与环境：{cfg.environment_mode}（private/group/both）")
-        lines.append(f"- 管理员：{cfg.admin_qq or '（未设，靠 AstrBot 全局 admins_id）'}")
+        admins = "、".join(cfg.admin_qq) if cfg.admin_qq else "（未设，靠 AstrBot 全局 admins_id）"
+        lines.append(f"- 管理员：{admins}")
         lines.append(f"- 调试日志：{'开' if cfg.debug_mode else '关'}")
         lines.append("改完立即生效；进阶项用 /重载配置 刷新。")
         return "\n".join(lines)
@@ -662,16 +684,17 @@ class HumanoidCore(Star):
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
-        pairs = self.engine.parse_affection_batch(_arg_after(event.message_str, "批量好感度"))
+        pairs, malformed = self.engine.parse_affection_batch(_arg_after(event.message_str, "批量好感度"))
         if not pairs:
             yield event.plain_result("格式错误，请使用：/批量好感度 QQ:数值")
             return
         core = self._core(event)
         applied = core.mood.set_affection_batch(pairs)
-        skipped = len(pairs) - applied
+        skipped = len(pairs) - applied + malformed
         if skipped:
             yield event.plain_result(
-                f"✅ 已批量设置 {applied} 个用户，跳过 {skipped} 个（数值需在 0-100 之间）。"
+                f"✅ 已批量设置 {applied} 个用户，跳过 {skipped} 个"
+                "（数值需在 0-100 之间，条目得写成 QQ:数值）。"
             )
         else:
             yield event.plain_result(f"✅ 已批量设置 {applied} 个用户。")
@@ -688,7 +711,11 @@ class HumanoidCore(Star):
         if not names:
             yield event.plain_result("📭 暂无昵称。")
             return
-        yield event.plain_result("📋 昵称列表：\n" + "\n".join(f"{k} → {v}" for k, v in names.items()))
+        lines = [
+            f"{uid} → {name}（{'自动认定' if source == 'auto' else '用户自设'}）"
+            for uid, (name, source) in names.items()
+        ]
+        yield event.plain_result("📋 昵称列表：\n" + "\n".join(lines))
 
     # -------------------- LLM 请求注入钩子 --------------------
 
@@ -821,9 +848,6 @@ class HumanoidCore(Star):
         监听所有消息，用于更新精力、社交能量、情绪衰减、过程 tick 以及记录 last_message。
         """
         try:
-            text = (getattr(event, "message_str", "") or "").strip()
-            if not text:
-                return
             role_id = self._self_id(event)
             user_id = self._sender(event)
             if user_id == role_id:
@@ -832,6 +856,13 @@ class HumanoidCore(Star):
             if not self.engine.environment_allows(not is_group):
                 return
             core = self.role_manager.get_or_create(role_id)
+            # 自动认定称呼：只在这个人还没有任何称呼时填一次，之后换名片也不会改口；
+            # 用户 /叫我 设过的更碰不到。纯图片消息也带名字，所以放在正文判空之前。
+            if self._config.auto_nickname:
+                core.mood.auto_nickname(user_id, _sender_name(event))
+            text = (getattr(event, "message_str", "") or "").strip()
+            if not text:
+                return
             try:
                 umo = str(getattr(event, "unified_msg_origin", "") or "")
             except Exception:

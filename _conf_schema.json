@@ -1,79 +1,88 @@
 {
   "timezone_city": {
-    "description": "【时间】她所在的城市（她感知的当地时区，也是 /时间 的默认城市），如：北京、莫斯科、东京",
-    "hint": "表里没收录的城市可以直接填 IANA 时区名（如 Asia/Ho_Chi_Minh、America/New_York）。填了但生效不了时，/拟人诊断 的【时间与时区】会直说她现在按 AstrBot 这台机器的时间过日子——以前这里会静默退回北京时间，说在东京却过着北京的一天。",
+    "description": "她所在的城市",
+    "hint": "决定她感知的钟点、作息和天气默认城市，也是 /时间 的默认城市。如：北京、东京；表里没有的可直接填 IANA 时区名（Asia/Ho_Chi_Minh）。",
     "type": "string",
     "default": "河源（记得改~）"
   },
   "schedule_use_persona": {
-    "description": "【日程】生成日程时直接读取 AstrBot 当前生效的人格设定（她在这个会话里本来就是谁，日程就照那个人排）。关掉后只按插件内的通用偏好排。",
+    "description": "日程按人设排",
+    "hint": "开：排日程时读取 AstrBot 当前生效的人格，她是谁就照谁排；关：只按下面「日程补充偏好」中性地排。",
     "type": "bool",
     "default": true
   },
   "use_llm_schedule": {
-    "description": "【日程】开启后由大模型动态排日程：每 15 分钟一个决策窗，这一段过完了、身体跟手上的事打架、或掷中变动概率时，才让模型看着她当时的身体数值决定下一段；关闭则完全按身体与钟点本地现算（不调模型）",
+    "description": "大模型排日程",
+    "hint": "开：每 15 分钟一个决策窗，到点、身体报警或掷中「改主意概率」时让模型现排下一段；关：完全不叫模型，按身体与钟点本地现算。",
     "type": "bool",
     "default": true
   },
   "schedule_refresh_minutes": {
-    "description": "【日程】决策窗间隔（分钟）：每隔这么久掷一次骰子决定「生成或不生成」下一段。默认 15 分钟",
-    "hint": "不是「每隔多久重排一整天」——未来从不预排，每次只决定当前这一段。窗越密她越「活」，模型调用也越多。",
+    "description": "决策窗间隔(分)",
+    "hint": "每隔多久决定一次要不要重排下一段。调大省模型额度，调小她改主意更勤。默认 15。",
     "type": "int",
     "default": 15,
     "minimum": 1,
     "maximum": 1440
   },
   "schedule_change_chance": {
-    "description": "【日程】变动概率（%）：这一段还没做完、身体也没报警时，每个决策窗仍然重新排一段的概率——她临时改主意的频率",
-    "hint": "0 = 只在这一段做完或身体需要时才排（最省额度）；30 = 平均每三四个窗改一次主意；100 = 每个窗都重排（回到高频调用）。",
+    "description": "改主意概率(%)",
+    "hint": "上一段没做完、身体也没报警时仍重排一段的概率——她临时改主意的频率。0=只在到期/报警时排，100=每窗都重排。",
     "type": "int",
     "default": 30,
     "minimum": 0,
     "maximum": 100
   },
   "schedule_prompt_extra": {
-    "description": "【日程】补充偏好（均衡参考）：会认「仅供参考」递给模型，与人设和身体状态一起权衡，不是必须执行的指令。留空则完全由人设和身体状态决定",
-    "hint": "例如「劳逸结合，有动有静」或「偏爱户外」。它只是参考，模型会与人设和身体状态一起权衡。",
+    "description": "日程补充偏好",
+    "hint": "以「仅供参考」递给模型，与人设、身体状态一起权衡，不是必须执行的指令。留空则完全由人设和身体决定。",
     "type": "string",
     "default": "劳逸结合，有动有静，节奏均衡。"
   },
   "message_merge_enabled": {
-    "description": "【多消息合并】把短时间内连续触发机器人的多条消息合并成一次回复（默认开）",
+    "description": "多消息合并",
+    "hint": "短时间内连续触发机器人的几条消息并成一次回复：私聊同一人连发合成一条回，群聊多人连续@合成一条回。指令与纯图片/语音不参与。",
     "type": "bool",
-    "default": true,
-    "hint": "私聊把同一人的连发两三条合成一次回；群聊把多人连续 @ 机器人的消息合成一次回。只在防抖窗口内、且机器人还没开始回复时才合并；指令、纯图片/语音消息不受影响。合并后模型一次看到全部几条，回得更连贯，也省一部分模型请求。"
+    "default": true
   },
   "message_merge_window_seconds": {
-    "description": "【进阶】合并防抖窗口（秒）：收到一条会回复的消息后等多久看还有没有新消息一起并进来，默认 1.5",
+    "description": "合并等待(秒)",
+    "hint": "收到消息后等这么久，看还有没有新消息一起并进来；代价是每条回复都晚这么久。默认 1.5。",
     "type": "float",
     "default": 1.5,
-    "hint": "代价是每条回复都会晚这么久（即使它是孤消息）。想多抓连发就调大一点（如 2~2.5），想回得快就调小（如 0.8）；设 0 等于关闭合并。"
+    "minimum": 0,
+    "maximum": 30
   },
   "message_merge_max_count": {
-    "description": "【进阶】一批最多合并多少条：防刷屏把上下文撑爆，默认 6",
+    "description": "一批最多几条",
+    "hint": "防止刷屏把上下文撑爆，只保留最近这么多条。默认 6。",
     "type": "int",
     "default": 6,
-    "hint": "超过这个条数时只保留最近的几条并进回复。"
+    "minimum": 1,
+    "maximum": 50
   },
   "inject_activity_context": {
-    "description": "【聊天上下文】每轮往模型那边放多少事实（下拉：medium=默认，时间/称呼/身体/情绪/日程/记忆全给，full=再加详细日程与社交意愿，mood_only=只给最轻的一档）",
+    "description": "上下文给多少事实",
+    "hint": "medium=时间/称呼/身体/情绪/日程/记忆全给（默认）；full=再加详细日程与社交意愿；mood_only=只给最轻的一档。",
     "type": "string",
     "default": "medium",
     "options": [
       "full",
       "medium",
       "mood_only"
-    ],
-    "hint": "三档给的都是客观事实，没有任何「她此刻的感受」「这一轮该说多长」这类句子：写进上下文的句子模型不会当参考，只会当任务。身体、情绪、形式倾向照旧在算，只是留在 state.json 与联动契约里。"
+    ]
   },
   "inject_token_budget": {
-    "description": "【进阶】注入的 Token 硬预算：超了按显著度从低到高丢句，时间/称呼/场景这些必需品永不丢。默认 3500，不调也完全正常",
+    "description": "注入Token预算",
+    "hint": "事实块超预算时按显著度从低到高丢句，时间/称呼/场景这些必需品永不丢。默认 3500，不调也完全正常。",
     "type": "int",
     "default": 3500,
-    "hint": "按中日韩一字一 token 估算，与社交侧同口径。以后加维度也不会超预算——丢的永远是低显著度的句子。"
+    "minimum": 200,
+    "maximum": 20000
   },
   "environment_mode": {
-    "description": "【环境】生效范围（下拉选择：both=全部，private=仅私聊，group=仅群聊）",
+    "description": "生效范围",
+    "hint": "both=私聊+群聊都参与；private=仅私聊；group=仅群聊。范围外不注入、不记账、不自动认称呼。",
     "type": "string",
     "default": "both",
     "options": [
@@ -83,32 +92,40 @@
     ]
   },
   "admin_qq": {
-    "description": "【权限】管理员QQ列表（数组），仅管理员可使用重置日程等管理指令",
+    "description": "管理员QQ",
+    "hint": "名单里的 QQ 号可用 /拟人诊断、/拟人设置、/重置* 等管理指令；AstrBot 全局管理员自动拥有权限。",
     "type": "list",
     "default": []
   },
   "debug_mode": {
-    "description": "【调试】是否启用调试模式（输出详细日志，包括LLM请求/响应、情绪计算过程等）",
+    "description": "调试日志",
+    "hint": "输出模型请求/响应、注入字数、情绪计算过程等详细日志，排查问题用，平时可关。",
     "type": "bool",
     "default": false
   },
   "max_energy": {
-    "description": "【进阶】【生理】精力上限值 (默认 100)",
+    "description": "精力上限",
+    "hint": "她的精力条顶格值，默认 100。",
     "type": "float",
     "default": 100.0
   },
   "enable_cycle": {
-    "description": "【进阶】【生理】是否开启生理周期模拟",
+    "description": "生理周期",
+    "hint": "开：按周期调制精力恢复与情绪幅度；关：没有周期这回事。",
     "type": "bool",
     "default": true
   },
   "cycle_length": {
-    "description": "【进阶】【生理】生理周期总天数 (默认 28 天)",
+    "description": "周期天数",
+    "hint": "一轮生理周期的长度，默认 28 天。",
     "type": "int",
-    "default": 28
+    "default": 28,
+    "minimum": 1,
+    "maximum": 365
   },
   "energy_decay_rate": {
-    "description": "【进阶】【生理】精力变化速度倍率",
+    "description": "精力变化倍率",
+    "hint": "所有精力涨落速度的总乘数：越大越容易累、歇起来也快。",
     "type": "string",
     "default": "0.5",
     "options": [
@@ -119,7 +136,8 @@
     ]
   },
   "cycle_description_style": {
-    "description": "【进阶】【生理】周期描述风格（default=完整描述，simple=简洁描述）",
+    "description": "周期描述风格",
+    "hint": "default=完整描述，simple=简洁。只影响 /你的状态 等给人看的文案，不改行为。",
     "type": "string",
     "default": "default",
     "options": [
@@ -128,66 +146,68 @@
     ]
   },
   "schedule_provider_name": {
-    "description": "【进阶】【日程】指定生成日程的首选模型 Provider（下拉选择已配置的 Provider）",
-    "hint": "存的是 Provider ID。若填了不存在的 ID，插件会在日志里列出全部可用 ID，也可用 /拟人诊断 查看。",
+    "description": "日程首选模型",
+    "hint": "生成日程用的 Provider（下拉选已配置的）；留空用 AstrBot 全局默认模型。",
     "type": "string",
     "_special": "select_provider",
     "default": ""
   },
   "schedule_fallback_provider_name": {
-    "description": "【进阶】【日程】备用模型 Provider，首选模型「未找到 / 超时 / 报错」时自动切换",
-    "hint": "三种失败等价处理，都会切到备用模型。",
+    "description": "日程备用模型",
+    "hint": "首选「未找到/超时/报错」时自动切到这个。",
     "type": "string",
     "_special": "select_provider",
     "default": ""
   },
   "schedule_allow_global_fallback": {
-    "description": "【进阶】【日程/费用控制】首选和备用模型都失败时，是否回退到 AstrBot 全局默认模型",
-    "hint": "开启后链路为 首选 → 备用 → 全局默认 → 内置模板。关闭则跳过全局默认，直接用内置模板（可控成本，但配错 ID 时不易发现）。",
+    "description": "允许回退全局模型",
+    "hint": "首选和备用都失败时，要不要再试 AstrBot 全局默认模型。关=额度可控。",
     "type": "bool",
     "default": true
   },
   "schedule_retry_interval_seconds": {
-    "description": "【进阶】【日程】同一个模型多次尝试之间的等待秒数",
+    "description": "同模型重试间隔(秒)",
+    "hint": "同一个模型两次尝试之间歇多久。",
     "type": "int",
     "default": 2,
     "minimum": 0,
     "maximum": 600
   },
   "schedule_llm_timeout_seconds": {
-    "description": "【进阶】【日程】单次日程生成的超时秒数（超时按失败处理并切下一个模型）",
-    "hint": "调大可容纳较慢的模型；调小能更快落回内置模板。",
+    "description": "单次生成超时(秒)",
+    "hint": "一次日程生成最多等多久，超时按失败处理并切下一个模型。",
     "type": "int",
     "default": 60,
     "minimum": 10,
     "maximum": 300
   },
   "schedule_generation_max_attempts": {
-    "description": "【进阶】【日程】每个模型最多尝试几次（失败后才切下一个模型）",
+    "description": "每模型试几次",
+    "hint": "同一个模型失败几次才放弃切下一个。默认 2。",
     "type": "int",
     "default": 2,
     "minimum": 1,
     "maximum": 5
   },
   "schedule_max_slots": {
-    "description": "【进阶】【日程】一天最多保留多少段（含已过完的）。超出后丢最早的：太久之前的事她自己也记不清",
-    "hint": "动态日程一段一段累积，这个值只是当天记录的上限，不影响每段怎么排。",
+    "description": "当天最多留几段",
+    "hint": "含已过完的段，超出丢最早的——太久之前的事她自己也记不清。默认 96。",
     "type": "int",
     "default": 96,
     "minimum": 6,
     "maximum": 96
   },
   "schedule_provider_cooldown_minutes": {
-    "description": "【进阶】【日程】模型失败后的冷却分钟数，冷却期内直接跳过该模型",
-    "hint": "避免一个配错或挂掉的模型让之后每次生成都白等一轮超时。设为 0 表示不冷却。/重置日程 会绕过冷却。",
+    "description": "日程模型冷却(分)",
+    "hint": "模型失败后歇这么久，期间直接用本地现算，不反复砸模型。",
     "type": "int",
     "default": 30,
     "minimum": 0,
     "maximum": 1440
   },
   "schedule_time_granularity": {
-    "description": "【进阶】【日程】每一段起点时间的对齐粒度（15min = 对齐到一刻钟；flexible = 不要求对齐）",
-    "hint": "只约束每一段从哪个刻度开始；一段做多久由模型决定。",
+    "description": "段起点对齐",
+    "hint": "15min=每段起点对到一刻钟整点；flexible=不要求对齐。",
     "type": "string",
     "default": "15min",
     "options": [
@@ -201,249 +221,323 @@
     ]
   },
   "weather_enabled": {
-    "description": "【进阶】【天气】是否启用 OpenWeather 真实天气",
+    "description": "真实天气",
+    "hint": "开：接 OpenWeather API，她知冷知热；关：天气相关注入与身体影响全部消失。",
     "type": "bool",
     "default": true
   },
   "weather_api_key": {
-    "description": "【进阶】【天气】OpenWeather API Key (请填入 32 位密钥)",
+    "description": "天气API Key",
+    "hint": "OpenWeather 的 32 位密钥，免费档就够（注册即送）。",
     "type": "string",
     "default": ""
   },
   "weather_location": {
-    "description": "【进阶】【天气】目标城市，英文格式如 Beijing,CN。留空则直接用上面的时区城市（需为英文名）；两处城市不一致会导致她说自己在北京却报河源的天气",
+    "description": "天气城市(英文)",
+    "hint": "如 Beijing,CN。留空则跟上面「她所在的城市」走（需英文名）。两处不一致会「说在北京却报河源的天气」。",
     "type": "string",
     "default": ""
   },
   "weather_refresh_minutes": {
-    "description": "【进阶】【天气】天气刷新间隔分钟数 (默认 60)",
+    "description": "天气刷新(分)",
+    "hint": "多久重新拉一次天气数据。默认 60。",
     "type": "int",
-    "default": 60
+    "default": 60,
+    "minimum": 1,
+    "maximum": 1440
   },
   "enable_chat_awareness": {
-    "description": "【进阶】【聊天感知】开启后，AI能感知自己是在群聊还是私聊中与你对话",
+    "description": "群聊里提不提「有人看着」",
+    "hint": "开：群聊时除了说明这是群聊，还告诉她「周围还有人看着」；关：只说是群聊，不提旁人在场。两种情况下群聊/私聊本身都会给。",
     "type": "bool",
     "default": true
   },
   "show_city_time_in_low_intrusion": {
-    "description": "【进阶】【聊天上下文】要不要把「你在某城市」这句话也放进去（关掉只剩日期与钟点）",
+    "description": "提她在哪个城市",
+    "hint": "开：上下文里写「她在XX」；关：只剩日期与钟点，不提城市名。",
     "type": "bool",
-    "default": true,
-    "hint": "地名会按 IANA_DISPLAY_NAMES 翻成中文；UTC±HH:MM 这类偏移量只出现在 /时间 与 /拟人诊断 里，不进上下文。"
+    "default": true
   },
   "mood_enabled": {
-    "description": "【进阶】【情绪】是否开启情绪模拟（好感度/亲近欲/攻击性）",
+    "description": "情绪模拟",
+    "hint": "开：对每个人各自积累好感度/亲近欲/攻击性，说话热冷有差别；关：对谁都是一个样。",
     "type": "bool",
     "default": true
   },
   "mood_sensitivity": {
-    "description": "【进阶】【情绪】情绪变化敏感度 (0-100)，数值越高单次变化越大",
+    "description": "情绪敏感度",
+    "hint": "0-100：越高，一条消息激起的情绪波动越大。",
     "type": "int",
-    "default": 60
+    "default": 60,
+    "minimum": 0,
+    "maximum": 100
   },
   "mood_decay_hours": {
-    "description": "【进阶】【情绪】情绪衰减周期（小时），当前值回归基线所需时间",
+    "description": "情绪回缓周期",
+    "hint": "小时：情绪当前值花多久淡回基线。越大越「上头久」。",
     "type": "float",
-    "default": 6.0
+    "default": 6.0,
+    "minimum": 0.1,
+    "maximum": 720
   },
   "mood_initial_affection": {
-    "description": "【进阶】【情绪】新用户初始好感度 (0-100)",
+    "description": "初始好感",
+    "hint": "新面孔的起点好感度（0-100）。",
     "type": "int",
-    "default": 46
+    "default": 46,
+    "minimum": 0,
+    "maximum": 100
   },
   "mood_initial_libido": {
-    "description": "【进阶】【情绪】新用户初始亲近欲 (0-50)",
+    "description": "初始亲近欲",
+    "hint": "新面孔的起点亲近欲（0-50）。",
     "type": "int",
-    "default": 34
+    "default": 34,
+    "minimum": 0,
+    "maximum": 50
   },
   "mood_initial_aggression": {
-    "description": "【进阶】【情绪】新用户初始攻击性 (0-50)",
+    "description": "初始攻击性",
+    "hint": "新面孔的起点攻击性（0-50）。",
     "type": "int",
-    "default": 28
+    "default": 28,
+    "minimum": 0,
+    "maximum": 50
   },
   "mood_affection_override": {
-    "description": "【进阶】【情绪】指定好感（格式：3881756548:100,多个用英文逗号分隔）",
+    "description": "指定某人好感",
+    "hint": "格式 3881756548:100，多个用英文逗号分隔；钉死后不随聊天变化。",
     "type": "list",
     "default": []
   },
   "mood_affection_delta_cap": {
-    "description": "【进阶】【情绪】单次好感度变化上限 (1-10)，数值越低变化越平缓",
+    "description": "单次好感变化上限",
+    "hint": "1-10：越低，一条消息能带来的好感变化越小，感情升温越平缓。",
     "type": "int",
-    "default": 2
+    "default": 2,
+    "minimum": 1,
+    "maximum": 10
   },
   "mood_log_enabled": {
-    "description": "【进阶】【情绪日志】是否启用情绪波动事件记录",
+    "description": "情绪日志",
+    "hint": "记下明显的情绪波动事件，/情绪日志 可查，给「今天被TA气到了」这类延续感供料。",
     "type": "bool",
     "default": true
   },
   "mood_log_max_entries": {
-    "description": "【进阶】【情绪日志】每个用户最多保留的事件记录条数",
+    "description": "日志每人几条",
+    "hint": "超过丢最早的。默认 28。",
     "type": "int",
-    "default": 28
+    "default": 28,
+    "minimum": 1,
+    "maximum": 1000
   },
   "mood_log_threshold_affection": {
-    "description": "【进阶】【情绪日志】好感度变化多少时触发记录",
+    "description": "好感记录阈值",
+    "hint": "一次变化超过多少才值得记一条日志。",
     "type": "int",
-    "default": 2
+    "default": 2,
+    "minimum": 0,
+    "maximum": 100
   },
   "mood_log_threshold_libido": {
-    "description": "【进阶】【情绪日志】亲近欲变化多少时触发记录",
+    "description": "亲近记录阈值",
+    "hint": "同上，管亲近欲维度。",
     "type": "int",
-    "default": 2
+    "default": 2,
+    "minimum": 0,
+    "maximum": 50
   },
   "mood_log_threshold_aggression": {
-    "description": "【进阶】【情绪日志】攻击性变化多少时触发记录",
+    "description": "攻击记录阈值",
+    "hint": "同上，管攻击性维度。",
     "type": "int",
-    "default": 1
+    "default": 1,
+    "minimum": 0,
+    "maximum": 50
   },
   "mood_update_timeout": {
-    "description": "【进阶】【情绪】单次情绪更新请求超时时间（秒），数值越大越不容易超时",
+    "description": "情绪请求超时(秒)",
+    "hint": "单次模型情绪分析最多等多久；调大更不容易超时。",
     "type": "float",
-    "default": 120
+    "default": 120,
+    "minimum": 5,
+    "maximum": 600
   },
   "mood_tag_enabled": {
-    "description": "【进阶】【心情标签】是否生成可读的心情标签（如「有点疲惫，开心，想贴贴」），显示在 /情绪详情 里；同一状态有多种说法随机换",
+    "description": "心情标签",
+    "hint": "生成「有点疲惫，开心」这类可读标签，显示在 /情绪详情；同一状态有多种说法随机换。",
     "type": "bool",
-    "default": true,
-    "hint": "这个标签给人看，不进聊天上下文——上下文里只有时间、称呼与隔了多久。"
+    "default": true
   },
   "mood_use_llm_for_delta": {
-    "description": "【进阶】【情绪】是否用大模型分析单次对话的情绪变化（关闭后仅用本地词典规则，更可控、零额外调用）",
-    "hint": "开启后按 mood_llm_interval_messages 的间隔调模型，不是每条都调。想完全不花模型额度就关掉它。",
+    "description": "用模型分析情绪",
+    "hint": "开：定期让模型判断这条消息惹她开心还是生气，与本地词典加权融合；关：只走本地词典，零额外调用、更可控。",
     "type": "bool",
     "default": true
   },
   "mood_provider_name": {
-    "description": "【进阶】【情绪】情绪分析专用模型 Provider（留空则沿用日程模型链）",
-    "hint": "仅在上面的「使用 LLM 分析情绪变化」开启时生效。留空则与日程共用同一条模型链。",
+    "description": "情绪分析模型",
+    "hint": "情绪分析专用 Provider；留空沿用日程那条模型链。",
     "type": "string",
     "_special": "select_provider",
     "default": ""
   },
   "mood_provider_cooldown_minutes": {
-    "description": "【进阶】【情绪】情绪分析模型失败后的冷却分钟数，冷却期内直接跳过该模型（0 = 不冷却）",
-    "hint": "与日程的冷却各自记账：即使两边用的是同一个模型，情绪这边失败也不会影响日程生成，反之亦然。",
+    "description": "情绪模型冷却(分)",
+    "hint": "分析失败后歇这么久再试；0=不冷却。",
     "type": "int",
     "default": 5,
     "minimum": 0,
     "maximum": 1440
   },
   "mood_llm_interval_messages": {
-    "description": "【进阶】【情绪】每个用户各自每多少条消息用模型分析一次（其余消息只走本地词典规则）。注意是按人算的：10 个人各自满 5 条就是 10 次请求，不是全局每 5 条一次。",
-    "hint": "人多时想省调用就把这个值调大，或直接用上面的开关关掉模型分析。",
+    "description": "每几条分析一次",
+    "hint": "按人各自计数：每人满这么多条才用模型分析一次，其余只走本地词典。注意是按人算的：10 人各满 5 条=10 次请求，不是全局一次。",
     "type": "int",
     "default": 5,
     "minimum": 1,
     "maximum": 100
   },
   "mood_verbose_log": {
-    "description": "【进阶】【情绪】是否打印情绪分析的消息计数日志（默认关闭，避免刷屏）",
-    "hint": "只控制「消息计数 N/M，将调用LLM/不调用」这一行。",
+    "description": "情绪计数日志",
+    "hint": "打印每人攒了几条待分析，排查用；平时关着避免刷屏。",
     "type": "bool",
     "default": false
   },
   "mood_enabled_in_group": {
-    "description": "【进阶】【情绪】是否在群聊中启用情绪系统（私聊始终生效）",
-    "hint": "开启后群内每个成员各自积累情绪；关闭则群消息完全不碰情绪。",
+    "description": "群聊也算情绪",
+    "hint": "关：群消息不做情绪分析（私聊始终生效）；开：群里每人各自积累好感。话痨群慎开，模型调用按比例涨。",
     "type": "bool",
     "default": false
   },
   "mood_data_retention_days": {
-    "description": "【进阶】【情绪】情绪数据保留天数，超过这个天数没说话的用户数据会被自动清理（0 = 永不清理）",
-    "hint": "会一并删掉该用户的情绪档案、情绪日志、心情标签和上一条消息记录；用户自己设定的昵称会保留。",
+    "description": "情绪数据保留(天)",
+    "hint": "超过这么多天没说话的人，情绪档案清回初始值（称呼与来源保留）。0=永不清理。",
     "type": "int",
     "default": 7,
     "minimum": 0,
     "maximum": 365
   },
+  "auto_nickname": {
+    "description": "自动认定称呼",
+    "hint": "这人还没有任何称呼时，从消息自带的名字认一次怎么叫TA：群聊优先群名片，私聊认QQ昵称。门槛很高：含数字/空格/emoji/装饰括号/占位词一律不认，宁缺勿错。认过或 /叫我 设过之后永不改动（含重启后），唯一例外是用户自己重新 /叫我。关掉也不追问名字，只是不带称呼。",
+    "type": "bool",
+    "default": true
+  },
   "social_energy_enabled": {
-    "description": "【进阶】【社交能量】是否开启社交能量（影响回复热情）",
+    "description": "社交能量",
+    "hint": "开：陪聊耗电、闲时回血，电量影响她回话的热忱与主动性。关掉后注入与 /你的状态 都不再提社交能量（联动契约里仍带这个值，以兼容已装的社交层）。",
     "type": "bool",
     "default": true
   },
   "social_energy_consumption_per_msg": {
-    "description": "【进阶】【社交能量】每条消息消耗的社交能量值 (0.05~1.0)。值越小越耐聊，高频聊天场景选 0.05",
+    "description": "每条消息耗能",
+    "hint": "0.05~1.0：越小越耐聊。高频聊天场景建议 0.05。",
     "type": "float",
-    "default": 0.05
+    "default": 0.05,
+    "minimum": 0,
+    "maximum": 100
   },
   "social_energy_recovery_per_minute": {
-    "description": "【进阶】【社交能量】每分钟恢复的社交能量值 (0.1~3.0)",
+    "description": "每分钟回血",
+    "hint": "0.1~3.0：越大，冷场后越快缓过来。",
     "type": "float",
-    "default": 1.5
+    "default": 1.5,
+    "minimum": 0,
+    "maximum": 100
   },
   "social_energy_reset_hour": {
-    "description": "【进阶】【社交能量】每天重置社交能量的小时 (0-23)，设为 -1 则不重置",
+    "description": "每日重置钟点",
+    "hint": "0-23：每天到这个点电量重置回满；-1=不按天重置，只按分钟慢慢回。",
     "type": "int",
-    "default": 0
+    "default": 0,
+    "minimum": -1,
+    "maximum": 23
   },
   "social_energy_recovery_interval_seconds": {
-    "description": "【进阶】【社交能量】恢复间隔（秒），范围 60~300",
+    "description": "回血检查间隔(秒)",
+    "hint": "多久结算一次恢复量，范围 60~300。",
     "type": "int",
-    "default": 60
+    "default": 60,
+    "minimum": 60,
+    "maximum": 300
   },
   "night_mode_enabled": {
-    "description": "【进阶】【夜间模式】是否启用「生物钟夜」。关掉后不再记睡眠债，昼夜低谷也失去位置",
-    "hint": "这一组时间说的是她的昼夜节律（哪段时间算夜里），不是「她实际在睡的那几个小时」——后者由日程决定。v2.16 起夜间不再往聊天里注入任何句子：她睡着时被吵到怎么回，是她自己的事。",
+    "description": "生物钟夜",
+    "hint": "她生理上的「夜里」：这段时间醒着记睡眠债、白天低谷的位置也由它锚定。关掉则不记债、低谷失去参照。",
     "type": "bool",
     "default": true
   },
   "night_start_hour": {
-    "description": "【进阶】【夜间模式】生物钟夜从几点开始 (0-23)：这段时间醒着会欠睡眠债，昼夜低谷也摆在这段里。她实际几点睡由日程决定，不由此项决定",
-    "hint": "与结束小时跨午夜很正常（23 → 6）。睡眠债的记账边界、昼夜低谷的位置都从这里推。",
+    "description": "夜里从几点起",
+    "hint": "0-23。注意：她实际几点睡由日程决定，不由这项决定——这项管的是生物钟。",
     "type": "int",
-    "default": 23
+    "default": 23,
+    "minimum": 0,
+    "maximum": 23
   },
   "night_end_hour": {
-    "description": "【进阶】【夜间模式】生物钟夜到几点结束 (0-23)。开着「日程贴合作息」时，睡眠区间会被要求排到这个点结束；关掉则由模型按人设决定",
-    "hint": "这只是生物钟夜的边界，不是闹钟：她几点醒由日程里睡眠时段排到几点决定。",
+    "description": "夜里到几点止",
+    "hint": "0-23。开了「作息贴夜间窗口」时睡眠会要求排到这个点结束；关着则模型按人设定。",
     "type": "int",
-    "default": 6
+    "default": 6,
+    "minimum": 0,
+    "maximum": 23
   },
   "show_sleep_window": {
-    "description": "【进阶】【夜间模式】上下文里要不要写「这会儿是她的睡眠时段」这条事实",
-    "hint": "关掉只是不再提这条事实：她的身体照算（困意、睡眠债、昼夜低谷都在算），社交层也照样看得到她在睡觉。插件不会因为这条就少回、短回或者不回——回不回、说多长从来不是插件该定的事。",
+    "description": "提不提睡眠这件事",
+    "hint": "开：上下文里写「这会儿是她的睡眠时段」，她真睡着了再写「她这会儿在睡」；关：这两句都不提，身体照算不误。",
     "type": "bool",
     "default": true
   },
   "night_deep_sleep_ratio": {
-    "description": "【进阶】【夜间模式】深度睡眠占整个夜间时长的比例（0.1~1.0），剩下的是浅睡/半醒",
-    "hint": "1.0 = 整夜都是深睡，0.1 = 几乎全程浅睡。",
+    "description": "深睡占比",
+    "hint": "0.1~1.0：夜间窗口里深度睡眠的比例，剩下的按浅睡/半醒算。",
     "type": "float",
     "default": 0.5,
     "minimum": 0.1,
     "maximum": 1.0
   },
   "holidays": {
-    "description": "【进阶】【节日】自定义节日列表，格式：[{\"date\": \"YYYY-MM-DD\", \"name\": \"节日名\"}]，内置公历节日自动识别",
+    "description": "自定义节日",
+    "hint": "格式 [{\"date\":\"YYYY-MM-DD\",\"name\":\"节日名\"}]。公历法定节日自动识别，这里补她自己的日子（生日、纪念日）。",
     "type": "list",
     "default": []
   },
   "enable_energy_natural_recovery": {
-    "description": "【进阶】【精力】是否启用自然恢复（仅在日程处于休息类时段时生效）",
-    "hint": "只在日程处于睡眠/休息类时段（energy_rate ≥ 0）时叠加。",
+    "description": "精力自然恢复",
+    "hint": "开：日程处于休息类时段时慢慢回血。",
     "type": "bool",
     "default": true
   },
   "energy_natural_recovery_per_minute": {
-    "description": "【进阶】【精力】每分钟自然恢复的精力值（0.05~0.9）",
+    "description": "每分钟恢复量",
+    "hint": "休息时段每分钟涨多少精力，0.05~0.9。",
     "type": "float",
-    "default": 0.15
+    "default": 0.15,
+    "minimum": 0,
+    "maximum": 100
   },
   "energy_natural_recovery_interval_minutes": {
-    "description": "【进阶】【精力】自然恢复的最小计费间隔（分钟）。不足一个间隔的休息时间不计入自然恢复",
-    "hint": "例如设为 30，则一次休息里只有满 30 分钟的整段才计入自然恢复，零头忽略。",
+    "description": "恢复计费间隔(分)",
+    "hint": "不足一个间隔的碎片休息不结算，防「躺 3 分钟回一半」。",
     "type": "int",
     "default": 1,
     "minimum": 1,
     "maximum": 1440
   },
   "energy_consumption_per_msg": {
-    "description": "【进阶】【精力】每次聊天消耗的精力值（0.01~0.9）",
+    "description": "聊天耗精力",
+    "hint": "每来一条消息掉多少精力，0.01~0.9。",
     "type": "float",
-    "default": 0.04
+    "default": 0.04,
+    "minimum": 0,
+    "maximum": 100
   },
   "energy_recovery_phase_multipliers": {
-    "description": "【进阶】【精力】生理周期各阶段恢复倍率，顺序：经期、卵泡期、排卵期、黄体早期、黄体晚期、经前期",
+    "description": "周期各段恢复倍率",
+    "hint": "6 个数按顺序对应：经期、卵泡期、排卵期、黄体早期、黄体晚期、经前期。1.0=正常。",
     "type": "list",
     "default": [
       0.5,
@@ -455,24 +549,24 @@
     ]
   },
   "state_flush_interval_seconds": {
-    "description": "【进阶】【性能】状态文件的合并写盘间隔（秒）",
-    "hint": "一个间隔内的所有改动合并成一次写入。调大更省磁盘 IO，调小则崩溃时丢失的状态更少。",
+    "description": "写盘间隔(秒)",
+    "hint": "状态文件的最小落盘间隔。越小断电丢得越少、IO 越多。默认 5。",
     "type": "int",
     "default": 5,
     "minimum": 1,
     "maximum": 60
   },
   "last_interaction_threshold_minutes": {
-    "description": "【进阶】【对话间隔】距离上次对话超过多少分钟，才开始记录并告知模型（默认5分钟）",
-    "hint": "设为 0 则每次都记录。算的是「上一次触发回复」到现在。第一次对话没有历史，不会出现这段提示。",
+    "description": "隔多久算好久没聊",
+    "hint": "超过这么多分钟，上下文里才告诉她「TA 多久没吭声了」。默认 5。最低就 5 分钟（间隔句子从 5 分钟一档开始），配更小也只能按 5 分钟生效。",
     "type": "int",
     "default": 5,
     "minimum": 0,
     "maximum": 1440
   },
   "last_interaction_mode": {
-    "description": "【进阶】【对话间隔】隔了一段时间后怎么报：simple=只报隔了多久；with_last_msg=同时给出TA离开前说的最后一句话，方便自然接上话头",
-    "hint": "两种都只给事实（隔了多久、原话是什么），不写「要主动问起」这类指令，怎么接出她自己决定。",
+    "description": "间隔怎么报",
+    "hint": "simple=只报隔了多久；with_last_msg=附上TA离开前的最后一句话，方便自然接话头。",
     "type": "string",
     "default": "with_last_msg",
     "options": [
@@ -481,85 +575,96 @@
     ]
   },
   "process_min_duration": {
-    "description": "【进阶】【过程】过程最小持续时间（分钟），避免频繁切换",
+    "description": "过程最短持续(分)",
+    "hint": "「她手上正在做的那件事」最少挂多久，防频繁跳变。",
     "type": "int",
     "default": 15,
     "minimum": 5,
     "maximum": 60
   },
   "process_max_duration": {
-    "description": "【进阶】【过程】过程最大持续时间（分钟）",
+    "description": "过程最长持续(分)",
+    "hint": "超过这个时长强制换下一件，防一件事挂一整天。",
     "type": "int",
     "default": 90,
     "minimum": 30,
     "maximum": 240
   },
   "process_auto_update": {
-    "description": "【进阶】【过程】是否自动更新过期过程",
+    "description": "自动更新过程",
+    "hint": "当前过程过期就自动换新的；关：留在原地直到日程换段。",
     "type": "bool",
     "default": true
   },
   "process_history_limit": {
-    "description": "【进阶】【过程】过程历史保留条数（0 表示不保留）。用于「最近做过什么」的延续感",
+    "description": "过程历史条数",
+    "hint": "留几条「最近做过什么」供延续感；0=不留。",
     "type": "int",
     "default": 5,
     "minimum": 0,
     "maximum": 20
   },
   "soma_enabled": {
-    "description": "【进阶】【身体】启用多轴生理层：睡眠压力、睡眠债、昼夜节律、饥饿、久坐与躯体不适、唤醒度、想说话的程度",
+    "description": "多轴身体",
+    "hint": "一整层生理模拟：睡眠压力/睡眠债/昼夜节律/饥饿/久坐发僵/唤醒度/说话欲。关：只剩精力一个数。",
     "type": "bool",
     "default": true
   },
   "body_tick_seconds": {
-    "description": "【进阶】【身体】身体自行推进的间隔秒数。不依赖用户发消息，没人聊天时她也会变困变饿",
+    "description": "身体推进间隔(秒)",
+    "hint": "没人找她她也会变困变饿——多久结算一次。默认 60。",
     "type": "int",
     "default": 60,
     "minimum": 15,
     "maximum": 600
   },
   "sleep_need_hours": {
-    "description": "【进阶】【身体】一晚该睡多久（小时）。睡够这个时长刚好把一夜的困意清干净",
-    "hint": "三处同时生效：睡着时困意的清除速率 = 100/本值；该睡而醒着时欠的债按 本值/夜间窗口长度 放大（窗口比需要的睡眠短，熬一夜更伤）；开着「日程贴合作息」时也会告诉模型她一晚要睡这么久。",
+    "description": "一晚该睡多久",
+    "hint": "小时：睡够这个数刚好把一夜的困意清干净；熬夜欠的债按它放大。",
     "type": "float",
     "default": 8.0,
     "minimum": 3.0,
     "maximum": 14.0
   },
   "schedule_follow_night_window": {
-    "description": "【进阶】【日程】把她的作息锁到你设的夜间窗口上",
-    "hint": "默认关。作息由她是谁决定：夜猫子人格凌晨 4 点睡 11 点起是合理的，她的身体节律（昼夜低谷、睡眠债记账边界）跟着她的日程走。打开后，每次决定下一段时都会把「这个窗口内必须是睡眠」作为硬约束递给模型。",
+    "description": "作息贴夜间窗口",
+    "hint": "硬覆盖：把她的睡眠强制切到你设的夜间窗口。默认关——作息由人设和日程决定。",
     "type": "bool",
     "default": false
   },
   "meal_interval_hours": {
-    "description": "【进阶】【身体】多久不吃东西算饿到位（小时）。日程里写着用餐的时段会自动消化饥饿度",
+    "description": "多久不吃算饿",
+    "hint": "小时：超过就饿到位。日程里写着用餐的时段会自动把饥饿度消化掉。",
     "type": "float",
     "default": 4.5,
     "minimum": 1.5,
     "maximum": 12.0
   },
   "sitting_discomfort_minutes": {
-    "description": "【进阶】【身体】连续坐多久开始肩颈发僵（分钟）。日程里写着运动/通勤/家务的时段不算久坐",
+    "description": "坐多久开始僵",
+    "hint": "分钟：连续久坐超过这个点肩颈开始发僵；日程里的运动/通勤/家务时段不算久坐。",
     "type": "int",
     "default": 90,
     "minimum": 15,
     "maximum": 600
   },
   "desire_refill_hours": {
-    "description": "【进阶】【身体】独处多久会把「想找人说说话」攒到位（小时，越短越爱找人）。聊过之后泄掉一半以上；接近上限时涨得越来越慢，不会长期顶格",
+    "description": "独处多久想说话",
+    "hint": "小时：越短越爱找人。聊过一轮会泄掉大半；接近上限时涨得越来越慢，不会长期顶格。",
     "type": "float",
     "default": 12.0,
     "minimum": 0.5,
     "maximum": 72.0
   },
   "weather_affects_body": {
-    "description": "【进阶】【身体】天气的冷热计入躯体不适（需要天气可用）",
+    "description": "冷热算进身体",
+    "hint": "天气的冷热计入躯体不适轴（需要天气功能可用）。",
     "type": "bool",
     "default": true
   },
   "contract_enabled": {
-    "description": "【进阶】【联动】把身体状态导出成带版本号的契约快照，供「自主拟人社交」读取她想说话的程度。没装那个插件也不影响运行",
+    "description": "导出契约给社交层",
+    "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度。没装那个插件开着也无害。",
     "type": "bool",
     "default": true
   }

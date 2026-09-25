@@ -16,6 +16,15 @@ MIN_KEY_LENGTH = 10
 REQUEST_TIMEOUT = 10.0
 FetchJson = Callable[[str, float], Awaitable[dict[str, Any]]]
 
+# 还没拿到真天气时 snapshot() 给的是「为什么没有天气」的说明书。这类句子是给主人
+# 看的，不能当状态递出去：模型与社交层会把它当成一句天气话接着说。
+NOTICE_WORDS = ("未填", "未开启", "获取中", "没配天气")
+
+
+def is_notice(text: str) -> bool:
+    """这句是配置说明书还是真天气。"""
+    return any(word in text for word in NOTICE_WORDS)
+
 
 def build_url(location: str, api_key: str) -> str:
     return f"{API_URL}?q={quote(location)}&appid={quote(api_key)}&units=metric&lang=zh_cn"
@@ -67,7 +76,8 @@ class WeatherService:
     def snapshot(self) -> dict[str, str]:
         cfg = self.config
         if not cfg.weather_enabled:
-            return {"weather": "晴朗 ☀️", "env": "天气未开启"}
+            # 没取到天气就是没天气：报「晴朗 ☀️」是插件替她编了一句瞎话。
+            return {"weather": "", "env": "天气未开启"}
         location = self.effective_location()
         if not location:
             return {
@@ -75,11 +85,11 @@ class WeatherService:
                 "env": "没配天气城市：把 weather_location 或 timezone_city 填成英文名+国家码（如 Beijing,CN）",
             }
         if len(cfg.weather_api_key) < MIN_KEY_LENGTH:
-            return {"weather": "晴朗 ☀️", "env": f"当前城市 [{location}]（未填 API Key）"}
+            return {"weather": "", "env": f"当前城市 [{location}]（未填 API Key）"}
         cached = self._scope.get_self("_cached_weather_obj")
         if isinstance(cached, dict) and self._scope.get_self("_cached_location") == location:
             return dict(cached)
-        return {"weather": "晴朗 ☀️", "env": f"当前城市 [{location}]（获取中）"}
+        return {"weather": "", "env": f"当前城市 [{location}]（获取中）"}
 
     def is_stale(self) -> bool:
         cfg = self.config

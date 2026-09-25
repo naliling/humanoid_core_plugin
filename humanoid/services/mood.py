@@ -34,10 +34,59 @@ DIMENSIONS = (
     ("aggression", "base_aggression", AGGRESSION_RANGE),
 )
 
-# 长期不活跃用户会被丢掉的历史字段。nickname 故意保留：那是用户自己让 bot 怎么称呼自己，
-# 丢了会当场改变说话方式；last_interaction 也保留，它是下次判定过期的依据。
+# 长期不活跃用户会被丢掉的历史字段。nickname/nickname_src 故意保留：那是用户自己让 bot
+# 怎么称呼自己（或是自动认定后不再改口的依据），丢了会当场改变说话方式；last_interaction
+# 也保留，它是下次判定过期的依据。
 # mood 删掉即可：profile() 会用配置里的初始值重建，正是文档承诺的「好感度清回初始值」。
 RETENTION_DROPPED_FIELDS = ("mood", "mood_logs", "mood_tag", "last_message", "said")
+
+# 自动认定称呼的硬性门槛：来源是消息带的名字（群聊是群名片、私聊是 QQ 昵称），
+# 都是用户随手可改的东西——宁缺勿滥：叫错人比不称呼难看得多，认不上就一个都不认。
+_AUTO_NICK_REJECT_EXACT = {
+    "n/a", "na", "null", "none", "unknown", "user", "匿名", "未设置",
+    "未命名", "默认", "默认昵称", "新朋友", "新用户", "该用户", "名字", "游客",
+    "abc", "abcd", "test", "qwq", "orz", "emmm", "aaa", "qq", "wx", "lol",
+    "xx", "sb", "nb", "cv", "你好", "在吗", "哈哈",
+}
+# 名字里出现这些词的基本是身份/角色标注或系统占位（已注销用户、XX管理员、测试号），不是拿来叫人的
+_AUTO_NICK_REJECT_SUBSTR = (
+    "注销", "未命名", "默认", "管理员", "机器人", "群主", "成员",
+    "通知", "公告", "用户", "客服", "助手", "游客", "匿名", "名字", "重置", "昵称", "测试",
+)
+# 只放汉字与基本拉丁字母加少量名字里真会用的连接符：数字、下划线、emoji、括号装饰
+# （【】（）★彡这类）一律进不来，带数字的名片也就进不来。
+_AUTO_NICK_ALLOWED = re.compile(r"[A-Za-z\u4e00-\u9fff\u00b7\u30fb\-\u2010-\u2015.．]+")
+_AUTO_NICK_HAS_LETTER = re.compile(r"[A-Za-z\u4e00-\u9fff]")
+_AUTO_NICK_LATIN_ONLY = re.compile(r"[A-Za-z]+")
+_AUTO_NICK_EDGE_PUNCT = "·・-‐‑‒–—．."
+
+
+def validate_auto_nickname(candidate: str) -> str:
+    """自动认定的名字校验：过得了全部规则才返回名字，否则返回空（不认定）。
+
+    宁可一个都不认：单字不足以确认身份；含任何数字/下划线/emoji/装饰括号的名片不认；
+    纯字母名至少 3 位（AB 这种缩写不算名）；首尾挂标点的是昵称装饰不是名字；
+    身份/角色词与颜文字直接拒。"""
+    name = (candidate or "").strip()
+    if not (2 <= len(name) <= 12):
+        return ""
+    if any(ch.isspace() for ch in name):
+        return ""
+    if name.lower() in _AUTO_NICK_REJECT_EXACT:
+        return ""
+    if any(word in name for word in _AUTO_NICK_REJECT_SUBSTR):
+        return ""
+    if not _AUTO_NICK_HAS_LETTER.search(name):
+        return ""
+    if not _AUTO_NICK_ALLOWED.fullmatch(name):
+        return ""
+    if _AUTO_NICK_LATIN_ONLY.fullmatch(name) and len(name) < 3:
+        return ""  # 两个拉丁字母多半是缩写/占位，不当名字
+    if name[0] in _AUTO_NICK_EDGE_PUNCT or name[-1] in _AUTO_NICK_EDGE_PUNCT:
+        return ""
+    if "--" in name or ".." in name:
+        return ""
+    return name
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,16 +298,39 @@ class MoodService:
             sentence = "昨天" + sentence[2:]
         return sentence, age_hours
 
-    def set_nickname(self, user_id: str, nickname: str) -> str:
+    def set_nickname(self, user_id: str, nickname: str, src: str = "user") -> str:
         self._scope.set_user(user_id, "nickname", nickname)
+        self._scope.set_user(user_id, "nickname_src", src)
         return nickname
 
-    def all_nicknames(self) -> dict[str, str]:
+    def nickname_source(self, user_id: str) -> str:
+        """称呼的来路：user=用户自己设的，auto=自动认定的，""=还没有称呼。
+
+        自动认定上线之前的称呼只可能来自 /叫我，没记来源的老数据按 user 算。"""
+        if not self._scope.get_user(user_id, "nickname", ""):
+            return ""
+        src = str(self._scope.get_user(user_id, "nickname_src", "") or "")
+        return src if src in ("user", "auto") else "user"
+
+    def auto_nickname(self, user_id: str, candidate: str) -> str:
+        """自动认定称呼：只在「还没有任何称呼」时填一次，认过之后永不改动。
+
+        已有称呼（用户 /叫我 设的、或早先自动认定的）一律不碰；候选名过不了
+        validate_auto_nickname 的高门槛也不认。返回真正认定的名字，没认定返回空。"""
+        if self._scope.get_user(user_id, "nickname", ""):
+            return ""
+        name = validate_auto_nickname(candidate)
+        if not name:
+            return ""
+        return self.set_nickname(user_id, name, src="auto")
+
+    def all_nicknames(self) -> dict[str, tuple[str, str]]:
+        """所有有称呼的用户：uid -> (称呼, 来源)。来源 user=自己设的，auto=自动认定的。"""
         result = {}
         for uid in self._scope.all_user_ids():
             name = self._scope.get_user(uid, "nickname")
             if name:
-                result[uid] = name
+                result[uid] = (name, self.nickname_source(uid))
         return result
 
     def decay_user(self, user_id: str) -> bool:

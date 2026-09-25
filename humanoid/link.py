@@ -114,7 +114,8 @@ def build_contract(core: Any) -> dict[str, Any]:
         "persona": str(core.schedule.status().get("persona", "") or ""),
         # 作息：社交层靠它知道她睡够没睡够，诊断靠它提示两套时间不一致。
         "routine": _routine_block(core, cfg, slots),
-        "weather": str((snap.get("weather") or {}).get("env", "")),
+        # 天气只递真天气：没配 Key 时那句「为什么没有」是给她主人看的，社交层拿到只会照着说。
+        "weather": _contract_weather(snap.get("weather")),
         # 契约里没有按用户的数据（1000 人时会把文件撑大）；这些路径是稳定承诺。
         "paths": {
             "user_affection": "roles.<bid>.users.<uid>.mood.affection",
@@ -123,6 +124,15 @@ def build_contract(core: Any) -> dict[str, Any]:
             "user_said": "roles.<bid>.users.<uid>.said",
         },
     }
+
+
+def _contract_weather(weather: Any) -> str:
+    """契约里的天气：拿到真天气才有值，配置说明书导出空串。"""
+
+    from .services.weather import is_notice
+
+    env = str((weather or {}).get("env", "") or "").strip()
+    return "" if not env or is_notice(env) else env
 
 
 def _routine_block(core, cfg, slots) -> dict:

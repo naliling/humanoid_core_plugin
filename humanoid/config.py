@@ -18,7 +18,7 @@ GRANULARITY_MINUTES: dict[str, int] = {
     "hourly": 60,
 }
 
-INJECT_MODES = ("full", "low", "mood_only")
+INJECT_MODES = ("medium", "full", "mood_only")
 ENVIRONMENT_MODES = ("both", "private", "group")
 CYCLE_STYLES = ("default", "simple")
 LAST_INTERACTION_MODES = ("simple", "with_last_msg")
@@ -213,6 +213,9 @@ class HumanoidConfig:
     mood_verbose_log: bool = False
     mood_enabled_in_group: bool = False
     mood_data_retention_days: int = 7
+    # 自动认定称呼：用户还没设过称呼时，从消息带的名字（群聊优先群名片）认一次怎么叫 TA。
+    # 只填空白、门槛很严、认过之后永不改动——用户 /叫我 设的更不会被它碰。
+    auto_nickname: bool = True
 
     social_energy_enabled: bool = True
     social_energy_consumption_per_msg: float = 0.05
@@ -325,6 +328,7 @@ class HumanoidConfig:
             message_merge_window_seconds=f("message_merge_window_seconds", 0.0, 30.0),
             message_merge_max_count=i("message_merge_max_count", 1, 50),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
+            inject_token_budget=i("inject_token_budget", 200, 20000),
             environment_mode=c("environment_mode", ENVIRONMENT_MODES),
             enable_chat_awareness=b("enable_chat_awareness"),
             show_city_time_in_low_intrusion=b("show_city_time_in_low_intrusion"),
@@ -351,6 +355,7 @@ class HumanoidConfig:
             mood_verbose_log=b("mood_verbose_log"),
             mood_enabled_in_group=b("mood_enabled_in_group"),
             mood_data_retention_days=i("mood_data_retention_days", 0, 365),
+            auto_nickname=b("auto_nickname"),
             social_energy_enabled=b("social_energy_enabled"),
             social_energy_consumption_per_msg=f("social_energy_consumption_per_msg", 0.0, 100.0),
             social_energy_recovery_per_minute=f("social_energy_recovery_per_minute", 0.0, 100.0),

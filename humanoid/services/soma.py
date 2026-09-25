@@ -484,7 +484,7 @@ class SomaService:
             say("debt", debt, 1.0, 5.0, 0.85)
 
         if snap["asleep"] >= 1.0:
-            out.append((0.9, "这会儿她在睡"))
+            out.append((0.9, "这会儿在睡"))
 
         say("hunger", snap["hunger"], 55.0, 45.0, 0.8)
 

@@ -46,9 +46,8 @@ FRAMING_TEXT = (
     "自然融入即可，无需刻意提及或逐条回应；如何回应、说什么、说多长，由她自己判断。"
 )
 
-# 注入块的硬长度上限（字符）。每条聊天请求都追加一次，所以它必须是个定值而不是
-# 「看拼出来多少」；超限时按块边界丢，绝不从句子中间硬截（截在半句上模型会自己补下去）。
-# 注入的硬预算走 cfg.inject_token_budget（Token），字符上限不再单独设。
+# 注入块的尺寸红线（字符）：只给测试用，防止哪天拼装逻辑把注入胀到几千字。
+# 运行时的限额走 cfg.inject_token_budget（超了按显著度整句丢），不存在按字符硬截。
 INJECT_MAX_CHARS = {"medium": 2000, "full": 3000, "mood_only": 500}
 
 
@@ -194,8 +193,14 @@ class PromptBuilder:
         except Exception:
             return []
         picked = [item for item in feelings if item[0] >= threshold]
+        if not self.config.show_sleep_window:
+            # 「她这会儿在睡」也是睡眠信息：关掉不提睡眠时段，就不能换句话又说她在睡。
+            picked = [item for item in picked if "在睡" not in item[1]]
         picked.sort(key=lambda item: item[0], reverse=True)
-        return [f"她{text}" for _, text in picked[:max_items]]
+        # 体感句一律披上主语，但 soma 自己带主语的整句不能再披一遍。
+        return [
+            text if text.startswith("她") else f"她{text}" for _, text in picked[:max_items]
+        ]
 
     def _night_lines(self) -> List[str]:
         """夜间/午睡：只报身体与日程的事实，不编细节、不管她怎么回。
@@ -215,7 +220,8 @@ class PromptBuilder:
                 snap = {}
             if float(snap.get("asleep", 0.0)) >= 1.0:
                 return []
-            lines.append("这会儿她在睡")
+            # 到点了但还醒着：说「她在睡」是假话，熬夜的人这个点正精神。
+            lines.append("这会儿是她的睡眠时段")
         else:
             lines.append("这会儿是她的夜间作息")
         return lines
@@ -382,12 +388,15 @@ class PromptBuilder:
 
     @staticmethod
     def _day_prose(lines: List[str]) -> List[str]:
-        """把 day_lines 的清单头削成自然句：她今天到这会上午在改海报，现在在跟客户过方案。"""
+        """把 day_lines 的清单头削成自然句：她今天上午在改海报，现在在跟客户过方案。
+
+        不写「今天到这会」：时段词本身就在每一项里（「下午在吃午饭」），加上去反而成了
+        「今天到这会下午在吃午饭」这种不像人话的句子，而模型会照抄。"""
         out: List[str] = []
         for line in lines:
             body = str(line).split("：", 1)[-1].replace("；", "，")
             if body:
-                out.append(f"她今天到这会{body}")
+                out.append(f"她今天{body}")
         return out
 
     def _memory_lines(self, user_id: str, detailed: bool) -> List[str]:
@@ -401,19 +410,22 @@ class PromptBuilder:
     def _nickname_line(self, user_id: str, is_group: bool) -> str:
         """称呼：必需品，不受情绪开关影响——用户自己设的称呼，任何档位都不能丢。
 
-        没记下过就说没记下，而不是不提——真人会想「我还不知道叫你什么」。"""
+        没记下称呼就整行不提：旧版写「还没问过TA叫什么」，模型把它当成待办，
+        逢人就追问名字。现在没名字就只叫「TA」，要名字交给自动认定去拿。"""
         try:
             nickname = self._core.mood.nickname(user_id)
         except Exception:
             return ""
-        return f"你管TA叫{nickname}" if nickname else "还没问过TA叫什么"
+        return f"你管TA叫{nickname}" if nickname else ""
 
     def _scene_lines(self, is_group: bool, detailed: bool = True) -> List[str]:
         """场景必需品：几点、在她的哪个城市、这是群聊还是私聊。三样永远在。"""
         cfg = self.config
-        lines: List[str] = [
-            "群聊，周围还有人看着" if is_group else "私聊，只有你和TA"
-        ]
+        if is_group:
+            # 「这是群聊」永远给；这一层「周围还有人看着」由 enable_chat_awareness 定。
+            lines: List[str] = ["群聊，周围还有人看着" if cfg.enable_chat_awareness else "群聊"]
+        else:
+            lines = ["私聊，只有你和TA"]
         now = self._core.clock.now()
         # 只报钟点，不报「上午/下午/晚上」这类时段词：时段词会被模型当成打招呼的
         # 由头（无论几点都回一句「下午好呀」），钟点是一张随手可看的表，用不用由她。
@@ -698,7 +710,7 @@ class PromptBuilder:
             )
             return "。".join(s for s, _ in sents if s)
         state = self._state_lines(snap, detailed=True)
-        if snap.get("social_energy"):
+        if snap.get("social_energy") and self.config.social_energy_enabled:
             state.append(f"她{self._core.social.hint()}")
         if state:
             sents.append((self._sentence(state), 4.0))
@@ -771,9 +783,10 @@ def _uid_tag(role_id: str) -> str:
 
 def _short_weather(weather: Dict[str, Any]) -> str:
     """天气只留一句能用的；没配好时直接不注入，而不是把配置说明书念给模型听。"""
+
+    from .services.weather import is_notice
+
     env = str(weather.get("env", "")).strip()
-    if not env:
-        return ""
-    if any(word in env for word in ("未填", "未开启", "获取中", "没配天气")):
+    if not env or is_notice(env):
         return ""
     return env.replace("当前城市", "这边")[:26]

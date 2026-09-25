@@ -145,35 +145,46 @@ class HumanoidEngine:
             "Token 预算": int(core.config.inject_token_budget),
         }
 
-    def parse_affection_batch(self, raw: str) -> list[tuple[str, float]]:
+    def parse_affection_batch(self, raw: str) -> tuple[list[tuple[str, float]], int]:
+        """解析批量导入：返回（可用的 QQ-数值对, 一眼就看错了多少条）。
+
+        坏条目单独报数而不是静默丢掉：有人粘了一整片文本进去，一句「已设置 1 个」
+        会把「其余根本没被认出来」一并掩盖掉。"""
         text = (raw or "").strip()
         if not text:
-            return []
+            return [], 0
         try:
             parsed = json.loads(text)
             if isinstance(parsed, list):
                 out: list[tuple[str, float]] = []
+                bad = 0
                 for item in parsed:
                     if isinstance(item, dict) and "qq" in item and "value" in item:
                         try:
                             out.append((str(item["qq"]).strip(), float(item["value"])))
+                            continue
                         except (TypeError, ValueError):
                             pass
+                    bad += 1
                 if out:
-                    return out
+                    return out, bad
         except (ValueError, TypeError):
             pass
 
         pairs: list[tuple[str, float]] = []
+        bad = 0
         for part in re.split(r"[,，\s]+", text):
+            if not part:
+                continue
             if ":" not in part and "：" not in part:
+                bad += 1
                 continue
             key, _, value = part.replace("：", ":").partition(":")
             try:
                 pairs.append((key.strip(), float(value.strip())))
             except (TypeError, ValueError):
-                pass
-        return pairs
+                bad += 1
+        return pairs, bad
 
     def reset_state(self):
         return 80.0, 100.0, 1

@@ -588,7 +588,11 @@ class HumanoidCoreInstance:
                 f"- 联动契约：v{contract.get('v', 1)}，已导出 {len(contract.get('feelings') or [])} 条体感"
             )
         else:
-            lines.append("- 联动契约：未生成（身体还没推进过，或 contract_enabled 关着）")
+            lines.append(
+                "- 联动契约：已关掉（contract_enabled=false）"
+                if not self.config.contract_enabled else
+                "- 联动契约：未生成（身体还没推进过，启动后等一轮再看）"
+            )
         try:
             state = self.signals.status()
         except Exception:
@@ -615,9 +619,13 @@ class HumanoidCoreInstance:
         if s['process']:
             p = s['process']
             lines.append(f"- 当前过程：{p.get('name', '休息')}（持续 {p.get('duration_minutes', 0)} 分钟）")
-        if s['weather']:
-            lines.append(f"- 天气：{s['weather'].get('weather', '未知')}")
-        if s['social_energy']:
+        wx = s['weather'] or {}
+        # 没取到天气时把「为什么没有」直说：这行是给人核对的，比空着一个尾巴有用。
+        if str(wx.get('weather', '') or ''):
+            lines.append(f"- 天气：{wx['weather']}")
+        elif str(wx.get('env', '') or ''):
+            lines.append(f"- 天气：{wx['env']}")
+        if s['social_energy'] and self.config.social_energy_enabled:
             lines.append(f"- 社交能量：{int(s['social_energy']['value'])}% ({s['social_energy']['text']})")
         if user_id and 'mood' in s:
             lines.append(f"- 好感度：{s['mood']['affection']:.1f}（{s['mood']['label']}）")

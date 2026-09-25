@@ -359,7 +359,7 @@ class DayNarrativeTest(unittest.TestCase):
         slots = normalize_slots(DAY_SCHEDULE, max_slots=16)
         core.scope.update_self(today_date=TODAY, daily_schedule=slots, schedule_source=SOURCE_LLM)
         text = core.build_injection("42", is_group=False)
-        self.assertIn("今天到这会", text)
+        self.assertIn("她今天", text)
         self.assertIn("跟客户过方案", text)
         # 只给事实，不给规矩：不出现「要/别/不要」这类过程指令。
         self.assertNotIn("不要", text)

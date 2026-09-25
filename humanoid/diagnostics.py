@@ -214,7 +214,7 @@ def _chain_pick(
         provider = resolver.resolve_global(None)
         if provider is not None:
             return f"{GLOBAL_LABEL}({resolver.id_of(provider)})"
-    return "无可用模型 → 将使用内置日程模板"
+    return "无可用模型 → 按身体与钟点现算一段（不调模型）"
 
 
 def build_report(
