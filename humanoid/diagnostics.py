@@ -377,6 +377,10 @@ def build_report(
         "没到期没报警没掷中就不调模型"
     )
     lines.append(
+        "- 上面这条的频率只由「到期/掷中」决定，硬上限看下面的【调用节流】："
+        "没有节流时，全天无人也能烧掉一百多次"
+    )
+    lines.append(
         "- 情绪分析："
         + (
             f"每个用户各自每 {cfg.mood_llm_interval_messages} 条私聊 1 次小 prompt（≤ 500 字）；"
@@ -389,6 +393,44 @@ def build_report(
         "- 本插件不会为聊天回复额外调模型：上下文里只有她的事实（时间/场景/称呼/身体/今天/"
         "隔了多久/注意力三轴的措辞），回复走 AstrBot 主链路。"
     )
+
+    gate = gateway.gate
+    if gate is not None:
+        snap = gate.snapshot()
+        lines += ["", "【调用节流】"]
+        idle_limit = snap["idle_limit_minutes"]
+        if idle_limit <= 0:
+            lines.append("- 空闲静默：已关闭（一直挂着也会继续调模型）")
+        elif snap["never_interacted"]:
+            lines.append(
+                f"- 空闲静默：开启（{int(idle_limit)} 分钟）。"
+                "还没人跟她说过话，后台日程现在全靠本地现算"
+            )
+        else:
+            idle_min = snap["idle_minutes"] or 0.0
+            state = "正在静默" if snap["idle_active"] else "活跃中"
+            lines.append(
+                f"- 空闲静默：开启（{int(idle_limit)} 分钟），已 {int(idle_min)} 分钟没人说话，当前 {state}"
+            )
+        interval = snap["interval_minutes"]
+        lines.append(
+            f"- 最小调用间隔：{int(interval)} 分钟（两次日程调用至少隔这么久）"
+            if interval > 0
+            else "- 最小调用间隔：未限制（改主意概率仍可能连着触发）"
+        )
+        budget = snap["budget"]
+        used = snap["used_today"]
+        lines.append(
+            f"- 今日预算：{used}/{budget} 次（所有 bot 共享，情绪分析不计入）"
+            if budget > 0
+            else f"- 今日预算：未限制（今天已用 {used} 次）"
+        )
+        verdict = snap["verdict"]
+        lines.append(
+            f"- 当前判定：{OK_MARK} {verdict.describe()}"
+            if verdict.allowed
+            else f"- 当前判定：{verdict.describe()}（本次不调模型，走本地兜底）"
+        )
 
     lines += [
         "",

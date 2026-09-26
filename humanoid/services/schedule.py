@@ -17,7 +17,7 @@ from typing import Any
 from ..clock import Clock
 from ..config import HumanoidConfig
 from ..jsonx import extract_json_array, extract_json_object
-from ..llm import LLMGateway, LLMResult, ProviderResolver
+from ..llm import OUTCOME_GATED, LLMGateway, LLMResult, ProviderResolver
 from ..persona import PERSONA_PROMPT_MAX, Persona, truncate
 from ..role_scope import RoleScope
 from ..slots import (
@@ -904,6 +904,17 @@ class ScheduleService:
     # 何时该重新决定
     # ------------------------------------------------------------------
 
+    def _gate_allows(self) -> bool:
+        """节流闸门：没人看着 / 间隔没到 / 今日预算用完时，都算「不需要决定」。
+
+        问在「本来该生成」之后而不是之前：正常无事可做的那几百个 tick 不该去
+        反复查闸门，更不该把 _roll_change 的骰子白白掷掉。
+        """
+        gate = getattr(self.gateway, "gate", None) if self.gateway is not None else None
+        if gate is None:
+            return True
+        return gate.check(PURPOSE).allowed
+
     def refresh_due(self) -> bool:
         """该不该决定下一段：没段/这一段过完了/身体打架/还没排上大模型/掷中骰子。"""
         cfg = self.config
@@ -929,8 +940,10 @@ class ScheduleService:
                 return True
         if cfg.use_llm_schedule and self.source != SOURCE_LLM:
             # 本地兜底段还占着位：尽快让大模型接手（退避会挡住砸模型的频率）。
-            return True
-        return self._roll_change()
+            due = True
+        else:
+            due = self._roll_change()
+        return due and self._gate_allows()
 
     def _roll_change(self) -> bool:
         """概率重估：每个决策窗掷一次骰子，本窗内结果保持不变。"""
@@ -1083,6 +1096,13 @@ class ScheduleService:
             self._generating = False
 
         if not result.ok:
+            if result.outcome == OUTCOME_GATED:
+                # 被节流跳过不是 provider 故障，不能进 30 分钟退避——那会让
+                # 「用户一说话就恢复」也一起失效。也不往 last_error 上挂：
+                # 那是给用户看的诊断位，不该长期显示一个无须处理的节流提示。
+                if self._log and cfg.debug_mode:
+                    self._log.debug(f"[humanoid_core] 日程被节流跳过: {result.detail}")
+                return None
             self.last_error = result.summary()
             self._fail_backoff(cfg)
             if self._log and cfg.debug_mode:

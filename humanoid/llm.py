@@ -14,10 +14,27 @@ OUTCOME_TIMEOUT = "timeout"
 OUTCOME_ERROR = "error"
 OUTCOME_EMPTY = "empty"
 OUTCOME_COOLDOWN = "cooldown"
+OUTCOME_GATED = "gated"
 OUTCOME_NO_CANDIDATE = "no_candidate"
 
 PURPOSE_SCHEDULE = "日程生成"
 PURPOSE_MOOD = "情绪分析"
+
+# 情绪分析不进门控：它由用户的真实发言触发（每 N 条私聊一次），没人说话时压根不会发生，
+# 本来就不构成空转。真要省额度，用户自己调 mood_llm_interval_messages 即可。
+GATE_EXEMPT_PURPOSES = frozenset({PURPOSE_MOOD})
+
+_GATE_IDLE = "idle"
+_GATE_INTERVAL = "interval"
+_GATE_BUDGET = "budget"
+_GATE_OFF = "off"
+
+_GATE_TEXT = {
+    _GATE_IDLE: "空闲静默中",
+    _GATE_INTERVAL: "未到最小调用间隔",
+    _GATE_BUDGET: "今日预算已用完",
+    _GATE_OFF: "未触发节流",
+}
 
 _COOLDOWN_CONFIG_BY_PURPOSE = {
     PURPOSE_SCHEDULE: "schedule_provider_cooldown_minutes",
@@ -32,6 +49,7 @@ _OUTCOME_TEXT = {
     OUTCOME_ERROR: "调用报错",
     OUTCOME_EMPTY: "返回空内容",
     OUTCOME_COOLDOWN: "冷却中已跳过",
+    OUTCOME_GATED: "已被节流跳过",
     OUTCOME_NO_CANDIDATE: "没有可用候选",
 }
 
@@ -191,8 +209,194 @@ class ProviderResolver:
 GLOBAL_LABEL = "全局默认"
 
 
+@dataclass(frozen=True, slots=True)
+class GateVerdict:
+    allowed: bool
+    reason: str = _GATE_OFF
+    detail: str = ""
+
+    def describe(self) -> str:
+        label = _GATE_TEXT.get(self.reason, self.reason)
+        return f"{label}：{self.detail}" if self.detail else label
+
+
+# 同一个理由的拒绝日志最多隔这么久记一次：后台每 30 秒问一次，不限速会洗屏。
+GATE_WARN_INTERVAL_SECONDS = 300.0
+
+
+class CallGate:
+    """模型调用节流闸门。
+
+    只管「没人看着时自己跑」的那类调用（目前是日程生成）。没有它的时候，
+    日程每 15 分钟排一段、掷中概率还会再加一段，全天零互动也能烧掉一百多次；
+    多开几个 bot 则是成倍往上叠。
+
+    三条规则，任一条命中就跳过这一次（不报错、不退避、不计数），由调用方走
+    自己的本地兜底：
+
+    * 空闲静默：距上一次真实用户互动超过 N 分钟就没人在看，不值得为看不见的
+      背景日程调模型；有人一说话立刻恢复。
+    * 最小间隔：两次调用之间至少隔 N 分钟。用户要「隔多少分钟就调一次」，
+      掷骰决定不了频率上限，掷中一次就能连着砸两次。
+    * 每日预算：所有 bot 共享一个自然日计数，防止多 bot 把额度一次撞穿。
+
+    情绪分析整条豁免：它由真实发言触发，没人说话时本来就不会发生。
+    """
+
+    __slots__ = (
+        "_config",
+        "_day",
+        "_last_call",
+        "_last_interaction",
+        "_log",
+        "_mono",
+        "_used_today",
+        "_warned",
+        "_wall",
+    )
+
+    def __init__(
+        self,
+        config_provider: Callable[[], Any],
+        logger: Any = None,
+        wall_clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._config = config_provider
+        self._log = logger
+        self._wall = wall_clock
+        self._mono = monotonic
+        # None 而不是 0：0 既像「从没互动过」，又是墙钟上一个完全合法的取值，
+        # 拿它当哨兵会让「到底有没有人说过话」这件事在某些时刻判错。
+        self._last_interaction: float | None = None
+        # None 而不是 0：0 同时是「从没调用过」和「正好在 0 时刻调用过」的真实取值，
+        # 拿它当哨兵会让间隔判定在单调钟从 0 起的场景下整个失效。
+        self._last_call: float | None = None
+        self._day = ""
+        self._used_today = 0
+        self._warned: dict[str, float] = {}
+
+    def note_interaction(self, now: float | None = None) -> None:
+        """收到一条真实用户消息。空转闸门只在这时候松开。"""
+        self._last_interaction = self._wall() if now is None else float(now)
+
+    @property
+    def last_interaction(self) -> float | None:
+        return self._last_interaction
+
+    @property
+    def used_today(self) -> int:
+        self._roll_day()
+        return self._used_today
+
+    def _roll_day(self) -> None:
+        today = time.strftime("%Y-%m-%d", time.localtime(self._wall()))
+        if today != self._day:
+            self._day = today
+            self._used_today = 0
+
+    def _idle_minutes(self) -> float:
+        return max(0.0, float(getattr(self._config(), "llm_idle_silence_minutes", 0) or 0))
+
+    def _min_interval_minutes(self) -> float:
+        return max(0.0, float(getattr(self._config(), "schedule_min_interval_minutes", 0) or 0))
+
+    def _daily_budget(self) -> int:
+        return max(0, int(getattr(self._config(), "llm_daily_call_budget", 0) or 0))
+
+    def check(self, purpose: str, *, now: float | None = None) -> GateVerdict:
+        """该不该放行这一次。纯查询，不计数——调用方要的是「能不能调」。"""
+        if purpose in GATE_EXEMPT_PURPOSES:
+            return GateVerdict(True, _GATE_OFF, "情绪分析不参与节流")
+
+        self._roll_day()
+        wall = self._wall() if now is None else float(now)
+
+        idle_limit = self._idle_minutes()
+        if idle_limit > 0:
+            if self._last_interaction is None:
+                # 装好到现在还没人跟她说过话：直接静默，而不是「等第一次说话才开始计时」。
+                return GateVerdict(False, _GATE_IDLE, "还没人跟她说过话")
+            idle_for = (wall - self._last_interaction) / 60.0
+            if idle_for >= idle_limit:
+                detail = (
+                    f"已 {int(idle_for // 60)} 小时 {int(idle_for % 60)} 分钟没人发消息"
+                    f"（阈值 {int(idle_limit)} 分钟）"
+                )
+                return GateVerdict(False, _GATE_IDLE, detail)
+
+        interval = self._min_interval_minutes()
+        if interval > 0 and self._last_call is not None:
+            elapsed = self._mono() - self._last_call
+            remaining = interval * 60.0 - elapsed
+            if remaining > 0:
+                return GateVerdict(
+                    False,
+                    _GATE_INTERVAL,
+                    f"距上次只过了 {int(elapsed // 60)} 分钟，还差 {remaining / 60:.0f} 分钟"
+                    f"到 {int(interval)} 分钟间隔",
+                )
+
+        budget = self._daily_budget()
+        if budget > 0 and self._used_today >= budget:
+            return GateVerdict(False, _GATE_BUDGET, f"今日 {self._used_today}/{budget} 次已用完")
+
+        return GateVerdict(True)
+
+    def consume(self, purpose: str) -> None:
+        """真的发了这一次请求才计数。"""
+        if purpose in GATE_EXEMPT_PURPOSES:
+            return
+        self._roll_day()
+        self._last_call = self._mono()
+        self._used_today += 1
+
+    def log_block(self, purpose: str, verdict: GateVerdict) -> None:
+        """记录一次拦截。同一理由限速，否则每 30 秒一条能把日志刷爆。"""
+        if self._log is None or verdict.allowed:
+            return
+        now = self._mono()
+        if now - self._warned.get(verdict.reason, -1e18) < GATE_WARN_INTERVAL_SECONDS:
+            return
+        self._warned[verdict.reason] = now
+        self._log.info(f"[humanoid_core] {purpose} {verdict.describe()}，本次跳过")
+
+    def snapshot(self) -> dict[str, Any]:
+        """给 /拟人诊断 用：让用户看得见钱花在哪儿、被什么挡住了。"""
+        self._roll_day()
+        wall = self._wall()
+        idle_limit = self._idle_minutes()
+        interval = self._min_interval_minutes()
+        budget = self._daily_budget()
+        idle_for = (
+            None if self._last_interaction is None
+            else (wall - self._last_interaction) / 60.0
+        )
+        never_interacted = self._last_interaction is None
+        return {
+            "idle_limit_minutes": idle_limit,
+            "idle_minutes": idle_for,
+            "idle_active": bool(
+                idle_limit > 0 and (never_interacted or (idle_for or 0.0) >= idle_limit)
+            ),
+            "never_interacted": never_interacted,
+            "interval_minutes": interval,
+            "budget": budget,
+            "used_today": self._used_today,
+            "verdict": self.check(PURPOSE_SCHEDULE),
+        }
+
+
 class LLMGateway:
-    __slots__ = ("_config", "_cooldown", "_last_results", "_log", "_monotonic", "_resolver")
+    __slots__ = (
+        "_config",
+        "_cooldown",
+        "_gate",
+        "_last_results",
+        "_log",
+        "_monotonic",
+        "_resolver",
+    )
 
     def __init__(
         self,
@@ -200,6 +404,7 @@ class LLMGateway:
         config_provider: Callable[[], Any],
         logger: Any = None,
         monotonic: Callable[[], float] = time.monotonic,
+        gate: "CallGate | None" = None,
     ) -> None:
         self._resolver = resolver
         self._config = config_provider
@@ -207,6 +412,16 @@ class LLMGateway:
         self._monotonic = monotonic
         self._cooldown: dict[tuple[str, str], float] = {}
         self._last_results: dict[str, LLMResult] = {}
+        self._gate = gate
+
+    @property
+    def gate(self) -> "CallGate | None":
+        return self._gate
+
+    def note_interaction(self, now: float | None = None) -> None:
+        """收到真实用户消息时转给闸门。"""
+        if self._gate is not None:
+            self._gate.note_interaction(now)
 
     def _cooldown_seconds(self, purpose: str) -> float:
         cfg = self._config()
@@ -282,6 +497,7 @@ class LLMGateway:
         if self._log and cfg.debug_mode:
             self._log.debug(f"[humanoid_core] LLM 请求 (purpose={purpose}) 提示词前200字: {prompt[:200]}...")
 
+        counted = False
         for label, configured_id in candidates:
             is_global = label == GLOBAL_LABEL and not configured_id
 
@@ -300,6 +516,25 @@ class LLMGateway:
                 if not is_global:
                     self._enter_cooldown(configured_id, purpose)
                 continue
+
+            # 闸门卡在这里而不是生成入口：候选全被冷却、provider 根本不存在时并没有
+            # 真的发请求，不该占掉一次额度。
+            # ignore_cooldown 是「用户此刻明确要求」（/重置日程）或人设重排的信号，
+            # 那种调用得给出去，否则管理员输个命令却被静默规则驳回。
+            if self._gate is not None and not counted and not ignore_cooldown:
+                verdict = self._gate.check(purpose)
+                if not verdict.allowed:
+                    self._gate.log_block(purpose, verdict)
+                    result = LLMResult(
+                        ok=False,
+                        outcome=OUTCOME_GATED,
+                        detail=verdict.detail,
+                        attempts=tuple(attempts),
+                    )
+                    self._last_results[purpose] = result
+                    return result
+                self._gate.consume(purpose)
+                counted = True
 
             actual_id = self._resolver.id_of(provider) or configured_id
             if self._log and cfg.debug_mode:

@@ -154,6 +154,16 @@ class HumanoidConfig:
     # 她临时改主意的频率。0 = 只在到期/身体报警时才排；100 = 每个窗都重排。
     schedule_change_chance: int = 30
     schedule_provider_cooldown_minutes: int = 30
+    # 日程两次调模型之间的最小间隔（分钟）。掷骰只决定「要不要临时改主意」，
+    # 定不住频率上限：掷中一次就可能连着砸两次。这一项才是硬上限，
+    # 0 = 只靠掷骰与越线判断（就是旧行为，全天无人时也能烧掉一百多次）。
+    schedule_min_interval_minutes: int = 30
+    # 多久没人发消息就停掉后台的模型调用（分钟）。没人看着时，背景日程不值得
+    # 每次都去问模型；用户一说话立刻恢复。0 = 不静默。
+    llm_idle_silence_minutes: int = 60
+    # 每日调用预算（次）：所有 bot 共享一个自然日计数，防止多开几个 bot 撞穿额度。
+    # 情绪分析不计入。0 = 不限。
+    llm_daily_call_budget: int = 200
     # 均衡参考偏好：会作为「仅供参考」的偏好递给模型，与人设和身体状态一起权衡，
     # 不是必须服从的指令。
     schedule_prompt_extra: str = "劳逸结合，有动有静，节奏均衡。"
@@ -314,6 +324,9 @@ class HumanoidConfig:
             schedule_refresh_minutes=i("schedule_refresh_minutes", 1, 1440),
             schedule_change_chance=i("schedule_change_chance", 0, 100),
             schedule_provider_cooldown_minutes=i("schedule_provider_cooldown_minutes", 0, 1440),
+            schedule_min_interval_minutes=i("schedule_min_interval_minutes", 0, 1440),
+            llm_idle_silence_minutes=i("llm_idle_silence_minutes", 0, 1440),
+            llm_daily_call_budget=i("llm_daily_call_budget", 0, 1_000_000),
             schedule_prompt_extra=s_opt("schedule_prompt_extra")[
                 : cls.SCHEDULE_PROMPT_EXTRA_MAX
             ],

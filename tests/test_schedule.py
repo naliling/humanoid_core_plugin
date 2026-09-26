@@ -14,7 +14,7 @@ from pathlib import Path
 from humanoid.clock import Clock
 from humanoid.config import HumanoidConfig
 from humanoid.jsonx import extract_json_array, extract_json_object
-from humanoid.llm import LLMGateway, ProviderResolver
+from humanoid.llm import CallGate, LLMGateway, ProviderResolver
 from humanoid.services.process import ProcessService
 from humanoid.services.schedule import (
     SOURCE_LLM,
@@ -454,6 +454,7 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         body=None,
         random_source=None,
         moment=FIXED_MOMENT,
+        gate=None,
     ):
         conf = config or cfg()
         self.conf = conf
@@ -464,7 +465,7 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         ctx = FakeContext(chat_providers=list(providers or []), global_provider=global_provider)
         resolver = ProviderResolver(ctx, log)
         clock_source = monotonic or time.monotonic
-        gateway = LLMGateway(resolver, lambda: self.conf, log, clock_source)
+        gateway = LLMGateway(resolver, lambda: self.conf, log, clock_source, gate=gate)
         clock = FrozenClock(moment)
         service = ScheduleService(
             store.scope,
@@ -939,6 +940,174 @@ class ProcessFollowsSegmentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after["slot_event"], "下楼取快递")
         self.assertEqual(after["name"], "下楼取快递")
         self.assertIn("改海报", process.recent() or [], "旧过程收进历史")
+
+
+class ThrottleTest(unittest.IsolatedAsyncioTestCase):
+    """调用节流：没人用的后台日程不该一直烧模型。
+
+    每个用例都按 core_instance._schedule_loop 的真实节奏跑满 24 小时
+    （每 30 秒问一次），而不是只断言某一次调用。
+    """
+
+    TICK = 30
+    TICKS_PER_DAY = 24 * 60 * 60 // 30
+
+    async def run_day(self, conf, provider, gate, *, chat_every_minutes=0, bots=1):
+        services = []
+        for _ in range(bots):
+            tmp = Path(tempfile.mkdtemp()) / "state.json"
+            store = ScopeStore(tmp)
+            store.load(FIXED_MOMENT.strftime("%Y-%m-%d"), conf.cycle_length)
+            log = RecordingLogger()
+            ctx = FakeContext(chat_providers=[provider])
+            resolver = ProviderResolver(ctx, log)
+            clock = FrozenClock(FIXED_MOMENT)
+            service = ScheduleService(
+                store.scope, lambda: conf, clock, logger=log, monotonic=gate._mono
+            )
+            service.set_resolver_gateway(
+                resolver,
+                LLMGateway(resolver, lambda: conf, log, gate._mono, gate=gate),
+            )
+            service.seed_first_segment()
+            services.append((service, clock))
+
+        for i in range(self.TICKS_PER_DAY):
+            gate._mono.advance(self.TICK)
+            gate._wall.advance(self.TICK)
+            if chat_every_minutes and (i * self.TICK) % (chat_every_minutes * 60) == 0:
+                gate.note_interaction()
+            for service, clock in services:
+                clock.advance(seconds=self.TICK)
+                await service.ensure_fresh()
+        return services[0][0]
+
+    def build(self, **overrides):
+        # 必须真的指到一个存在的 provider：否则「零调用」会因为根本调不通而假绿。
+        conf = cfg(
+            schedule_provider_name="p",
+            schedule_allow_global_fallback=False,
+            **overrides,
+        )
+        gate = CallGate(
+            lambda: conf, wall_clock=FakeClock(86400.0), monotonic=FakeClock(86400.0)
+        )
+        provider = FakeProvider("p", reply=seg_reply())
+        return conf, gate, provider
+
+    async def assert_reachable(self, conf, gate, provider):
+        """先证明这条链路调得通，后面的「零调用」才有意义。"""
+        service, _store, _log = self.build_and_service(conf, gate, provider)
+        await service.ensure_fresh(force=True, ignore_cooldown=True)
+        self.assertEqual(provider.calls, 1, "测试链路本身必须能调通模型")
+        provider.calls = 0
+        return service
+
+    async def test_idle_day_costs_nothing(self):
+        """全天零互动：一次模型都不该调。这是本次改动的核心承诺。"""
+        conf, gate, provider = self.build(llm_idle_silence_minutes=60)
+        await self.assert_reachable(conf, gate, provider)
+        await self.run_day(conf, provider, gate)
+        self.assertEqual(provider.calls, 0, "没人用就不该调模型")
+
+    async def test_idle_still_leaves_her_with_a_schedule(self):
+        """静默不等于空白：本地模板必须把日程接上，不能让她「还没决定」。"""
+        conf, gate, provider = self.build(llm_idle_silence_minutes=60)
+        service = await self.run_day(conf, provider, gate)
+        self.assertTrue(service.segments(), "静默期间也要有段可做")
+        self.assertIsNotNone(service.active_segment())
+
+    async def test_talking_releases_the_throttle(self):
+        conf, gate, provider = self.build(llm_idle_silence_minutes=60)
+        await self.run_day(conf, provider, gate, chat_every_minutes=45)
+        self.assertGreater(provider.calls, 0, "有人在用时日程必须能跟上")
+        self.assertLessEqual(provider.calls, 32, "每 45 分钟一次互动不该超过约 32 次")
+
+    async def test_min_interval_caps_frequency_even_when_talking(self):
+        """一直有人在聊时，硬上限是「最小间隔」而不是掷骰。"""
+        conf, gate, provider = self.build(
+            llm_idle_silence_minutes=60, schedule_min_interval_minutes=30
+        )
+        await self.run_day(conf, provider, gate, chat_every_minutes=1)
+        self.assertLessEqual(provider.calls, 48, "30 分钟间隔 = 一天最多 48 次")
+
+    async def test_many_bots_share_one_budget(self):
+        """多 bot 场景：所有 bot 共用一份每日预算，不是各算各的。
+
+        刻意不跑满一整天：墙钟跨过零点预算会按设计重置，那会把「共享」这件事
+        测成「每天各自一份」。这里只验证跨 bot 的额度是同一份。
+        """
+        conf, gate, provider = self.build(
+            llm_idle_silence_minutes=0,
+            schedule_min_interval_minutes=0,
+            llm_daily_call_budget=10,
+        )
+        fleet = [self.build_and_service(conf, gate, provider) for _ in range(5)]
+
+        async def one_round(index):
+            service, _store, _log = fleet[index % len(fleet)]
+            # 推进到 refresh_due 真的为 True。段边界是对齐到粒度的，推进固定时长
+            # 不保证正好用完那一段，那样这个测试会静默地少调几次、断言反而更松。
+            # 走的是正常路径，不能用 force+ignore_cooldown——那条本来就绕过节流。
+            for _ in range(12):
+                service._clock.advance(minutes=60)
+                if service.refresh_due():
+                    break
+            self.assertTrue(service.refresh_due(), "该轮到生成而没轮到，测试前提不成立")
+            await service.ensure_fresh()
+
+        for expected in range(1, 11):
+            await one_round(expected - 1)
+            self.assertEqual(provider.calls, expected)
+        await one_round(10)
+        self.assertEqual(provider.calls, 10, "5 个 bot 加起来也只能花掉 10 次预算")
+        self.assertEqual(gate.used_today, 10)
+
+    async def test_gated_skip_does_not_enter_provider_backoff(self):
+        """被节流不是 provider 故障：不能因此进 30 分钟退避，否则「一说话就恢复」失效。"""
+        conf, gate, provider = self.build(llm_idle_silence_minutes=60)
+        service, _store, _log = self.build_and_service(conf, gate, provider)
+        await service.ensure_fresh()  # 从未互动 → 被静默挡下
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(service.retry_after, 0.0, "节流不该进退避")
+        self.assertEqual(service.last_error, "", "节流不是错误，不该挂在诊断里")
+
+    def build_and_service(self, conf, gate, provider):
+        tmp = Path(tempfile.mkdtemp()) / "state.json"
+        store = ScopeStore(tmp)
+        store.load(FIXED_MOMENT.strftime("%Y-%m-%d"), conf.cycle_length)
+        log = RecordingLogger()
+        ctx = FakeContext(chat_providers=[provider])
+        resolver = ProviderResolver(ctx, log)
+        clock = FrozenClock(FIXED_MOMENT)
+        service = ScheduleService(
+            store.scope, lambda: conf, clock, logger=log, monotonic=gate._mono
+        )
+        service.set_resolver_gateway(
+            resolver, LLMGateway(resolver, lambda: conf, log, gate._mono, gate=gate)
+        )
+        service.seed_first_segment()
+        return service, store, log
+
+    async def test_user_initiated_refresh_bypasses_throttle(self):
+        """/重置日程 是用户此刻的明确要求，不能被静默规则驳回。"""
+        conf, gate, provider = self.build(llm_idle_silence_minutes=60)
+        service, _store, _log = self.build_and_service(conf, gate, provider)
+        changed = await service.ensure_fresh(force=True, ignore_cooldown=True)
+        self.assertTrue(changed)
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(service.source, SOURCE_LLM)
+
+    async def test_throttle_fully_disabled_restores_old_behaviour(self):
+        """三项都置 0 时行为跟改动前一致：节流是可关的，不是硬编码。"""
+        conf, gate, provider = self.build(
+            llm_idle_silence_minutes=0,
+            schedule_min_interval_minutes=0,
+            llm_daily_call_budget=0,
+            schedule_change_chance=30,
+        )
+        await self.run_day(conf, provider, gate)
+        self.assertGreater(provider.calls, 20, "关掉节流就该回到旧的高频行为")
 
 
 if __name__ == "__main__":

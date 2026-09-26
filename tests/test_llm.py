@@ -11,11 +11,13 @@ from humanoid.llm import (
     OUTCOME_COOLDOWN,
     OUTCOME_EMPTY,
     OUTCOME_ERROR,
+    OUTCOME_GATED,
     OUTCOME_NO_CANDIDATE,
     OUTCOME_NOT_FOUND,
     OUTCOME_TIMEOUT,
     PURPOSE_MOOD,
     PURPOSE_SCHEDULE,
+    CallGate,
     LLMGateway,
     ProviderResolver,
     extract_text,
@@ -435,6 +437,184 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.ok)
 
 
+
+
+class CallGateTest(unittest.TestCase):
+    """节流闸门：空闲静默 / 最小间隔 / 每日预算，以及情绪豁免。"""
+
+    def build(self, **overrides):
+        conf = cfg(**overrides)
+        # 两台钟都从 0 起算：空闲判定看「距上次互动多久」，间隔判定看单调钟。
+        wall = FakeClock(0.0)
+        mono = FakeClock(0.0)
+        gate = CallGate(lambda: conf, wall_clock=wall, monotonic=mono)
+        return gate, conf, wall, mono
+
+    def test_never_interacted_is_idle_right_away(self):
+        """插件刚装好、还没人说过话时就得静默——那正是空转的来源。"""
+        gate, _conf, wall, _mono = self.build(llm_idle_silence_minutes=60)
+        wall.advance(3600 * 24)
+        verdict = gate.check(PURPOSE_SCHEDULE)
+        self.assertFalse(verdict.allowed)
+        self.assertIn("空闲", verdict.describe())
+
+    def test_interaction_releases_idle_but_only_until_threshold(self):
+        gate, _conf, wall, _mono = self.build(llm_idle_silence_minutes=60)
+        wall.advance(3600 * 24)
+        gate.note_interaction()
+        self.assertTrue(gate.check(PURPOSE_SCHEDULE).allowed)
+        wall.advance(60 * 60)
+        self.assertFalse(gate.check(PURPOSE_SCHEDULE).allowed)
+
+    def test_idle_disabled_never_blocks(self):
+        gate, _conf, wall, _mono = self.build(llm_idle_silence_minutes=0)
+        wall.advance(3600 * 24 * 30)
+        self.assertTrue(gate.check(PURPOSE_SCHEDULE).allowed)
+
+    def test_min_interval_blocks_then_releases(self):
+        gate, _conf, wall, mono = self.build(
+            llm_idle_silence_minutes=0, schedule_min_interval_minutes=30
+        )
+        gate.consume(PURPOSE_SCHEDULE)
+        mono.advance(29 * 60)
+        self.assertFalse(gate.check(PURPOSE_SCHEDULE).allowed)
+        mono.advance(2 * 60)
+        self.assertTrue(gate.check(PURPOSE_SCHEDULE).allowed)
+
+    def test_daily_budget_blocks_and_resets_next_day(self):
+        gate, _conf, wall, _mono = self.build(
+            llm_idle_silence_minutes=0, schedule_min_interval_minutes=0,
+            llm_daily_call_budget=2,
+        )
+        gate.consume(PURPOSE_SCHEDULE)
+        gate.consume(PURPOSE_SCHEDULE)
+        self.assertFalse(gate.check(PURPOSE_SCHEDULE).allowed)
+        self.assertEqual(gate.used_today, 2)
+        # 跨过零点：计数归零，预算重新可用
+        wall.advance(86400)
+        self.assertEqual(gate.used_today, 0)
+        self.assertTrue(gate.check(PURPOSE_SCHEDULE).allowed)
+
+    def test_mood_is_exempt_from_every_rule(self):
+        """情绪分析整条豁免：没人说话时它本来就不会被触发。"""
+        gate, _conf, wall, _mono = self.build(
+            llm_idle_silence_minutes=1, schedule_min_interval_minutes=1,
+            llm_daily_call_budget=1,
+        )
+        wall.advance(86400)
+        for _ in range(5):
+            self.assertTrue(gate.check(PURPOSE_MOOD).allowed)
+            gate.consume(PURPOSE_MOOD)
+        self.assertEqual(gate.used_today, 0, "情绪不计入每日预算")
+
+    def test_zero_everything_disables_gating(self):
+        gate, _conf, wall, mono = self.build(
+            llm_idle_silence_minutes=0, schedule_min_interval_minutes=0,
+            llm_daily_call_budget=0,
+        )
+        wall.advance(86400)
+        for _ in range(50):
+            gate.consume(PURPOSE_SCHEDULE)
+            self.assertTrue(gate.check(PURPOSE_SCHEDULE).allowed)
+
+    def test_snapshot_reports_state(self):
+        gate, _conf, wall, _mono = self.build(llm_idle_silence_minutes=60)
+        wall.advance(7200)
+        snap = gate.snapshot()
+        self.assertTrue(snap["never_interacted"])
+        self.assertTrue(snap["idle_active"])
+        self.assertEqual(snap["idle_limit_minutes"], 60)
+        self.assertFalse(snap["verdict"].allowed)
+
+    def test_block_logging_is_rate_limited(self):
+        conf = cfg(llm_idle_silence_minutes=1)
+        log = RecordingLogger()
+        wall = FakeClock(0.0)
+        mono = FakeClock(0.0)
+        gate = CallGate(lambda: conf, log, wall_clock=wall, monotonic=mono)
+        wall.advance(7200)
+        verdict = gate.check(PURPOSE_SCHEDULE)
+        for _ in range(50):
+            gate.log_block(PURPOSE_SCHEDULE, verdict)
+        self.assertEqual(
+            len([r for r in log.records if r[0] == "info"]), 1, "同一理由不能每 30 秒刷一条日志"
+        )
+
+
+class GateIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    """闸门接进网关后的行为：拦截不报错、不计数、不影响用户主动触发。"""
+
+    def build(self, ctx, config, gate, clock):
+        log = RecordingLogger()
+        resolver = ProviderResolver(ctx, log)
+        return LLMGateway(resolver, lambda: config, log, clock, gate=gate), log
+
+    async def test_gated_call_returns_blocked_without_touching_provider(self):
+        conf = cfg(llm_idle_silence_minutes=1, schedule_min_interval_minutes=0,
+                   llm_daily_call_budget=0)
+        wall = FakeClock(7200.0)
+        gate = CallGate(lambda: conf, wall_clock=wall, monotonic=FakeClock(7200.0))
+        provider = FakeProvider("p1", reply="OK")
+        gw, _log = self.build(FakeContext(chat_providers=[provider]), conf, gate, FakeClock(7200.0))
+        res = await gw.generate(
+            prompt="hi", chain=(("首选模型", "p1"),), allow_global=False, timeout=5
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(res.outcome, OUTCOME_GATED)
+        self.assertEqual(provider.calls, 0, "被节流时根本不该发请求")
+        self.assertEqual(gate.used_today, 0, "被节流不该占额度")
+
+    async def test_ignore_cooldown_bypasses_gate(self):
+        """/重置日程 这类用户主动要求必须给出去。"""
+        conf = cfg(llm_idle_silence_minutes=1, schedule_min_interval_minutes=0,
+                   llm_daily_call_budget=0)
+        wall = FakeClock(7200.0)
+        gate = CallGate(lambda: conf, wall_clock=wall, monotonic=FakeClock(7200.0))
+        provider = FakeProvider("p1", reply="OK")
+        gw, _log = self.build(FakeContext(chat_providers=[provider]), conf, gate, FakeClock(7200.0))
+        res = await gw.generate(
+            prompt="hi", chain=(("首选模型", "p1"),), allow_global=False, timeout=5,
+            ignore_cooldown=True,
+        )
+        self.assertTrue(res.ok)
+        self.assertEqual(provider.calls, 1)
+
+    async def test_gate_is_shared_across_every_bot(self):
+        """多 bot 场景：多个网关共用一个闸门，预算是一起算的。"""
+        conf = cfg(llm_idle_silence_minutes=0, schedule_min_interval_minutes=0,
+                   llm_daily_call_budget=3)
+        mono = FakeClock(0.0)
+        gate = CallGate(lambda: conf, wall_clock=mono, monotonic=mono)
+        provider = FakeProvider("p1", reply="OK")
+        ctx = FakeContext(chat_providers=[provider])
+        for _ in range(3):
+            gw, _log = self.build(ctx, conf, gate, mono)
+            res = await gw.generate(
+                prompt="hi", chain=(("首选模型", "p1"),), allow_global=False, timeout=5
+            )
+            self.assertTrue(res.ok)
+        self.assertEqual(gate.used_today, 3)
+        fourth, _ = self.build(ctx, conf, gate, mono)
+        res = await fourth.generate(
+            prompt="hi", chain=(("首选模型", "p1"),), allow_global=False, timeout=5
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(res.outcome, OUTCOME_GATED)
+        self.assertEqual(provider.calls, 3, "第 4 个 bot 应被预算挡住")
+
+    async def test_cooldown_skipped_provider_does_not_spend_budget(self):
+        """候选全在冷却里时并没有真的发请求，不该占掉一次额度。"""
+        conf = cfg(llm_idle_silence_minutes=0, schedule_min_interval_minutes=0,
+                   llm_daily_call_budget=5, schedule_provider_cooldown_minutes=30)
+        mono = FakeClock(0.0)
+        gate = CallGate(lambda: conf, wall_clock=mono, monotonic=mono)
+        provider = FakeProvider("p1", reply="OK")
+        gw, _log = self.build(FakeContext(chat_providers=[provider]), conf, gate, mono)
+        res = await gw.generate(
+            prompt="hi", chain=(("首选模型", "typo"),), allow_global=False, timeout=5
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(gate.used_today, 0)
 
 
 if __name__ == "__main__":

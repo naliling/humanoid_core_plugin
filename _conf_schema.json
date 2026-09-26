@@ -205,6 +205,30 @@
     "minimum": 0,
     "maximum": 1440
   },
+  "schedule_min_interval_minutes": {
+    "description": "日程最小调用间隔(分)",
+    "hint": "两次调模型之间至少隔这么久。改主意概率只决定「要不要临时改」，定不住频率上限——掷中一次就可能连着砸两次。调大更省额度。0=不限（就是旧行为）。默认 30，即一天最多约 48 次。",
+    "type": "int",
+    "default": 30,
+    "minimum": 0,
+    "maximum": 1440
+  },
+  "llm_idle_silence_minutes": {
+    "description": "空闲静默(分)",
+    "hint": "连续这么久没人发消息，就停掉后台的模型调用（有人一说话立刻恢复）。没人看着时背景日程不值得一直调模型——这是全天空转的主要来源。0=不静默。默认 60。",
+    "type": "int",
+    "default": 60,
+    "minimum": 0,
+    "maximum": 1440
+  },
+  "llm_daily_call_budget": {
+    "description": "每日调用预算(次)",
+    "hint": "自然日内的调用上限，所有 bot 共享同一个计数，防止多开几个 bot 把额度撞穿。情绪分析不计入。0=不限。默认 200。",
+    "type": "int",
+    "default": 200,
+    "minimum": 0,
+    "maximum": 1000000
+  },
   "schedule_time_granularity": {
     "description": "段起点对齐",
     "hint": "15min=每段起点对到一刻钟整点；flexible=不要求对齐。",

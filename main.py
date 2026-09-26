@@ -20,7 +20,7 @@ from astrbot.core.agent.message import TextPart  # 新增导入
 from .humanoid import __version__
 from .humanoid.config import ConfigBox, HumanoidConfig, plan_default_migrations
 from .humanoid.engine import LOG_PREFIX, HumanoidEngine
-from .humanoid.llm import LLMGateway, ProviderResolver
+from .humanoid.llm import CallGate, LLMGateway, ProviderResolver
 from .humanoid.persona import PersonaSource
 from .humanoid.role_manager import RoleManager
 from .humanoid.state import StateStore
@@ -199,6 +199,12 @@ _ENUM_WORDS = {
     "inject_activity_context": {"medium", "full", "mood_only"},
     "environment_mode": {"private", "group", "both"},
 }
+# 命令行只能传字符串，这些项必须显式转成 int，否则写回配置文件的是 "60" 而不是 60。
+_INT_KEYS = frozenset({
+    "schedule_min_interval_minutes",
+    "llm_idle_silence_minutes",
+    "llm_daily_call_budget",
+})
 
 
 def _coerce_setting(key: str, value: str, current: Any) -> Any:
@@ -210,6 +216,12 @@ def _coerce_setting(key: str, value: str, current: Any) -> Any:
             if lowered == word.lower():
                 return flag
         return None
+    if key in _INT_KEYS:
+        # 不走下面的默认分支：那一路会把 "60" 当字符串写进配置文件。
+        try:
+            return int(text)
+        except ValueError:
+            return None
     if key in _ENUM_WORDS:
         lowered = text.lower()
         return lowered if lowered in _ENUM_WORDS[key] else None
@@ -297,7 +309,12 @@ class HumanoidCore(Star):
         self._state_store.load(today, self._config.cycle_length)
 
         self.resolver = ProviderResolver(context, logger)
-        self.gateway = LLMGateway(self.resolver, lambda: self._config, logger)
+        # 闸门建在网关这一层：网关全局只有一份，所有 bot 共用它，
+        # 所以每日预算与最小间隔是整个插件一起算的，不是每个 bot 各有一份。
+        self.call_gate = CallGate(lambda: self._config, logger)
+        self.gateway = LLMGateway(
+            self.resolver, lambda: self._config, logger, gate=self.call_gate
+        )
         # 日程得按她真正在用的那个人格来排，而不是按插件里一个十二选一的标签。
         self.persona_source = PersonaSource(context, logger)
 
@@ -504,6 +521,12 @@ class HumanoidCore(Star):
         "日程人设": "schedule_use_persona",
         "模型日程": "use_llm_schedule",
         "偏好": "schedule_prompt_extra",
+        "间隔": "schedule_min_interval_minutes",
+        "调用间隔": "schedule_min_interval_minutes",
+        "静默": "llm_idle_silence_minutes",
+        "空闲静默": "llm_idle_silence_minutes",
+        "预算": "llm_daily_call_budget",
+        "日预算": "llm_daily_call_budget",
         "上下文": "inject_activity_context",
         "环境": "environment_mode",
         "管理员": "admin_qq",
@@ -591,6 +614,13 @@ class HumanoidCore(Star):
             lines.append(f"- 城市（全局默认）：{cfg.timezone_city or '（未定）'}　→ /拟人设置 城市 大阪")
         lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人设置 人设 开")
         lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（每 {cfg.schedule_refresh_minutes} 分钟决定一次要不要排下一段，变动概率 {cfg.schedule_change_chance}%）")
+        lines.append(
+            f"- 调用节流：最短间隔 {cfg.schedule_min_interval_minutes} 分钟"
+            f"，空闲 {cfg.llm_idle_silence_minutes} 分钟静默"
+            f"，今日已用 {self.call_gate.used_today}/"
+            f"{cfg.llm_daily_call_budget or '不限'} 次（所有 bot 共享）"
+            f"　→ /拟人设置 间隔 30"
+        )
         lines.append(f"- 日程额外偏好：{cfg.schedule_prompt_extra or '（空）'}")
         lines.append(f"- 上下文详略：{cfg.inject_activity_context}（medium/full/mood_only）")
         lines.append(f"- 参与环境：{cfg.environment_mode}（private/group/both）")
@@ -852,6 +882,9 @@ class HumanoidCore(Star):
             user_id = self._sender(event)
             if user_id == role_id:
                 return
+            # 任何一条真实用户消息都算「有人在用」：松开空闲静默，让日程重新跟上。
+            # 放在后续所有早退之前，否则「被过滤的环境」会把静默一直吊着。
+            self.call_gate.note_interaction()
             is_group = not _is_private_chat(event)
             if not self.engine.environment_allows(not is_group):
                 return

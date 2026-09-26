@@ -162,6 +162,34 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("精力", out[0])
         self.assertIn("城市", out[0])
 
+    async def test_settings_writes_throttle_numbers_as_ints(self):
+        """/拟人设置 间隔 45 必须存成 int 45，不能是字符串 "45"。"""
+        out = await collect(self.star.cmd_settings(FakeEvent("/拟人设置 间隔 45")))
+        self.assertIn("已设为", out[-1])
+        self.assertIsInstance(self.star._config_box.raw["schedule_min_interval_minutes"], int)
+        self.assertEqual(self.star._config.schedule_min_interval_minutes, 45)
+        self.assertEqual(self.star._config_box.raw["schedule_min_interval_minutes"], 45)
+
+    async def test_settings_rejects_non_numeric_throttle_value(self):
+        out = await collect(self.star.cmd_settings(FakeEvent("/拟人设置 预算 一堆")))
+        self.assertIn("不是这一项能接受的值", out[-1])
+        self.assertNotIn("llm_daily_call_budget", self.star._config_box.raw)
+
+    async def test_settings_shows_throttle_line(self):
+        out = await collect(self.star.cmd_settings(FakeEvent("/拟人设置")))
+        self.assertIn("调用节流", out[0])
+        self.assertIn("最短间隔", out[0])
+
+    async def test_gate_is_installed_and_shared(self):
+        """闸门挂在全局网关上：所有 bot 共用同一份预算。"""
+        self.assertIsNotNone(self.star.call_gate)
+        self.assertIs(self.star.gateway.gate, self.star.call_gate)
+
+    async def test_on_message_releases_idle_silence(self):
+        self.star.call_gate.note_interaction(12345.0)
+        snap = self.star.call_gate.snapshot()
+        self.assertFalse(snap["never_interacted"], "一条真实消息就该松开静默")
+
     async def test_help_lists_diagnose(self):
         out = await collect(self.star.cmd_help(FakeEvent("/拟人帮助")))
         self.assertIn("/拟人诊断", out[0])
