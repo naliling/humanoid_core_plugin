@@ -28,7 +28,16 @@ if TYPE_CHECKING:
 from .config import HumanoidConfig
 from .data.mood_map import get_mood_label, mood_complex
 from .services.schedule import day_lines, day_phrases, done_between, just_done
-from .wording import CARE_WORDS, SINCE_WORDS, pick, scale_word
+from .wording import (
+    AGENCY_CONTINUATION,
+    AGENCY_INITIATIVE,
+    CARE_WORDS,
+    FOCUS_WORDS,
+    SINCE_WORDS,
+    SPARE_WORDS,
+    pick,
+    scale_word,
+)
 
 _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 
@@ -135,6 +144,7 @@ class PromptBuilder:
         agency: Optional[Dict[str, float]] = None,
         text: str = "",
         interest: Optional[Dict[str, float]] = None,
+        persona_prompt: str = "",
     ) -> str:
         cfg = self.config
         events = events or []
@@ -149,6 +159,14 @@ class PromptBuilder:
             nickname = self._nickname_line(user_id, is_group)
             if nickname:
                 relation = relation + [nickname]
+            voice = self._persona_voice_line(persona_prompt)
+            if voice:
+                relation = relation + [voice]
+            tendency = self._tendency_lines(agency, interest, self._seed(user_id))
+            if tendency:
+                # 倾向这一层也跟着进最轻的一档：它不是「生活细节」，
+                # 而是「她现在想不想说话」——缺了它，模型只能拿身体读数自己猜
+                relation = relation + tendency
             sents = [
                 (self._sentence(self._scene_lines(is_group, detailed=False)), 10.0),
                 (self._sentence(relation), 8.0),
@@ -159,9 +177,9 @@ class PromptBuilder:
             return self._finish(sents, cfg)
 
         if mode == "full":
-            return self._finish(self._build_full(user_id, is_group, events, agency, text, interest), cfg)
+            return self._finish(self._build_full(user_id, is_group, events, agency, text, interest, persona_prompt), cfg)
 
-        return self._finish(self._build_medium(user_id, is_group, events, agency, text, interest), cfg)
+        return self._finish(self._build_medium(user_id, is_group, events, agency, text, interest, persona_prompt), cfg)
 
     # ------------------------------------------------------------------
     # 分块
@@ -224,6 +242,59 @@ class PromptBuilder:
             lines.append("这会儿是她的睡眠时段")
         else:
             lines.append("这会儿是她的夜间作息")
+        return lines
+
+    @staticmethod
+    def _persona_voice_line(persona_prompt: str) -> str:
+        """人设里关于「她怎么说话」的原话。
+
+        以前人设根本不进聊天 prompt：所有角色的注入层口吻完全一样，永远是
+        「她…，她…，她…」的第三人称统一腔，角色差异只靠 pick() 的种子在每档一两个词
+        之间轮换。这里不搬整段人设（1200 字会把时间、场景、身体、关系全挤掉），
+        只摘带说话方式信号的**原句**，并明确标出这是人设原话而不是插件的判断。
+        """
+        if not persona_prompt:
+            return ""
+        from .persona import speech_traits
+
+        traits = speech_traits(persona_prompt)
+        return f"人设里写着她是这样说话的：{traits}" if traits else ""
+
+    def _tendency_lines(
+        self,
+        agency: Dict[str, float],
+        interest: Dict[str, float],
+        seed: List[Any],
+    ) -> List[str]:
+        """她此刻的倾向：想不想说、想不想接着、注意力在哪、有多少闲。
+
+        这七个数（agency 五轴 + focus/spare）以前算了、传了七层，_behavior_lines 里
+        一次都没读过——模型只拿到「她很困」这类身体状态，得自己推「那她大概不想说话」，
+        而这恰恰是该给它的参考。给不出倾向，就只能给身体读数；只给读数，模型只能猜。
+
+        措辞上有一条硬要求：**只描述她此刻的状态，不写对模型的要求**。
+        「她这会儿挺想说点什么」是状态；「所以你应该主动找TA」是越界。
+        """
+        def word(key: str, value: Any, ladder) -> str:
+            try:
+                v = max(0.0, min(1.0, float(value)))
+            except (TypeError, ValueError):
+                return ""
+            # scale_word 返回的是「该档位的多个候选词」组成的元组（取不到时是空串），
+            # 必须原样交给 pick 让它抽一个出来，不能再包一层或 or ""——
+            # 那会让这里返回 tuple，后面 join 句子时直接报类型错
+            return pick(key, seed, scale_word(v, ladder))
+
+        lines: List[str] = []
+        for key, source, ladder in (
+            ("ag_initiative", agency.get("initiative"), AGENCY_INITIATIVE),
+            ("ag_continuation", agency.get("continuation"), AGENCY_CONTINUATION),
+            ("focus", interest.get("focus"), FOCUS_WORDS),
+            ("spare", interest.get("spare"), SPARE_WORDS),
+        ):
+            got = word(key, source, ladder)
+            if got:
+                lines.append(got)
         return lines
 
     def _relation_lines(
@@ -309,13 +380,13 @@ class PromptBuilder:
         except (TypeError, ValueError):
             return []
         if affection - base >= 8.0:
-            lines.append(pick("emo_up", seed, ("最近对TA更上心了", "心里离TA更近了些")))
+            lines.append(pick("emo_up", seed, ("最近对TA更上心", "心里离TA近了些")))
         elif base - affection >= 8.0:
-            lines.append(pick("emo_down", seed, ("心里对TA淡了些", "最近对TA没那么热络")))
+            lines.append(pick("emo_down", seed, ("心里对TA淡了些", "最近没那么热络")))
         if aggression >= 30.0:
-            lines.append(pick("emo_angry", seed, ("心里压着火气", "憋着一股气")))
+            lines.append(pick("emo_angry", seed, ("心里压着火", "一股气没处发")))
         if libido >= 32.0:
-            lines.append(pick("emo_miss", seed, ("有点想TA", "心里惦记着TA")))
+            lines.append(pick("emo_miss", seed, ("有点惦记TA", "心思飘过去了")))
         return lines
 
     def _echo_lines(self) -> List[str]:
@@ -395,8 +466,11 @@ class PromptBuilder:
         out: List[str] = []
         for line in lines:
             body = str(line).split("：", 1)[-1].replace("；", "，")
-            if body:
-                out.append(f"她今天{body}")
+            # 「现在空着」不值得占一条消息的形状：拼出来是「她今天上午在改海报，现在空着」。
+            # 原来只有 medium 档在外层拦，full 档没拦，会漏出这种不像人话的句子
+            if not body or "现在空着" in body:
+                continue
+            out.append(f"她今天{body}")
         return out
 
     def _memory_lines(self, user_id: str, detailed: bool) -> List[str]:
@@ -449,16 +523,33 @@ class PromptBuilder:
         except Exception:
             pass
         # 季节：真人知道现在入秋了、快过年了。
+        # 按所在城市的时区判南北半球——只看月份的话，9 月的悉尼角色会被告知「入秋了」。
+        # 没有权威的纬度表，与其造一张不如按时区名判：下面这些前缀本身就只在南半球。
+        # Australia/Darwin 在北纬、南回归线上，刻意不列进去。
         month = now.month
         season = ""
-        if month in (3, 4, 5):
-            season = "开春了"
-        elif month in (6, 7, 8):
-            season = "入夏了"
-        elif month in (9, 10, 11):
-            season = "入秋了"
-        elif month in (12, 1, 2):
-            season = "入冬了"
+        try:
+            from .data.cities import resolve_zone_name
+
+            zone = str(resolve_zone_name(str(self._core.config.timezone_city or "")) or "").upper()
+        except Exception:
+            zone = ""
+        southern = zone.startswith(
+            ("AUSTRALIA/SYDNEY", "AUSTRALIA/MELBOURNE", "AUSTRALIA/HOBART",
+             "AUSTRALIA/ADELAIDE", "AUSTRALIA/BRISBANE", "AUSTRALIA/LORD_HOWE",
+             "PACIFIC/AUCKLAND", "ANTARCTICA/")
+        )
+        # 北半球 3-5 春 / 6-8 夏 / 9-11 秋 / 12-2 冬；南半球反过来
+        table = (
+            ((9, 11), (12, 2), (3, 5), (6, 8))
+            if southern else
+            ((3, 5), (6, 8), (9, 11), (12, 2))
+        )
+        for idx, (lo, hi) in enumerate(table):
+            in_span = (lo <= month <= hi) if lo <= hi else (month >= lo or month <= hi)
+            if in_span:
+                season = ("开春了", "入夏了", "入秋了", "入冬了")[idx]
+                break
         if season:
             lines.append(season)
         if cfg.show_city_time_in_low_intrusion:
@@ -601,6 +692,7 @@ class PromptBuilder:
         agency: Dict[str, float],
         interest: Dict[str, float],
         detailed: bool,
+        persona_prompt: str = "",
     ) -> None:
         """睡着时也不能丢的必需品：她对TA、称呼、间隔、TA说过的话。
 
@@ -620,12 +712,21 @@ class PromptBuilder:
         )
         if situ:
             sents.append((self._sentence(situ), 7.0))
+        tendency = self._sentence(
+            self._tendency_lines(agency, interest, self._seed(user_id))
+        )
+        if tendency:
+            sents.append((tendency, 6.5))
+        voice = self._persona_voice_line(persona_prompt)
+        if voice:
+            sents.append((voice, 7.5))
         memory = self._sentence(self._memory_lines(user_id, detailed=detailed))
         if memory:
             sents.append((memory, 6.0))
 
     def _build_medium(
-        self, user_id: str, is_group: bool, events, agency, text: str, interest: Dict[str, float]
+        self, user_id: str, is_group: bool, events, agency, text: str,
+        interest: Dict[str, float], persona_prompt: str = ""
     ) -> str:
         snap = self._core.snapshot(refresh=False)
         # 夜间精简：睡着时省掉生活细节，但必需品（关系/称呼/间隔/记忆）由
@@ -642,7 +743,8 @@ class PromptBuilder:
             if body:
                 sents.append((self._sentence(body), 9.0))
             self._append_sleep_essentials(
-                sents, user_id, is_group, events, agency, interest, detailed=False
+                sents, user_id, is_group, events, agency, interest,
+                detailed=False, persona_prompt=persona_prompt,
             )
             return "。".join(s for s, _ in sents if s)
 
@@ -675,6 +777,14 @@ class PromptBuilder:
         )
         if situ:
             sents.append((self._sentence(situ), 7.0))
+        tendency = self._sentence(
+            self._tendency_lines(agency, interest, self._seed(user_id))
+        )
+        if tendency:
+            sents.append((tendency, 6.5))
+        voice = self._persona_voice_line(persona_prompt)
+        if voice:
+            sents.append((voice, 7.5))
 
         # medium 档：精力不 notable 时身边句整句消失，形状每条消息都在变。
         try:
@@ -691,7 +801,8 @@ class PromptBuilder:
         return "。".join(s for s, _ in sents if s)
 
     def _build_full(
-        self, user_id: str, is_group: bool, events, agency, text: str, interest: Dict[str, float]
+        self, user_id: str, is_group: bool, events, agency, text: str,
+        interest: Dict[str, float], persona_prompt: str = ""
     ) -> str:
         snap = self._core.snapshot(refresh=False)
         try:
@@ -738,6 +849,14 @@ class PromptBuilder:
         )
         if situ:
             sents.append((self._sentence(situ), 7.0))
+        tendency = self._sentence(
+            self._tendency_lines(agency, interest, self._seed(user_id))
+        )
+        if tendency:
+            sents.append((tendency, 6.5))
+        voice = self._persona_voice_line(persona_prompt)
+        if voice:
+            sents.append((voice, 7.5))
         memory = self._sentence(self._memory_lines(user_id, detailed=True))
         if memory:
             sents.append((memory, 6.0))

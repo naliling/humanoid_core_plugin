@@ -204,13 +204,20 @@ class SchedulePersonaTest(unittest.TestCase):
         self.assertIn("她是「林小满」", prompt)
         # 旧版那句「请为「温柔体贴」这个人设规划今天」不该再以另一种形式回来
         self.assertNotIn("温柔体贴", prompt)
-        self.assertIn("每天都沿用同一个答案", prompt)
+        # 原来这里断言的是「每天都沿用同一个答案」——那句出自
+        # 「设定里没写的，按最合理、最省心的方式补一个出来」，是在命令模型替她造身份。
+        # 现在人设照旧整段进 prompt，但没提到的部分要求留白。
+        self.assertIn("不要替他编", prompt)
 
     def test_prompt_without_persona_stays_sane(self):
         for persona in (None, Persona(), Persona(name="空壳", prompt="", source="未取到人设")):
             prompt = segment_prompt(cfg(), now_text="15:20", weekday="六", persona=persona)
-            self.assertIn("有自己生活的普通人", prompt)
+            # 无人设时仍要给得出可执行的指引（否则模型不知道该排什么），
+            # 但不能假设她的职业——旧句「按一份普通上班族/学生的真实日子补」会给她安身份
             self.assertIn("只输出一个 JSON 对象", prompt)
+            self.assertIn("有事要做", prompt)
+            self.assertNotIn("上班族", prompt)
+            self.assertNotIn("学生", prompt)
 
     def test_giant_persona_is_clamped_by_the_prompt_builder(self):
         """日程一天要跑 1~2 次，不能因为谁把人设写成一万字就撑成七千 token 的请求。
