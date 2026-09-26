@@ -304,13 +304,31 @@ class CallGate:
     def _daily_budget(self) -> int:
         return max(0, int(getattr(self._config(), "llm_daily_call_budget", 0) or 0))
 
-    def check(self, purpose: str, *, now: float | None = None) -> GateVerdict:
-        """该不该放行这一次。纯查询，不计数——调用方要的是「能不能调」。"""
+    def check(
+        self,
+        purpose: str,
+        *,
+        now: float | None = None,
+        budget_only: bool = False,
+    ) -> GateVerdict:
+        """该不该放行这一次。纯查询，不计数——调用方要的是「能不能调」。
+
+        `budget_only=True` 是给「用户此刻明确要求」用的（`/重置日程`、人设重排）：那种调用
+        要绕开**空闲静默与最小间隔**——那是后台自动决策的节奏，不该把管理员手下的命令
+        驳回——但**仍然要占每日预算**。额度是硬约束，绕过它等于开了个不限量的口子：
+        反复点 `/重置日程` 就能把当天的额度撞穿，而 `/拟人诊断` 里看不出任何痕迹。
+        """
         if purpose in GATE_EXEMPT_PURPOSES:
             return GateVerdict(True, _GATE_OFF, "情绪分析不参与节流")
 
         self._roll_day()
         wall = self._wall() if now is None else float(now)
+
+        if budget_only:
+            budget = self._daily_budget()
+            if budget > 0 and self._used_today >= budget:
+                return GateVerdict(False, _GATE_BUDGET, f"今日 {self._used_today}/{budget} 次已用完")
+            return GateVerdict(True)
 
         idle_limit = self._idle_minutes()
         if idle_limit > 0:
@@ -519,10 +537,10 @@ class LLMGateway:
 
             # 闸门卡在这里而不是生成入口：候选全被冷却、provider 根本不存在时并没有
             # 真的发请求，不该占掉一次额度。
-            # ignore_cooldown 是「用户此刻明确要求」（/重置日程）或人设重排的信号，
-            # 那种调用得给出去，否则管理员输个命令却被静默规则驳回。
-            if self._gate is not None and not counted and not ignore_cooldown:
-                verdict = self._gate.check(purpose)
+            if self._gate is not None and not counted:
+                # ignore_cooldown 是「用户此刻明确要求」（/重置日程）或人设重排的信号，
+                # 那种调用得给出去：绕开空闲静默与最小间隔，但仍受每日预算约束。
+                verdict = self._gate.check(purpose, budget_only=ignore_cooldown)
                 if not verdict.allowed:
                     self._gate.log_block(purpose, verdict)
                     result = LLMResult(

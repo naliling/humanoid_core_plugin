@@ -284,7 +284,27 @@ class SomaTest(unittest.TestCase):
         sleepy = fixture.soma.form_policy(30.0, 20.0)
         self.assertGreater(alert["max_chars"], sleepy["max_chars"])
         self.assertLess(sleepy["question_bias"], alert["question_bias"])
-        self.assertTrue(sleepy["burst_ok"])
+
+    def test_burst_ok_means_she_has_the_stamina(self):
+        """`burst_ok` 是「有余力才能连着发」，不是「难受到可以连着发」。
+
+        旧写法是从 max_chars 推的（`<= 45`），于是它只在她最难受的时候为真，语义正好
+        倒过来。社交层拿它决定「主动开话题时能不能接二条」——判反了就是越难受越被连着戳。
+        """
+        start = datetime(2026, 8, 22, 9, 0, tzinfo=TZ)
+        fixture = SomaFixture(start, cfg(enable_cycle=False), DAY_SCHEDULE)
+        fixture.soma._set("sleep_pressure", 15.0)
+        fixture.soma._set("sleep_debt", 0.0)
+        fixture.soma._set("discomfort", 0.0)
+        self.assertTrue(
+            fixture.soma.form_policy(90.0, 90.0)["burst_ok"],
+            "精神好的时候应该允许连着发",
+        )
+        fixture.soma._set("sleep_pressure", 92.0)
+        self.assertFalse(
+            fixture.soma.form_policy(30.0, 20.0)["burst_ok"],
+            "累到 20 字上限时不该被连着发",
+        )
 
     def test_tick_does_not_write_state_every_minute(self):
         """60 秒一次的 tick 不该把状态文件写成常驻磁盘写入。"""

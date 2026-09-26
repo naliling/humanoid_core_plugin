@@ -183,13 +183,17 @@ class HumanoidConfig:
     weather_location: str = ""
     weather_refresh_minutes: int = 60
 
-    # 多消息合并（消息防抖）：短时间内连续触发机器人的多条消息，合并成一次模型请求、
-    # 只回一条。私聊合并同一用户连发；群聊合并多人连续 @。仅在防抖窗口内、且机器人
-    # 还没开始回复时才合并；命令、纯图片/语音消息不参与。
+    # 多消息合并（防抖）：连续触发机器人的多条消息，合并成一次模型请求、只回一条。
+    # 判定「说完了吗」用规则（humanoid/merge.py）而不是固定时间窗：句末有标点/语气词的
+    # 零延迟放行，只有像「今天真的好累啊」这种拿不准的才等一句。整体做法参考
+    # astrbot_plugin_debounce，但它靠 BERT 模型（要 onnxruntime+transformers+modelscope
+    # 四个依赖、运行时再从 ModelScope 拉模型），本机实测装那几个包跑了 5 分钟没装完，
+    # 拉不到模型还会静默失效，所以不引入。
     message_merge_enabled: bool = True
-    # 防抖窗口（秒）：收到一条会触发回复的消息后，等这么久看还有没有新消息一起并进来。
-    # 代价是每条回复都会晚这么久；默认 1.5 秒是抓连发与不拖沓之间的折中。
-    message_merge_window_seconds: float = 1.5
+    # 规则判不出来时（没标点、长度中等）最多等这么久，等后续那句一起并进来。
+    # 只在这条「拿不准」的路上付延迟：句末有标点/语气词的消息零延迟直接发。
+    # 0 = 不等待，等于只看标点。
+    message_merge_timeout_seconds: float = 3.0
     # 一批最多合并多少条：防刷屏把 prompt 撑爆，只保留最近这么多条。
     message_merge_max_count: int = 6
 
@@ -214,7 +218,10 @@ class HumanoidConfig:
     mood_log_max_entries: int = 28
     mood_log_threshold_affection: int = 2
     mood_log_threshold_libido: int = 2
-    mood_log_threshold_aggression: int = 1
+    # 原为 1：单次 delta 上限是 2，所以每一条负面消息的攻击性变化都跨过这个门槛，
+    # 情绪日志被单条对话刷满，而 last_emotional_event 只看最新一条——于是「今天TA惹她
+    # 不痛快了」会连续挂一整天。提到 2 后只有真的明显波动才记。
+    mood_log_threshold_aggression: int = 2
     mood_update_timeout: float = 120.0
     mood_tag_enabled: bool = True
     mood_use_llm_for_delta: bool = True
@@ -338,7 +345,7 @@ class HumanoidConfig:
             weather_location=s_opt("weather_location"),
             weather_refresh_minutes=i("weather_refresh_minutes", 1, 1440),
             message_merge_enabled=b("message_merge_enabled"),
-            message_merge_window_seconds=f("message_merge_window_seconds", 0.0, 30.0),
+            message_merge_timeout_seconds=f("message_merge_timeout_seconds", 0.0, 30.0),
             message_merge_max_count=i("message_merge_max_count", 1, 50),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
             inject_token_budget=i("inject_token_budget", 200, 20000),

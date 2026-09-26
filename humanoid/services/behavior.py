@@ -212,36 +212,33 @@ class BehaviorService:
 
     def compute_agency(
         self,
-        user_id: str,
         events: List[Dict[str, Any]],
         social_energy: float,
-        mood_profile: Dict[str, Any],
         energy: float,
     ) -> Dict[str, float]:
-        """根据长期状态 + 短期注意力形成行为倾向。
+        """她此刻的行为倾向：想不想开话头、还想不想接着聊。
 
-        这些值不是回复命令，只是 LLM 的决策背景。
+        返回的就是这两轴，没有别的。原来还算了 curiosity / care / social_willingness
+        三轴并按好感度与事件逐条调整，可 prompt_builder 一眼都不读——三份算完就扔的死功。
         """
         agency = {
-            "initiative": 0.42,
-            "curiosity": 0.32,
-            "care": 0.48,
-            "social_willingness": 0.60,
+            # 基线定得比中档门槛（0.45）高一点是有意的：原来基线 0.42 卡在门槛下方，
+            # 于是**每一条消息**的注入开头都是「她不太想开话头／这会儿没什么特别想说的」——
+            # 一句话就把模型往冷淡上推。0.52 让「她有点想说话」成为常态，
+            # 「话匣子是开着的」那档也终于够得着（0.52+0.06+0.04+事件增量）。
+            "initiative": 0.52,
             "continuation": 0.52,
         }
 
         social_energy = float(social_energy)
         energy = float(energy)
-        affection = float(mood_profile.get("affection", 50.0))
 
         if social_energy < 30:
-            agency["social_willingness"] *= 0.45
             agency["initiative"] *= 0.70
         elif social_energy < 60:
-            agency["social_willingness"] *= 0.78
             agency["initiative"] *= 0.88
         elif social_energy > 85:
-            agency["social_willingness"] += 0.06
+            agency["initiative"] += 0.06
 
         if energy < 20:
             agency["initiative"] *= 0.55
@@ -252,36 +249,15 @@ class BehaviorService:
         elif energy > 80:
             agency["initiative"] += 0.04
 
-        if affection >= 70:
-            agency["care"] += 0.12
-            agency["curiosity"] += 0.08
-        elif affection <= 30:
-            agency["care"] -= 0.10
-            agency["social_willingness"] -= 0.08
-
         for event in events:
             typ = event.get("type")
-            bucket = event.get("data", {}).get("gap_bucket")
             attention = max(0.0, min(1.0, float(event.get("attention", 0.0))))
             if attention <= 0:
                 continue
-
-            if typ == "conversation_started":
-                agency["curiosity"] += 0.08 * attention
-                agency["care"] += 0.04 * attention
-            elif typ == "conversation_resumed":
-                agency["curiosity"] += 0.12 * attention
+            if typ == "conversation_resumed":
                 agency["continuation"] += 0.10 * attention
-            elif typ == "user_returned":
-                agency["curiosity"] += 0.18 * attention
-                agency["care"] += 0.12 * attention
+            elif typ in ("user_returned", "long_gap"):
                 agency["initiative"] += 0.08 * attention
-                if bucket == "long_return":
-                    agency["curiosity"] += 0.05 * attention
-            elif typ == "long_gap":
-                agency["curiosity"] += 0.22 * attention
-                agency["care"] += 0.15 * attention
-                agency["initiative"] += 0.10 * attention
 
         for key, value in agency.items():
             agency[key] = max(0.0, min(1.0, float(value)))
@@ -349,7 +325,10 @@ class BehaviorService:
         body = (text or "").strip()
         if not body:
             return 0.20
-        value = 0.34
+        # 同上：0.34 卡在 FOCUS_WORDS 的中档门槛（0.45）下方，于是「你好」这种短消息
+        # 也会被描述成「她心思飘在别处／注意力没放在对话上」——而它和同一句里的
+        # 「她现在很闲」直接打架（有空却没在听）。0.46 让默认落在「心思比较齐」。
+        value = 0.46
         # 很多人打字不带问号，但「…吗」「…呢」就是在问她。
         if any(ch in body for ch in "?？") or body[-1] in ("吗", "呢", "吧", "啊", "呀"):
             value += 0.18
@@ -370,8 +349,8 @@ class BehaviorService:
             libido = float(profile.get("libido", 25.0))
         except (TypeError, ValueError):
             aggression, libido = 15.0, 25.0
-        value -= min(0.20, max(0.0, aggression - 30.0) / 100.0 * 0.7)
-        value += min(0.10, max(0.0, libido - 35.0) / 100.0 * 0.4)
+        value -= min(0.20, max(0.0, aggression - 40.0) / 100.0 * 0.7)
+        value += min(0.10, max(0.0, libido - 42.0) / 100.0 * 0.4)
         return round(max(0.0, min(1.0, value)), 3)
 
     def _her_today_keywords(self) -> List[str]:

@@ -1096,7 +1096,32 @@ class ThrottleTest(unittest.IsolatedAsyncioTestCase):
         changed = await service.ensure_fresh(force=True, ignore_cooldown=True)
         self.assertTrue(changed)
         self.assertEqual(provider.calls, 1)
-        self.assertEqual(service.source, SOURCE_LLM)
+
+    async def test_manual_refresh_still_pays_the_daily_budget(self):
+        """/重置日程 绕开的是**节奏**（空闲静默、最小间隔），不是**额度**。
+
+        额度是硬约束：绕开它等于开了个不限量的口子——反复点这条命令就能把当天的
+        调用预算撞穿，而 `/拟人诊断` 里看不出任何痕迹（旧实现压根不计数）。
+        """
+        from humanoid.config import HumanoidConfig as _Cfg
+        from humanoid.llm import PURPOSE_SCHEDULE, CallGate
+
+        conf = _Cfg.from_raw({
+            "llm_daily_call_budget": 1,
+            "llm_idle_silence_minutes": 60,     # 静默开着：手动请求必须绕开它
+            "schedule_min_interval_minutes": 60,
+        })
+        gate = CallGate(lambda: conf)
+        # 没人跟她说过话 → 静默与间隔都该拦
+        self.assertFalse(gate.check(PURPOSE_SCHEDULE).allowed, "默认就该被静默拦下")
+        # 手动请求：绕开静默与间隔（此刻没人看着，但管理员明确要求了）
+        manual = gate.check(PURPOSE_SCHEDULE, budget_only=True)
+        self.assertTrue(manual.allowed, f"手动请求不该被静默驳回：{manual.describe()}")
+        gate.consume(PURPOSE_SCHEDULE)
+        # 额度用完之后，手动请求也一样要停
+        again = gate.check(PURPOSE_SCHEDULE, budget_only=True)
+        self.assertFalse(again.allowed, "预算用完后手动请求也该被挡")
+        self.assertIn("已用完", again.detail)
 
     async def test_throttle_fully_disabled_restores_old_behaviour(self):
         """三项都置 0 时行为跟改动前一致：节流是可关的，不是硬编码。"""

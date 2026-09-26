@@ -157,7 +157,7 @@ class InjectionFreedomTest(unittest.TestCase):
                                        interest={"care": 0.9, "focus": 0.9, "spare": 0.9})
         cold = builder._relation_lines("43", False, detailed=False,
                                        interest={"care": 0.05, "focus": 0.05, "spare": 0.05})
-        self.assertTrue(any("亲密" in line or "在意" in line for line in mine), mine)
+        self.assertTrue(any("亲密" in line or "在意" in line or "她对TA" in line for line in mine), mine)
         # 措辞按天抽签：0.00 档有几套说法，都得认。
         self.assertTrue(any(word in line for line in cold for word in ("疏远", "不常联系")),
                         f"低在意度没说出距离感：{cold}")
@@ -438,25 +438,38 @@ class NewConstraintTest(unittest.TestCase):
         )
 
     def test_awake_and_want_to_talk_axes_are_used(self):
-        """arousal 与 social_desire 的词表早就写好，却一次都没被调用过。"""
+        """arousal 的词表早就写好，却一次都没被调用过。"""
         text = self._inject(arousal=90.0, social_desire=90.0, sleep_pressure=5.0)
+        # arousal 高 → 「人挺精神的/脑子转得挺快」；想不想说话由行为倾向的 initiative 说，
+        # 它的措辞有四档（挺想说点什么/话匣子是开着的/有点想说话/接话接得住）。
         self.assertTrue(
-            any(w in text for w in ("精神", "有交流意愿", "想找人说", "想说话")),
-            f"清醒度/想说话没进体感：{text}",
+            any(w in text for w in ("精神", "脑子转得挺快", "想说话", "挺想说点什么", "话匣子", "接话接得住")),
+            f"清醒度/想说话没进上下文：{text}",
         )
 
-    def test_persona_voice_reaches_the_prompt(self):
-        """人设以前只进日程、从不进聊天 prompt，于是所有角色口吻一模一样。"""
-        from humanoid.persona import speech_traits
+    def test_persona_never_reaches_the_prompt(self):
+        """人设不搬进聊天上下文。
 
-        self.assertTrue(
-            speech_traits("她说话很慢，喜欢用嗯开头。口头禅是「真的假的」。"),
-            "speech_traits 连这几句都没摘出来",
+        它以前是按「风格/语气/口头禅」这类关键词从句子里挑原句，挑中的是人设里写给
+        作者看的**示例对话**——于是示例里的人设、情色内容、别人的 @ 全都进了每一轮
+        聊天，而且模型会把示例当成「她刚说过的话」去接。AstrBot 已经把人设放进
+        system_prompt，插件再搬一遍只有副作用。
+        """
+        from humanoid import persona as persona_module
+
+        self.assertFalse(
+            hasattr(persona_module, "speech_traits"),
+            "speech_traits 又回来了：它会按关键词摘人设的示例对话",
         )
-        self.assertEqual(
-            speech_traits("她养了一只叫饭团的橘猫，24岁，住在杭州。"), "",
-            "纯身世背景不该被当成说话方式",
+        from humanoid.prompt_builder import PromptBuilder
+
+        self.assertFalse(
+            hasattr(PromptBuilder, "_persona_voice_line"),
+            "_persona_voice_line 又回来了：它会把人设原文拼进注入",
         )
+        text = self._inject()
+        for leaked in ("人设里写着", "回复风格", "不列", "发言风格"):
+            self.assertNotIn(leaked, text, f"人设原文漏进上下文：{leaked}\n{text}")
 
     def test_mood_tag_carries_no_first_person_lines(self):
         """「她今天想贴贴」是把角色会说的话塞给模型。"""

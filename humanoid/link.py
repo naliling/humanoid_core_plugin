@@ -53,7 +53,16 @@ def build_contract(core: Any) -> dict[str, Any]:
     feelings: list[str] = []
     if cfg.soma_enabled:
         try:
-            feelings = [text for _, text in core.soma.feelings(float(snap["energy"]["value"]))[:3]]
+            # 与聊天注入**同一个口径**：按显著度从高到低排，再取前三条。
+            # 原来是 `feelings(...)[:3]`（按生成顺序截），只要有三条体感，
+            # 「今天到这会」「手上正在做」「等下」就全被挤掉——主动消息退化成
+            # 「我现在很饿」，她在哪、在干什么整个消失，和聊天时像两个人。
+            ranked = sorted(
+                core.soma.feelings(float(snap["energy"]["value"])),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            feelings = [text for _, text in ranked[:3]]
         except Exception:
             feelings = []
     offset = now.utcoffset()

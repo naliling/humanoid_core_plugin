@@ -648,7 +648,7 @@ class WeatherTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("appid=key%20with%20space", url)
 
     async def test_parse_payload_without_humidity(self):
-        parsed = parse_payload({"weather": [{"description": "晴"}], "main": {"temp": 30}}, "X")
+        parsed = parse_payload({"weather": [{"description": "晴"}], "main": {"temp": 30}})
         self.assertIsNotNone(parsed)
         self.assertNotIn("湿度", parsed["env"])
 

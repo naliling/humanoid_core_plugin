@@ -133,14 +133,43 @@ def period_of(minutes: int) -> str:
     return "白天"
 
 
+# 日程事件名是模型写的自由文本，有的自带动词与介词（"坐在客厅沙发上看书"）。外面再套
+# 一个「在」就成「现在在坐在客厅沙发上看书」——模型会照着这句病句往下说。
+# 拼接前先看一眼开头：动词/介词开头的直接接，其它才补「在」。
+_ACTION_HEADS = frozenset("在坐躺站靠趴蹲爬走跑跳吃喝做玩看读写听说聊打开学忙醒起洗梳穿等逛买煮烤拖练画唱骑划")
+
+_EVENT_PHRASE_MAX = 24
+
+
 def _event_phrase(event: str) -> str:
-    """把时段名削成能放进一句口语里的动作。"""
+    """把时段名削成能放进一句口语里的动作。
+
+    原来直接按 16 字硬截，「坐在客厅沙发看书并吃点水果」会被砍成「坐在客厅沙发看书并吃点水」
+    这种断句。改成先按标点收尾，实在没有标点才截。
+    """
     text = str(event or "").strip()
     for affix in ("安排", "活动", "时间", "（", "("):
         cut = text.find(affix)
         if cut > 1:
             text = text[:cut]
-    return text.strip(" -·、，。/~")[:16]
+    text = text.strip(" -·、，。/~")
+    if len(text) <= _EVENT_PHRASE_MAX:
+        return text
+    head = text[:_EVENT_PHRASE_MAX]
+    cut = max((head.rfind(ch) for ch in "，。；、,; "), default=-1)
+    if cut >= _EVENT_PHRASE_MAX // 2:
+        return head[:cut].strip(" -·、，。/~")
+    return head.rstrip(" -·、，。/~")
+
+
+def _with_at(lead: str, phrase: str) -> str:
+    """把时段词或「现在」与动作拼成一句，不出现「在坐在」这种叠字。"""
+    body = str(phrase or "").strip()
+    if not body:
+        return ""
+    if body.startswith("在") or body[0] in _ACTION_HEADS:
+        return f"{lead}{body}"
+    return f"{lead}在{body}"
 
 
 def day_phrases(
@@ -182,7 +211,7 @@ def day_phrases(
                 continue
             phrase = _event_phrase(event)
             if phrase:
-                done.insert(0, f"{period_of(lo)}在{phrase}")
+                done.insert(0, _with_at(period_of(lo), phrase))
             continue
         if lo - now_minutes <= DAY_UPCOMING_MINUTES:
             phrase = _event_phrase(event)
@@ -217,7 +246,7 @@ def done_between(
             continue
         phrase = _event_phrase(event)
         if phrase:
-            out.append(f"{period_of(lo)}在{phrase}")
+            out.append(_with_at(period_of(lo), phrase))
     return out[: max(0, int(limit))]
 
 
@@ -235,7 +264,7 @@ def day_lines(
     if done:
         bits.append("、".join(done))
     if include_doing and doing:
-        bits.append(f"现在在{doing}")
+        bits.append(_with_at("现在", doing))
     elif include_doing and done:
         bits.append("现在空着")
     if upcoming:

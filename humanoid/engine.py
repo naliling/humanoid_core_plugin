@@ -9,7 +9,7 @@ from typing import Any
 from . import __version__
 from .clock import lookup_city_time
 from .config import ConfigBox, HumanoidConfig
-from .diagnostics import build_report
+from .diagnostics import build_report, state_size_lines
 from .role_manager import RoleManager
 
 LOG_PREFIX = "[humanoid_core]"
@@ -117,6 +117,7 @@ class HumanoidEngine:
             body_status=body_status,
             inject_estimate=self._inject_estimate(core),
             zone_status=self._zone_status(core),
+            state_size_lines=state_size_lines(core),
             version=__version__,
         )
 

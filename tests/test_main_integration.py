@@ -413,38 +413,82 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await self.star.inject_context(FakeEvent("你好", private=True), req)
         self.assertEqual(req.system_prompt, "", "私聊在 group 模式下不应被注入")
 
-    # ---------- 多消息合并（消息防抖） ----------
+    # ---------- 消息合并（防抖） ----------
 
     def _set_merge(self, **kw):
         self.raw.update(kw)
         self.star._config_box.reload(self.raw)
 
     async def test_merge_lone_message_proceeds(self):
-        self._set_merge(message_merge_window_seconds=0.05)
-        ev = FakeEvent("你好", sender="555")
+        """带句末标点的消息零延迟直接走：不为它白等一拍。"""
+        self._set_merge(message_merge_timeout_seconds=5.0)
+        ev = FakeEvent("你好呀。", sender="555")
         await self.star.debounce_merge(ev)
         self.assertFalse(ev.is_stopped(), "孤消息不该被停，正常回复")
         self.assertIsNone(ev.get_extra(main_module.MERGE_EXTRA_KEY), "只有一条时不挂合并块")
 
     async def test_merge_two_messages_only_last_replies(self):
-        self._set_merge(message_merge_window_seconds=0.1)
-        e1 = FakeEvent("在吗", sender="556")
-        e2 = FakeEvent("帮我看个问题", sender="556")
+        """两条**没说完**的半句要并成一条，只回一次。"""
+        self._set_merge(message_merge_timeout_seconds=0.2)
+        e1 = FakeEvent("我今天", sender="556")
+        e2 = FakeEvent("特别累", sender="556")
         t1 = asyncio.create_task(self.star.debounce_merge(e1))
-        await asyncio.sleep(0.03)  # e1 先进入窗口
+        await asyncio.sleep(0.03)  # e1 先到
         t2 = asyncio.create_task(self.star.debounce_merge(e2))
         await asyncio.gather(t1, t2)
         self.assertTrue(e1.is_stopped(), "先到的被后到的取代，不单独回")
         self.assertFalse(e2.is_stopped(), "后到的胜出，负责合并回复")
-        self.assertEqual(e2.get_extra(main_module.MERGE_EXTRA_KEY), ["在吗"])
+        self.assertEqual(e2.get_extra(main_module.MERGE_EXTRA_KEY), ["我今天"])
+
+    async def test_merge_answered_complete_sentence_is_not_delayed(self):
+        """句末语气词的消息零延迟：「在吗」是两三个字，但它是完整的一问。"""
+        self._set_merge(message_merge_timeout_seconds=5.0)
+        ev = FakeEvent("在吗", sender="5563")
+        await self.star.debounce_merge(ev)
+        self.assertFalse(ev.is_stopped())
+        self.assertEqual(self.star._debounce.peek_text(ev, ""), "在吗")
+
+    async def test_merge_swallows_typing_one_by_one(self):
+        """逐字连发（「你」「今天」「我好累啊」）不能被切成两半。
+
+        「攒够两条就发」不算数：用户可能还在一个字一个字打。所以攒够条数只等一个短的
+        确认窗口（Debouncer.SETTLE_CAP_SECONDS），期间来的后续都并进同一句。
+        """
+        from humanoid import debounce as debounce_mod
+
+        self._set_merge(message_merge_timeout_seconds=0.3)
+        texts = ["你", "今天", "我好累啊"]
+        events = [FakeEvent(t, sender="5561") for t in texts]
+        gap = debounce_mod.SETTLE_CAP_SECONDS / 4
+
+        async def feed(ev):
+            await asyncio.sleep(gap)
+            await self.star.debounce_merge(ev)
+
+        await asyncio.gather(*[feed(ev) for ev in events])
+        alive = [ev for ev in events if not ev.is_stopped()]
+        self.assertEqual(len(alive), 1, f"应该只有一条胜出，实际 {len(alive)} 条")
+        self.assertEqual(alive[0].get_extra(main_module.MERGE_EXTRA_KEY), ["你", "今天"])
+        self.assertEqual(
+            self.star._debounce.peek_text(alive[0], ""), "你 今天 我好累啊",
+            "三句应该拼成一条完整的话",
+        )
+
+    async def test_merge_waits_when_unsure_then_sends_itself(self):
+        """拿不准又没人接：等满等待时间也要发出去，不能卡住不回。"""
+        self._set_merge(message_merge_timeout_seconds=0.15)
+        ev = FakeEvent("今天真的好累", sender="5562")
+        await self.star.debounce_merge(ev)
+        self.assertFalse(ev.is_stopped(), "等到时间就该自己发")
+        self.assertEqual(self.star._debounce.peek_text(ev, ""), "今天真的好累")
 
     async def test_merge_next_batch_starts_clean(self):
         """胜出者清空缓冲：下一批不该带上一批的内容。"""
-        self._set_merge(message_merge_window_seconds=0.05)
-        first = FakeEvent("第一批", sender="559")
+        self._set_merge(message_merge_timeout_seconds=0.05)
+        first = FakeEvent("第一批。", sender="559")
         await self.star.debounce_merge(first)
         self.assertFalse(first.is_stopped())
-        second = FakeEvent("第二批", sender="559")
+        second = FakeEvent("第二批。", sender="559")
         await self.star.debounce_merge(second)
         self.assertFalse(second.is_stopped())
         self.assertIsNone(second.get_extra(main_module.MERGE_EXTRA_KEY), "新一批不带旧内容")
@@ -457,7 +501,7 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.prompt, "在吗\n有空吗\n帮我看个问题", "更早几条按时间正序前置进 prompt")
 
     async def test_merge_disabled_is_noop(self):
-        self._set_merge(message_merge_enabled=False, message_merge_window_seconds=0.05)
+        self._set_merge(message_merge_enabled=False, message_merge_timeout_seconds=0.05)
         ev = FakeEvent("你好", sender="558")
         await self.star.debounce_merge(ev)
         self.assertFalse(ev.is_stopped())

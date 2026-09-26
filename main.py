@@ -25,6 +25,7 @@ from .humanoid.persona import PersonaSource
 from .humanoid.role_manager import RoleManager
 from .humanoid.state import StateStore
 from .humanoid.clock import Clock
+from .humanoid.debounce import MERGE_EXTRA_KEY, Debouncer
 
 DATA_SUBDIR = ("plugin_data", "humanoid_core")
 
@@ -54,7 +55,7 @@ NO_PERMISSION = "❌ 权限不足，该指令仅管理员可用。"
 
 # 多消息合并：防抖胜出的那条把同一批里更早的几条原话挂在事件上，交给 on_llm_request
 # 前置进 prompt。走事件自带的 extra、不走全局字典，合并数据随事件走，跨事件不会串。
-MERGE_EXTRA_KEY = "humanoid_merge_earlier"
+LOG_PREFIX = "[humanoid_core] "
 
 # 默认值一次性迁移的标记文件。AstrBot 更新配置只补缺不覆盖，不调这一手的话老用户
 # 会永远停在装插件那一版的行为上。
@@ -233,39 +234,6 @@ def _coerce_setting(key: str, value: str, current: Any) -> Any:
     return text
 
 
-class _MergeSession:
-    """一个会话（umo）的防抖状态：序号单调递增，缓冲区按到达顺序放原话。
-
-    同一会话的多条消息各自是一个并发的 pipeline 任务，共享这个状态；每条先 seq += 1
-    再 append（两步之间无 await，单线程下原子），然后睡等窗口；醒来后 seq 还是自己的
-    就是这一批的最后一条（胜出者），否则被后来者取代。
-    """
-
-    __slots__ = ("seq", "buffer", "last_active")
-
-    def __init__(self) -> None:
-        self.seq = 0
-        self.buffer: List[str] = []
-        self.last_active = time.monotonic()
-
-
-# 会话表上限：超过才做一次全表清扫（平时 O(1)，均摊开销可忽略）。
-# 清扫只删一小时没动静的会话——刚用过的（含正在睡等窗口里的）永远不会被误删。
-_MERGE_SESSION_CAP = 256
-_MERGE_SESSION_IDLE_SECONDS = 3600.0
-
-
-def _sweep_merge_sessions(sessions: dict, *, cap: int = _MERGE_SESSION_CAP) -> None:
-    """惰性清理防抖会话表：每个见过的会话永久留一个小对象，长期运行（机器人被拉进
-    越来越多群）只会慢慢积累；超上限时把一小时没动静的删掉，活跃的不动。"""
-    if len(sessions) <= cap:
-        return
-    now = time.monotonic()
-    stale = [key for key, sess in sessions.items() if now - sess.last_active > _MERGE_SESSION_IDLE_SECONDS]
-    for key in stale:
-        sessions.pop(key, None)
-
-
 def _part_text(part: Any) -> Optional[str]:
     if isinstance(part, dict):
         if str(part.get("type", "text")) not in ("text", ""):
@@ -298,8 +266,8 @@ class HumanoidCore(Star):
 
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
-        # 多消息合并（消息防抖）的按会话状态；进程内内存，键是 unified_msg_origin。
-        self._merge_sessions: dict[str, _MergeSession] = {}
+        # 多消息合并（防抖）的按会话状态；进程内内存，键是 unified_msg_origin。
+        self._debounce = Debouncer(lambda: self._config, logger)
 
         state_path = data_dir / "state.json"
         self._state_store = StateStore(state_path, lambda: self._config.state_flush_interval_seconds, logger)
@@ -376,6 +344,9 @@ class HumanoidCore(Star):
             core.process.current()
 
     async def terminate(self) -> None:
+        # 合并缓冲里可能还压着没发出的内容（用户发了半句就没下文了）。卸载时丢掉是对的：
+        # 它的主人已经不在了，放到下一个会话里说出去反而是惊吓。
+        self._debounce.reset()
         await self.role_manager.stop()
         await self._state_store.stop()
         session, self._session = self._session, None
@@ -637,6 +608,8 @@ class HumanoidCore(Star):
             yield event.plain_result(NO_PERMISSION)
             return
         self._config_box.reload()
+        # 合并等待秒数可能被改了，把压着的半句清掉，免得它按旧配置等完才发。
+        self._debounce.reset()
         yield event.plain_result(f"✅ 配置已重载。当前注入档位：{self._config.inject_activity_context}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -773,8 +746,11 @@ class HumanoidCore(Star):
             core = self.role_manager.get_or_create(self._self_id(event))
             user_id = self._sender(event)
             text = (getattr(event, "message_str", "") or "").strip()
+            # 注意力（上心程度）要看用户到底说了什么：合并了几条时看合并后的全貌，
+            # 否则前几条里的问句、提到的话题都不参与判断，注意力会被算低。
+            said = self._debounce.peek_text(event, text)
             # 时间间隔由 Core.on_message 统一记账，这里只读。
-            injection = core.build_injection(user_id, is_group=is_group, text=text)
+            injection = core.build_injection(user_id, is_group=is_group, text=said)
 
             if self._config.debug_mode:
                 from .humanoid.prompt_builder import estimate_tokens
@@ -784,8 +760,11 @@ class HumanoidCore(Star):
                     f" ≈{estimate_tokens(injection)} token（{self._config.inject_activity_context} 档）:\n{injection}"
                 )
 
-            _append_framing(req)
             if injection:
+                # 框架句在 system_prompt 里说的是「以下是她当前的**真实处境**」。
+                # 注入为空时（预算卡太小、构建抛异常）留着它，模型收下一句宣告却一条事实都
+                # 拿不到——它会自己编。所以没有事实就不要宣告。
+                _append_framing(req)
                 stale = _drop_stale_blocks(req, text)
                 if stale:
                     logger.debug(f"{LOG_PREFIX} 从上下文里抹掉 {stale} 份旧的身体事实块")
@@ -805,33 +784,33 @@ class HumanoidCore(Star):
 
     @filter.on_waiting_llm_request()
     async def debounce_merge(self, event: AstrMessageEvent):
-        """把同一会话短时间内连续触发机器人的多条消息，合并成一次回复。
+        """把同一会话连续触发机器人的多条消息合并成一次回复。
 
-        为什么放在这个钩子：OnWaitingLLMRequestEvent 只在确定要调 LLM 时才触发（指令
-        不会走到这一步），且它在抢会话锁之前——睡等窗口不占锁、不挡别的会话。同一会话的
-        每条消息各自是一个并发的 pipeline 任务（event_bus 用 create_task 派发），所以睡的
-        时候后面的消息能进来刷新序号。
+        放这个钩子有三个原因：
 
-        胜出规则：每条消息登记一个递增序号并把原话入缓冲，睡一个防抖窗口；醒来后序号
-        还是自己的→窗口内没有新消息，它就是这一批最后一条，继续走回复并把更早几条挂上
-        事件交给 inject_context 并进 prompt；序号被后来者赶超→停事件，这一条不再单独回。
+        1. 它只在**确定要调 LLM** 时才触发，指令不会走到这里（否则 `/好感度` 也会被等 3 秒）。
+        2. 它在**抢会话锁之前**：等一句不占锁，也不挡别的会话。
+        3. 同一会话的多条消息各自是并发的 pipeline 任务（event_bus 用 create_task 派发），
+           所以等的时候后面的消息能进来把自己顶掉。
 
-        改了文案不用担心旧会话：被停的消息未入历史（未走到 _save_to_history），它们的内容
-        都进了胜出者的合并 prompt，所以身体/情绪记账（走 on_message）照旧逐条算，只是回复合一。
+        判定「这句话说完了吗」用 `humanoid/merge.py` 的规则而不是固定时间窗：句末有标点或
+        语气词的消息**零延迟**直接发（旧的固定 1.5 秒窗口会让每条回复都平白晚 1.5 秒），
+        只有「今天真的好累啊」这种拿不准的才等一句。状态机与取舍见 `humanoid/debounce.py`。
+
+        被合并掉的旧消息走 `stop_event()`，它**没有走到 on_llm_request**（所以不会被注入
+        事实块），但 `on_message` 照旧逐条记账——身体/情绪/记忆按每条真实发言算，
+        只有「回复」是合一的。内容不会丢：一直在 buffer 里，由胜出者带走。
         """
         try:
             cfg = self._config
             if not cfg.message_merge_enabled:
-                return
-            window = float(cfg.message_merge_window_seconds)
-            if window <= 0:
                 return
             is_group = not _is_private_chat(event)
             if not self.engine.environment_allows(not is_group):
                 return
             text = (getattr(event, "message_str", "") or "").strip()
             if not text:
-                # 只对纯文本消息做合并；图片/语音这类照常单独回复，不去合并。
+                # 只对纯文本消息做合并；图片/语音这类照常单独回复。
                 return
             try:
                 umo = str(getattr(event, "unified_msg_origin", "") or "")
@@ -839,36 +818,14 @@ class HumanoidCore(Star):
                 umo = ""
             if not umo:
                 return
-
-            sess = self._merge_sessions.setdefault(umo, _MergeSession())
-            sess.seq += 1
-            my_seq = sess.seq
-            sess.buffer.append(text)
-            sess.last_active = time.monotonic()
-            _sweep_merge_sessions(self._merge_sessions)
-            max_count = max(1, int(cfg.message_merge_max_count))
-            if len(sess.buffer) > max_count:
-                del sess.buffer[:-max_count]
-
-            await asyncio.sleep(window)
-
-            if my_seq != sess.seq:
-                # 窗口内又来了新消息 → 交给后来者合并回复，这一条不再单独回。
-                event.stop_event()
+            proceed = await self._debounce.hold(
+                event, key=umo, text=text, stop_event=event.stop_event
+            )
+            if not proceed:
                 return
-            # 我是这一批的最后一条：把更早几条（自己已在 prompt 里）挂到事件上，清空缓冲开新一批。
-            batch = sess.buffer
-            sess.buffer = []
-            earlier = batch[:-1]
-            if earlier:
-                setter = getattr(event, "set_extra", None)
-                if callable(setter):
-                    try:
-                        setter(MERGE_EXTRA_KEY, earlier)
-                    except Exception:
-                        pass
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 消息合并失败: {e}")
+
 
     # -------------------- 消息事件监听 --------------------
 
@@ -900,13 +857,13 @@ class HumanoidCore(Star):
                 umo = str(getattr(event, "unified_msg_origin", "") or "")
             except Exception:
                 umo = ""
-            # 预热人设缓存：build_injection 是同步的，而 persona() 要 await。
-            # 预热后它才能把「人设里写着她是这样说话的」那句抽出来的原话给到注入块。
+            # 记下这个角色最近在哪个会话说话：日程生成要靠它挑生效的人格（会话上
+            # 指定的 > 该画像默认 > 全局默认）。这里只记，不解析——解析是 await，
+            # 放在每条消息的热路径上没必要，日程真正要用时自己会去解。
             try:
                 source = getattr(core, "persona_source", None)
                 if source is not None and umo:
                     source.note_umo(core.role_id, umo)
-                    await source.persona(core.role_id)
             except Exception:
                 pass
             core.on_message(user_id, text, is_group=is_group, umo=umo)

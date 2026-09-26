@@ -7,7 +7,7 @@ desc: |
   人形化不替她写台词，也不给她定字数——自由的身体、日子、注意力是她的，嘴也是。
 
   使用轻量 配置不复杂 需要调的东西就一些 额外的都标上【进阶】。
-version: 2.21.0
+version: 2.22.2
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"

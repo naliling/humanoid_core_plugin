@@ -24,7 +24,7 @@ from typing import Any
 from ..config import HumanoidConfig
 from ..role_scope import RoleScope
 from ..slots import is_meal_event, is_sleep_event, sleep_window_minutes
-from ..wording import FEELING_WORDS, pick, scale_word
+from ..wording import FEELING_WORDS, band_index, pick, scale_word
 
 # 一次补算最多推进多久。插件停机一周后重启，不该攒出「睡眠压力 5000」。
 MAX_CATCHUP_HOURS = 72.0
@@ -154,14 +154,23 @@ class SomaService:
         不能把夜间窗口当成「她在睡」：熬夜的时候她 3 点仍然醒着，该记的是睡眠债而不是
         把困意清零。没有日程可用时才退到夜间窗口。
 
+        同样不能把「有日程」当成「现在被某段盖着」——刚跨过零点而新的一段还没排出来时，
+        `slot_at` 拿不到东西，旧写法会把它当成「日程里没写睡」→ 不睡，而那时真正的
+        问题是日程空窗。空窗就按「不知道」处理：两边都不假定（既不记睡了，也不硬说她醒着）。
+
         同时提到吃饭的时段算吃饭：「午餐与午休发呆」里那个「午休」把她判成睡着的话，
         中午就再也不会主动找人了。
         """
         slots = self._slots()
-        if slots:
-            return is_sleep_event(self.slot_at(moment).get("event", ""))
-        cfg = self.config
-        return bool(cfg.night_mode_enabled and cfg.is_night_hour(moment.hour))
+        if not slots:
+            # 完全没日程（新装、或跨天且新段还没排出来）：不看夜间窗口。
+            # 那几分钟里积分出来的「假睡眠」比少记一段睡更难看。
+            return False
+        current = self.slot_at(moment)
+        event = str(current.get("event", "") or "") if current else ""
+        if not event:
+            return False
+        return is_sleep_event(event)
 
     def _slots(self) -> list[dict]:
         if self._schedule is None:
@@ -389,15 +398,23 @@ class SomaService:
         return {0: 60.0, 5: 28.0, 4: 18.0}.get(phase, 6.0)
 
     def _desire_modifier(self) -> float:
+        """很困/很不舒服时，「想找人说话」涨得慢一点。
+
+        但压制只留给**真难受**：原来 sleep_pressure > 55 就乘 0.75，而夜里正是她既独处
+        （所以在攒）又最容易困（所以被按住）的时段——两相一抵，晚上几乎攒不起来，
+        社交插件那个「挺想找人说说话」（desire>=75）就永远轮不到她。
+
+        所以门槛提高：真的困到不行（>85）才明显压制，中等程度的困不影响她想找人。
+        """
         pressure = self._get("sleep_pressure", 0.0)
         discomfort = self._get("discomfort", 0.0)
         factor = 1.0
-        if pressure > 75.0:
-            factor *= 0.45
-        elif pressure > 55.0:
-            factor *= 0.75
-        if discomfort > 55.0:
-            factor *= 0.6
+        if pressure > 85.0:
+            factor *= 0.55
+        elif pressure > 70.0:
+            factor *= 0.85
+        if discomfort > 70.0:
+            factor *= 0.7
         return factor
 
     # ------------------------------------------------------------------
@@ -466,10 +483,12 @@ class SomaService:
     def feelings(self, energy: float) -> list[tuple[float, str]]:
         """(显著度 0~1, 体感一句话)。只保留中性的身体事实，移除所有替AI说话或带情绪倾向的台词。
 
-        六条身体轴里现在会实际用上六条：sleepy / debt / hunger / discomfort / arousal /
-        social_desire。后两条的词表早就写好了（wording.FEELING_WORDS）但一直没被调用——
-        她算了「多清醒」「多想找人说话」却一句都没进过上下文。energy 也终于用上了：
-        之前它只是个摆设参数，精力 5 和精力 95 的体感输出完全一样。
+        身体轴里实际会用的是 sleepy / debt / hunger / discomfort / arousal。后两条的词表
+        早就写好了（wording.FEELING_WORDS）但一直没被调用——她算了「多清醒」「多想找人
+        说话」却一句都没进过上下文。energy 也终于用上了：之前它只是个摆设参数，精力 5 和
+        精力 95 的体感输出完全一样。
+
+        social_desire 的词表已删：想不想说话由 behavior 的 initiative 独占。
         """
         out: list[tuple[float, str]] = []
         snap = self.snapshot()
@@ -481,7 +500,7 @@ class SomaService:
 
         def say(kind: str, value: float, floor: float, span: float, top: float) -> str:
             ladder = FEELING_WORDS.get(kind) or []
-            word = pick(kind, seed + [round(value / 5.0)], scale_word(value, ladder))
+            word = pick(kind, seed + [band_index(value, ladder)], scale_word(value, ladder))
             if word and value >= floor:
                 out.append((_clamp((value - floor) / span, 0.0, top), word))
             return word
@@ -509,7 +528,7 @@ class SomaService:
                             0.85,
                             pick(
                                 "hunger_long",
-                                seed + [round(hunger_hours)],
+                                seed + [min(3, int(hunger_hours))],
                                 ("饿了好一阵了", "肚子空了有一阵", "饿了有一会儿了"),
                             ),
                         )
@@ -527,15 +546,12 @@ class SomaService:
         if energy <= 35.0 or arousal <= 30.0:
             say("arousal", min(arousal, energy), 0.0, 45.0, 0.7)
         elif energy >= 80.0 and arousal >= 70.0:
-            out.append((0.6, pick("arousal_high", seed + [round(arousal / 5.0)],
+            out.append((0.6, pick("arousal_high", seed + [min(2, int(arousal // 10))],
                                    ("人挺精神的", "脑子转得挺快"))))
 
-        # 想不想找人说话：设一个较高的门槛，否则「有交流意愿」这种话会天天出现在上下文里，
-        # 而她实际上大部分时间并不想说话。
-        desire = float(snap.get("social_desire", 0.0) or 0.0)
-        if desire >= 55.0:
-            say("social_desire", desire, 55.0, 40.0, 0.8)
-
+        # 「想不想找人说话」不进注入：它与行为倾向的 initiative 是同一件事，而后者综合了
+        # 精力、社交能量与刚发生的事件，信息更多。两边都说就是「有交流意愿，她有点想
+        # 说话」——模型会当成两回事。数值仍留在 snapshot 里给契约（link.py）用。
         return out
 
     def _today_key(self) -> str:
@@ -572,7 +588,16 @@ class SomaService:
             "max_chars": max_chars,
             "question_bias": round(question_bias, 2),
             "long_reply_ok": max_chars >= 90,
-            "burst_ok": max_chars <= 45,
+            # 「能不能连着发」不再从 max_chars 推。旧写法是 `max_chars <= 45`，于是它
+            # **只在她最难受的时候为真**（20/40/45 三档），而精力充沛时为假——语义正好
+            # 倒过来：有余力才谈得上连着发，累到 20 字上限的人更可能发完就没电。
+            # 社交层拿它决定「主动开话题时能不能接二条」，判反了就是越难受越被连着戳。
+            "burst_ok": bool(
+                energy >= 55
+                and snap["sleep_pressure"] < 72
+                and snap["discomfort"] < 62
+                and snap["asleep"] < 1.0
+            ),
         }
 
     def note_chat(self, now: float | None = None) -> None:

@@ -29,14 +29,17 @@ def is_notice(text: str) -> bool:
 def build_url(location: str, api_key: str) -> str:
     return f"{API_URL}?q={quote(location)}&appid={quote(api_key)}&units=metric&lang=zh_cn"
 
-def parse_payload(payload: dict[str, Any], location: str) -> dict[str, str] | None:
+def parse_payload(payload: dict[str, Any]) -> dict[str, str] | None:
     try:
         desc = str(payload["weather"][0]["description"])
         temp = float(payload["main"]["temp"])
     except (KeyError, IndexError, TypeError, ValueError):
         return None
     weather_str = f"{desc} 🌡️ {temp:g}°C"
-    env = f"当前城市 [{location}] 天气：{desc}，气温 {temp:g}℃"
+    # env 是给模型看的：不再拼 location——那是配置里的英文名+国家码（如
+    # 「Zelenogradsk,RU」），而场景层已经说过一次「你在泽列诺格拉茨克」，
+    # 同一个地方在一句话里出现两次，其中一次还是英文，看着像两处。
+    env = f"天气：{desc}，气温 {temp:g}℃"
     humid = payload.get("main", {}).get("humidity")
     if humid is not None:
         env += f"，湿度 {humid}%"
@@ -73,23 +76,48 @@ class WeatherService:
             return city
         return ""
 
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self) -> dict:
+        """当前天气。真天气才给可用的 `env`；拿不到时给的是**给人看的说明书**。
+
+        拿不到的那些情况统一标 `notice=True`：调用方（尤其是往上下文里注入的那个）靠这个
+        字段判断「这句是说明书，别递进模型」，而不是猜字符串里有没有「未开启」这类词——
+        之前靠黑名单，任何人新加一句不含这些词的提示就会漏进上下文。
+        """
         cfg = self.config
+        now = self._clock.now()
         if not cfg.weather_enabled:
             # 没取到天气就是没天气：报「晴朗 ☀️」是插件替她编了一句瞎话。
-            return {"weather": "", "env": "天气未开启"}
+            return self._notice("天气未开启")
         location = self.effective_location()
         if not location:
-            return {
-                "weather": "",
-                "env": "没配天气城市：把 weather_location 或 timezone_city 填成英文名+国家码（如 Beijing,CN）",
-            }
+            return self._notice(
+                "没配天气城市：把 weather_location 或 timezone_city 填成英文名+国家码（如 Beijing,CN）"
+            )
         if len(cfg.weather_api_key) < MIN_KEY_LENGTH:
-            return {"weather": "", "env": f"当前城市 [{location}]（未填 API Key）"}
+            return self._notice(f"当前城市 [{location}]（未填 API Key）")
         cached = self._scope.get_self("_cached_weather_obj")
         if isinstance(cached, dict) and self._scope.get_self("_cached_location") == location:
-            return dict(cached)
-        return {"weather": "", "env": f"当前城市 [{location}]（获取中）"}
+            # 缓存再对也不能拿陈的当现在的：停机一天重启，第一条消息就会看到昨天的天气，
+            # 而注入里它是现在时陈述（「外头多云，气温 12℃」）。超过刷新间隔就当没数据。
+            fetched = parse_state_timestamp(
+                str(self._scope.get_self("_last_weather_fetch", "") or ""), now
+            )
+            if fetched is None:
+                return self._notice("天气还没取到")
+            # 宽限期：刷新失败（网络抖动）时宁可拿一小时前的天气，也别让她突然没天气可讲；
+            # 但停机几天再回来还拿三天前的数据说「外头多云」就是骗人了。超过 3 倍刷新
+            # 间隔才作废。
+            grace = max(1, cfg.weather_refresh_minutes) * 60 * 3
+            if (now - fetched).total_seconds() >= grace:
+                return self._notice("天气数据过期了")
+            result = dict(cached)
+            result.setdefault("notice", False)
+            return result
+        return self._notice(f"当前城市 [{location}]（获取中）")
+
+    @staticmethod
+    def _notice(text: str) -> dict:
+        return {"weather": "", "env": text, "notice": True}
 
     def is_stale(self) -> bool:
         cfg = self.config
@@ -118,7 +146,7 @@ class WeatherService:
             self._log.debug(f"[humanoid_core] 天气请求: {_redacted(url)}")
         try:
             payload = await self._fetch(url, REQUEST_TIMEOUT)
-            parsed = parse_payload(payload, location)
+            parsed = parse_payload(payload)
             if parsed is None:
                 raise ValueError("天气接口返回格式无效")
             weather_str = parsed["weather"]

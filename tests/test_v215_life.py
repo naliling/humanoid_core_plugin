@@ -525,13 +525,18 @@ class EmotionLineTest(unittest.TestCase):
         record.update(mood)
         return core
 
-    def test_still_angry_shows_in_the_label_not_a_script(self):
-        """情绪信到标签为止：状态照给，怎么开口不由插件写。"""
+    def test_still_angry_shows_in_the_state_not_a_script(self):
+        """情绪信到状态词为止：状态照给，怎么开口不由插件写。
+
+        v2.22 起心气只给一句：攻击性到了门槛就只说「压着火」，不再并排关系标签——
+        同一句里又是气又是「热烈」，读起来自相矛盾。
+        """
         core = self.core_with_mood(affection=55.0, libido=10.0, aggression=40.0, base_aggression=28.0)
         text = core.build_injection("42", is_group=False)
-        self.assertIn("她对TA", text)
-        # 攻击性偏高的那一档，标签本身就得能看出不对劲（如「不讲理」「较劲」）。
-        self.assertTrue(any(w in text for w in ("不讲理", "较劲", "炸毛", "嘴硬", "别扭")), text)
+        self.assertTrue(
+            any(w in text for w in ("压着火", "一股气没处发")),
+            f"攻击性到了门槛却没说她在气：{text}",
+        )
         for script in ("积了点火", "攒着点事", "火压在底下", "说话会短", "顶回去"):
             self.assertNotIn(script, text)
 

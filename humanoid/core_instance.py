@@ -173,6 +173,11 @@ class HumanoidCoreInstance:
 
         这里取的是**生效城市**（`clock.city`）：角色单独设了就是它自己的，没设才是全局。
         因此只改某一个机器人的城市时，只有它会 rebase，另一个不受影响。
+
+        **从 `now_epoch()` 随时自查**，而不只在构造与 `/拟人设置 城市` 时调一次：
+        管理员在**面板**上改全局 `timezone_city` 时不会经过 `set_city_override`，
+        旧代码就完全不知道时区变了（`/拟人诊断` 也不会报），于是下一次精力结算会按新
+        时区去解释旧时区写的墙上时间，可能凭空来一次「新的一天」——精力 20 突然跳到 80。
         """
         current = self.clock.city
         stored = str(self._scope.get_self("tz_city", "") or "")
@@ -215,7 +220,14 @@ class HumanoidCoreInstance:
         soma 积分、间隔事件、`last_interaction`、措辞里「过了多久」全从这里出，
         保证只有一台钟。生产里它与系统时间同一瞬；测试里换上 FrozenClock 后身体
         与场景一起冻结。钟拿不出 epoch（老测试替身）时退回系统时间，不抛错。
+
+        顺带自查时区有没有被改过（面板上改全局城市不会经过 set_city_override），
+        免得旧时区写的墙上时间被按新时区读回来，凭空来一次「新的一天」。
         """
+        try:
+            self._rebase_after_move()
+        except Exception:
+            pass
         try:
             return float(self.clock.timestamp())
         except Exception:
@@ -430,23 +442,14 @@ class HumanoidCoreInstance:
         if self.config.soma_enabled:
             self.soma.advance(now)
         events = self.behavior.consume_relevant_events(user_id, now)
-        # compute_agency 的基线来自 social_energy / energy / affection，跟有没有事件无关；
-        # events 只是往上叠增量。原来包了一层 `if events:`，于是她一天里绝大多数时候
-        # 算出来的 agency 都是空的——而那恰恰是最该给模型的参考：精力足、社交意愿高的
-        # 时候，模型不会知道「她现在其实挺想说点什么」，只能自己从身体读数猜。
+        # compute_agency 的基线来自 social_energy / energy，跟有没有事件无关；events 只是
+        # 往上叠增量。原来包了一层 `if events:`，于是她一天里绝大多数时候算出来的 agency
+        # 都是空的——而那恰恰是最该给模型的参考：精力足、社交意愿高的时候，模型不会知道
+        # 「她现在其实挺想说点什么」，只能自己从身体读数猜。
         try:
-            # mood.profile() 有副作用：它会真的建一份情绪档案并落盘。群聊关闭情绪时
-            # 绝不能碰它——那等于绕过了 mood_enabled_in_group，多写一份不该存在的档案。
-            # 不取 mood 时 compute_agency 内部会退回 affection 默认值，行为一致。
-            want_mood = bool(
-                self.config.mood_enabled
-                and (not is_group or self.config.mood_enabled_in_group)
-            )
             agency = self.behavior.compute_agency(
-                user_id=user_id,
                 events=events,
                 social_energy=self.social.value,
-                mood_profile=self.mood.profile(user_id) if want_mood else {},
                 energy=self.energy.energy,
             )
         except Exception:
@@ -456,20 +459,11 @@ class HumanoidCoreInstance:
             interest = self.behavior.interest_state(user_id, now, text=text, is_group=is_group)
         except Exception:
             interest = {}
-        # 人设里的说话方式。以前人设根本不进聊天 prompt（只进了日程生成），
-        # 于是所有角色的注入层口吻完全一样。现在只摘其中与说话有关的原句传下去。
-        # build_injection 是同步的，而 persona() 要 await——所以这里只读缓存，
-        # 预热在 main 的 async handler 里做（见 PersonaSource.persona_cached）。
-        persona_prompt = ""
-        try:
-            source = getattr(self, "persona_source", None)
-            if source is not None:
-                persona_prompt = source.persona_cached(self.role_id).prompt
-        except Exception:
-            persona_prompt = ""
+        # 人设不进这里：以前会摘「说话方式」的原句传下去，结果人设里写给作者看的示例
+        # 对话原样进了每一轮聊天。AstrBot 已经把人设放进 system_prompt，不需要再搬一遍。
         return self.prompt_builder.build(
             user_id, is_group, events=events, agency=agency, text=text,
-            interest=interest, persona_prompt=persona_prompt,
+            interest=interest,
         )
 
     def refresh_contract(self) -> dict | None:
@@ -654,6 +648,21 @@ class HumanoidCoreInstance:
             lines.append(f"- 社交能量：{int(s['social_energy']['value'])}% ({s['social_energy']['text']})")
         if user_id and 'mood' in s:
             lines.append(f"- 好感度：{s['mood']['affection']:.1f}（{s['mood']['label']}）")
+            # 认识多久只在面板上给：它不进上下文，因为递进模型它就会拿去念
+            # （「我们认识这么久了」是聊天里最没劲的一句话）。关系深浅由注入里的
+            # 位置词承载，模型那边够用了。
+            try:
+                first_met = self.mood.first_met(user_id)
+            except Exception:
+                first_met = 0.0
+            if first_met > 0:
+                from .prompt_builder import PromptBuilder
+
+                lines.append(
+                    "- 认识："
+                    + PromptBuilder._days_line(self.now_epoch() - first_met)
+                    + "（此项仅面板可见，不进上下文）"
+                )
             # 注意力三轴只在这个地方给人看数值：进上下文的是措辞，不是百分比。
             try:
                 axes = self.behavior.interest_state(user_id, self.now_epoch())

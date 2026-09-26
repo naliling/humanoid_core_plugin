@@ -13,6 +13,11 @@
 * 不写台词——「我现在需要休息，明天再聊吧」这种句子等于插件替她把话说完。
 * 不下禁令——「不要接着聊」「控制在20字」「这一轮不追问」插件根本执行不了，只是让模型猜规矩。
 * 不编细节——「手机震醒的」「眼睛睁不开」不是身体算出来的东西，是插件替她写的人设。
+* **不搬人设**——v2.16.x 曾经从人设里摘「说话方式」的原句进上下文。它是按「风格/语气/口头禅」
+  这类关键词从句子里挑，挑中的是人设里写给作者看的**示例对话**，于是情色内容、别人的 @
+  都原样进了每一轮聊天；而且它走的是用户消息（不是 system_prompt），模型会把示例
+  当成「她刚说过的话」去接。AstrBot 自己已经把人设放进 system_prompt，插件再搬一遍
+  只有副作用。
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ if TYPE_CHECKING:
     from .core_instance import HumanoidCoreInstance
 
 from .config import HumanoidConfig
-from .data.mood_map import get_mood_label, mood_complex
+from .data.mood_map import get_mood_label
 from .services.schedule import day_lines, day_phrases, done_between, just_done
 from .wording import (
     AGENCY_CONTINUATION,
@@ -45,7 +50,7 @@ _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef
 # 所以每次注入前要把历史里旧的块抹掉（`main.py` 负责），标记就是给这一步认路用的。
 # 换文案时把 v 后面的数字加一，老会话里的旧块会被当成不认识的内容直接清掉。
 MARK_PREFIX = "〔她的身体与生活"
-MARK_VERSION = "v9"
+MARK_VERSION = "v10"
 
 # 给 system_prompt 的那段话：说明下面这些是什么、按什么方式读它。稳定文本，不含事实。
 # 只划参考边界，不下指令：说什么、怎么说、说多长，都由她自己判断。
@@ -55,8 +60,8 @@ FRAMING_TEXT = (
     "自然融入即可，无需刻意提及或逐条回应；如何回应、说什么、说多长，由她自己判断。"
 )
 
-# 注入块的尺寸红线（字符）：只给测试用，防止哪天拼装逻辑把注入胀到几千字。
-# 运行时的限额走 cfg.inject_token_budget（超了按显著度整句丢），不存在按字符硬截。
+# 注入块的尺寸红线（字符）：防止哪天拼装逻辑把注入胀到几千字。
+# 实际卡住体积的是 cfg.inject_token_budget（超了按显著度整句丢）。
 INJECT_MAX_CHARS = {"medium": 2000, "full": 3000, "mood_only": 500}
 
 
@@ -79,18 +84,16 @@ MAX_FEELINGS_LOW = 2
 MAX_FEELINGS_FULL = 5
 FEELING_THRESHOLD_LOW = 0.55
 
-# 注入块里「今天干了什么」与「记得的事」各给多少。这两块是生活细节，
-# 但注入每条聊天请求都追加一次，必须控住体积。
-DAY_ITEMS_LOW = 2
-DAY_ITEMS_FULL = 3
-TOPICS_LOW = 2
-TOPICS_FULL = 4
+# 「记得的事」给几句原话。一条就够：给多了模型会当成一份话题清单逐条追着问，
+# 而真人只记得一两件事，剩下的过半天就忘了。
+TOPICS_LOW = 1
+TOPICS_FULL = 1
 
-# 情绪偏到一定程度就直接说心里怎么样，而不是只贴一个标签词。
-AGGRAVATED_AGGRESSION = 28.0
-EAGER_LIBIDO = 32.0
-COLD_AFFECTION = 32.0
-WARM_AFFECTION = 72.0
+# 心气词（压着火 / 惦记TA / 拧巴）的触发门槛。刻意高于配置里的初始值
+# （aggression 28、libido 34）——门槛压着初始值时，这几句几乎每条消息都在，
+# 于是「一股气没处发，有点惦记TA，她有点拧巴，矛盾」成了常驻背景。
+EMOTION_AGGRESSION_ONSET = 40.0
+EMOTION_LIBIDO_ONSET = 42.0
 
 EVENT_TEXT = {
     "conversation_started": "这是你和TA的第一次对话",
@@ -144,7 +147,6 @@ class PromptBuilder:
         agency: Optional[Dict[str, float]] = None,
         text: str = "",
         interest: Optional[Dict[str, float]] = None,
-        persona_prompt: str = "",
     ) -> str:
         cfg = self.config
         events = events or []
@@ -159,16 +161,13 @@ class PromptBuilder:
             nickname = self._nickname_line(user_id, is_group)
             if nickname:
                 relation = relation + [nickname]
-            voice = self._persona_voice_line(persona_prompt)
-            if voice:
-                relation = relation + [voice]
             tendency = self._tendency_lines(agency, interest, self._seed(user_id))
             if tendency:
                 # 倾向这一层也跟着进最轻的一档：它不是「生活细节」，
                 # 而是「她现在想不想说话」——缺了它，模型只能拿身体读数自己猜
                 relation = relation + tendency
             sents = [
-                (self._sentence(self._scene_lines(is_group, detailed=False)), 10.0),
+                (self._sentence(self._scene_lines(is_group)), 10.0),
                 (self._sentence(relation), 8.0),
                 (self._sentence(self._feelings_lines(max_items=1, threshold=0.7)), 7.0),
                 (self._sentence(self._day_lines(detailed=False)), 5.0),
@@ -177,9 +176,9 @@ class PromptBuilder:
             return self._finish(sents, cfg)
 
         if mode == "full":
-            return self._finish(self._build_full(user_id, is_group, events, agency, text, interest, persona_prompt), cfg)
+            return self._finish(self._build_full(user_id, is_group, events, agency, text, interest), cfg)
 
-        return self._finish(self._build_medium(user_id, is_group, events, agency, text, interest, persona_prompt), cfg)
+        return self._finish(self._build_medium(user_id, is_group, events, agency, text, interest), cfg)
 
     # ------------------------------------------------------------------
     # 分块
@@ -244,22 +243,6 @@ class PromptBuilder:
             lines.append("这会儿是她的夜间作息")
         return lines
 
-    @staticmethod
-    def _persona_voice_line(persona_prompt: str) -> str:
-        """人设里关于「她怎么说话」的原话。
-
-        以前人设根本不进聊天 prompt：所有角色的注入层口吻完全一样，永远是
-        「她…，她…，她…」的第三人称统一腔，角色差异只靠 pick() 的种子在每档一两个词
-        之间轮换。这里不搬整段人设（1200 字会把时间、场景、身体、关系全挤掉），
-        只摘带说话方式信号的**原句**，并明确标出这是人设原话而不是插件的判断。
-        """
-        if not persona_prompt:
-            return ""
-        from .persona import speech_traits
-
-        traits = speech_traits(persona_prompt)
-        return f"人设里写着她是这样说话的：{traits}" if traits else ""
-
     def _tendency_lines(
         self,
         agency: Dict[str, float],
@@ -300,94 +283,127 @@ class PromptBuilder:
     def _relation_lines(
         self, user_id: str, is_group: bool, detailed: bool, interest: Dict[str, float]
     ) -> List[str]:
-        """她对TA、以及对TA正在讲的这件事，各是什么位置。三轴措辞 + 心气，没有数值。"""
+        """她对TA是什么位置、认识多久、最近一次情绪事件。
+
+        关系只说一句。原先 label、care、affection 偏离三处各说一句，拼出来是
+        「她对TA热烈，她和TA十分在意，最近对TA更上心」——同一件事说三遍，
+        模型会当成三件事。有明确升降时用升降句（它带方向），否则退到位置词。
+        """
         cfg = self.config
         core = self._core
         if not (cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group)):
             return []
         seed = self._seed(user_id)
-        lines: List[str] = []
         try:
             data = core.mood.profile(user_id)
-            label = get_mood_label(data["affection"], data["libido"], data["aggression"])
         except Exception:
-            data, label = {}, ""
-        care = float(interest.get("care", 0.5))
-        care_word = pick("care", seed, scale_word(care, CARE_WORDS) or "")
+            data = {}
 
-        if label:
-            lines.append(f"她对TA{label}")
-        if care_word:
-            lines.append(f"她和TA{care_word}")
+        lines: List[str] = []
+        position = self._position_line(data, interest, seed)
+        if position:
+            lines.append(position)
         lines.extend(self._emotion_lines(data, seed))
-        # 复合情绪：攻击性与亲近欲双高时，单字标签说不出的那种拧巴。
-        if data:
-            complex_word = mood_complex(
+
+        # **认识多久不进上下文。** 关系深浅已经由上面那句位置词承载（「她对TA关系亲密」比
+        # 「你们认识 400 天」更能指导她怎么说话），而把天数递给模型，它就会拿去念——
+        # 「我们认识这么久了」是聊天里最没劲的一句话。想知道天数用 `/你的状态`，那里给你看。
+        # 很久没见这件事也不需要专门说一句：间隔那块会报「TA有 7 天没吭声了」。
+
+        # 情绪事件：她记得今天发生过什么（被骂了/被逗开心了），不记得才出戏。
+        emo_ev = core.mood.last_emotional_event(user_id)
+        if emo_ev:
+            lines.append(emo_ev[0])
+        return [line for line in lines if line]
+
+    def _position_line(
+        self, data: Dict[str, Any], interest: Dict[str, float], seed: List[Any]
+    ) -> str:
+        """她对TA的位置：升降 / 在意度 / 关系标签，三者只出一句。
+
+        三种说法统一用「她对TA…」开头，拼进句子里读起来是一件事而不是三件。
+        顺序有讲究：好感度相对基线有明确升降时，升降句最有用（它说了往哪边），
+        「热烈」「十分在意」这种静态词反而不如它。
+        """
+        if not data:
+            return ""
+        try:
+            affection = float(data.get("affection", 50.0))
+            base = float(data.get("base_affection", affection))
+        except (TypeError, ValueError):
+            return ""
+        if affection - base >= 8.0:
+            return f"她对TA{pick('rel_shifted_up', seed, ('最近更上心', '心里离TA近了些'))}"
+        if base - affection >= 8.0:
+            return f"她对TA{pick('rel_shifted_down', seed, ('最近淡了些', '心里离TA远了些'))}"
+        try:
+            care = max(0.0, min(1.0, float(interest.get("care", 0.5))))
+        except (TypeError, ValueError):
+            care = 0.5
+        try:
+            label = core.mood.stable_label(user_id)
+        except Exception:
+            label = get_mood_label(
                 float(data.get("affection", 50.0)),
                 float(data.get("libido", 25.0)),
                 float(data.get("aggression", 15.0)),
             )
-            if complex_word:
-                lines.append(complex_word)
-        # 关系时长：真人对「认识多久了」是有感觉的，措辞随天数自然变。
-        first = self._core.mood.first_met(user_id)
-        if first > 0:
-            days = (_core_epoch(self._core) - first) / 86400.0
-            if days < 2:
-                lines.append(pick("rel_new", seed, ("你们才认识没几天", "你们认识没几天")))
-            elif days < 7:
-                lines.append("你们认识几天了")
-            elif days < 30:
-                lines.append(f"你们认识{int(days)}天了")
-            elif days < 60:
-                lines.append("你们认识一个多月了")
-            elif days < 100:
-                lines.append("你们认识两个多月了")
-            elif days < 365:
-                lines.append(f"你们认识{int(days // 30)}个月了")
-            elif days < 730:
-                lines.append("你们认识一年多了")
-            else:
-                lines.append(f"你们认识{int(days // 365)}年了")
-        # 情绪事件：她记得今天发生过什么（被骂了/被逗开心了），不记得才出戏。
-        emo_ev = self._core.mood.last_emotional_event(user_id)
-        if emo_ev:
-            lines.append(emo_ev[0])
-        tag = ""
-        if cfg.mood_tag_enabled:
-            try:
-                tag = core.mood.tag(user_id)
-            except Exception:
-                tag = ""
-        if tag:
-            lines.append(f"她今天{tag}")
-        return [line for line in lines if line]
+        # 在意度高的时候交给关系标签（词表细，热烈/眷恋/吃醋都从这里来）；在意度低的时候
+        # 标签往往还在说「调皮」这种好感度词，而真正该说的是「关系疏远、不常联系」——
+        # 那才是她对这段关系的定位。两边只出一句，不并列。
+        if care >= 0.62 and label:
+            return f"她对TA{label}"
+        care_word = pick("care", seed, scale_word(care, CARE_WORDS))
+        if care_word:
+            return f"她对TA{care_word}"
+        return f"她对TA{label}" if label else ""
+
+    @staticmethod
+    def _days_line(elapsed: float) -> str:
+        """认识多久——**只给 `/你的状态` 面板看，不进上下文**。
+
+        「你们认识几天了」这种档位话回答不了「几天」，而具体天数递进模型会被拿去念。
+        面板里给准数，是为了你自己能核对；模型那边靠关系位置词（「关系亲密／普通」）就够。
+        """
+        seconds = max(0.0, float(elapsed))
+        days = seconds / 86400.0
+        if days < 1.0:
+            hours = int(seconds // 3600)
+            return "刚认识上" if hours < 1 else f"认识 {hours} 个小时"
+        whole = int(days)
+        if whole < 30:
+            return f"认识 {whole} 天"
+        if days < 365:
+            return f"认识 {int(days // 30)} 个月"
+        return f"认识 {int(days // 365)} 年"
 
     @staticmethod
     def _emotion_lines(data: Dict[str, Any], seed: List[Any]) -> List[str]:
-        """把偏出常态的情绪轴说成心里状态的客观事实。
+        """她此刻的心气：最多一句。
 
-        只说「她心里现在怎么样」，不说「所以要怎么开口」——前者是她此刻的处境，
-        后者是插件替她决定说话方式。措辞按天抽，同一状态一天里不换说法。"""
+        原先压着火、惦记TA、拧巴三处各自判阈值，谁也不看谁，于是气一上来就拼成
+        「一股气没处发，有点惦记TA，她有点拧巴」——既矛盾又重复。这里按谁压过谁
+        排一次，只出最重的那一句。
+        """
         if not data:
             return []
-        lines: List[str] = []
         try:
-            affection = float(data.get("affection", 50.0))
-            base = float(data.get("base_affection", affection))
-            aggression = float(data.get("aggression", 15.0))
             libido = float(data.get("libido", 25.0))
+            aggression = float(data.get("aggression", 15.0))
         except (TypeError, ValueError):
             return []
-        if affection - base >= 8.0:
-            lines.append(pick("emo_up", seed, ("最近对TA更上心", "心里离TA近了些")))
-        elif base - affection >= 8.0:
-            lines.append(pick("emo_down", seed, ("心里对TA淡了些", "最近没那么热络")))
-        if aggression >= 30.0:
-            lines.append(pick("emo_angry", seed, ("心里压着火", "一股气没处发")))
-        if libido >= 32.0:
-            lines.append(pick("emo_miss", seed, ("有点惦记TA", "心思飘过去了")))
-        return lines
+        angry = aggression >= EMOTION_AGGRESSION_ONSET
+        eager = libido >= EMOTION_LIBIDO_ONSET
+        if angry and eager:
+            return [pick("emo_tense", seed, ("她心里两个念头抣着", "她有点拧巴", "又气又放不下"))]
+        if angry:
+            return [pick("emo_angry", seed, ("心里压着火", "一股气没处发"))]
+        if eager:
+            # 原来的备选是「心思飘过去了」——那和「有点惦记TA」意思正相反，而且和
+            # FOCUS_WORDS 的「她心思飘在别处」撞车，同一句里能出现两句互相打架的。
+            # 「惦记」这一维的说法要同向。
+            return [pick("emo_miss", seed, ("有点惦记TA", "心思在TA那边"))]
+        return []
 
     def _echo_lines(self) -> List[str]:
         """她刚：带着上一件事的余韵进来。全是刚发生的时间性事实。
@@ -429,6 +445,23 @@ class PromptBuilder:
         elif dur > 60:
             lines.append("手上这事做了一阵了")
         return lines
+
+    @staticmethod
+    def _drop_echoed_in_day(echo: List[str], day_lines: List[str]) -> List[str]:
+        """「她刚在X」与「今天上午X」说的是同一件事时，只留后者的那一份。
+
+        日程里刚结束的那段会同时落进这两处：「她刚在起身去厨房准备水果」+
+        「她今天上午起身去厨房准备水果」。不滤就是同一件事在一句话里说两遍。
+        """
+        day_text = "".join(day_lines or [])
+        if not day_text:
+            return echo
+        out: List[str] = []
+        for line in echo:
+            if line.startswith("她刚在") and line[len("她刚在"):] in day_text:
+                continue
+            out.append(line)
+        return out
 
     def _day_lines(
         self, detailed: bool, include_doing: bool = True, exclude: Optional[List[str]] = None
@@ -492,7 +525,7 @@ class PromptBuilder:
             return ""
         return f"你管TA叫{nickname}" if nickname else ""
 
-    def _scene_lines(self, is_group: bool, detailed: bool = True) -> List[str]:
+    def _scene_lines(self, is_group: bool) -> List[str]:
         """场景必需品：几点、在她的哪个城市、这是群聊还是私聊。三样永远在。"""
         cfg = self.config
         if is_group:
@@ -531,25 +564,34 @@ class PromptBuilder:
         try:
             from .data.cities import resolve_zone_name
 
-            zone = str(resolve_zone_name(str(self._core.config.timezone_city or "")) or "").upper()
+            # 城市口径必须和下面「你在XX」那句同一个源：那里读的是 clock（带角色级
+            # 覆盖），这里原来读 config.timezone_city，于是多 bot 各自设城市时
+            # 季节按全局城市判，9 月在悉尼的 bot 会被告知「入秋了」。
+            # 解析不出时区名就不判季节——拿不准时说季节，比说错一句更糟。
+            zone = str(resolve_zone_name(str(self._core.clock.city or "")) or "").upper()
         except Exception:
             zone = ""
-        southern = zone.startswith(
-            ("AUSTRALIA/SYDNEY", "AUSTRALIA/MELBOURNE", "AUSTRALIA/HOBART",
-             "AUSTRALIA/ADELAIDE", "AUSTRALIA/BRISBANE", "AUSTRALIA/LORD_HOWE",
-             "PACIFIC/AUCKLAND", "ANTARCTICA/")
-        )
-        # 北半球 3-5 春 / 6-8 夏 / 9-11 秋 / 12-2 冬；南半球反过来
-        table = (
-            ((9, 11), (12, 2), (3, 5), (6, 8))
-            if southern else
-            ((3, 5), (6, 8), (9, 11), (12, 2))
-        )
-        for idx, (lo, hi) in enumerate(table):
-            in_span = (lo <= month <= hi) if lo <= hi else (month >= lo or month <= hi)
-            if in_span:
-                season = ("开春了", "入夏了", "入秋了", "入冬了")[idx]
-                break
+        if zone:
+            southern = zone.startswith(
+                ("AUSTRALIA/SYDNEY", "AUSTRALIA/MELBOURNE", "AUSTRALIA/HOBART",
+                 "AUSTRALIA/ADELAIDE", "AUSTRALIA/BRISBANE", "AUSTRALIA/LORD_HOWE",
+                 "PACIFIC/AUCKLAND", "ANTARCTICA/",
+                 # 南美洲：阿根廷、智利、乌拉圭、玻利维亚。美洲这一区里南半球城市和大把
+                 # 北半球城市混在一起，所以只列确实在南半球的那几个前缀。
+                 "AMERICA/ARGENTINA/", "AMERICA/SANTIAGO/", "AMERICA/MONTEVIDEO/",
+                 "AMERICA/LA_PAZ/", "PACIFIC/CHATHAM")
+            )
+            # 北半球 3-5 春 / 6-8 夏 / 9-11 秋 / 12-2 冬；南半球反过来
+            table = (
+                ((9, 11), (12, 2), (3, 5), (6, 8))
+                if southern else
+                ((3, 5), (6, 8), (9, 11), (12, 2))
+            )
+            for idx, (lo, hi) in enumerate(table):
+                in_span = (lo <= month <= hi) if lo <= hi else (month >= lo or month <= hi)
+                if in_span:
+                    season = ("开春了", "入夏了", "入秋了", "入冬了")[idx]
+                    break
         if season:
             lines.append(season)
         if cfg.show_city_time_in_low_intrusion:
@@ -586,14 +628,25 @@ class PromptBuilder:
         return ""
 
     def _state_lines(self, snap: Dict[str, Any], detailed: bool) -> List[str]:
-        """精力与手上在做的事。
+        """精力读数（只在低时兜底）与生理周期。
 
-        开了生理层之后，low 档不再注入「精力状态良好」这类标签：体感已经把它说得更准，
-        同时出现两份只会让模型去调和问题。关掉 soma 时仍需要它兜底。
+        精力这一层原来总是说一遍「精力充沛/状态挺好」：体感的 arousal 已经在说同一件事，
+        两份同时在，读出来就是「她人挺精神的，她精力充沛」。所以这里只在低档位兜底——
+        体感在中间区间（energy 40~80）什么都不说，而那正是该给一句的时候。
+        关掉 soma 时没有体感，仍要靠它。
         """
         lines: List[str] = []
-        if detailed or not self.config.soma_enabled:
-            lines.append(f"她{snap['energy']['text']}")
+        try:
+            energy = snap.get("energy") or {}
+            energy_value = float(energy.get("value", 80.0))
+        except (TypeError, ValueError, AttributeError):
+            energy_value = 80.0
+        if energy_value < 45.0 or not self.config.soma_enabled:
+            # 取值也走安全路径：上面读 value 时防了一层，这里再防一层不是多余的——
+            # 一边防读取、一边硬下标，防御是不对称的，snapshot 一旦换了实现就会在这里炸。
+            text = str(energy.get("text", "") or "") if isinstance(energy, dict) else ""
+            if text:
+                lines.append(f"她{text}")
         cycle = str(snap.get("cycle") or "").strip()
         if cycle and detailed:
             lines.append(cycle)
@@ -605,6 +658,7 @@ class PromptBuilder:
         events: List[Dict[str, Any]],
         agency: Dict[str, float],
         with_previous: bool,
+        is_group: bool = False,
     ) -> List[str]:
         """隔了多久 + TA离开前那句原话。
 
@@ -634,14 +688,18 @@ class PromptBuilder:
                 lines.append(f"TA离开前说的最后一句：「{previous[:60]}」")
         lines.extend(self._during_gap_lines(seconds))
         # 聊天频率：TA今天话不少/很少，中间档不给。
-        try:
-            count = int(self._core.scope.get_self("daily_msg_count", 0) or 0)
-        except Exception:
-            count = 0
-        if count >= 20:
-            lines.append("TA今天话不少")
-        elif 0 < count <= 3:
-            lines.append("TA今天话很少")
+        # 只在私聊给：这个计数挂在角色上（`daily_msg_count` 是 self 级），群聊里 A 会看到
+        # 「TA今天话不少」，而那句话可能是 B、C 在私聊里刷出来的——同一条注入发给不同的人，
+        # 说的却是同一件事。
+        if not is_group:
+            try:
+                count = int(self._core.scope.get_self("daily_msg_count", 0) or 0)
+            except Exception:
+                count = 0
+            if count >= 20:
+                lines.append("TA今天话不少")
+            elif 0 < count <= 3:
+                lines.append("TA今天话很少")
         # 几天没说话：隔 3 小时和隔 5 天是两回事，关系层面的分量。
         if seconds is not None:
             try:
@@ -692,7 +750,6 @@ class PromptBuilder:
         agency: Dict[str, float],
         interest: Dict[str, float],
         detailed: bool,
-        persona_prompt: str = "",
     ) -> None:
         """睡着时也不能丢的必需品：她对TA、称呼、间隔、TA说过的话。
 
@@ -709,6 +766,7 @@ class PromptBuilder:
         situ = self._behavior_lines(
             user_id, events, agency,
             with_previous=self.config.last_interaction_mode == "with_last_msg",
+            is_group=is_group,
         )
         if situ:
             sents.append((self._sentence(situ), 7.0))
@@ -717,16 +775,13 @@ class PromptBuilder:
         )
         if tendency:
             sents.append((tendency, 6.5))
-        voice = self._persona_voice_line(persona_prompt)
-        if voice:
-            sents.append((voice, 7.5))
         memory = self._sentence(self._memory_lines(user_id, detailed=detailed))
         if memory:
             sents.append((memory, 6.0))
 
     def _build_medium(
         self, user_id: str, is_group: bool, events, agency, text: str,
-        interest: Dict[str, float], persona_prompt: str = ""
+        interest: Dict[str, float],
     ) -> str:
         snap = self._core.snapshot(refresh=False)
         # 夜间精简：睡着时省掉生活细节，但必需品（关系/称呼/间隔/记忆）由
@@ -736,7 +791,7 @@ class PromptBuilder:
         except (TypeError, ValueError):
             asleep = False
         sents: List[tuple[str, float]] = [
-            (self._sentence(self._scene_lines(is_group, detailed=False)), 10.0)
+            (self._sentence(self._scene_lines(is_group)), 10.0)
         ]
         if asleep:
             body = self._feelings_lines(MAX_FEELINGS_LOW, 0.0)
@@ -744,9 +799,9 @@ class PromptBuilder:
                 sents.append((self._sentence(body), 9.0))
             self._append_sleep_essentials(
                 sents, user_id, is_group, events, agency, interest,
-                detailed=False, persona_prompt=persona_prompt,
+                detailed=False,
             )
-            return "。".join(s for s, _ in sents if s)
+            return sents
 
         body = self._feelings_lines(MAX_FEELINGS_LOW, FEELING_THRESHOLD_LOW) + self._night_lines()
         sleep_cause = self._sleep_cause_line()
@@ -755,12 +810,12 @@ class PromptBuilder:
         if body:
             sents.append((self._sentence(body), 8.0))
 
-        echo = self._sentence(self._echo_lines())
+        day_list = self._day_lines(detailed=False)
+        echo = self._sentence(self._drop_echoed_in_day(self._echo_lines(), day_list))
         if echo:
             sents.append((echo, 6.0))
 
         # 显著度浮动：今天只在手上真有事时给；「现在空着」不值得占一条消息的形状。
-        day_list = self._day_lines(detailed=False)
         if day_list and not any("现在空着" in line for line in day_list):
             sents.append((self._sentence(day_list), 5.0))
 
@@ -774,6 +829,7 @@ class PromptBuilder:
         situ = self._behavior_lines(
             user_id, events, agency,
             with_previous=self.config.last_interaction_mode == "with_last_msg",
+            is_group=is_group,
         )
         if situ:
             sents.append((self._sentence(situ), 7.0))
@@ -782,27 +838,20 @@ class PromptBuilder:
         )
         if tendency:
             sents.append((tendency, 6.5))
-        voice = self._persona_voice_line(persona_prompt)
-        if voice:
-            sents.append((voice, 7.5))
 
-        # medium 档：精力不 notable 时身边句整句消失，形状每条消息都在变。
-        try:
-            energy_val = float(snap.get("energy", {}).get("value", 80.0))
-        except (TypeError, ValueError):
-            energy_val = 80.0
-        hands = self._state_lines(snap, detailed=False) if (energy_val < 45.0 or energy_val > 90.0) else []
+        # medium 档：精力够高时身边句整句消失，形状每条消息都在变。
+        hands = self._state_lines(snap, detailed=False)
         if hands:
             sents.append((self._sentence(hands), 4.0))
         memory = self._sentence(self._memory_lines(user_id, detailed=False))
         if memory:
             sents.append((memory, 6.0))
 
-        return "。".join(s for s, _ in sents if s)
+        return sents
 
     def _build_full(
         self, user_id: str, is_group: bool, events, agency, text: str,
-        interest: Dict[str, float], persona_prompt: str = ""
+        interest: Dict[str, float],
     ) -> str:
         snap = self._core.snapshot(refresh=False)
         try:
@@ -810,7 +859,7 @@ class PromptBuilder:
         except (TypeError, ValueError):
             asleep = False
         sents: List[tuple[str, float]] = [
-            (self._sentence(self._scene_lines(is_group, detailed=True)), 10.0)
+            (self._sentence(self._scene_lines(is_group)), 10.0)
         ]
         if asleep:
             body = self._feelings_lines(MAX_FEELINGS_FULL, 0.0)
@@ -819,10 +868,8 @@ class PromptBuilder:
             self._append_sleep_essentials(
                 sents, user_id, is_group, events, agency, interest, detailed=True
             )
-            return "。".join(s for s, _ in sents if s)
+            return sents
         state = self._state_lines(snap, detailed=True)
-        if snap.get("social_energy") and self.config.social_energy_enabled:
-            state.append(f"她{self._core.social.hint()}")
         if state:
             sents.append((self._sentence(state), 4.0))
         body = self._feelings_lines(MAX_FEELINGS_FULL, 0.0) + self._night_lines()
@@ -831,10 +878,11 @@ class PromptBuilder:
             body = body + [sleep_cause]
         if body:
             sents.append((self._sentence(body), 8.0))
-        echo = self._sentence(self._echo_lines())
+        day_list = self._day_lines(detailed=True)
+        echo = self._sentence(self._drop_echoed_in_day(self._echo_lines(), day_list))
         if echo:
             sents.append((echo, 6.0))
-        day = self._sentence(self._day_lines(detailed=True))
+        day = self._sentence(day_list)
         if day:
             sents.append((day, 5.0))
         relation = self._relation_lines(user_id, is_group, detailed=True, interest=interest)
@@ -846,6 +894,7 @@ class PromptBuilder:
         situ = self._behavior_lines(
             user_id, events, agency,
             with_previous=self.config.last_interaction_mode == "with_last_msg",
+            is_group=is_group,
         )
         if situ:
             sents.append((self._sentence(situ), 7.0))
@@ -854,13 +903,10 @@ class PromptBuilder:
         )
         if tendency:
             sents.append((tendency, 6.5))
-        voice = self._persona_voice_line(persona_prompt)
-        if voice:
-            sents.append((voice, 7.5))
         memory = self._sentence(self._memory_lines(user_id, detailed=True))
         if memory:
             sents.append((memory, 6.0))
-        return "。".join(s for s, _ in sents if s)
+        return sents
 
     def _finish(self, sents, cfg: HumanoidConfig) -> str:
         # 兼容两种入参：List[tuple[str, float]]（带显著度）或纯字符串。
@@ -896,16 +942,35 @@ class PromptBuilder:
         return header + "\n" + body + "。"
 
 
+# ── 模块末尾的辅助函数区 ──
+def is_notice(text: str) -> bool:
+    """这句天气是配置说明书还是真天气。
+
+    保留下来是为了认**旧状态文件里已经写进去的** notice 文本，以及给面板/诊断显示用；
+    注入路径已经改看 `snapshot()` 的 `notice` 字段了。
+    """
+    from .services.weather import is_notice as _is_notice
+
+    return _is_notice(text)
+
+
 def _uid_tag(role_id: str) -> str:
     return re.sub(r"[^0-9A-Za-z]", "", str(role_id))[-8:] or "self"
 
 
 def _short_weather(weather: Dict[str, Any]) -> str:
-    """天气只留一句能用的；没配好时直接不注入，而不是把配置说明书念给模型听。"""
+    """天气只留一句能用的；没配好时直接不注入，而不是把配置说明书念给模型听。
 
-    from .services.weather import is_notice
+    「这是说明书」由 `WeatherService.snapshot()` 写在 `notice` 字段上（而不是靠猜字符串）
+    ——之前靠关键词黑名单，任何人新加一句不含那些词的提示就会原样进上下文。
 
+    以前这里还会按字数硬截一次，于是「气温 12℃」被截掉只剩「…天气：多云」——
+    天气没有温度等于没说。句子长度改由天气服务自己控制（见 parse_payload）。
+    """
+
+    if weather.get("notice"):
+        return ""
     env = str(weather.get("env", "")).strip()
     if not env or is_notice(env):
         return ""
-    return env.replace("当前城市", "这边")[:26]
+    return env.replace("天气：", "", 1)

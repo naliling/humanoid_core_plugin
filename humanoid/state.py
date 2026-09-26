@@ -236,7 +236,18 @@ class StateStore:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        await self.flush()
+        # 卸载时的最后一次落盘失败（磁盘满、只读）**不能抛出去**：那会顺着
+        # terminate() 冒到 AstrBot，把「插件卸载」变成一个报错事件。记一条日志就够了——
+        # 状态文件本来就是缓存，丢一次不影响它下次从零开始。
+        try:
+            await self.flush()
+        except Exception as exc:
+            logger = getattr(self, "_log", None)
+            if logger is not None:
+                try:
+                    logger.warning(f"[humanoid_core] 卸载时落盘失败（不影响使用）: {exc}")
+                except Exception:
+                    pass
 
     async def _flush_loop(self) -> None:
         while True:

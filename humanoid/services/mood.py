@@ -6,13 +6,14 @@ import asyncio
 import random
 import re
 import time
+import weakref
 from collections.abc import Callable
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from ..config import HumanoidConfig
-from ..data.mood_map import generate_mood_tag, get_mood_label, mood_complex
+from ..data.mood_map import generate_mood_tag, get_mood_label
 from ..jsonx import extract_json_object
 from ..llm import PURPOSE_MOOD, LLMGateway
 from ..recall import MAX_SNIPPETS, note_said, recall_lines
@@ -34,11 +35,22 @@ DIMENSIONS = (
     ("aggression", "base_aggression", AGGRESSION_RANGE),
 )
 
+# 关系标签的滞回阈值：三条轴里任意一条相对「上次定档时」漂过这么多分，才承认新档位。
+# 12.5 分一档，所以 6 分是「半个档」——单条消息最多动 2 分，要连着聊三四条才可能跨过去。
+LABEL_ANCHOR_DRIFT = 6.0
+
+# 情绪分析失败日志的限速（秒）：同一条理由这么久内只报一次。
+MOOD_WARN_INTERVAL_SECONDS = 300.0
+
 # 长期不活跃用户会被丢掉的历史字段。nickname/nickname_src 故意保留：那是用户自己让 bot
 # 怎么称呼自己（或是自动认定后不再改口的依据），丢了会当场改变说话方式；last_interaction
-# 也保留，它是下次判定过期的依据。
+# 也保留，它是下次判定过期的依据。first_met 同样保留（prune 时从 mood 里搬上来），
+# 否则会出现「你管TA叫小明，你们刚认识上」。
+# attention 也在清理范围内：它是 `behavior.care()` 算在意度时写的，那条路径必然经过
+# mood.profile，所以它是「有真实互动」的标记；而 `/拟人诊断` 为了量 token 会拿一个
+# status-probe 的假用户去跑 build_injection，留下一个清不掉的空壳。
 # mood 删掉即可：profile() 会用配置里的初始值重建，正是文档承诺的「好感度清回初始值」。
-RETENTION_DROPPED_FIELDS = ("mood", "mood_logs", "mood_tag", "last_message", "said")
+RETENTION_DROPPED_FIELDS = ("mood", "mood_logs", "mood_tag", "last_message", "said", "attention")
 
 # 自动认定称呼的硬性门槛：来源是消息带的名字（群聊是群名片、私聊是 QQ 昵称），
 # 都是用户随手可改的东西——宁缺勿滥：叫错人比不称呼难看得多，认不上就一个都不认。
@@ -139,13 +151,38 @@ class MoodService:
         self._time = time_source
         self._gateway = gateway
         self._log = logger
-        # 按用户细粒度锁，避免不同用户互相阻塞
-        self._user_locks: dict[str, asyncio.Lock] = {}
+        # 按用户细粒度锁，避免不同用户互相阻塞。
+        # 弱引用：锁只在「这个用户正在结算」期间有引用，没人用就自动消失——否则群里
+        # 每来一个新成员就多留一个 Lock，永不回收（长期运行是缓慢泄漏）。
+        self._user_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+        self._warned: dict[str, float] = {}
+
+    def _warn_throttled(self, message: str, reason: str) -> None:
+        """同一理由最多五分钟一条。
+
+        情绪分析是**每 5 条消息一次**触发的，而失败（Provider 挂了、模型不认这个指令）
+        会持续很久。不限速的话，一个坏掉的 Provider 能把日志刷成每天几千条——
+        CallGate 那边的拦截日志早就有限速了，这里以前漏了。
+        """
+        if self._log is None:
+            return
+        now = self._time()
+        if now - self._warned.get(reason, -1e18) < MOOD_WARN_INTERVAL_SECONDS:
+            return
+        self._warned[reason] = now
+        self._log.warning(f"[humanoid_core] {message}")
 
     def _get_user_lock(self, user_id: str) -> asyncio.Lock:
-        if user_id not in self._user_locks:
-            self._user_locks[user_id] = asyncio.Lock()
-        return self._user_locks[user_id]
+        # 先拿到局部变量再存回去：弱引用字典只存弱引用，赋值那一刻如果没人拿着它，
+        # 它当场就被回收掉，紧接着再取就是 KeyError。调用方 `async with lock` 期间会在栈上
+        # 持有强引用，所以「有人在用」这件事本身就是它存活的前提。
+        lock = self._user_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._user_locks[user_id] = lock
+        return lock
 
     @property
     def config(self) -> HumanoidConfig:
@@ -169,7 +206,10 @@ class MoodService:
             "base_affection": affection,
             "base_libido": float(cfg.mood_initial_libido),
             "base_aggression": float(cfg.mood_initial_aggression),
-            "first_met": self._time(),
+            # 过期清理会把整个 mood 记录删掉，而称呼是故意保留的。关系时长跟着删就成了
+            # 「你管TA叫小明，你们刚认识上」——叫得出名字的人不可能是刚认识。first_met
+            # 另存一份在 user 级（prune 前会搬到那里），情绪清了但「认识多久了」留着。
+            "first_met": self._first_met_of(user_state),
             "last_interaction": self._time(),
             "last_decay": self._time(),
             "turn_count": 0,
@@ -178,6 +218,21 @@ class MoodService:
         user_state["mood"] = record
         self._scope.mark_dirty()
         return record
+
+    def _first_met_of(self, user_state: dict) -> float:
+        """认识的时间点。优先用**没被过期清理删掉**的那份。
+
+        情绪档案 7 天不活跃就没了（`mood_data_retention_days`），但「认识多久了」不该跟着
+        归零：清理时会把 mood.first_met 搬到 user 级的 `first_met`，这里优先读它。
+        """
+        for key in ("first_met",):
+            try:
+                stored = float(user_state.get(key, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                stored = 0.0
+            if stored > 0:
+                return stored
+        return self._time()
 
     def _repair(self, record: dict, user_state: dict) -> dict:
         changed = False
@@ -205,8 +260,48 @@ class MoodService:
         return record
 
     def label(self, user_id: str) -> str:
-        data = self.profile(user_id)
-        return get_mood_label(data["affection"], data["libido"], data["aggression"])
+        return get_mood_label(*self._axes(self.profile(user_id)))
+
+    @staticmethod
+    def _axes(record: dict) -> tuple[float, float, float]:
+        try:
+            return (
+                float(record.get("affection", 50.0)),
+                float(record.get("libido", 25.0)),
+                float(record.get("aggression", 15.0)),
+            )
+        except (TypeError, ValueError):
+            return 50.0, 25.0, 15.0
+
+    def stable_label(self, user_id: str) -> str:
+        """关系标签，带**滞回**。
+
+        三条轴都是按 12.5 跳档查表的（`get_mood_label`），而单条消息的好感变化上限是 2。
+        结果是：好感 87.4 → 87.5（**+0.1**）就从「亲密」跳成「信赖」，同一段对话里可能
+        来回跳好几次。模型读到的是「她一会儿对我心动一会儿对我信赖」——那不是细腻，那像换了个人。
+
+        所以这里记一个「上一次定档时的三轴值」（`label_anchor`）：当前值相对它没漂够
+        `LABEL_ANCHOR_DRIFT` 就沿用旧标签，漂够了才重新查表并把 anchor 换掉。
+        **平时不写盘**——只有真的换档时才写，所以这个滞回不增加写盘频率。
+        """
+        record = self.profile(user_id)
+        affection, libido, aggression = self._axes(record)
+        anchor = record.get("label_anchor")
+        if isinstance(anchor, dict):
+            try:
+                drift = max(
+                    abs(affection - float(anchor["a"])),
+                    abs(libido - float(anchor["l"])),
+                    abs(aggression - float(anchor["g"])),
+                )
+                if drift < LABEL_ANCHOR_DRIFT:
+                    return str(anchor.get("label") or "")
+            except (KeyError, TypeError, ValueError):
+                pass
+        label = get_mood_label(affection, libido, aggression)
+        record["label_anchor"] = {"a": affection, "l": libido, "g": aggression, "label": label}
+        self._scope.mark_dirty()
+        return label
 
     def tag(self, user_id: str) -> str:
         return self._scope.get_user(user_id, "mood_tag", "")
@@ -230,7 +325,8 @@ class MoodService:
         return recall_lines(self.said(user_id), self._time(), max_items=max_items)
 
     def nickname(self, user_id: str) -> str:
-        return self._scope.get_user(user_id, "nickname", "")
+        # 纯查询，不建条目：群聊里给每个人查一次称呼，不该因此在状态文件里留下几百个空壳。
+        return str(self._scope.peek_user(user_id, "nickname", "") or "")
 
     def first_met(self, user_id: str) -> float:
         """第一次互动的时间。老档案由 _repair 用 last_interaction 补，不会缺。"""
@@ -243,8 +339,15 @@ class MoodService:
     def last_emotional_event(self, user_id: str) -> tuple[str, float] | None:
         """最近一次情绪大波动，转成无数字的事实句 + 距今小时数。
 
-        logs 本来就只在波动超过阈值时才写，所以任何一条都是大波动。24 小时外的
-        不算「今天发生过的事」。拿不到方向或维度时返回 None，不编一个。
+        两条约束，都是为了让「刚才TA惹她不痛快了」不至于变成常驻背景：
+
+        1. 窗口从固定的 24 小时改成 ``mood_decay_hours``（默认 6 小时）。情绪轴本来
+           就这么回缓的，回缓完了还提「惹她不痛快」，说的是一件已经过去的事。
+        2. 当前值已经淡回基线（偏离不足 5）就不提。日志记的是那一刻，现在她自己早
+           就不气了，这时候报「惹她不痛快」等于造一个不存在的现在时。
+
+        logs 本来就只在波动超过阈值时才写，所以任何一条都是大波动。拿不到方向或
+        维度时返回 None，不编一个。
         """
         entries = self.logs(user_id, limit=1)
         if not entries:
@@ -268,10 +371,22 @@ class MoodService:
                 parsed = parsed.replace(tzinfo=zone)
         at = parsed.timestamp()
         age_hours = (self._time() - at) / 3600.0
-        if age_hours < 0 or age_hours > 24.0:
+        try:
+            window_hours = max(0.5, float(self.config.mood_decay_hours))
+        except (TypeError, ValueError):
+            window_hours = 6.0
+        if age_hours < 0 or age_hours > window_hours:
             return None
         event = str(entry.get("event", ""))
         up = "上升" in event
+        if "攻击性" in event:
+            axis, base_axis = "aggression", "base_aggression"
+        elif "好感度" in event:
+            axis, base_axis = "affection", "base_affection"
+        else:
+            return None
+        if not self._axis_still_deviated(user_id, axis, base_axis):
+            return None
         if "攻击性" in event:
             if up:
                 sentence = pick(
@@ -281,7 +396,7 @@ class MoodService:
                 )
             else:
                 sentence = "今天气消了些"
-        elif "好感度" in event:
+        else:
             if up:
                 sentence = pick(
                     "emo_ev_aff_up",
@@ -290,13 +405,27 @@ class MoodService:
                 )
             else:
                 sentence = "今天心里对TA凉了些"
-        else:
-            return None
         if age_hours < 1.0:
             sentence = "刚才" + sentence[2:]
-        elif age_hours > 20.0:
-            sentence = "昨天" + sentence[2:]
+        elif age_hours > window_hours * 0.75:
+            sentence = "早些时候" + sentence[2:]
         return sentence, age_hours
+
+    def _axis_still_deviated(self, user_id: str, axis: str, base_axis: str) -> bool:
+        """这次波动现在还成立吗：当前值离基线够不够远。
+
+        直接读状态而不走 profile()：那条路上 profile 会建档案，而这里只是问一句
+        「她还气不气」。没有档案就放行——宁可多说一句，不凭空拦掉真实事件。
+        """
+        record = self._scope.user_state(user_id).get("mood")
+        if not isinstance(record, dict):
+            return True
+        try:
+            current = float(record.get(axis, 0.0))
+            base = float(record.get(base_axis, 0.0))
+        except (TypeError, ValueError):
+            return True
+        return abs(current - base) >= 5.0
 
     def set_nickname(self, user_id: str, nickname: str, src: str = "user") -> str:
         self._scope.set_user(user_id, "nickname", nickname)
@@ -387,6 +516,15 @@ class MoodService:
                 continue
             if stamp > cutoff:
                 continue
+            # 先把「认识多久了」搬到不会被清理的 user 级字段，再删情绪档案。
+            mood = user_state.get("mood")
+            if isinstance(mood, dict):
+                try:
+                    first_met = float(mood.get("first_met", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    first_met = 0.0
+                if first_met > 0:
+                    user_state["first_met"] = first_met
             for key in RETENTION_DROPPED_FIELDS:
                 user_state.pop(key, None)
             pruned += 1
@@ -587,12 +725,14 @@ class MoodService:
         )
         if not result.ok:
             if self._log is not None:
-                self._log.warning(f"[humanoid_core] 情绪分析失败：{result.summary()}")
+                self._warn_throttled(
+                    f"情绪分析失败：{result.summary()}", "request"
+                )
             return None
         data = extract_json_object(result.text)
         if not data:
             if self._log is not None:
-                self._log.warning("[humanoid_core] 情绪分析失败：模型返回不是有效 JSON")
+                self._warn_throttled("情绪分析失败：模型返回不是有效 JSON", "json")
             return None
         try:
             delta = Delta(
@@ -605,7 +745,7 @@ class MoodService:
             return delta
         except (TypeError, ValueError):
             if self._log is not None:
-                self._log.warning("[humanoid_core] 情绪分析失败：JSON 数值无效")
+                self._warn_throttled("情绪分析失败：JSON 数值无效", "json")
             return None
 
     def _log_event(self, user_id: str, before: dict, record: dict):

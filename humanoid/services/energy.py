@@ -9,7 +9,7 @@ from typing import Any
 
 from ..clock import format_state_timestamp, parse_state_timestamp
 from ..config import HumanoidConfig
-from ..wording import pick, scale_word
+from ..wording import band_index, pick, scale_word
 
 
 # 精力五档，每档几套等价说法（同一状态不必每次同一句）。
@@ -41,7 +41,8 @@ def describe_energy(energy: float, seed=None) -> str:
     """精力档位词。**只说身体，不说语气**——「精力充沛，语气轻快」那半句是在教她怎么说话。"""
     ladder = ENERGY_WORDS
     word = scale_word(energy, ladder)
-    return pick("energy", list(seed or []) + [round(energy / 10.0)], word) if word else ""
+    # 种子给档位序号而不是实时值：精力 88 → 92 同属「精力充沛」，换个说法就成了另一个人。
+    return pick("energy", list(seed or []) + [band_index(energy, ladder)], word) if word else ""
 
 
 class EnergyService:
@@ -158,8 +159,13 @@ class EnergyService:
             return 0.0
         slots = self._schedule()
         decay = max(0.0, float(cfg.energy_decay_rate))
-        if decay == 0.0 or not slots:
+        if decay == 0.0:
             return 0.0
+        if not slots:
+            # 没日程可用时（刚跨过零点、新的一段还没排出来的那一两分钟）按**自然恢复**算，
+            # 不按 0。返回 0 等于把精力冻住：这段时间里她既不消耗也不回血，而这几分钟
+            # 恰好是模型最慢的时候（要现排一段），冻得最明显。
+            return self._idle_recovery(start_min, end_min, cfg)
 
         body = self._body_axis()
         discomfort_factor = body.discomfort_factor() if body is not None else 1.0
@@ -199,6 +205,23 @@ class EnergyService:
                 if credited > 0:
                     total += recovery_per_min * recovery_factor * decay * credited
         return total
+
+    def _idle_recovery(self, start_min: float, end_min: float, cfg: HumanoidConfig) -> float:
+        """没有日程可依时的那段空窗：只给自然恢复，不给消耗。
+
+        给恢复是因为「什么也没做」实际是躺着的概率远高于「什么也没做且一直在消耗」；
+        幅度按分钟数走，不看是什么时段——反正这段时间本来就不该有结论。
+        """
+        if not cfg.enable_energy_natural_recovery:
+            return 0.0
+        per_min = max(0.0, float(cfg.energy_natural_recovery_per_minute))
+        if per_min <= 0:
+            return 0.0
+        step = max(1, int(cfg.energy_natural_recovery_interval_minutes))
+        credited = (int(max(0.0, end_min - start_min)) // step) * step
+        if credited <= 0:
+            return 0.0
+        return per_min * cfg.phase_recovery_multiplier(self.cycle_day) * max(0.0, float(cfg.energy_decay_rate)) * credited
 
     def consume_for_message(self) -> float:
         cfg = self.config
@@ -262,6 +285,8 @@ class EnergyService:
         return day
 
     def cycle_description(self) -> str:
+        """周期描述。只说周期，不夹带精力评价——精力由体感（arousal）说，
+        这里再补一句「精力充沛」就是同一件事在一句话里说两遍。"""
         cfg = self.config
         if not cfg.enable_cycle:
             return ""
@@ -270,13 +295,4 @@ class EnergyService:
         phase = PHASE_NAMES[idx]
         if cfg.cycle_description_style == "simple":
             return f"{phase}（第{day}天）"
-        energy = self.energy
-        if energy < 10:
-            note = "，精力很低"
-        elif energy < 30:
-            note = "，精力偏低"
-        elif energy > 80:
-            note = "，精力充沛"
-        else:
-            note = ""
-        return f"处于【{phase}】，{PHASE_NOTES[idx]}{note}"
+        return f"处于【{phase}】，{PHASE_NOTES[idx]}"
