@@ -16,6 +16,7 @@ persona_id）按 ``platform_id::`` 路由到具体角色（core/umop_config_rout
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -96,6 +97,50 @@ async def _conversation_persona_id(context: Any, umo: str) -> Optional[str]:
         return getattr(conv, "persona_id", None) if conv else None
     except Exception:
         return None
+
+
+# 从人设里挑「与说话方式有关」的信号词。只用于**筛选**，不用于生成内容。
+SPEECH_MARKERS = (
+    "说话", "语气", "口头禅", "习惯", "风格", "喜欢用", "爱用", "称呼", "喜欢说",
+    "不爱说", "分寸", "客气", "直接", "慢热", "毒舌", "别扭", "文静", "话多",
+    "话少", "嘴笨", "嘴毒", "轻声", "慢吞吞", "爱撒娇", "爱吐槽", "听得懂",
+)
+# 人设里这些句子说的是「她是谁」而不是「她怎么说话」，不摘
+_IDENTITY_MARKERS = (
+    "身高", "体重", "年龄", "生日", "毕业", "专业", "住在", "家里有", "父母", "童年",
+)
+_SENTENCE_SPLIT_CHARS = "。！？!?\n；;"
+
+
+def speech_traits(prompt: str, max_items: int = 2, max_chars: int = 30) -> str:
+    """从人设里挑出与说话方式有关的原句，逗号分隔。
+
+    为什么不是把整段人设塞进聊天 prompt：
+    - 人设上限 1200 字，而注入块预算只有 2000 token，它一进来就把时间、场景、
+      身体、关系全挤没了；
+    - 而且人设里大半是身世背景（哪里人、做什么工作），跟「她怎么说话」没关系。
+
+    这里只**摘原文**，插件不新增一个字：带说话方式信号的句子才会被选中，
+    并优先滤掉明显在讲身份的句子。摘不到就返回空串，不补。
+    """
+    text = str(prompt or "").strip()
+    if not text:
+        return ""
+    picked: list[str] = []
+    for raw in re.split(f"[{re.escape(_SENTENCE_SPLIT_CHARS)}]", text):
+        line = raw.strip()
+        if len(line) < 4 or len(line) > 120:
+            continue
+        if not any(m in line for m in SPEECH_MARKERS):
+            continue
+        if any(m in line for m in _IDENTITY_MARKERS):
+            continue
+        piece = line[:max_chars]
+        if piece not in picked:
+            picked.append(piece)
+        if len(picked) >= max_items:
+            break
+    return "，".join(picked)
 
 
 async def resolve_persona(context: Any, umo: str = "") -> Persona:
@@ -200,6 +245,18 @@ class PersonaSource:
             persona = EMPTY
         self._cache[key] = _Entry(persona=persona, at=self._time(), umo=umo)
         return persona
+
+    def persona_cached(self, role_id: str) -> Persona:
+        """只读已缓存的人设，**不触发解析**。
+
+        build_injection 在消息热路径上且是同步的，不能等 persona() 的 async 解析。
+        预热在 main 的 async handler 里做（persona()），这里只取现成的。
+        没预热过就返回空——那意味着这一条少一句人设口吻，不影响其它内容。
+        """
+        entry = self._cache.get(str(role_id))
+        if entry is None:
+            return EMPTY
+        return entry.persona
 
     def invalidate(self, role_id: str = "") -> None:
         if role_id:

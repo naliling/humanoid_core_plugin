@@ -158,9 +158,16 @@ class InjectionFreedomTest(unittest.TestCase):
         cold = builder._relation_lines("43", False, detailed=False,
                                        interest={"care": 0.05, "focus": 0.05, "spare": 0.05})
         self.assertTrue(any("亲密" in line or "在意" in line for line in mine), mine)
-        # 措辞按天抽签：0.00 档有「关系疏远」「缺乏交集」两套说法，都得认。
-        self.assertTrue(any(word in line for line in cold for word in ("疏远", "缺乏交集")),
+        # 措辞按天抽签：0.00 档有几套说法，都得认。
+        self.assertTrue(any(word in line for line in cold for word in ("疏远", "不常联系")),
                         f"低在意度没说出距离感：{cold}")
+        # 「保持客气」是在说她**该**客气（那是给模型的指令），「缺乏交集」是在断言
+        # 事实（可对方此刻正在跟她说话）——两个都不该再出现
+        for banned in ("保持客气", "缺乏交集"):
+            self.assertFalse(
+                any(banned in line for line in cold),
+                f"距离感又写成了指令或断言：{banned} / {cold}",
+            )
         self.assertNotEqual(mine, cold)
         for line in mine + cold:
             self.assertNotIn("0.", line, f"三轴把数值端上来了：{line}")
@@ -391,6 +398,74 @@ class MovedCityTest(unittest.TestCase):
         stamp = str(self.self_state(store).get("last_update"))
         self.make_core(store, "北京")
         self.assertEqual(str(self.self_state(store).get("last_update")), stamp, "没搬家就别动计时")
+
+
+class NewConstraintTest(unittest.TestCase):
+    """v1.16 的新约束：算了的参考值必须真的进 prompt，兼底不得编造经历。"""
+
+    def _inject(self, **body):
+        from humanoid.core_instance import HumanoidCoreInstance
+        from humanoid.state import StateStore
+        from tests.fakes import FrozenClock, FakeContext, RecordingLogger
+
+        store = StateStore(Path(tempfile.mkdtemp()) / "state.json", lambda: 0.01)
+        store.load(TODAY, 28)
+        core = HumanoidCoreInstance(
+            role_id="bot1",
+            state_store=store,
+            config_provider=lambda: cfg(),
+            logger=RecordingLogger(),
+            stop_event=asyncio.Event(),
+            resolver=FakeContext(),
+            gateway=None,
+        )
+        core.clock = FrozenClock(MOMENT)
+        if body:
+            core.soma.data.update(body)
+        return core.build_injection("42", is_group=False)
+
+    def test_tendency_axes_reach_the_prompt(self):
+        """agency/focus/spare 以前算了传了七层、一次没读。
+
+        模型只拿到「她很困」这类身体状态，得自己推「那她大概不想说话」——而这
+        恰恰是该给它的参考。
+        """
+        text = self._inject()
+        self.assertTrue(
+            any(w in text for w in ("想说的", "不太想开话头", "接得住", "放不下",
+                                     "注意力", "心思", "很闲", "腾不出手", "不算太忙")),
+            f"倾向层没进 prompt：{text}",
+        )
+
+    def test_awake_and_want_to_talk_axes_are_used(self):
+        """arousal 与 social_desire 的词表早就写好，却一次都没被调用过。"""
+        text = self._inject(arousal=90.0, social_desire=90.0, sleep_pressure=5.0)
+        self.assertTrue(
+            any(w in text for w in ("精神", "有交流意愿", "想找人说", "想说话")),
+            f"清醒度/想说话没进体感：{text}",
+        )
+
+    def test_persona_voice_reaches_the_prompt(self):
+        """人设以前只进日程、从不进聊天 prompt，于是所有角色口吻一模一样。"""
+        from humanoid.persona import speech_traits
+
+        self.assertTrue(
+            speech_traits("她说话很慢，喜欢用嗯开头。口头禅是「真的假的」。"),
+            "speech_traits 连这几句都没摘出来",
+        )
+        self.assertEqual(
+            speech_traits("她养了一只叫饭团的橘猫，24岁，住在杭州。"), "",
+            "纯身世背景不该被当成说话方式",
+        )
+
+    def test_mood_tag_carries_no_first_person_lines(self):
+        """「她今天想贴贴」是把角色会说的话塞给模型。"""
+        from humanoid.data.mood_map import generate_mood_tag
+
+        for _ in range(30):
+            tag = generate_mood_tag(80.0, 80.0, 5.0, 5.0)
+            for banned in ("想贴贴", "气鼓鼓", "想找人说话"):
+                self.assertNotIn(banned, tag, f"心情标签又带上了台词：{tag}")
 
 
 if __name__ == "__main__":

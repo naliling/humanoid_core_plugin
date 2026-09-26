@@ -867,6 +867,15 @@ class HumanoidCore(Star):
                 umo = str(getattr(event, "unified_msg_origin", "") or "")
             except Exception:
                 umo = ""
+            # 预热人设缓存：build_injection 是同步的，而 persona() 要 await。
+            # 预热后它才能把「人设里写着她是这样说话的」那句抽出来的原话给到注入块。
+            try:
+                source = getattr(core, "persona_source", None)
+                if source is not None and umo:
+                    source.note_umo(core.role_id, umo)
+                    await source.persona(core.role_id)
+            except Exception:
+                pass
             core.on_message(user_id, text, is_group=is_group, umo=umo)
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 消息记账失败: {e}")

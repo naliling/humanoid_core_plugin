@@ -280,12 +280,18 @@ def persona_block(persona: Persona | None) -> str:
             f"{prompt}\n\n"
             "先从这里读出她的身份、年纪感、职业或在读状态、住在哪里、独居还是跟人住、"
             "平时跟谁来往、喜欢什么讨厌什么、花钱和精力的习惯。\n"
-            "设定里没写的，按最合理、最省心的方式补一个出来，并且每天都沿用同一个答案。\n"
+            # 原句是「设定里没写的，按最合理、最省心的方式补一个出来，并且每天都沿用同一个答案」——
+            # 那是在命令模型给她造一份身份。改成：设定里有的照用，没有的别编——
+            # 留白比凭空多一个身份安全，而“今天在做什么”本来就该由她自己说。
+            "设定里没提到的，不要替他编：那里留白即可。她的日常由她自己讲，"
+            "你只需要把“她现在这个状态大概会处在什么样的处境”排出来，不要替她定身份。\n"
         )
     return (
-        "她是一个有自己生活的普通人，没有现成的人设资料可读。\n"
-        "按一份普通上班族/学生的真实日子补：有自己的住处、有自己的事要做、"
-        "有自己的开销和疲惫。补出来的身份每天保持一致。\n"
+        "没有现成的人设资料可读。\n"
+        # 原句「按一份普通上班族/学生的真实日子补」直接预设了她是上班族还是学生。
+        # 退休的人、自由职业者、全职带孩子的角色都会被凭空安一份工位。
+        "不要假设她的职业或身份。排一段中性、多数人都成立的日子：有自己的住处、"
+        "有事要做、会累。这些怎么安排、她具体在做什么，由她自己说。\n"
     )
 
 
@@ -383,8 +389,12 @@ def segment_prompt(
         "\n"
         "【输出格式】\n"
         "1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释文字。\n"
-        '2. 形如：{"continue": false, "event": "去超市买菜", "location": "超市", '
-        '"emotion": "随性", "energy_rate": -0.05, "minutes": 85}\n'
+        # 原来这里是 {"event": "去超市买菜", "location": "超市"}——一个有画面感的
+        # 具体事件。模型对 few-shot 示例的模仿远强于对抽象规则的服从，它会被当成
+        # 「这就是合意的答案范式」反复复用。换成占位式，格式照样清楚，但不给画面。
+        '2. 形如：{"continue": false, "event": "<她在做的事>", "location": "<在哪>", '
+        '"emotion": "<心情>", "energy_rate": -0.05, "minutes": 85}\n'
+        "   event 写具体在做什么、location 写她在哪，两者都要具体到能说出口的程度；\n"
         "3. continue：true = 接着做手上这件事（event/location/emotion 留空，速率沿用）；"
         "false = 换一件事。\n"
         f"4. minutes：这一段做多久。最短 {SEGMENT_MIN_MINUTES} 分钟，一般的事最长 "
@@ -529,11 +539,20 @@ def dynamic_segment(
     prev: Slot | None = None,
     seed: list[Any] | None = None,
 ) -> Slot:
-    """没有可用模型时的兜底：按身体读数与钟点当场决定这一段。
+    """没有可用模型时的兜底：**只给状态，不给事件**。
 
-    不是查表也不是预制模板——饥饿、困意、当前钟点共同决定，且措辞按天抽签，
-    同一时刻不会每天给出同一个答案。身体越线时它自己会换成吃饭或睡觉；夜里
-    会一直睡到生物钟夜结束（跨午夜就结转到明天）。
+    分支的**选择**确实由身体读数决定（饿了就走饿、累了就走累）——这部分是真的。
+    但分支内曾经写着 36 条具体事件（“看书做笔记”“下楼买饭团”“叫了份外卖”）和 11 个
+    地点（“工位/书房/教室”），它们会经 day_phrases 变成「她今天上午在看书做笔记」这样
+    一句**第一人称事实**，而注入块开头写着“以下是她当前的**真实处境**”——等于把编出来
+    的一天当成既成事实交给模型。更麻烦的是地点：工位与教室直接预设了她是上班族还是学生，
+    退休的人、自由职业者会凭空多出一张工位。
+
+    现在只给状态：她饿了、在忙、到饭点了。**做什么、看到什么、经历了什么，由她自己说。**
+    同文件的 current_slot() 早就写着「拿不到段时给一个中性『自由活动』，不编造她在做什么」，
+    那是这个模块自己的标准，这里跟它对齐。
+
+    措辞仍按 (角色, 日期, 钟点) 抽签，同一时刻不会每天给出同一个答案。
     """
     body = body or {}
     prev = prev or {}
@@ -561,52 +580,43 @@ def dynamic_segment(
             minutes = 120
         event, location, emotion, rate = "睡一觉", "卧室", "沉睡", 0.15
     elif hunger >= CHANGE_TRIGGER_HUNGER:
-        event = pick("seg_eat", seed_key, (
-            "弄点吃的", "下楼买饭团", "煮碗面", "叫了份外卖", "热昨天剩的饭",
-        ))
-        location = pick("seg_eat_where", seed_key, ("厨房", "楼下便利店", "餐桌"))
-        emotion, rate, minutes = "饿了", 0.08, 40
+        event = pick("seg_eat", seed_key, ("有点饿了", "想找点吃的", "肚子空着"))
+        location, emotion, rate, minutes = "家里", "饿", 0.08, 40
     elif discomfort >= 62:
-        event = pick("seg_rest", seed_key, ("躺一会儿", "热敷一下", "停下来缓缓"))
-        location, emotion, rate, minutes = "家中", "不太舒服", 0.05, 45
+        event = pick("seg_rest", seed_key, ("有点不舒服", "想缓一缓", "不太自在"))
+        location, emotion, rate, minutes = "家里", "不太舒服", 0.05, 45
     elif in_night:
         # 夜里还醒着、困意又没到线：低刺激地待着，等困意上来
-        event = pick("seg_night_idle", seed_key, ("躺在床上刷手机", "半梦半醒地待着", "起来喝口水再躺回去"))
-        location, emotion, rate, minutes = "卧室", "迷糊", 0.02, 45
+        event = pick("seg_night_idle", seed_key, ("还没什么困意", "安静待着", "夜里醒着"))
+        location, emotion, rate, minutes = "家里", "迷糊", 0.02, 45
     elif energy <= 30:
-        event = pick("seg_low", seed_key, ("靠着发会儿呆", "闭眼歇一会儿", "起来倒杯水"))
-        location, emotion, rate, minutes = "家中", "有点累", 0.05, 30
+        event = pick("seg_low", seed_key, ("有点提不起劲", "想歇一下", "没什么精神"))
+        location, emotion, rate, minutes = "家里", "有点累", 0.05, 30
     else:
+        # 按钟点给**处境**而不是事件：她这个钟点在忙 / 到饭点了 / 闲下来了，
+        # 但具体在做什么不编——那得她自己说
         hour = (now_minute // 60) % 24
         if 7 <= hour < 9:
-            event = pick("seg_morning", seed_key, (
-                "收拾出门", "边吃早饭边看手机", "洗漱完整理包",
-            ))
-            location = pick("seg_morning_where", seed_key, ("家中", "通勤路上"))
+            event = pick("seg_morning", seed_key, ("刚起来没多久", "还在醒神"))
             emotion, rate, minutes = "清醒中", -0.05, 60
         elif 9 <= hour < 12:
-            event = pick("seg_forenoon", seed_key, (
-                "处理上午的事", "回消息和对进度", "写点东西", "看书做笔记",
-            ))
-            location = pick("seg_forenoon_where", seed_key, ("工位", "书房", "教室"))
+            event = pick("seg_forenoon", seed_key, ("在忙自己的事", "手头有东西要处理"))
             emotion, rate, minutes = "专注", -0.07, 90
         elif 12 <= hour < 14:
-            event = pick("seg_noon", seed_key, ("吃午饭", "热饭吃", "出去吃点"))
-            location, emotion, rate, minutes = "餐厅", "放松", 0.08, 45
+            event = pick("seg_noon", seed_key, ("到饭点了", "中午"))
+            emotion, rate, minutes = "放松", 0.08, 45
         elif 14 <= hour < 18:
-            event = pick("seg_afternoon", seed_key, (
-                "接着弄手头的活", "整理桌面和文件", "跑一趟外面", "开个小会",
-            ))
-            location = pick("seg_afternoon_where", seed_key, ("工位", "外面", "家中"))
+            event = pick("seg_afternoon", seed_key, ("还在忙", "下午这段在做事"))
             emotion, rate, minutes = "平稳", -0.06, 90
         elif 18 <= hour < 20:
-            event = pick("seg_evening_meal", seed_key, ("做晚饭", "出去吃", "点外卖"))
-            location, emotion, rate, minutes = "厨房", "惬意", 0.06, 60
+            event = pick("seg_evening_meal", seed_key, ("到饭点了", "天快黑了"))
+            emotion, rate, minutes = "惬意", 0.06, 60
         else:
-            event = pick("seg_evening", seed_key, (
-                "刷会儿手机", "看一集剧", "洗澡收拾", "跟人聊两句", "翻两页书",
-            ))
-            location, emotion, rate, minutes = "家中", "轻松", -0.02, 75
+            event = pick("seg_evening", seed_key, ("今天差不多到这儿了", "闲下来了"))
+            emotion, rate, minutes = "轻松", -0.02, 75
+        # 地点不再按“工位/书房/教室”分类：那是给她安身份（上班还是上学）。
+        # 统一给中性的“家里”，与 current_slot() 的兼底一致
+        location = "家里"
 
     start = segment_start(now_minute, step)
     end = start + minutes

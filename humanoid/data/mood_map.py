@@ -70,13 +70,23 @@ def mood_complex(affection: float, libido: float, aggression: float) -> str:
 
     词表取自 generate_mood_tag 已有的说法，不新写台词。其余状态返回空串——
     单字标签已经够用，硬加只会让注入变长。
+
+    返回的是**带主语的完整短句**——旧版返回裸词「拧巴」，被 _relation_lines 直接
+    拼进句子，拼出来是「……，拧巴，……」这样的断片。
     """
     if aggression >= 30.0 and libido >= 30.0:
-        return random.choice(("又气又想靠近", "拧巴"))
+        return random.choice(("她心里两个念头抣着", "她有点拧巴", "又气又想靠近"))
     return ""
 
 
 def get_mood_label(affection: float, libido: float, aggression: float) -> str:
+    """查表拿关系标签（输出是「宠溺/安心/着迷」这类状态词）。
+
+    这张表的列键是 (libido分桶, aggression分桶)，而表里的词读起来像爱情。
+    实际语义不是「性欲」而是亲近/占有——libido 高会出「宠溺/着迷」，
+    aggression 同时高会出「吃醋」。所以这里的 libido 轴是当亲近欲用的，
+    以后改词表别按字面理解成性。
+    """
     table = AFFECTION_MAP.get(affection_rank(affection), {})
     return table.get((round_to_bucket(libido), round_to_bucket(aggression)), "普通")
 
@@ -104,11 +114,13 @@ def generate_mood_tag(affection: float, libido: float, aggression: float, energy
         parts.append(random.choice(("冷淡", "提不起劲", "闷闷的", "兴致不高")))
 
     if aggression >= 30 and libido >= 30:
-        parts.append(random.choice(("矛盾", "拧巴", "又气又想靠近")))
+        parts.append(random.choice(("矛盾", "拧巴", "两个念头抣着")))
     elif aggression >= 30:
-        parts.append(random.choice(("有点烦躁", "压着火气", "憋着不痛快", "气鼓鼓")))
+        # 「气鼓鼓」是角色会说的话，不是第三人称叙述；换成一组的客观状态词
+        parts.append(random.choice(("有点烦躁", "压着火气", "心里不痛快")))
     elif libido >= 30:
-        parts.append(random.choice(("想贴贴", "想找人说话", "软乎乎", "亲切")))
+        # 「想贴贴」同上。整块输出会变成「她今天想贴贴」——那是给她递台词。
+        parts.append(random.choice(("想亲近人", "想有人说说话", "黏糊", "松快")))
     elif aggression <= 8 and libido <= 8:
         parts.append(random.choice(("松弛", "自在", "没什么心事")))
     else:

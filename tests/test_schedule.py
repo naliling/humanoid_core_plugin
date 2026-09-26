@@ -394,17 +394,49 @@ class DynamicSegmentTest(unittest.TestCase):
         self.assertNotIn("carry_end", slot)
 
     def test_hunger_override(self):
+        """饥饿越线要切到“饿”这个状态，但**不编造她具体在吃什么**。
+
+        旧实现在这里写死了 5 条具体事件（“弄点吃的/下楼买饭团/煮碗面/叫了份外卖/
+        热昨天剩的饭”），它们会变成「她今天下午在煮碗面」这样一句事实句交给模型。
+        身体读数决定的是“她在什么状态”，不是“她干了什么”。
+        """
         slot = dynamic_segment(
             cfg(), {"hunger": 92.0}, now_minute=15 * 60, step=15, seed=["bot", "d"],
         )
-        self.assertTrue(any(word in slot["event"] for word in ("吃", "面", "饭", "外卖")), slot)
+        self.assertTrue(any(w in slot["event"] for w in ("饿", "想找点吃的", "肚子空着")), slot)
+        for banned in ("饭团", "面", "外卖", "煮", "热昨天"):
+            self.assertNotIn(banned, slot["event"], f"又编起具体事件了：{slot['event']}")
+        self.assertEqual(slot["emotion"], "饿")
 
     def test_night_awake_low_stays_low_stimulus(self):
+        """夜里还醒着：给“还没什么困意”这类状态，地点不预设她已经在卧室。
+
+        旧实现写死 location="卧室"（连带三条“在床上刷手机/半梦半醒/起来喝水”），
+        那是替她写好了半夜在干什么。
+        """
         slot = dynamic_segment(
             cfg(night_start_hour=23, night_end_hour=7),
             {"sleep_pressure": 40.0}, now_minute=1 * 60, step=15, seed=["bot", "d"],
         )
-        self.assertEqual(slot["location"], "卧室")
+        self.assertTrue(any(w in slot["event"] for w in ("困意", "安静待着", "夜里醒着")), slot)
+        for banned in ("手机", "半梦半醒", "喝水"):
+            self.assertNotIn(banned, slot["event"], f"又编起具体事件了：{slot['event']}")
+
+    def test_fallback_never_presets_an_identity(self):
+        """兼容底不预设她是上班族还是学生。
+
+        旧实现在上午/下午把地点写成“工位/书房/教室”，那等于凭空给她安一份工作。
+        """
+        for hour in range(24):
+            for body in ({}, {"energy": 15.0}, {"hunger": 95.0}):
+                slot = dynamic_segment(
+                    cfg(), body, now_minute=hour * 60, step=15, seed=["bot", f"d{hour}"],
+                )
+                for banned in ("工位", "教室", "书房", "通勤"):
+                    self.assertNotIn(
+                        banned, slot.get("location", ""), f"{hour} 点给地点安了身份"
+                    )
+                    self.assertNotIn(banned, slot["event"], f"{hour} 点事件里安了身份")
 
     def test_daytime_follows_hours(self):
         slot = dynamic_segment(cfg(), {}, now_minute=10 * 60, step=15, seed=["bot", "d"])

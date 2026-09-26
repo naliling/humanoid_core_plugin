@@ -464,11 +464,20 @@ class SomaService:
     # ------------------------------------------------------------------
 
     def feelings(self, energy: float) -> list[tuple[float, str]]:
-        """(显著度 0~1, 体感一句话)。只保留中性的身体事实，移除所有替AI说话或带情绪倾向的台词。"""
+        """(显著度 0~1, 体感一句话)。只保留中性的身体事实，移除所有替AI说话或带情绪倾向的台词。
+
+        六条身体轴里现在会实际用上六条：sleepy / debt / hunger / discomfort / arousal /
+        social_desire。后两条的词表早就写好了（wording.FEELING_WORDS）但一直没被调用——
+        她算了「多清醒」「多想找人说话」却一句都没进过上下文。energy 也终于用上了：
+        之前它只是个摆设参数，精力 5 和精力 95 的体感输出完全一样。
+        """
         out: list[tuple[float, str]] = []
         snap = self.snapshot()
-        cfg = self.config
         seed = [self._scope.role_id, self._today_key()]
+        try:
+            energy = float(energy)
+        except (TypeError, ValueError):
+            energy = 60.0
 
         def say(kind: str, value: float, floor: float, span: float, top: float) -> str:
             ladder = FEELING_WORDS.get(kind) or []
@@ -511,6 +520,21 @@ class SomaService:
             say("discomfort", discomfort, 60.0, 40.0, 0.85)
         elif discomfort >= 38:
             out.append((0.5, "略有不适"))
+
+        # 清醒度：精力掉了人会发懵，精力足了人才清醒。两者现在合在一起看，
+        # 因为 arousal 本身也是从精力和作息推出来的，单独用会让同一件事说两遍。
+        arousal = float(snap.get("arousal", 50.0) or 0.0)
+        if energy <= 35.0 or arousal <= 30.0:
+            say("arousal", min(arousal, energy), 0.0, 45.0, 0.7)
+        elif energy >= 80.0 and arousal >= 70.0:
+            out.append((0.6, pick("arousal_high", seed + [round(arousal / 5.0)],
+                                   ("人挺精神的", "脑子转得挺快"))))
+
+        # 想不想找人说话：设一个较高的门槛，否则「有交流意愿」这种话会天天出现在上下文里，
+        # 而她实际上大部分时间并不想说话。
+        desire = float(snap.get("social_desire", 0.0) or 0.0)
+        if desire >= 55.0:
+            say("social_desire", desire, 55.0, 40.0, 0.8)
 
         return out
 

@@ -322,7 +322,8 @@ class HumanoidCoreInstance:
             return
         self._scope.set_self("persona_realigned", stamp)
         if self.schedule.source != "llm":
-            # 日程还是内置模板，本来就该让后台循环去生成今天的版本，不另开一次。
+            # 日程现在只由“按身体现算”的兼底撑着（它只给状态、不编具体事件）。
+            # 人设变了也换不出更多东西来——等模型排出的那一版接手时再重排。
             return
         self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 认出了人设「{persona.label}」，重排今日日程")
         self.schedule.request_refresh(force=True, ignore_cooldown=True)
@@ -429,22 +430,46 @@ class HumanoidCoreInstance:
         if self.config.soma_enabled:
             self.soma.advance(now)
         events = self.behavior.consume_relevant_events(user_id, now)
-        agency = {}
-        if events:
+        # compute_agency 的基线来自 social_energy / energy / affection，跟有没有事件无关；
+        # events 只是往上叠增量。原来包了一层 `if events:`，于是她一天里绝大多数时候
+        # 算出来的 agency 都是空的——而那恰恰是最该给模型的参考：精力足、社交意愿高的
+        # 时候，模型不会知道「她现在其实挺想说点什么」，只能自己从身体读数猜。
+        try:
+            # mood.profile() 有副作用：它会真的建一份情绪档案并落盘。群聊关闭情绪时
+            # 绝不能碰它——那等于绕过了 mood_enabled_in_group，多写一份不该存在的档案。
+            # 不取 mood 时 compute_agency 内部会退回 affection 默认值，行为一致。
+            want_mood = bool(
+                self.config.mood_enabled
+                and (not is_group or self.config.mood_enabled_in_group)
+            )
             agency = self.behavior.compute_agency(
                 user_id=user_id,
                 events=events,
                 social_energy=self.social.value,
-                mood_profile=self.mood.profile(user_id),
+                mood_profile=self.mood.profile(user_id) if want_mood else {},
                 energy=self.energy.energy,
             )
+        except Exception:
+            agency = {}
         # 注意力三轴：上心程度要看 TA 这句活本身，所以得把原文递进去。
         try:
             interest = self.behavior.interest_state(user_id, now, text=text, is_group=is_group)
         except Exception:
             interest = {}
+        # 人设里的说话方式。以前人设根本不进聊天 prompt（只进了日程生成），
+        # 于是所有角色的注入层口吻完全一样。现在只摘其中与说话有关的原句传下去。
+        # build_injection 是同步的，而 persona() 要 await——所以这里只读缓存，
+        # 预热在 main 的 async handler 里做（见 PersonaSource.persona_cached）。
+        persona_prompt = ""
+        try:
+            source = getattr(self, "persona_source", None)
+            if source is not None:
+                persona_prompt = source.persona_cached(self.role_id).prompt
+        except Exception:
+            persona_prompt = ""
         return self.prompt_builder.build(
-            user_id, is_group, events=events, agency=agency, text=text, interest=interest
+            user_id, is_group, events=events, agency=agency, text=text,
+            interest=interest, persona_prompt=persona_prompt,
         )
 
     def refresh_contract(self) -> dict | None:
