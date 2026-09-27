@@ -210,6 +210,35 @@ class HumanoidCoreInstance:
         self._rebase_after_move()
         return self.clock.city
 
+    def char_name(self) -> str:
+        """注入里代表角色的那个名字。
+
+        优先用管理员 `/设置参照名称` 设的；没设就用人设里的名字。两者都拿不到时返回
+        空串，注入退回「她」——功能不受影响，只是代入感弱一点。
+        """
+        try:
+            override = str(self._scope.get_self("char_name_override", "") or "").strip()
+        except Exception:
+            override = ""
+        if override:
+            return override
+        source = getattr(self, "persona_source", None)
+        if source is None:
+            return ""
+        try:
+            return source.cached_name(self.role_id)
+        except Exception:
+            return ""
+
+    def set_char_name(self, name: str) -> str:
+        """管理员设定参照名称。传空/「清除」= 去掉设定，回到跟随人设名。"""
+        value = str(name or "").strip()
+        if value in ("", "清除", "默认", "跟随", "跟随人设", "无"):
+            self._scope.set_self("char_name_override", "")
+            return ""
+        self._scope.set_self("char_name_override", value)
+        return value
+
     @property
     def config(self) -> HumanoidConfig:
         return self._config_provider()
@@ -432,7 +461,14 @@ class HumanoidCoreInstance:
         if self.weather.is_stale():
             self._spawn_background(self.weather.refresh_async(), "weather-refresh")
 
-    def build_injection(self, user_id: str, is_group: bool = False, text: str = "") -> str:
+    def build_injection(
+        self,
+        user_id: str,
+        is_group: bool = False,
+        text: str = "",
+        user_name: str = "",
+        char_name: str = "",
+    ) -> str:
         """拼本次请求要追加的事实块。
 
         只读不写：时间间隔、情绪、注意力都在 `on_message` 里记过账，这里再记一次就会
@@ -464,6 +500,8 @@ class HumanoidCoreInstance:
         return self.prompt_builder.build(
             user_id, is_group, events=events, agency=agency, text=text,
             interest=interest,
+            char_name=char_name or self.char_name(),
+            user_name=user_name,
         )
 
     def refresh_contract(self) -> dict | None:
@@ -626,31 +664,66 @@ class HumanoidCoreInstance:
         return lines
 
     def status_lines(self, user_id: str) -> list[str]:
+        """`/你的状态`：分组的体检单。
+
+        排版按「先看什么」来：一眼能看到时间/身体，下面再是关系与环境。不用 emoji
+        ——emoji 堆多了反而看不清哪行是哪行，列对齐就够了。
+        """
         s = self.snapshot(user_id)
-        lines = [
-            f"🧠 角色：{self.role_id}",
-            f"- 时间：{s['time']} 星期{s['weekday']}",
-            f"- 城市：{s['city']}",
-            f"- 精力：{int(s['energy']['value'])}/{int(s['energy']['max'])} ({s['energy']['text']})",
-            f"- 生理：{s['cycle'] or '未开启'}",
-        ]
-        lines += self.body_lines()
-        if s['process']:
-            p = s['process']
-            lines.append(f"- 当前过程：{p.get('name', '休息')}（持续 {p.get('duration_minutes', 0)} 分钟）")
-        wx = s['weather'] or {}
-        # 没取到天气时把「为什么没有」直说：这行是给人核对的，比空着一个尾巴有用。
-        if str(wx.get('weather', '') or ''):
-            lines.append(f"- 天气：{wx['weather']}")
-        elif str(wx.get('env', '') or ''):
-            lines.append(f"- 天气：{wx['env']}")
-        if s['social_energy'] and self.config.social_energy_enabled:
-            lines.append(f"- 社交能量：{int(s['social_energy']['value'])}% ({s['social_energy']['text']})")
-        if user_id and 'mood' in s:
-            lines.append(f"- 好感度：{s['mood']['affection']:.1f}（{s['mood']['label']}）")
-            # 认识多久只在面板上给：它不进上下文，因为递进模型它就会拿去念
-            # （「我们认识这么久了」是聊天里最没劲的一句话）。关系深浅由注入里的
-            # 位置词承载，模型那边够用了。
+        now = self.clock.now()
+        width = 12
+
+        def row(label: str, value: str, note: str = "") -> str:
+            base = f"  {label.ljust(width)}{value}"
+            return f"{base}  {note}" if note else base
+
+        out: list[str] = [f"Humanoid Core · {self.role_id}"]
+        out.append(f"{now.strftime('%Y-%m-%d %H:%M')} 星期{s['weekday']}  ·  {s['city']}")
+
+        out.append("")
+        out.append("身体")
+        out.append(row("精力", f"{int(s['energy']['value'])}/{int(s['energy']['max'])}", s['energy']['text']))
+        soma = s.get("soma") or {}
+        if soma:
+            out.append(row("睡眠压力", f"{soma.get('sleep_pressure', 0):.0f}/100"))
+            debt = float(soma.get("sleep_debt", 0) or 0)
+            if debt > 0.05:
+                out.append(row("睡眠债", f"{debt:.1f} 小时"))
+            out.append(row("饥饿", f"{soma.get('hunger', 0):.0f}/100"))
+            out.append(row("躯体不适", f"{soma.get('discomfort', 0):.0f}/100"))
+            out.append(row("唤醒度", f"{soma.get('arousal', 0):.0f}/100"))
+        if s.get("cycle"):
+            out.append(row("生理", s["cycle"]))
+
+        out.append("")
+        out.append("社交")
+        if s.get("social_energy") and self.config.social_energy_enabled:
+            out.append(row("社交能量", f"{int(s['social_energy']['value'])}%", s['social_energy']['text']))
+        if soma:
+            out.append(row("想找人说", f"{soma.get('social_desire', 0):.0f}/100"))
+        proc = s.get("process") or {}
+        if proc:
+            out.append(row("当前过程", str(proc.get("name", "休息")),
+                            f"已持续 {int(proc.get('duration_minutes', 0) or 0)} 分钟"))
+        if user_id:
+            try:
+                axes = self.behavior.interest_state(user_id, self.now_epoch()) or {}
+            except Exception:
+                axes = {}
+            if axes:
+                out.append(row("注意力", "·".join(
+                    f"{k} {float(axes.get(k, 0)):.0%}"
+                    for k in ("care", "focus", "spare")
+                ).replace("care", "在意").replace("focus", "上心").replace("spare", "余量")))
+
+        if user_id and "mood" in s:
+            out.append("")
+            out.append(f"关系 · {user_id}")
+            out.append(row("好感度", f"{s['mood']['affection']:.1f}/100", str(s['mood']['label'])))
+            mood_raw = self.scope.user_state(user_id).get("mood") or {}
+            if mood_raw:
+                out.append(row("亲近欲", f"{float(mood_raw.get('libido', 0)):.0f}/50"))
+                out.append(row("攻击性", f"{float(mood_raw.get('aggression', 0)):.0f}/50"))
             try:
                 first_met = self.mood.first_met(user_id)
             except Exception:
@@ -658,24 +731,49 @@ class HumanoidCoreInstance:
             if first_met > 0:
                 from .prompt_builder import PromptBuilder
 
-                lines.append(
-                    "- 认识："
-                    + PromptBuilder._days_line(self.now_epoch() - first_met)
-                    + "（此项仅面板可见，不进上下文）"
-                )
-            # 注意力三轴只在这个地方给人看数值：进上下文的是措辞，不是百分比。
+                out.append(row("认识", PromptBuilder._days_line(self.now_epoch() - first_met),
+                                "仅面板可见，不进上下文"))
             try:
-                axes = self.behavior.interest_state(user_id, self.now_epoch())
+                recent = self.mood.logs(user_id, limit=3)
             except Exception:
-                axes = {}
-            if axes:
-                lines.append(
-                    "- 注意力：在意 {:.0%}、上心 {:.0%}、余量 {:.0%}".format(
-                        axes.get("care", 0.0), axes.get("focus", 0.0), axes.get("spare", 0.0)
-                    )
-                )
-                lines.append("  （上心程度拿你刚这句话现算，所以每条消息都在动）")
-        return lines
+                recent = []
+            if recent:
+                out.append(row("情绪事件", f"最近 {len(recent)} 条",
+                                str(recent[-1].get("event", "")).replace("，", "，")))
+
+        out.append("")
+        out.append("环境")
+        wx = s.get("weather") or {}
+        if str(wx.get("weather", "") or ""):
+            out.append(row("天气", str(wx["weather"])))
+        elif str(wx.get("env", "") or ""):
+            out.append(row("天气", "未取到", str(wx["env"])))
+        segs = self.schedule.segments()
+        active = self.schedule.active_segment()
+        out.append(row("日程", f"今天 {len(segs)} 段", self.schedule.source_text))
+        if active:
+            out.append(row("", f"当前 {active.get('start', '')}-{active.get('end', '')}",
+                            f"{active.get('event', '')}"))
+
+        out.append("")
+        out.append("联动")
+        contract = self._scope.get_self("contract")
+        out.append(row("契约", "已生成" if contract else "未生成",
+                       "供自主拟人社交读取"))
+        state = {}
+        try:
+            state = dict(self.signals.status() or {})
+        except Exception:
+            state = {}
+        link_state = str(state.get("state", "") or "").strip("-")
+        friendly = {
+            "no_data_root": "未装 / 没有数据目录",
+            "no_contract": "已装，但没读到契约",
+            "stale": "已装，契约已过期",
+            "fresh": "已装，正在联动",
+        }.get(link_state, link_state or "状态未知")
+        out.append(row("社交插件", friendly))
+        return out
 
     def schedule_text(self) -> str:
         """她今天过出来的日程：已过完的段 + 当前段，没有预排的未来。"""

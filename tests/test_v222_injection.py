@@ -54,7 +54,15 @@ class InjectionLayerTest(unittest.TestCase):
             resolver=FakeContext(),
             gateway=None,
         )
-        core.clock = FrozenClock(MOMENT)
+        # 把**所有服务**的钟一起冻住。只换 `core.clock` 的话，schedule/soma/energy 手里
+        # 还是构造时创建的真实钟——于是「今天」按机器日期算，`today_date` 对不上、日程读
+        # 出来是空的。这个文件那天正好跨了天才暴露，属于定时炸弹。
+        frozen = FrozenClock(MOMENT, city="北京")
+        core.clock = frozen
+        for name in ("schedule", "soma", "energy", "social", "process", "mood"):
+            svc = getattr(core, name, None)
+            if svc is not None and hasattr(svc, "_clock"):
+                svc._clock = frozen
         return core
 
     def add_mood_log(self, core, user_id, event: str, minutes_ago: int) -> None:
@@ -344,6 +352,113 @@ class InjectionLayerTest(unittest.TestCase):
         self.assertEqual(core.mood.nickname("real"), "小明", "真设了就要查得到")
 
     # ------------------------------------------------------------------
+    # 身份锚定
+    # ------------------------------------------------------------------
+
+    def test_marker_header_survives_personalization(self):
+        """标题 `〔她的身体与生活…〕` 里的「她」不能被换成名字。
+
+        `_drop_stale_blocks` 靠 MARK_PREFIX 认出历史里的旧块并抹掉。标题一旦变成
+        「〔小雨的身体与生活…」，前缀对不上，聊天越久历史里堆的过期状态块就越多——
+        正是那段代码当初要解决的问题。这条是回归锁。
+        """
+        from humanoid.prompt_builder import MARK_PREFIX, PromptBuilder
+
+        core = self.core()
+        core.mood.profile("42")
+        text = core.build_injection("42", is_group=False, char_name="小雨", user_name="陌陌")
+        self.assertTrue(
+            text.startswith(MARK_PREFIX),
+            f"标题必须以 MARK_PREFIX 开头，否则旧块清不掉：\n{text[:80]}",
+        )
+        self.assertNotIn("小雨的身体与生活", text, "标题被改名了")
+
+    def test_names_replace_first_mention_only(self):
+        """名字只锚定一次：每句都以名字开头就成了流水账。"""
+        from humanoid.prompt_builder import PromptBuilder
+
+        out = PromptBuilder._personalize(
+            "私聊，只有她和陌陌。她今天有点累。她对陌陌还算熟。", "小雨", "陌陌"
+        )
+        self.assertEqual(
+            out, "私聊，只有小雨和陌陌。她今天有点累。她对陌陌还算熟。",
+            "名字只该锚定第一次，之后继续用「她」",
+        )
+
+    def test_emotion_line_carries_the_name(self):
+        """情绪句是独立的内心独白，每次都要叫得出名字。"""
+        from humanoid.prompt_builder import PromptBuilder
+
+        out = PromptBuilder._personalize("（她的内心：心里有点堵）", "小雨", "陌陌")
+        self.assertEqual(out, "（小雨的内心：心里有点堵）")
+
+    def test_names_with_pronouns_are_rejected(self):
+        """名字里混进代词会替换出「小小雨今天…」这种句子，直接弃用。"""
+        from humanoid.prompt_builder import PromptBuilder
+
+        for bad in ("小她", "你你", "TA", "她她"):
+            out = PromptBuilder._personalize("她今天有点累", bad, "小明")
+            self.assertEqual(out, "她今天有点累", f"名字「{bad}」该被弃用")
+
+    # ------------------------------------------------------------------
+    # 情绪：括号内心 + 日常措辞 + 每轮一条
+    # ------------------------------------------------------------------
+
+    def test_emotion_is_bracketed_inner_voice(self):
+        """情绪包在括号里、标成「内心」，且**整条注入里最多一条**。
+
+        括号是「这是状态、不是要说出口的话」的信号；不加括号时，模型会把
+        「她心里有点堵」当成可以复述的事实，念出来就是「我心里有点堵」。
+        """
+        core = self.core()
+        core.mood.profile("42").update(
+            {"affection": 80.0, "base_affection": 46.0, "aggression": 50.0, "base_aggression": 28.0}
+        )
+        text = core.build_injection("42", is_group=False, text="在吗")
+        self.assertIn("（她的内心：", text, f"情绪该是括号里的内心：\n{text}")
+        self.assertLessEqual(
+            text.count("内心"), 1, f"一轮只该给一条情绪，模型会当成要复述的清单：\n{text}"
+        )
+
+    def test_emotion_uses_plain_words_not_diagnosis(self):
+        """旧措辞（「心里压着火」「一股气没处发」）是病历腔，模型会原样复读。"""
+        core = self.core()
+        core.mood.profile("42").update({"aggression": 52.0, "base_aggression": 28.0})
+        text = core.build_injection("42", is_group=False, text="在吗")
+        for clinical in ("压着火", "气没处发", "拧巴", "抣着"):
+            self.assertNotIn(clinical, text, f"病历腔又回来了「{clinical}」：\n{text}")
+        self.assertIn("内心", text, f"该给情绪：\n{text}")
+
+    def test_neutral_state_gets_no_tense_wording(self):
+        """常态不该被读成有情绪——门槛必须高于初始值，否则天天都在演。"""
+        core = self.core()
+        core.mood.profile("42")
+        text = core.build_injection("42", is_group=False, text="在吗")
+        for tense in ("心里有点堵", "有点不想搭理", "有点躲着你", "火还没消",
+                      "空落落", "心里发闷", "有点想躲着你"):
+            self.assertNotIn(tense, text, f"常态被判成了异常情绪「{tense}」：\n{text}")
+
+    def test_grudge_needs_repeat_not_one_hit(self):
+        """「记着上次那件事」不能一次就上——单次算记仇，重复且近期才算在意。"""
+        from humanoid.emotion import EmotionLayer
+
+        core = self.core()
+        core.mood.profile("42").update({"aggression": 50.0, "base_aggression": 28.0})
+        one = EmotionLayer(core)._attitude(core.mood.profile("42"), "42", 0)
+        self.assertNotIn("火", one[1], f"只被惹一次就记仇：{one}")
+        # 两条负向事件（情绪日志用「好感度下降」表示被惹）
+        logs: list = []
+        for minutes, aff in ((10, 40.0), (25, 41.0)):
+            logs.append({
+                "time": (MOMENT - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S"),
+                "event": f"好感度下降至 {aff}",
+                "affection": aff, "libido": 34.0, "aggression": 48.0,
+            })
+        core.scope.user_state("42")["mood_logs"] = logs
+        twice = EmotionLayer(core)._attitude(core.mood.profile("42"), "42", 0)
+        self.assertIn("火", twice[1], f"反复被惹就该记着了：{twice}")
+
+    # ------------------------------------------------------------------
     # 长期不活跃 / 群聊 / 天气 / 半球
     # ------------------------------------------------------------------
 
@@ -373,7 +488,7 @@ class InjectionLayerTest(unittest.TestCase):
 
         # 情绪归零后关系位置退回中性——她不记得你们有多熟，但她还记得你叫什么。
         text = core.build_injection("42", is_group=False, text="好久不见")
-        self.assertIn("你管TA叫小明", text)
+        self.assertIn("对TA的称呼是「小明」", text)
         self.assertIn("她对TA", text, f"关系位置仍要给（中性那档）：\n{text}")
         self.assertNotIn("关系亲密", text, f"情绪都清零了还说她亲密：\n{text}")
         panel = "\n".join(core.status_lines("42"))

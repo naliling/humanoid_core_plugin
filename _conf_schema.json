@@ -449,6 +449,12 @@
     "type": "bool",
     "default": true
   },
+  "auto_identify_user": {
+    "description": "自动识别用户",
+    "hint": "开：把这条消息的发送者名取来当对方的标识（群聊取群名片，私聊取 QQ 昵称），注入里用真名把「她」和「对方」分开，模型不会认混人；关：对方统一写「TA」。名字直接取用，不做长度与内容校验。",
+    "type": "bool",
+    "default": false
+  },
   "social_energy_enabled": {
     "description": "社交能量",
     "hint": "开：陪聊耗电、闲时回血，电量影响她回话的热忱与主动性。关掉后注入与 /你的状态 都不再提社交能量（联动契约里仍带这个值，以兼容已装的社交层）。",

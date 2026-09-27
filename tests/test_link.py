@@ -350,8 +350,8 @@ class InjectionBudgetTest(unittest.TestCase):
         harness, core = self.build({"inject_activity_context": "low"})
         text = core.build_injection("42", is_group=False)
         self.assertEqual(text.count(MARK_PREFIX), 1, text)
-        self.assertNotIn("由她自己判断", text, "框架句被复制进每条消息了")
-        self.assertIn("由她自己判断", FRAMING_TEXT, "怎么读这些事实，得在 system_prompt 里说清")
+        self.assertNotIn("由你自己判断", text, "框架句被复制进每条消息了")
+        self.assertIn("由你自己判断", FRAMING_TEXT, "怎么读这些事实，得在 system_prompt 里说清")
         self.assertIn("身体与生活", FRAMING_TEXT)
 
 

@@ -528,15 +528,17 @@ class EmotionLineTest(unittest.TestCase):
     def test_still_angry_shows_in_the_state_not_a_script(self):
         """情绪信到状态词为止：状态照给，怎么开口不由插件写。
 
-        v2.22 起心气只给一句：攻击性到了门槛就只说「压着火」，不再并排关系标签——
-        同一句里又是气又是「热烈」，读起来自相矛盾。
+        v2.22 起心气只给一句；v2.23 起走 `humanoid/emotion.py`：说「心里有点堵」这类
+        日常话（旧的「一股气没处发」是病历腔，会被模型原样复读），并且括号包起来
+        当内心独白，不再并排关系标签。
         """
         core = self.core_with_mood(affection=55.0, libido=10.0, aggression=40.0, base_aggression=28.0)
         text = core.build_injection("42", is_group=False)
         self.assertTrue(
-            any(w in text for w in ("压着火", "一股气没处发")),
+            any(w in text for w in ("心里有点堵", "不想搭理你")),
             f"攻击性到了门槛却没说她在气：{text}",
         )
+        self.assertIn("（她的内心：", text, f"情绪该包在括号里当内心独白：{text}")
         for script in ("积了点火", "攒着点事", "火压在底下", "说话会短", "顶回去"):
             self.assertNotIn(script, text)
 
@@ -559,8 +561,8 @@ class EmotionLineTest(unittest.TestCase):
         core = self.core_with_mood()
         text = core.build_injection("42", is_group=False)
         self.assertNotIn("不必逐条回应", text)
-        self.assertIn("由她自己判断", FRAMING_TEXT)
-        self.assertIn("处境", FRAMING_TEXT)
+        self.assertIn("由你自己判断", FRAMING_TEXT)
+        self.assertIn("身上的事实", FRAMING_TEXT)
 
 
 

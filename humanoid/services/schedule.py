@@ -619,29 +619,29 @@ def dynamic_segment(
         event = pick("seg_night_idle", seed_key, ("还没什么困意", "安静待着", "夜里醒着"))
         location, emotion, rate, minutes = "家里", "迷糊", 0.02, 45
     elif energy <= 30:
-        event = pick("seg_low", seed_key, ("有点提不起劲", "想歇一下", "没什么精神"))
+        event = pick("seg_low", seed_key, ("歇着", "发呆", "瘫着"))
         location, emotion, rate, minutes = "家里", "有点累", 0.05, 30
     else:
         # 按钟点给**处境**而不是事件：她这个钟点在忙 / 到饭点了 / 闲下来了，
         # 但具体在做什么不编——那得她自己说
         hour = (now_minute // 60) % 24
         if 7 <= hour < 9:
-            event = pick("seg_morning", seed_key, ("刚起来没多久", "还在醒神"))
+            event = pick("seg_morning", seed_key, ("醒神", "赖床"))
             emotion, rate, minutes = "清醒中", -0.05, 60
         elif 9 <= hour < 12:
-            event = pick("seg_forenoon", seed_key, ("在忙自己的事", "手头有东西要处理"))
+            event = pick("seg_forenoon", seed_key, ("忙自己的事", "手头有东西要处理"))
             emotion, rate, minutes = "专注", -0.07, 90
         elif 12 <= hour < 14:
-            event = pick("seg_noon", seed_key, ("到饭点了", "中午"))
+            event = pick("seg_noon", seed_key, ("吃饭", "吃午饭"))
             emotion, rate, minutes = "放松", 0.08, 45
         elif 14 <= hour < 18:
-            event = pick("seg_afternoon", seed_key, ("还在忙", "下午这段在做事"))
+            event = pick("seg_afternoon", seed_key, ("做事", "忙手里的活"))
             emotion, rate, minutes = "平稳", -0.06, 90
         elif 18 <= hour < 20:
-            event = pick("seg_evening_meal", seed_key, ("到饭点了", "天快黑了"))
+            event = pick("seg_evening_meal", seed_key, ("做饭", "弄吃的"))
             emotion, rate, minutes = "惬意", 0.06, 60
         else:
-            event = pick("seg_evening", seed_key, ("今天差不多到这儿了", "闲下来了"))
+            event = pick("seg_evening", seed_key, ("歇着", "窝着"))
             emotion, rate, minutes = "轻松", -0.02, 75
         # 地点不再按“工位/书房/教室”分类：那是给她安身份（上班还是上学）。
         # 统一给中性的“家里”，与 current_slot() 的兼底一致

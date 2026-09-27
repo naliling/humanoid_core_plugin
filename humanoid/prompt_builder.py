@@ -32,10 +32,10 @@ if TYPE_CHECKING:
 
 from .config import HumanoidConfig
 from .data.mood_map import get_mood_label
+from .emotion import EmotionLayer, bracket
 from .services.schedule import day_lines, day_phrases, done_between, just_done
 from .wording import (
     AGENCY_CONTINUATION,
-    AGENCY_INITIATIVE,
     CARE_WORDS,
     FOCUS_WORDS,
     SINCE_WORDS,
@@ -50,15 +50,48 @@ _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef
 # 所以每次注入前要把历史里旧的块抹掉（`main.py` 负责），标记就是给这一步认路用的。
 # 换文案时把 v 后面的数字加一，老会话里的旧块会被当成不认识的内容直接清掉。
 MARK_PREFIX = "〔她的身体与生活"
-MARK_VERSION = "v10"
+MARK_VERSION = "v11"
 
 # 给 system_prompt 的那段话：说明下面这些是什么、按什么方式读它。稳定文本，不含事实。
 # 只划参考边界，不下指令：说什么、怎么说、说多长，都由她自己判断。
-FRAMING_TEXT = (
-    "\n\n【她的身体与生活】\n"
-    "以下是她当前的真实处境与身体状态，作为背景参考。"
-    "自然融入即可，无需刻意提及或逐条回应；如何回应、说什么、说多长，由她自己判断。"
-)
+def _safe_name(raw: str) -> str:
+    """名字里混进代词会替换出「小小雨今天…」这种句子，直接弃用、退回代词。"""
+    name = str(raw or "").strip()
+    if not name or "她" in name or "你" in name or "TA" in name:
+        return ""
+    return name
+
+
+def build_framing(char_name: str = "", user_name: str = "") -> str:
+    """给 system_prompt 的那段说明：这些是什么、怎么读、指的是谁。
+
+    **指名道姓这一段是必须的。** 模型没有"自我"这个概念——它不扮演角色，只是按
+    system_prompt 生成下一段文本。而 system_prompt 里人设写的是「你叫小雨」，
+    注入里若写「她今天有点累」，模型读到的是"有个叫她的实体状态如何"，那是旁白，
+    它会照着旁白转述（于是出现复读、或者冒出"好的我知道了"这种话）。
+    写明「小雨指你自己」之后，同一句话才从旁白变成自述。
+
+    另一半作用是把「不必使用」的授权收回来：原来那句「无需刻意提及」落到模型那儿
+    等于"可以无视"——于是整个状态块被跳过，参考等于白给。改成「会影响你的语气和分寸」
+    之后，它知道这些是要用的，只是别逐条念出来。
+
+    末句「说什么、说多长由她自己判断」是插件的核心原则，不动。
+    """
+    who = _safe_name(char_name)
+    them = _safe_name(user_name)
+    role = f"「{who}」" if who else "「她」"
+    peer = f"「{them}」" if them else "「TA」"
+    return (
+        "\n\n【她的身体与生活】\n"
+        f"下面提到的{role}指你自己，{peer}指正在和{role}说话的那个人。"
+        "这些不是让你转述的资料，是你现在身上的事实："
+        "累的时候话就短，忙起来就不追问，心思在对方身上时才会主动往下接。不必逐条报备。"
+        "如何回应、说什么、说多长，由你自己判断。"
+    )
+
+
+# 模块级保留一份默认文案：诊断、测试这些不需要带名字的地方直接用它。
+FRAMING_TEXT = build_framing()
 
 # 注入块的尺寸红线（字符）：防止哪天拼装逻辑把注入胀到几千字。
 # 实际卡住体积的是 cfg.inject_token_budget（超了按显著度整句丢）。
@@ -82,7 +115,9 @@ def estimate_tokens(text: str) -> int:
 # 低注入档下最多给几条体感：真人多数时候不觉得自己在报备身体。
 MAX_FEELINGS_LOW = 2
 MAX_FEELINGS_FULL = 5
-FEELING_THRESHOLD_LOW = 0.55
+# 体感门槛。**只在明显不适时才说**——「她有些困意」这种常态不影响这一轮怎么回，
+# 写进去只会摊薄模型对那几条真正有用的事的注意（实测一句曾塞到七件事）。
+FEELING_THRESHOLD_LOW = 0.75
 
 # 「记得的事」给几句原话。一条就够：给多了模型会当成一份话题清单逐条追着问，
 # 而真人只记得一两件事，剩下的过半天就忘了。
@@ -96,7 +131,7 @@ EMOTION_AGGRESSION_ONSET = 40.0
 EMOTION_LIBIDO_ONSET = 42.0
 
 EVENT_TEXT = {
-    "conversation_started": "这是你和TA的第一次对话",
+    "conversation_started": "这是你们头一次说话",
     "conversation_resumed": "TA刚重新接上话",
     "user_returned": "TA重新出现了",
     "long_gap": "TA隔了很久才回来",
@@ -132,6 +167,7 @@ def _core_epoch(core) -> float:
 class PromptBuilder:
     def __init__(self, core_instance: "HumanoidCoreInstance") -> None:
         self._core = core_instance
+        self._emotion = EmotionLayer(core_instance)
 
     @property
     def config(self) -> HumanoidConfig:
@@ -147,6 +183,8 @@ class PromptBuilder:
         agency: Optional[Dict[str, float]] = None,
         text: str = "",
         interest: Optional[Dict[str, float]] = None,
+        char_name: str = "",
+        user_name: str = "",
     ) -> str:
         cfg = self.config
         events = events or []
@@ -169,16 +207,23 @@ class PromptBuilder:
             sents = [
                 (self._sentence(self._scene_lines(is_group)), 10.0),
                 (self._sentence(relation), 8.0),
+                (self._emotion_line(user_id, interest, agency, is_group), 8.5),
                 (self._sentence(self._feelings_lines(max_items=1, threshold=0.7)), 7.0),
                 (self._sentence(self._day_lines(detailed=False)), 5.0),
                 (self._sentence(self._memory_lines(user_id, detailed=False)), 6.0),
             ]
-            return self._finish(sents, cfg)
+            return self._finish(sents, cfg, char_name, user_name)
 
         if mode == "full":
-            return self._finish(self._build_full(user_id, is_group, events, agency, text, interest), cfg)
+            return self._finish(
+                self._build_full(user_id, is_group, events, agency, text, interest),
+                cfg, char_name, user_name,
+            )
 
-        return self._finish(self._build_medium(user_id, is_group, events, agency, text, interest), cfg)
+        return self._finish(
+            self._build_medium(user_id, is_group, events, agency, text, interest),
+            cfg, char_name, user_name,
+        )
 
     # ------------------------------------------------------------------
     # 分块
@@ -269,8 +314,9 @@ class PromptBuilder:
             return pick(key, seed, scale_word(v, ladder))
 
         lines: List[str] = []
+        # **不含 initiative**：主动性归情绪层了（`EmotionLayer._willingness`）。
+        # 两边都给就会出现「（她有点想说话）。她有点想说话」——同一件事在一句里两遍。
         for key, source, ladder in (
-            ("ag_initiative", agency.get("initiative"), AGENCY_INITIATIVE),
             ("ag_continuation", agency.get("continuation"), AGENCY_CONTINUATION),
             ("focus", interest.get("focus"), FOCUS_WORDS),
             ("spare", interest.get("spare"), SPARE_WORDS),
@@ -280,8 +326,39 @@ class PromptBuilder:
                 lines.append(got)
         return lines
 
+    def _emotion_line(
+        self,
+        user_id: str,
+        interest: Dict[str, float],
+        agency: Dict[str, float],
+        is_group: bool = False,
+    ) -> str:
+        """她此刻的心情，括号包起来：**每轮最多一条**。
+
+        五个维度（当天基调 / 此刻心气 / 对你的态度 / 愿意说多少 / 主动性）各自给候选，
+        带显著度一起竞争，最高者胜出。集合大是为了挑得准，不是为了句子多——
+        一次给三四条，模型会当成要复述的清单。
+        """
+        cfg = self.config
+        if not (cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group)):
+            # 群聊没开情绪时直接不给：情绪层要读 mood.profile()，那个方法**会建档**，
+            # 于是群里每个说过话的人都凭空多一份情绪档案。
+            return ""
+        try:
+            _score, text = self._emotion.candidate(
+                user_id, interest=interest or {}, agency=agency or {}
+            )
+        except Exception:
+            return ""
+        return bracket(text)
+
     def _relation_lines(
-        self, user_id: str, is_group: bool, detailed: bool, interest: Dict[str, float]
+        self,
+        user_id: str,
+        is_group: bool,
+        detailed: bool,
+        interest: Dict[str, float],
+        agency: Optional[Dict[str, float]] = None,
     ) -> List[str]:
         """她对TA是什么位置、认识多久、最近一次情绪事件。
 
@@ -303,7 +380,7 @@ class PromptBuilder:
         position = self._position_line(data, interest, seed)
         if position:
             lines.append(position)
-        lines.extend(self._emotion_lines(data, seed))
+
 
         # **认识多久不进上下文。** 关系深浅已经由上面那句位置词承载（「她对TA关系亲密」比
         # 「你们认识 400 天」更能指导她怎么说话），而把天数递给模型，它就会拿去念——
@@ -376,34 +453,6 @@ class PromptBuilder:
         if days < 365:
             return f"认识 {int(days // 30)} 个月"
         return f"认识 {int(days // 365)} 年"
-
-    @staticmethod
-    def _emotion_lines(data: Dict[str, Any], seed: List[Any]) -> List[str]:
-        """她此刻的心气：最多一句。
-
-        原先压着火、惦记TA、拧巴三处各自判阈值，谁也不看谁，于是气一上来就拼成
-        「一股气没处发，有点惦记TA，她有点拧巴」——既矛盾又重复。这里按谁压过谁
-        排一次，只出最重的那一句。
-        """
-        if not data:
-            return []
-        try:
-            libido = float(data.get("libido", 25.0))
-            aggression = float(data.get("aggression", 15.0))
-        except (TypeError, ValueError):
-            return []
-        angry = aggression >= EMOTION_AGGRESSION_ONSET
-        eager = libido >= EMOTION_LIBIDO_ONSET
-        if angry and eager:
-            return [pick("emo_tense", seed, ("她心里两个念头抣着", "她有点拧巴", "又气又放不下"))]
-        if angry:
-            return [pick("emo_angry", seed, ("心里压着火", "一股气没处发"))]
-        if eager:
-            # 原来的备选是「心思飘过去了」——那和「有点惦记TA」意思正相反，而且和
-            # FOCUS_WORDS 的「她心思飘在别处」撞车，同一句里能出现两句互相打架的。
-            # 「惦记」这一维的说法要同向。
-            return [pick("emo_miss", seed, ("有点惦记TA", "心思在TA那边"))]
-        return []
 
     def _echo_lines(self) -> List[str]:
         """她刚：带着上一件事的余韵进来。全是刚发生的时间性事实。
@@ -523,7 +572,7 @@ class PromptBuilder:
             nickname = self._core.mood.nickname(user_id)
         except Exception:
             return ""
-        return f"你管TA叫{nickname}" if nickname else ""
+        return f"对TA的称呼是「{nickname}」" if nickname else ""
 
     def _scene_lines(self, is_group: bool) -> List[str]:
         """场景必需品：几点、在她的哪个城市、这是群聊还是私聊。三样永远在。"""
@@ -532,7 +581,7 @@ class PromptBuilder:
             # 「这是群聊」永远给；这一层「周围还有人看着」由 enable_chat_awareness 定。
             lines: List[str] = ["群聊，周围还有人看着" if cfg.enable_chat_awareness else "群聊"]
         else:
-            lines = ["私聊，只有你和TA"]
+            lines = ["私聊，只有她和TA"]
         now = self._core.clock.now()
         # 只报钟点，不报「上午/下午/晚上」这类时段词：时段词会被模型当成打招呼的
         # 由头（无论几点都回一句「下午好呀」），钟点是一张随手可看的表，用不用由她。
@@ -763,6 +812,7 @@ class PromptBuilder:
             relation = relation + [nickname]
         if relation:
             sents.append((self._sentence(relation), 8.0))
+        sents.append((self._emotion_line(user_id, interest, agency, is_group), 8.5))
         situ = self._behavior_lines(
             user_id, events, agency,
             with_previous=self.config.last_interaction_mode == "with_last_msg",
@@ -825,6 +875,7 @@ class PromptBuilder:
             relation = relation + [nickname]
         if relation:
             sents.append((self._sentence(relation), 8.0))
+        sents.append((self._emotion_line(user_id, interest, agency, is_group), 8.5))
 
         situ = self._behavior_lines(
             user_id, events, agency,
@@ -891,6 +942,7 @@ class PromptBuilder:
             relation = relation + [nickname]
         if relation:
             sents.append((self._sentence(relation), 8.0))
+        sents.append((self._emotion_line(user_id, interest, agency, is_group), 8.5))
         situ = self._behavior_lines(
             user_id, events, agency,
             with_previous=self.config.last_interaction_mode == "with_last_msg",
@@ -908,7 +960,13 @@ class PromptBuilder:
             sents.append((memory, 6.0))
         return sents
 
-    def _finish(self, sents, cfg: HumanoidConfig) -> str:
+    def _finish(
+        self,
+        sents,
+        cfg: HumanoidConfig,
+        char_name: str = "",
+        user_name: str = "",
+    ) -> str:
         # 兼容两种入参：List[tuple[str, float]]（带显著度）或纯字符串。
         if isinstance(sents, str):
             sents = [(sents, 10.0)]
@@ -939,7 +997,43 @@ class PromptBuilder:
         body = "。".join(sents[i][0] for i in kept_idx)
         if not body:
             return ""
-        return header + "\n" + body + "。"
+        # **只对正文做替换，标题不动。** 标题里的「〔她的身体与生活」是
+        # `MARK_PREFIX`——`_drop_stale_blocks` 靠它认出历史里的旧块并抹掉。
+        # 一旦标题被换成「〔小雨的身体与生活…」，前缀对不上，聊天越久历史里堆的
+        # 过期状态块就越多（那正是这段代码当初要解决的问题）。
+        return header + "\n" + self._personalize(body + "。", char_name, user_name)
+
+    _safe_name = staticmethod(_safe_name)
+
+    @classmethod
+    def _personalize(cls, text: str, char_name: str = "", user_name: str = "") -> str:
+        """把代词换成真名。
+
+        词表里一律写「她」指角色、「TA」指玩家，**不写「你」**——system_prompt 里
+        「你」已经是角色了，注入里再拿「你」指玩家，模型会把玩家当成自己。
+
+        换成真名的原因：模型在 system_prompt 里认的是「你叫小雨」。于是
+        「小雨今天有点堵」它当成自己说的话；「她今天有点堵」它当成在转述别人的事——
+        这就是「模型在照着一份关于第三方的说明书说话」的由来。
+
+        但**只替换第一次**：名字是拿来建立映射的，建立之后就该继续用「她」——
+        每句都以「小雨」开头反而像流水账，句子之间的连贯感也没了。框架句里那句
+        「「小雨」指你自己」已经把映射讲清了，后面跟着「她」不会歧义。
+
+        名字取不到、或名字里混进代词时原样返回，退回「她 / TA」，功能不受影响。
+        """
+        if not text:
+            return text
+        who = cls._safe_name(user_name)
+        if who:
+            text = text.replace("TA", who)
+        name = cls._safe_name(char_name)
+        if name:
+            # 情绪句例外：它是独立的内心独白，每次都该叫得出名字（「小雨的内心：心里有点堵」），
+            # 否则括号里又冒出一个「她」，读者得回头去猜这是谁。
+            text = text.replace("（她的内心：", f"（{name}的内心：")
+            text = text.replace("她", name, 1)
+        return text
 
 
 # ── 模块末尾的辅助函数区 ──

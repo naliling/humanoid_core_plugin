@@ -233,6 +233,9 @@ class HumanoidConfig:
     # 自动认定称呼：用户还没设过称呼时，从消息带的名字（群聊优先群名片）认一次怎么叫 TA。
     # 只填空白、门槛很严、认过之后永不改动——用户 /叫我 设的更不会被它碰。
     auto_nickname: bool = True
+    # 自动识别用户：开着就把**这条消息的发送者名**（群名片 / QQ 昵称）取来当对方的标识，
+    # 注入里用真名区分「她」和「你」；关着统一写「TA」。默认关。
+    auto_identify_user: bool = False
 
     social_energy_enabled: bool = True
     social_energy_consumption_per_msg: float = 0.05
@@ -376,6 +379,7 @@ class HumanoidConfig:
             mood_enabled_in_group=b("mood_enabled_in_group"),
             mood_data_retention_days=i("mood_data_retention_days", 0, 365),
             auto_nickname=b("auto_nickname"),
+            auto_identify_user=b("auto_identify_user"),
             social_energy_enabled=b("social_energy_enabled"),
             social_energy_consumption_per_msg=f("social_energy_consumption_per_msg", 0.0, 100.0),
             social_energy_recovery_per_minute=f("social_energy_recovery_per_minute", 0.0, 100.0),

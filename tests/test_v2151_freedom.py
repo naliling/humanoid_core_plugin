@@ -129,7 +129,7 @@ class InjectionFreedomTest(unittest.TestCase):
             text = core.build_injection("42", is_group=False)
             self.assertIn("私聊", text, f"{mode} 档没告诉她这是私聊：\n{text}")
             self.assertIn("15:20", text, f"{mode} 档没给她时间：\n{text}")
-            self.assertIn("你管TA叫小鱼", text, f"{mode} 档没给她称呼：\n{text}")
+            self.assertIn("对TA的称呼是「小鱼」", text, f"{mode} 档没给她称呼：\n{text}")
             group = core.build_injection("42", is_group=True)
             self.assertIn("群聊", group, f"{mode} 档没告诉她这是群聊：\n{group}")
 
@@ -137,9 +137,9 @@ class InjectionFreedomTest(unittest.TestCase):
         """给 system_prompt 的那段只讲「这些是什么、怎么读」，不含禁令也不含事实。"""
         for word in ("不要", "必须", "别", "控制在", "只说", "回一句"):
             self.assertNotIn(word, FRAMING_TEXT, f"框架句里出现了「{word}」")
-        self.assertIn("处境", FRAMING_TEXT)
+        self.assertIn("身上的事实", FRAMING_TEXT)
         self.assertIn("身体与生活", FRAMING_TEXT, "框架句要指得清它说的是哪几块")
-        self.assertIn("由她自己判断", FRAMING_TEXT, "参考边界要说清：插件不替她决定怎么开口")
+        self.assertIn("由你自己判断", FRAMING_TEXT, "参考边界要说清：插件不替她决定怎么开口")
         for digit in ("%", "UTC+"):
             self.assertNotIn(digit, FRAMING_TEXT)
 

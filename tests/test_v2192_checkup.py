@@ -182,6 +182,11 @@ class TokenBudgetTest(unittest.TestCase):
     def test_smaller_budget_never_grows_the_block(self):
         big = wrecked(self.MOMENT, inject_token_budget=3500)
         small = wrecked(self.MOMENT, inject_token_budget=200)
+        # build_injection 会推进身体积分（soma.advance），所以同一个 core 的第一次和第二次
+        # 读到的状态不同。不预热的话这一条比的是「推进前 vs 推进后」而不是两种预算，
+        # 会随时间漂移——之前就一直靠巧合通过。
+        big.build_injection("42", is_group=False)
+        small.build_injection("42", is_group=False)
         self.assertLessEqual(
             len(small.build_injection("42", is_group=False)),
             len(big.build_injection("42", is_group=False)),

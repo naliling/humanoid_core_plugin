@@ -191,8 +191,9 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(snap["never_interacted"], "一条真实消息就该松开静默")
 
     async def test_help_lists_diagnose(self):
-        out = await collect(self.star.cmd_help(FakeEvent("/拟人帮助")))
-        self.assertIn("/拟人诊断", out[0])
+        out = await collect(self.star.cmd_help(FakeEvent("/拟人 帮助")))
+        self.assertIn("/拟人 诊断", out[0])
+        self.assertIn("/拟人 参照名称", out[0])
         self.assertIn(main_module.__version__, out[0])
 
     async def test_mood_commands(self):
@@ -374,11 +375,11 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await self.star.inject_context(FakeEvent("你好", sender="7120"), req)
         self.assertNotIn("还没问过", req.system_prompt)
         self.assertNotIn("叫什么", req.system_prompt)
-        # 认下名字后同一个位置换成「你管TA叫X」
+        # 认下名字后同一个位置换成「对TA的称呼是X」
         await self.star.on_message(FakeEvent("你好", sender="7120", sender_name="阿名"))
         req2 = FakeProviderRequest("")
         await self.star.inject_context(FakeEvent("在吗", sender="7120"), req2)
-        self.assertIn("你管TA叫阿名", req2.system_prompt)
+        self.assertIn("对TA的称呼是「阿名」", req2.system_prompt)
 
     # ---------- 钩子 ----------
 

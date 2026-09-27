@@ -31,25 +31,31 @@ DATA_SUBDIR = ("plugin_data", "humanoid_core")
 
 HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 
-/你的状态 - 查看精力、身体轴（困意/睡眠债/饥饿/不适…）、生理、天气、日程、过程
-/查看日程 - 看她今天过出来的日程（动态，一段一段现排，不预排未来）
-/时间 城市 - 查看指定城市当前时间
-/叫我 昵称 - 设置 AI 对你的称呼（没设过时 AI 会自动认一次，认过之后不再改）
-/好感度 - 查看情绪档案
-/情绪详情 - 查看详细情绪档案
-/情绪日志 - 查看情绪波动记录
-/拟人帮助 - 显示本帮助
+所有指令都挂在「拟人」组下（/help 里展开即可）：
 
-管理员指令：
-/拟人设置 - 看常用项；写成「/拟人设置 城市 大阪」就改一项，立即生效
-/拟人诊断 - 排查模型选择、时区是否真的生效、上下文多大
-/重置日程 - 立即重新决定她当前这一段在做什么
-/重置状态 - 重置精力、社交能量与生理周期
-/重置情绪 - 重置自己的情绪至初始值
-/设置好感度 数值 - 手动设置好感度（0-100）
-/批量好感度 QQ:数值 - 批量导入好感度
-/查看所有昵称 - 查看所有用户设置的昵称
-/重载配置 - 重载插件配置"""
+查状态（谁都能用）
+/拟人 状态 - 精力、身体轴（困意/睡眠债/饥饿/不适）、生理、天气、日程、关系、注意力
+/拟人 日程 - 她今天过出来的日程（动态现排，不预排未来）
+/拟人 时间 城市 - 查看指定城市当前时间
+/拟人 好感度 - 情绪档案总览
+/拟人 情绪详情 - 含基线值与交互轮次
+/拟人 情绪日志 - 情绪波动记录
+/拟人 叫我 昵称 - 设置她对你的称呼（没设过时她会自动认一次，认过之后不再改）
+/拟人 帮助 - 显示本帮助
+
+管理员：改配置
+/拟人 设置 - 看常用项；写成「/拟人 设置 城市 大阪」就改一项，立即生效
+/拟人 参照名称 名字 - 设定注入里代表她的名字（默认跟人设里的名字）
+/拟人 诊断 - 排查模型选择、时区是否生效、上下文多大、状态文件多大
+/拟人 重载 - 重载插件配置
+
+管理员：动数据
+/拟人 重置日程 - 立即重新决定她当前这一段
+/拟人 重置状态 - 重置精力、社交能量与生理周期
+/拟人 重置情绪 - 把**你自己**的情绪重置到初始值
+/拟人 设置好感度 数值 - 手动设置自己的好感度（0-100）
+/拟人 批量好感度 QQ:数值 - 批量导入（逗号分隔）
+/拟人 查看昵称 - 所有用户设置的昵称"""
 
 NO_PERMISSION = "❌ 权限不足，该指令仅管理员可用。"
 
@@ -100,21 +106,21 @@ def _sender_name(event: AstrMessageEvent) -> str:
         return ""
 
 
-def _append_framing(req: Any) -> None:
-    """把「这些事实该怎么读」放进 system_prompt，一个请求只放一次。
+def _append_framing(req: Any, char_name: str = "", user_name: str = "") -> None:
+    """把「这些事实该怎么读、指的是谁」放进 system_prompt，一个请求只放一次。
 
     AstrBot 在 `build_main_agent` 里先把人设写进 system_prompt，再跑 OnLLMRequestEvent
     钩子，所以这里追加的内容排在人设后面；而初始 system 消息不会落进会话历史，
     这段话不会越滚越多。
     """
-    from .humanoid.prompt_builder import FRAMING_TEXT, MARK_PREFIX
+    from .humanoid.prompt_builder import MARK_PREFIX, build_framing
 
     current = getattr(req, "system_prompt", None)
     if not isinstance(current, str):
         current = ""
     if MARK_PREFIX in current:
         return
-    req.system_prompt = current + FRAMING_TEXT
+    req.system_prompt = current + build_framing(char_name, user_name)
 
 
 def _drop_stale_blocks(req: Any, current_text: str = "") -> int:
@@ -390,13 +396,29 @@ class HumanoidCore(Star):
 
     # -------------------- 用户指令 --------------------
 
-    @filter.command("你的状态")
+    # -------------------- 指令组 --------------------
+    # 18 个扁平指令在 `/help` 里糊成一片，挂到一个组下折叠起来就好找。
+    #
+    # **只开一个组**，不按「状态/配置/管理」再切子组：三个 `@command_group("拟人")`
+    # 同名的话，真实 AstrBot 是把子命令累加、还是后注册的覆盖前面的，本地验证不了——
+    # 赌输了就是一大半指令直接消失。分组的信息放在子命令命名和下面的 docstring 里。
+
+    @filter.command_group("拟人")
+    def humanoid_group(self):
+        """人形化伴侣
+
+        查状态：状态 / 好感度 / 情绪详情 / 情绪日志 / 日程 / 时间 / 叫我 / 帮助
+        改配置（管理员）：参照名称 / 诊断 / 设置 / 重载
+        动数据（管理员）：重置日程 / 重置状态 / 重置情绪 / 设置好感度 / 批量好感度 / 查看昵称
+        """
+
+    @humanoid_group.command("状态")
     async def cmd_status(self, event: AstrMessageEvent):
         """查看当前角色的完整状态（精力、身体轴、生理、天气、日程、过程、社交能量等）。"""
         core = self._core(event)
         yield event.plain_result("\n".join(core.status_lines(self._sender(event))))
 
-    @filter.command("好感度")
+    @humanoid_group.command("好感度")
     async def cmd_mood(self, event: AstrMessageEvent):
         """查看当前用户的好感度、亲近欲、攻击性及情绪标签。"""
         if not self._config.mood_enabled:
@@ -405,7 +427,7 @@ class HumanoidCore(Star):
         core = self._core(event)
         yield event.plain_result(core.mood.profile_text(self._sender(event)))
 
-    @filter.command("情绪详情")
+    @humanoid_group.command("情绪详情")
     async def cmd_mood_detail(self, event: AstrMessageEvent):
         """查看详细情绪档案，包含基线值和交互轮次。"""
         if not self._config.mood_enabled:
@@ -414,7 +436,7 @@ class HumanoidCore(Star):
         core = self._core(event)
         yield event.plain_result(core.mood.profile_text(self._sender(event), detailed=True))
 
-    @filter.command("情绪日志")
+    @humanoid_group.command("情绪日志")
     async def cmd_mood_log(self, event: AstrMessageEvent):
         """查看最近的情绪波动记录（事件列表）。"""
         if not self._config.mood_log_enabled:
@@ -423,13 +445,13 @@ class HumanoidCore(Star):
         core = self._core(event)
         yield event.plain_result(core.mood.logs_text(self._sender(event)))
 
-    @filter.command("查看日程")
+    @humanoid_group.command("日程")
     async def cmd_view_schedule(self, event: AstrMessageEvent):
         """查看今日完整的日程表。"""
         core = self._core(event)
         yield event.plain_result(core.schedule_text())
 
-    @filter.command("时间")
+    @humanoid_group.command("时间")
     async def cmd_time(self, event: AstrMessageEvent):
         """查看指定城市（或当前机器人生效城市）的当前时间、星期和节日。"""
         # 默认用当前 bot 的生效城市（含角色级时区覆盖），而不是全局配置：
@@ -444,7 +466,7 @@ class HumanoidCore(Star):
         else:
             yield event.plain_result(text)
 
-    @filter.command("叫我")
+    @humanoid_group.command("叫我")
     async def cmd_set_nickname(self, event: AstrMessageEvent):
         """设置 AI 对你的称呼（昵称）。"""
         nickname = _arg_after(event.message_str, "叫我")
@@ -466,7 +488,40 @@ class HumanoidCore(Star):
         core.mood.set_nickname(user_id, nickname, src="user")
         yield event.plain_result(f"✅ 记住了，以后叫你：{nickname}")
 
-    @filter.command("拟人帮助")
+    @humanoid_group.command("参照名称")
+    async def cmd_set_char_name(self, event: AstrMessageEvent):
+        """管理员：设定注入里代表这个角色的名字。
+
+        注入里现在不写「她」，写这个名字——模型在 system_prompt 里认的是「你叫XX」，
+        于是「小雨今天有点堵」它当成自己说的话，「她今天有点堵」它当成在转述别人的事。
+        名字要先用管理员设的（这里），没设才跟随人设里的名字。
+        """
+        if not self._is_admin(event):
+            yield event.plain_result(NO_PERMISSION)
+            return
+        value = _arg_after(event.message_str, "设置参照名称")
+        core = self._core(event)
+        if not value:
+            current = core.char_name()
+            yield event.plain_result(
+                f"当前参照名称：{current or '（未设定）'}"
+                + "\n（没设时自动跟用人设里的名字；写「/设置参照名称 清除」可以去掉设定）"
+            )
+            return
+        if value in ("清除", "默认", "跟随", "跟随人设", "无"):
+            core.set_char_name("")
+            yield event.plain_result("✅ 已清除，之后跟随人设里的名字")
+            return
+        if len(value) > 24:
+            yield event.plain_result("名字太长了，24 个字以内。")
+            return
+        if any(ch in value for ch in ("她", "你")) or "TA" in value:
+            yield event.plain_result("名字里不能有「她」「你」「TA」——注入靠它们区分角色和对方。")
+            return
+        core.set_char_name(value)
+        yield event.plain_result(f"✅ 参照名称已设为「{value}」，注入里会用这个名字称呼她。")
+
+    @humanoid_group.command("帮助")
     async def cmd_help(self, event: AstrMessageEvent):
         """显示所有指令的帮助信息。"""
         yield event.plain_result(HELP_TEXT)
@@ -474,7 +529,7 @@ class HumanoidCore(Star):
     # -------------------- 管理员指令 --------------------
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("拟人诊断")
+    @humanoid_group.command("诊断")
     async def cmd_diagnose(self, event: AstrMessageEvent):
         """诊断模型链配置、冷却状态、日程生成情况等。"""
         if not self._is_admin(event):
@@ -505,7 +560,7 @@ class HumanoidCore(Star):
     }
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("拟人设置")
+    @humanoid_group.command("设置")
     async def cmd_settings(self, event: AstrMessageEvent):
         """`/拟人设置` 看常用项；`/拟人设置 城市 大阪` 改一项，改完立即生效。"""
         if not self._is_admin(event):
@@ -601,7 +656,7 @@ class HumanoidCore(Star):
         lines.append("改完立即生效；进阶项用 /重载配置 刷新。")
         return "\n".join(lines)
 
-    @filter.command("重载配置")
+    @humanoid_group.command("重载")
     async def cmd_reload(self, event: AstrMessageEvent):
         """热重载插件配置，无需重启。"""
         if not self._is_admin(event):
@@ -613,7 +668,7 @@ class HumanoidCore(Star):
         yield event.plain_result(f"✅ 配置已重载。当前注入档位：{self._config.inject_activity_context}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("重置日程")
+    @humanoid_group.command("重置日程")
     async def cmd_reset_schedule(self, event: AstrMessageEvent):
         """立即强制重新决定当前这一段（绕过冷却）。"""
         if not self._is_admin(event):
@@ -640,7 +695,7 @@ class HumanoidCore(Star):
             )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("重置状态")
+    @humanoid_group.command("重置状态")
     async def cmd_reset_state(self, event: AstrMessageEvent):
         """重置精力、社交能量和生理周期至初始值。"""
         if not self._is_admin(event):
@@ -651,7 +706,7 @@ class HumanoidCore(Star):
         yield event.plain_result(f"✅ 已重置：精力 {int(energy)}，社交 {int(social)}，周期第 {cycle} 天。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("重置情绪")
+    @humanoid_group.command("重置情绪")
     async def cmd_reset_mood(self, event: AstrMessageEvent):
         """重置当前用户的情绪至初始值。"""
         if not self._is_admin(event):
@@ -662,7 +717,7 @@ class HumanoidCore(Star):
         yield event.plain_result(f"✅ 好感度 {r['affection']:.0f}，亲近欲 {r['libido']:.0f}，攻击性 {r['aggression']:.0f}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("设置好感度")
+    @humanoid_group.command("设置好感度")
     async def cmd_set_affection(self, event: AstrMessageEvent):
         """手动设置当前用户的好感度（0-100）。"""
         if not self._is_admin(event):
@@ -681,7 +736,7 @@ class HumanoidCore(Star):
         yield event.plain_result(f"✅ 好感度已设为 {v:.0f}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("批量好感度")
+    @humanoid_group.command("批量好感度")
     async def cmd_batch_affection(self, event: AstrMessageEvent):
         """批量导入好感度（格式：QQ:数值, QQ:数值）。"""
         if not self._is_admin(event):
@@ -703,7 +758,7 @@ class HumanoidCore(Star):
             yield event.plain_result(f"✅ 已批量设置 {applied} 个用户。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("查看所有昵称")
+    @humanoid_group.command("查看昵称")
     async def cmd_list_nicknames(self, event: AstrMessageEvent):
         """列出所有用户设置的昵称。"""
         if not self._is_admin(event):
@@ -749,8 +804,16 @@ class HumanoidCore(Star):
             # 注意力（上心程度）要看用户到底说了什么：合并了几条时看合并后的全貌，
             # 否则前几条里的问句、提到的话题都不参与判断，注意力会被算低。
             said = self._debounce.peek_text(event, text)
+            # 对话对方的名字：开关开着才用真名（默认关=写「TA」）。取的是**这条消息的
+            # 发送者名**——群聊是群名片、私聊是 QQ 昵称，不依赖 AstrBot 的任何配置开关。
+            user_name = ""
+            if self._config.auto_identify_user:
+                user_name = _sender_name(event)
+            char_name = core.char_name()
             # 时间间隔由 Core.on_message 统一记账，这里只读。
-            injection = core.build_injection(user_id, is_group=is_group, text=said)
+            injection = core.build_injection(
+                user_id, is_group=is_group, text=said, user_name=user_name
+            )
 
             if self._config.debug_mode:
                 from .humanoid.prompt_builder import estimate_tokens
@@ -764,7 +827,7 @@ class HumanoidCore(Star):
                 # 框架句在 system_prompt 里说的是「以下是她当前的**真实处境**」。
                 # 注入为空时（预算卡太小、构建抛异常）留着它，模型收下一句宣告却一条事实都
                 # 拿不到——它会自己编。所以没有事实就不要宣告。
-                _append_framing(req)
+                _append_framing(req, char_name, user_name)
                 stale = _drop_stale_blocks(req, text)
                 if stale:
                     logger.debug(f"{LOG_PREFIX} 从上下文里抹掉 {stale} 份旧的身体事实块")
@@ -857,13 +920,15 @@ class HumanoidCore(Star):
                 umo = str(getattr(event, "unified_msg_origin", "") or "")
             except Exception:
                 umo = ""
-            # 记下这个角色最近在哪个会话说话：日程生成要靠它挑生效的人格（会话上
-            # 指定的 > 该画像默认 > 全局默认）。这里只记，不解析——解析是 await，
-            # 放在每条消息的热路径上没必要，日程真正要用时自己会去解。
+            # 记下这个角色最近在哪个会话说话，并预热一次人设：日程要靠 umo 挑生效人格，
+            # 注入要用**角色名**（`char_name`，同步读缓存）。解析是 await 且有 10 分钟
+            # 缓存，正常只第一次真的跑。
             try:
                 source = getattr(core, "persona_source", None)
                 if source is not None and umo:
                     source.note_umo(core.role_id, umo)
+                    if not source.cached_name(core.role_id):
+                        await source.persona(core.role_id)
             except Exception:
                 pass
             core.on_message(user_id, text, is_group=is_group, umo=umo)

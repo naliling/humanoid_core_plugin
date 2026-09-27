@@ -177,7 +177,7 @@ class LegacyEngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(snap["today"])
             self.assertTrue(snap["schedule"]["slots"], "老档案启动后也要有当下这一段")
             self.assertLessEqual(snap["energy"]["value"], snap["energy"]["max"])
-            self.assertIn("角色：default", "\n".join(core.status_lines("3881756548")))
+            self.assertIn("default", "\n".join(core.status_lines("3881756548")))
             self.assertIn("好感度上升至 78.5", core.mood.logs_text("3881756548"))
         finally:
             await roles.stop()

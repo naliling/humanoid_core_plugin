@@ -201,6 +201,22 @@ class PersonaSource:
         self._cache[key] = _Entry(persona=persona, at=self._time(), umo=umo)
         return persona
 
+    def cached_name(self, role_id: str) -> str:
+        """只读缓存，拿**人设里的角色名**。没预热过就返回空串。
+
+        注入里用她的名字而不是「她」：模型在 system_prompt 里已经认了「你叫小雨」，
+        看到「小雨今天有点累」会直接对上自己，而「她今天有点累」是旁白——它会以为在
+        转述别人的事。取名字必须是同步的（`build_injection` 在热路径上），
+        所以只读缓存、不解析；预热在 main 的 async 钩子里做。
+        """
+        entry = self._cache.get(str(role_id))
+        if entry is None:
+            return ""
+        name = str(entry.persona.name or "").strip()
+        if not name or name.startswith("（未命名"):
+            return ""
+        return name
+
     def invalidate(self, role_id: str = "") -> None:
         if role_id:
             self._cache.pop(str(role_id), None)

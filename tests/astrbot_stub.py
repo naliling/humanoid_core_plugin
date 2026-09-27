@@ -39,6 +39,42 @@ class EventMessageType:
     TEXT = "text"
 
 
+class _GroupHandle:
+    """`@filter.command_group` 装饰后的产物：仍是个可调用对象（组本身没行为），
+    同时挂着 `.command()` / `.group()` 给子命令用。"""
+
+    def __init__(self, func, factory: "_GroupFactory") -> None:
+        self._func = func
+        self._factory = factory
+
+    def command(self, name: str = "", **kw):
+        return self._factory.command(name, **kw)
+
+    def group(self, name: str = "", **kw):
+        return self._factory.group(name, **kw)
+
+    def __call__(self, *args, **kwargs):
+        return self._func(*args, **kwargs)
+
+    def __getattr__(self, item):
+        return getattr(self._func, item)
+
+
+class _GroupFactory:
+    """`@filter.command_group` / `@组名.group` 的产物：挂一个 `.command()` 出来。"""
+
+    def __init__(self, owner: "_Filter", kind: str, name: str) -> None:
+        self._owner = owner
+        self._kind = kind
+        self._name = name
+
+    def command(self, name: str = "", **kw):
+        return self._owner._register("command", f"{self._name} {name}".strip())
+
+    def group(self, name: str = "", **kw):
+        return _GroupFactory(self._owner, "group", f"{self._name} {name}".strip())
+
+
 class _Filter:
     """装饰器只负责登记，真正驱动指令由测试直接调用被装饰的函数。"""
 
@@ -56,6 +92,17 @@ class _Filter:
 
     def command(self, name: str = "", **kw):
         return self._register("command", name)
+
+    def command_group(self, name: str = "", **kw):
+        """指令组：是**装饰器**，返回的句柄既能调用（组本身没行为），又有 `.command`。"""
+        def deco(func):
+            return _GroupHandle(func, _GroupFactory(self, "command_group", name))
+        return deco
+
+    def group(self, name: str = "", **kw):
+        def deco(func):
+            return _GroupHandle(func, _GroupFactory(self, "group", name))
+        return deco
 
     def permission_type(self, level: Any):
         return self._register("permission", level)

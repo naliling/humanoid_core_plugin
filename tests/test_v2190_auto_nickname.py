@@ -150,7 +150,7 @@ class NicknameLineTest(unittest.TestCase):
         service, _ = make_service()
         service.auto_nickname("7", "阿哲")
         pb = PromptBuilder(_MoodOnlyCore(service))
-        self.assertEqual(pb._nickname_line("7", is_group=False), "你管TA叫阿哲")
+        self.assertEqual(pb._nickname_line("7", is_group=False), "对TA的称呼是「阿哲」")
 
 
 if __name__ == "__main__":
