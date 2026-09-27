@@ -393,6 +393,38 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
         blended = Delta(0.0, 0.0, 0.0).blend(Delta(10.0, 10.0, 10.0), 0.3)
         self.assertAlmostEqual(blended.affection, 3.0)
 
+    async def test_local_negative_skips_model_without_changing_result(self):
+        """本地判负明确时那次模型调用是白花的，跳过它结果一个数都不差。
+
+        情绪是「本地词典 + 模型」融合，模型只占 0.3 权重（见 `_resolve_delta`）：负面词典
+        命中时 `base.affection` 必然 ≤ -2，结果会走 `base.scaled(1.2)` 把模型那一票整段
+        丢掉。所以调模型之前先判一次：省掉一次网络往返，而好感照样按本地词典跌。
+        """
+        conf = cfg(mood_use_llm_for_delta=True, mood_llm_interval_messages=3,
+                   mood_provider_name="p")
+        # 模型给一个大到无法忽视的正向结果：一旦它被采纳，好感必然明显偏高。
+        reply = '{"affection_delta":9,"libido_delta":0,"aggression_delta":0}'
+
+        hot_provider = FakeProvider("p", reply=reply)
+        hot, _, _ = self.build(conf, [hot_provider])
+        hot.profile("1")["last_interaction"] = self.time_value
+        for _ in range(3):
+            await hot.update_from_message("1", "你真蠢滚开")
+
+        self.assertEqual(hot_provider.calls, 0, "本地已判负时不该调模型")
+        self.assertLess(
+            hot.profile("1")["affection"], conf.mood_initial_affection,
+            "负面消息照样要掉好感（本地词典在起作用，不是没生效）",
+        )
+
+        mild_provider = FakeProvider("p", reply=reply)
+        mild, _, _ = self.build(conf, [mild_provider])
+        mild.profile("1")["last_interaction"] = self.time_value
+        for _ in range(3):
+            await mild.update_from_message("1", "hi")
+
+        self.assertEqual(mild_provider.calls, 1, "中性消息该照常调模型")
+
     async def test_llm_call_interval(self):
         provider = FakeProvider("p", reply='{"affection_delta":1,"libido_delta":0,"aggression_delta":0}')
         service, _, _ = self.build(
