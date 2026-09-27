@@ -366,7 +366,7 @@ class InjectionLayerTest(unittest.TestCase):
 
         core = self.core()
         core.mood.profile("42")
-        text = core.build_injection("42", is_group=False, char_name="小雨", user_name="陌陌")
+        text = core.build_injection("42", is_group=False, char_name="小雨", user_name="阿明")
         self.assertTrue(
             text.startswith(MARK_PREFIX),
             f"标题必须以 MARK_PREFIX 开头，否则旧块清不掉：\n{text[:80]}",
@@ -378,10 +378,10 @@ class InjectionLayerTest(unittest.TestCase):
         from humanoid.prompt_builder import PromptBuilder
 
         out = PromptBuilder._personalize(
-            "私聊，只有她和陌陌。她今天有点累。她对陌陌还算熟。", "小雨", "陌陌"
+            "私聊，只有她和阿明。她今天有点累。她对阿明还算熟。", "小雨", "阿明"
         )
         self.assertEqual(
-            out, "私聊，只有小雨和陌陌。她今天有点累。她对陌陌还算熟。",
+            out, "私聊，只有小雨和阿明。她今天有点累。她对阿明还算熟。",
             "名字只该锚定第一次，之后继续用「她」",
         )
 
@@ -389,7 +389,7 @@ class InjectionLayerTest(unittest.TestCase):
         """情绪句是独立的内心独白，每次都要叫得出名字。"""
         from humanoid.prompt_builder import PromptBuilder
 
-        out = PromptBuilder._personalize("（她的内心：心里有点堵）", "小雨", "陌陌")
+        out = PromptBuilder._personalize("（她的内心：心里有点堵）", "小雨", "阿明")
         self.assertEqual(out, "（小雨的内心：心里有点堵）")
 
     def test_names_with_pronouns_are_rejected(self):

@@ -42,6 +42,11 @@ LABEL_ANCHOR_DRIFT = 6.0
 # 情绪分析失败日志的限速（秒）：同一条理由这么久内只报一次。
 MOOD_WARN_INTERVAL_SECONDS = 300.0
 
+# 本地情绪已经判得足够死时（好感跌到这个值以下），模型那一票本来就不会被采纳
+# ——见 `_resolve_delta`。这条消息就**别调模型了**：结果一模一样，省掉一次网络往返。
+# 注意两处必须用同一个值，否则会出现"调了但没用"或"没调却被当成算了"。
+LLM_SKIPPABLE_AFFECTION = -1.5
+
 # 长期不活跃用户会被丢掉的历史字段。nickname/nickname_src 故意保留：那是用户自己让 bot
 # 怎么称呼自己（或是自动认定后不再改口的依据），丢了会当场改变说话方式；last_interaction
 # 也保留，它是下次判定过期的依据。first_met 同样保留（prune 时从 mood 里搬上来），
@@ -580,9 +585,21 @@ class MoodService:
                 user_state = self._scope.user_state(user_id)
 
             messages_since = int(record.get("messages_since_llm", 0)) + 1
-            record["messages_since_llm"] = messages_since
             interval = max(1, cfg.mood_llm_interval_messages)
             should_call_llm = cfg.mood_use_llm_for_delta and messages_since >= interval
+            if should_call_llm and base_delta.affection <= LLM_SKIPPABLE_AFFECTION:
+                # 本地已经判死了（骂人/重话），模型的结果到了也会被 `_resolve_delta`
+                # 整段丢掉——这次调用纯白花。省掉它：结果一个数都不差，还快一拍。
+                should_call_llm = False
+                if cfg.mood_verbose_log and self._log is not None:
+                    self._log.debug(
+                        f"[humanoid_core] {user_id}: 本地已判负（{base_delta.affection:+.2f}），"
+                        "跳过本轮模型情绪分析"
+                    )
+            # 计数先累加，真正调了模型才归零。跳过时**保留**：这一轮没分析，
+            # 攒着的条数要留着，下一条消息到了还按同一条路再判一次
+            # （万一下一条不是骂人，就该让模型说话）。
+            record["messages_since_llm"] = messages_since
             if should_call_llm:
                 record["messages_since_llm"] = 0
             self._scope.mark_dirty()
@@ -613,7 +630,7 @@ class MoodService:
     def _resolve_delta(self, base: Delta, llm: Delta | None) -> Delta:
         if llm is None:
             return base
-        if base.affection < -1.5:
+        if base.affection <= LLM_SKIPPABLE_AFFECTION:
             return base.scaled(1.2)
         return base.blend(llm, 0.3)
 
