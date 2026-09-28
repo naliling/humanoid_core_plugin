@@ -498,11 +498,30 @@ class SomaService:
         except (TypeError, ValueError):
             energy = 60.0
 
-        def say(kind: str, value: float, floor: float, span: float, top: float) -> str:
+        def say(kind: str, value: float, floor: float, span: float, top: float,
+                reverse: bool = False) -> str:
+            """挂一条体感：**分数跟着词走，不跟数值走。**
+
+            原来分数是 `(value - floor) / span` 算出来的，而词是按**档位**查表的——
+            两边各走各的，于是会出现「说得很重但说不出口」：
+
+                hunger=88 → 词已经是「饿得发慌」，分数 0.733，门槛 0.75 → 被滤掉
+                arousal=30 → 词已经是「精力不太够」，分数 0.333 → 被滤掉
+
+            越难受越不说，和这层存在的理由正好相反。改成按档位给分：
+            顶档拿满 `top`（那一档本来就是「值得说」的），越往下越低。
+            `reverse=True` 用于「值越低越严重」的那种轴（没精神）。
+            """
             ladder = FEELING_WORDS.get(kind) or []
-            word = pick(kind, seed + [band_index(value, ladder)], scale_word(value, ladder))
-            if word and value >= floor:
-                out.append((_clamp((value - floor) / span, 0.0, top), word))
+            band = band_index(value, ladder)
+            word = pick(kind, seed + [band], scale_word(value, ladder))
+            if not (word and value >= floor):
+                return word
+            steps = max(1, len(ladder) - 1)
+            pos = (steps - band) if reverse else band
+            # 顶档 1.0 → 拿满；每往下一档掉 0.22，最下面那档约 0.34
+            score = top * (0.34 + 0.66 * (pos / steps))
+            out.append((_clamp(score, 0.0, top), word))
             return word
 
         say("sleepy", snap["sleep_pressure"], 50.0, 45.0, 0.95)
@@ -544,9 +563,25 @@ class SomaService:
         # 因为 arousal 本身也是从精力和作息推出来的，单独用会让同一件事说两遍。
         arousal = float(snap.get("arousal", 50.0) or 0.0)
         if energy <= 35.0 or arousal <= 30.0:
-            say("arousal", min(arousal, energy), 0.0, 45.0, 0.7)
+            # 显著度要**反向**：这一支是「她很没精神」才进的，值越低越该说。
+            #
+            # 原来直接 `say(..., 0.0, 45.0, 0.7)`，算出来是 `(value-0)/45`——
+            # 于是 arousal=10 得 0.22、arousal=20 得 0.44，全被 prompt 侧那道 0.7 的
+            # 门槛滤掉。**越难受越说不出来**，正好和这一支存在的理由相反。
+            # 高档那边（下面 `energy>=80 and arousal>=70`）是同一个毛病：写死 0.6，
+            # 同样进不去。两处一起修的。
+            # `reverse=True`：这一支是「很没精神」才进的，值越低越该说。
+            # 原来写死 `0.6`、低档写 `1 - level/45`，两处都跟档位脱钩。
+            say("arousal", min(arousal, energy), 0.0, 45.0, 0.8, reverse=True)
         elif energy >= 80.0 and arousal >= 70.0:
-            out.append((0.6, pick("arousal_high", seed + [min(2, int(arousal // 10))],
+            # 显著度必须**高过** prompt 侧那道 0.7 的门槛，否则这一整档永远进不了上下文。
+            #
+            # 原来写的是 0.6 —— 于是「她很精神」这件事她算了、词表也写了、注释还专门
+            # 解释「终于用上了」，但 `_feelings_lines(threshold=0.7)` 把它全滤掉了。
+            # 而且方向正好是反的：低唤醒那档走 `say(..., top=0.7)` 能到 0.7 进得去，
+            # 高唤醒这档固定 0.6 进不去。一个「arousal 的词表一次都没被调用过」的旧
+            # 断言就是这么被别的词蒙混过关、一直没修的。
+            out.append((0.78, pick("arousal_high", seed + [min(2, int(arousal // 10))],
                                    ("人挺精神的", "脑子转得挺快"))))
 
         # 「想不想找人说话」不进注入：它与行为倾向的 initiative 是同一件事，而后者综合了

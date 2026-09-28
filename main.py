@@ -31,17 +31,18 @@ DATA_SUBDIR = ("plugin_data", "humanoid_core")
 
 HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 
-所有指令都挂在「拟人」组下（/help 里展开即可）：
+查状态的指令**直接打，不带前缀**：
 
-查状态（谁都能用）
-/拟人 状态 - 精力、身体轴（困意/睡眠债/饥饿/不适）、生理、天气、日程、关系、注意力
-/拟人 日程 - 她今天过出来的日程（动态现排，不预排未来）
-/拟人 时间 城市 - 查看指定城市当前时间
-/拟人 好感度 - 情绪档案总览
-/拟人 情绪详情 - 含基线值与交互轮次
-/拟人 情绪日志 - 情绪波动记录
-/拟人 叫我 昵称 - 设置她对你的称呼（没设过时她会自动认一次，认过之后不再改）
-/拟人 帮助 - 显示本帮助
+/你的状态 - 精力、身体轴（困意/睡眠债/饥饿/不适）、生理、天气、日程、关系、注意力
+/查看日程 - 她今天过出来的日程（动态现排，不预排未来）
+/时间 城市 - 查看指定城市当前时间
+/好感度 - 情绪档案总览
+/情绪详情 - 含基线值与交互轮次
+/情绪日志 - 情绪波动记录
+/叫我 昵称 - 设置她对你的称呼（没设过时她会自动认一次，认过之后不再改）
+/拟人帮助 - 显示本帮助
+
+下面这些是管理员指令，挂在「拟人」组下，要打 /拟人 前缀：
 
 管理员：改配置
 /拟人 设置 - 看常用项；写成「/拟人 设置 城市 大阪」就改一项，立即生效
@@ -396,29 +397,38 @@ class HumanoidCore(Star):
 
     # -------------------- 用户指令 --------------------
 
-    # -------------------- 指令组 --------------------
-    # 18 个扁平指令在 `/help` 里糊成一片，挂到一个组下折叠起来就好找。
+    # -------------------- 指令 --------------------
     #
-    # **只开一个组**，不按「状态/配置/管理」再切子组：三个 `@command_group("拟人")`
-    # 同名的话，真实 AstrBot 是把子命令累加、还是后注册的覆盖前面的，本地验证不了——
-    # 赌输了就是一大半指令直接消失。分组的信息放在子命令命名和下面的 docstring 里。
+    # 以前 18 个全挂在 `@command_group("拟人")` 下面，于是全都得打 `/拟人 XXX`。
+    # 有使用者反馈这比早期版本难用——早期就是直接 `/状态`。
+    #
+    # 现在分成两层：
+    #   · **所有人能用的 8 个走顶层**，恢复成 `/你的状态`、`/查看日程`、`/拟人帮助`…
+    #     不带任何前缀。
+    #   · **管理员的 10 个留在「拟人」组里**（`/拟人 设置`），它们本来就不该随手可用，
+    #     多一层前缀反而是好事。
+    #
+    # 当初担心过「三个同名 `@command_group` 会不会互相覆盖」，所以才把所有指令塞进
+    # 一个组里。改完之后**只剩一个组**，那个顾虑不存在了。
 
     @filter.command_group("拟人")
     def humanoid_group(self):
-        """人形化伴侣
+        """人形化伴侣 · 管理指令（全部需要管理员）
 
-        查状态：状态 / 好感度 / 情绪详情 / 情绪日志 / 日程 / 时间 / 叫我 / 帮助
-        改配置（管理员）：参照名称 / 诊断 / 设置 / 重载
-        动数据（管理员）：重置日程 / 重置状态 / 重置情绪 / 设置好感度 / 批量好感度 / 查看昵称
+        改配置：参照名称 / 诊断 / 设置 / 重载
+        动数据：重置日程 / 重置状态 / 重置情绪 / 设置好感度 / 批量好感度 / 查看昵称
+
+        查状态的指令不带前缀，直接用：/你的状态 /好感度 /情绪详情 /情绪日志
+        /查看日程 /时间 /叫我 /拟人帮助
         """
 
-    @humanoid_group.command("状态")
+    @filter.command("你的状态")
     async def cmd_status(self, event: AstrMessageEvent):
         """查看当前角色的完整状态（精力、身体轴、生理、天气、日程、过程、社交能量等）。"""
         core = self._core(event)
         yield event.plain_result("\n".join(core.status_lines(self._sender(event))))
 
-    @humanoid_group.command("好感度")
+    @filter.command("好感度")
     async def cmd_mood(self, event: AstrMessageEvent):
         """查看当前用户的好感度、亲近欲、攻击性及情绪标签。"""
         if not self._config.mood_enabled:
@@ -427,7 +437,7 @@ class HumanoidCore(Star):
         core = self._core(event)
         yield event.plain_result(core.mood.profile_text(self._sender(event)))
 
-    @humanoid_group.command("情绪详情")
+    @filter.command("情绪详情")
     async def cmd_mood_detail(self, event: AstrMessageEvent):
         """查看详细情绪档案，包含基线值和交互轮次。"""
         if not self._config.mood_enabled:
@@ -436,7 +446,7 @@ class HumanoidCore(Star):
         core = self._core(event)
         yield event.plain_result(core.mood.profile_text(self._sender(event), detailed=True))
 
-    @humanoid_group.command("情绪日志")
+    @filter.command("情绪日志")
     async def cmd_mood_log(self, event: AstrMessageEvent):
         """查看最近的情绪波动记录（事件列表）。"""
         if not self._config.mood_log_enabled:
@@ -445,13 +455,13 @@ class HumanoidCore(Star):
         core = self._core(event)
         yield event.plain_result(core.mood.logs_text(self._sender(event)))
 
-    @humanoid_group.command("日程")
+    @filter.command("查看日程")
     async def cmd_view_schedule(self, event: AstrMessageEvent):
         """查看今日完整的日程表。"""
         core = self._core(event)
         yield event.plain_result(core.schedule_text())
 
-    @humanoid_group.command("时间")
+    @filter.command("时间")
     async def cmd_time(self, event: AstrMessageEvent):
         """查看指定城市（或当前机器人生效城市）的当前时间、星期和节日。"""
         # 默认用当前 bot 的生效城市（含角色级时区覆盖），而不是全局配置：
@@ -466,7 +476,7 @@ class HumanoidCore(Star):
         else:
             yield event.plain_result(text)
 
-    @humanoid_group.command("叫我")
+    @filter.command("叫我")
     async def cmd_set_nickname(self, event: AstrMessageEvent):
         """设置 AI 对你的称呼（昵称）。"""
         nickname = _arg_after(event.message_str, "叫我")
@@ -521,7 +531,7 @@ class HumanoidCore(Star):
         core.set_char_name(value)
         yield event.plain_result(f"✅ 参照名称已设为「{value}」，注入里会用这个名字称呼她。")
 
-    @humanoid_group.command("帮助")
+    @filter.command("拟人帮助")
     async def cmd_help(self, event: AstrMessageEvent):
         """显示所有指令的帮助信息。"""
         yield event.plain_result(HELP_TEXT)
@@ -800,6 +810,17 @@ class HumanoidCore(Star):
             _apply_merged_prompt(event, req)
             core = self.role_manager.get_or_create(self._self_id(event))
             user_id = self._sender(event)
+            # 她这条要发出去的话，先记一笔（等下一条用户消息进来才知道对方接没接）。
+            #
+            # 情绪分析以前**只看得见用户说的话**——于是「她说完没人接」和「她说完对方
+            # 认真回了」算成同一件事，而前者其实是件挺难受的事。这里是 Core 里唯一能
+            # 看到「她说了什么」的地方：进 LLM 之前。
+            try:
+                _out = str(getattr(req, "prompt", "") or "").strip()
+                if _out:
+                    core.mood.note_spoke(user_id, _out[-300:])
+            except Exception:
+                pass
             text = (getattr(event, "message_str", "") or "").strip()
             # 注意力（上心程度）要看用户到底说了什么：合并了几条时看合并后的全貌，
             # 否则前几条里的问句、提到的话题都不参与判断，注意力会被算低。

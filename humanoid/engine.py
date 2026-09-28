@@ -90,7 +90,7 @@ class HumanoidEngine:
         process_status = core.process.current() if hasattr(core, "process") else {}
         body_status = None
         if hasattr(core, "soma"):
-            target, at = core.signals.last_proactive()
+            target, at = core.signals.last_proactive(getattr(core, "role_id", ""))
             now = core.soma.now
             body_status = {
                 "soma": core.soma.snapshot(),

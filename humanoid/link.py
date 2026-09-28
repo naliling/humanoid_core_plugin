@@ -114,6 +114,12 @@ def build_contract(core: Any) -> dict[str, Any]:
             "location": str(slot.get("location", "")),
         },
         # 今天这条时线：刚做过什么 / 正在做什么 / 接下来做什么。
+        # 她还没做完的那几件事。social 那边拿它当由头（「还在整理那份个案笔记」）
+        # ——这是最像人的一种主动开口：说自己手上真在干的事，而不是天气。
+        "ongoing": [str(x) for x in (core.schedule.ongoing_tasks() or []) if str(x).strip()][:3],
+        # 「她自己想做的」——社交层拿它当由头（"她今天想去那家书店"），
+        # 这是最像人的一种主动开口：说自己真想做的事，不是天气、也不是工作。
+        "wants": [str(x) for x in (day.get("wants") or []) if str(x).strip()][:2],
         "day": {
             "doing": str(day.get("doing") or ""),
             "done": [str(x) for x in (day.get("done") or []) if str(x).strip()],
@@ -239,14 +245,32 @@ class SocialSignals:
         self._loaded_at = now
         return payload
 
-    def last_proactive(self) -> tuple[str, float]:
+    def _scope_of(self, payload: dict[str, Any], role_id: str = "") -> dict[str, Any]:
+        """信号文件里属于**这个角色**的那一份。
+
+        social 那边是这么写的（`signals.py`）：单 Bot 时写顶层，多 Bot 时**只写
+        `by_bid[bid]`**——顶层留给跨角色共用的那部分（`ignored_streak`、心跳时间）。
+
+        后果是这里原来只 `payload.get("last_proactive_at")`，在多 Bot 部署下**永远
+        读不到**，于是 `note_proactive()` 永远不被调用、`social_desire` 只涨不泄：
+        社交层每发一条，Core 那边一点反应都没有，联动单边断。
+        """
+        if role_id:
+            by_bid = payload.get("by_bid")
+            if isinstance(by_bid, dict):
+                row = by_bid.get(str(role_id))
+                if isinstance(row, dict):
+                    return row
+        return payload
+
+    def last_proactive(self, role_id: str = "") -> tuple[str, float]:
         """社交层最近一次主动开口：(对象 uid, epoch)。没有则 ("", 0.0)。"""
-        payload = self.read()
+        row = self._scope_of(self.read(), role_id)
         try:
-            at = float(payload.get("last_proactive_at", 0.0) or 0.0)
+            at = float(row.get("last_proactive_at", 0.0) or 0.0)
         except (TypeError, ValueError):
             at = 0.0
-        target = str(payload.get("last_target_uid", "") or "")
+        target = str(row.get("last_target_uid", "") or "")
         return target, at
 
     def ignored_streak(self) -> int:

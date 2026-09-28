@@ -166,7 +166,18 @@ class HumanoidConfig:
     llm_daily_call_budget: int = 200
     # 均衡参考偏好：会作为「仅供参考」的偏好递给模型，与人设和身体状态一起权衡，
     # 不是必须服从的指令。
+    # ↓ 面板最后一项。默认关。
+    ccb: bool = False
     schedule_prompt_extra: str = "劳逸结合，有动有静，节奏均衡。"
+    # 生成日程时人设最多注入多少字。
+    #
+    # 原来写死 1200。人设里写着外貌、物种、年纪、偏好——这些正是决定日程长什么样的
+    # 东西，写得越细越容易被砍掉尾巴，于是模型只看到「会说话的小马」，看不到
+    # 「18 岁、有主见、喜欢夜里出去」，排出来的东西退回通用模板。
+    #
+    # 调大会让请求变大（日程一天跑 1~2 次），所以留成配置项而不是无限放开；
+    # 人设再长也只到这里，超出部分照常按行边界截断。
+    schedule_persona_max_chars: int = 3000
     # 自由文本配置项，必须卡长度：它逐字进入日程生成 prompt，有人能往里面粘一整篇设定。
     SCHEDULE_PROMPT_EXTRA_MAX = 300
     schedule_time_granularity: str = "15min"
@@ -198,6 +209,16 @@ class HumanoidConfig:
     message_merge_max_count: int = 6
 
     inject_activity_context: str = "medium"
+    # 日程的「现在在做什么」要不要进对话上下文。
+    #
+    # 开着时模型知道她此刻在做什么，能对上话；关掉时只保留「今天做过什么」，
+    # 手上在忙这件事完全不提。
+    #
+    # 有人反馈过：日程出现在上下文里，模型会照着它「无缘无故出去干这干那」——
+    # 看到「现在在整理个案笔记」就开始安排出门之类的事。**我不能确定这确实是日程
+    # 导致的**（模型自己有那份冲动，日程也可能只是给了它一个理由），所以这里只给
+    # 开关，不替用户猜。默认开着；真被驱使了就关掉，日程照常生成，只是不往对话里报。
+    inject_schedule_now: bool = True
     # 注入的 Token 硬预算：超了按显著度从低到高丢句，必需品（时间/称呼/场景）永不丢。
     inject_token_budget: int = 3500
     environment_mode: str = "both"
@@ -226,7 +247,11 @@ class HumanoidConfig:
     mood_tag_enabled: bool = True
     mood_use_llm_for_delta: bool = True
     mood_provider_cooldown_minutes: int = 5
-    mood_llm_interval_messages: int = 5
+    mood_llm_interval_messages: int = 10
+    # 攒到间隔就触发时，一次最多把这么多条合起来分析（旧的在前）
+    mood_llm_batch_max: int = 10
+    # 每条截多少字进分析（10 条加起来仍可控）
+    mood_llm_message_chars: int = 300
     mood_verbose_log: bool = False
     mood_enabled_in_group: bool = False
     mood_data_retention_days: int = 7
@@ -351,6 +376,10 @@ class HumanoidConfig:
             message_merge_timeout_seconds=f("message_merge_timeout_seconds", 0.0, 30.0),
             message_merge_max_count=i("message_merge_max_count", 1, 50),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
+            inject_schedule_now=bool(src.get("inject_schedule_now", True)),
+            schedule_persona_max_chars=max(
+                200, min(8000, int(src.get("schedule_persona_max_chars", 3000) or 3000))
+            ),
             inject_token_budget=i("inject_token_budget", 200, 20000),
             environment_mode=c("environment_mode", ENVIRONMENT_MODES),
             enable_chat_awareness=b("enable_chat_awareness"),
@@ -374,7 +403,10 @@ class HumanoidConfig:
             mood_tag_enabled=b("mood_tag_enabled"),
             mood_use_llm_for_delta=b("mood_use_llm_for_delta"),
             mood_provider_cooldown_minutes=i("mood_provider_cooldown_minutes", 0, 1440),
+            ccb=bool(src.get("ccb", False)),
             mood_llm_interval_messages=i("mood_llm_interval_messages", 1, 100),
+            mood_llm_batch_max=i("mood_llm_batch_max", 1, 30),
+            mood_llm_message_chars=i("mood_llm_message_chars", 50, 2000),
             mood_verbose_log=b("mood_verbose_log"),
             mood_enabled_in_group=b("mood_enabled_in_group"),
             mood_data_retention_days=i("mood_data_retention_days", 0, 365),

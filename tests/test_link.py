@@ -419,3 +419,45 @@ class DiagnosticsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_last_proactive_reads_the_right_role_in_multibot():
+    """多 Bot 时 social 只写 by_bid[bid]，Core 原来只读顶层 → social_desire 永不泄。
+
+    社交层每主动发一条，Core 这边 `note_proactive()` 就该被调一次去泄 `social_desire`。
+    读不到就意味着那条反馈链路单边断着：她越想说，越没人接。
+    """
+    sig = SocialSignals.__new__(SocialSignals)
+    sig._payload = {
+        "last_proactive_at": 1.0,               # 单 Bot 时的顶层老位置
+        "by_bid": {
+            "roleA": {"last_proactive_at": 222.0, "last_target_uid": "u9"},
+            "roleB": {"last_proactive_at": 333.0, "last_target_uid": "u1"},
+        },
+    }
+    sig.read = lambda: sig._payload
+
+    assert SocialSignals.last_proactive(sig, "roleA") == ("u9", 222.0)
+    assert SocialSignals.last_proactive(sig, "roleB") == ("u1", 333.0)
+
+
+def test_last_proactive_falls_back_to_toplevel():
+    """没有 by_bid（单 Bot）或这个角色不在里面，回退顶层——不能把老部署弄坏。"""
+    sig = SocialSignals.__new__(SocialSignals)
+    sig._payload = {"last_proactive_at": 7.0, "last_target_uid": "x"}
+    sig.read = lambda: sig._payload
+    assert SocialSignals.last_proactive(sig, "roleA") == ("x", 7.0)
+    assert SocialSignals.last_proactive(sig) == ("x", 7.0)
+
+
+def test_unknown_role_does_not_see_another_roles_row():
+    sig = SocialSignals.__new__(SocialSignals)
+    sig._payload = {
+        "last_proactive_at": 1.0,
+        "by_bid": {"roleA": {"last_proactive_at": 222.0, "last_target_uid": "u9"}},
+    }
+    sig.read = lambda: sig._payload
+    # roleB 不在里面 —— 宁可读到顶层的 0，也别把 roleA 的动静算到自己头上
+    target, at = SocialSignals.last_proactive(sig, "roleB")
+    assert at == 1.0
+    assert target == ""

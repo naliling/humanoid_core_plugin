@@ -22,7 +22,16 @@ from typing import Any, Callable, Optional
 
 # 人设原文注入上限。日程只需要它的身份与生活方式，全文塞进去会顶掉别的内容；
 # 按 1200 字算，中文一字一 token，日程 prompt 总量仍在千余 token 量级。
-PERSONA_PROMPT_MAX = 1200
+# 人设注入日程 prompt 时的字数上限。
+#
+# 原来是 1200。日程 prompt 总长约 2300，人设占掉一半以上——而人设里写着外貌、物种、
+# 年纪、偏好这些**决定日程长什么样**的东西。写得越细越容易被砍掉尾巴，
+# 于是模型只看到「会说话的小马」，看不到「18 岁、有主见、喜欢夜里出去」，
+# 排出来的东西自然退回通用模板。
+#
+# 提到 3000：日程 prompt 本身不长，多给人设一点预算换来的是「按这个人排」而不是
+# 「按模板排」。上限仍留着，防止把整本设定书灌进去稀释掉任务本身。
+PERSONA_PROMPT_MAX = 3000
 
 # AstrBot 里表示「这个会话显式不使用任何人格」的哨兵值
 NO_PERSONA_MARKER = "[%None]"
@@ -200,6 +209,15 @@ class PersonaSource:
             persona = EMPTY
         self._cache[key] = _Entry(persona=persona, at=self._time(), umo=umo)
         return persona
+
+    def cached_persona(self, role_id: str) -> "Persona | None":
+        """只读缓存拿**整个** Persona（含正文），没预热过返回 None。
+
+        `cached_name` 只能给名字；要抽人设正文里的自称就得拿这个。同步读缓存，
+        不触发任何 IO——`char_name()` 在注入热路径上，每条消息都会调一次。
+        """
+        entry = self._cache.get(str(role_id))
+        return entry.persona if entry is not None else None
 
     def cached_name(self, role_id: str) -> str:
         """只读缓存，拿**人设里的角色名**。没预热过就返回空串。

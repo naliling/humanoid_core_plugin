@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+from . import relstage
 import math
 import re
 import time
@@ -344,9 +345,20 @@ class PromptBuilder:
             # 群聊没开情绪时直接不给：情绪层要读 mood.profile()，那个方法**会建档**，
             # 于是群里每个说过话的人都凭空多一份情绪档案。
             return ""
+        # ccb 需要知道「这是不是群」和「她是谁」——两条都是它的硬闸，
+        # 拿不到就走安全侧（不出）。
+        persona_prompt = ""
+        try:
+            source = getattr(self._core, "persona_source", None)
+            if source is not None:
+                snap = source.cached_persona(self._core.role_id)
+                persona_prompt = str(getattr(snap, "prompt", "") or "")
+        except Exception:
+            persona_prompt = ""
         try:
             _score, text = self._emotion.candidate(
-                user_id, interest=interest or {}, agency=agency or {}
+                user_id, interest=interest or {}, agency=agency or {},
+                is_group=bool(is_group), persona_prompt=persona_prompt,
             )
         except Exception:
             return ""
@@ -380,6 +392,16 @@ class PromptBuilder:
         position = self._position_line(data, interest, seed)
         if position:
             lines.append(position)
+
+        # 关系到了哪一步。位置词说「多亲密」，这句说「到什么程度可以说什么」——
+        # 好感 60 和 90 不该一样，但现在看起来一样。
+        # 只说状态，不对模型下指令（「所以你应该…」是越界）。
+        try:
+            stage_line = relstage.line_for(data.get("affection", 46.0))
+        except (TypeError, ValueError, AttributeError):
+            stage_line = ""
+        if stage_line:
+            lines.append(stage_line)
 
 
         # **认识多久不进上下文。** 关系深浅已经由上面那句位置词承载（「她对TA关系亲密」比
@@ -527,6 +549,10 @@ class PromptBuilder:
             return []
         now = self._core.clock.now()
         now_minutes = now.hour * 60 + now.minute
+        # 「现在在做什么」可以被关掉（`inject_schedule_now`）。关掉时 include_doing=False，
+        # 于是只留「今天做过什么」——她手上在忙什么不进上下文，模型也就没东西可照着发挥。
+        # 日程照常生成、照常推进，只是不往对话里报。
+        want_now = include_doing and bool(getattr(self._core.config, "inject_schedule_now", True))
         try:
             phrases = day_phrases(
                 slots, now_minutes,
@@ -534,7 +560,7 @@ class PromptBuilder:
                 future_limit=1,
             )
             return self._day_prose(
-                day_lines(phrases, max_items=2 if detailed else 1, include_doing=include_doing)
+                day_lines(phrases, max_items=2 if detailed else 1, include_doing=want_now)
             )
         except Exception:
             return []

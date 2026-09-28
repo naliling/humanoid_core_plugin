@@ -222,10 +222,21 @@ def day_phrases(
                     else f"{period_of(lo)}还要{phrase}"
                 )
 
+    # 「她自己想做的」：今天（以及接下来）标了 wants 的那几段。
+    wants: list[str] = []
+    for slot in slots or []:
+        if not isinstance(slot, dict) or not slot.get("wants"):
+            continue
+        event = str(slot.get("event", "") or "").strip()
+        if event:
+            wants.append(event)
     return {
         "doing": doing,
         "done": done[:max(0, int(past_limit))],
         "next": upcoming[:max(0, int(future_limit))],
+        # 今天想做的事。**空列表也要给这个键**——社交侧按 `day.get("wants")` 取，
+        # 缺键和空列表要能分开处理（今天是合法的「没有」）。
+        "wants": wants[:3],
     }
 
 
@@ -299,21 +310,35 @@ def just_done(
     return best[1] if best else ""
 
 
-def persona_block(persona: Persona | None) -> str:
+def persona_block(persona: Persona | None, limit: int = PERSONA_PROMPT_MAX) -> str:
     """把 AstrBot 人格设定写成分段 prompt 的开头：她是谁，先立住再决定这一段。"""
     if persona is not None and persona.usable:
-        prompt = truncate(persona.prompt, PERSONA_PROMPT_MAX)
+        prompt = truncate(persona.prompt, max(200, int(limit or PERSONA_PROMPT_MAX)))
+        # 人设面板里没填名字时 name 是空串——原样拼出去就是「她是「」。」
+        # 日程一天生成几次，这句话会反复出现在她眼前。改成不提名字。
+        who = (
+            f"她是「{persona.name}」。"
+            if str(persona.name or "").strip()
+            else "她在 AstrBot 里的人格设定是下面这份，"
+        )
         return (
-            f"她是「{persona.name}」。下面是她在 AstrBot 里的人格设定，"
-            "这就是她本人，不是她在扮谁：\n"
-            f"{prompt}\n\n"
+            who
+            + "这就是她本人，不是她在扮谁：\n"
+            + f"{prompt}\n\n"
             "先从这里读出她的身份、年纪感、职业或在读状态、住在哪里、独居还是跟人住、"
             "平时跟谁来往、喜欢什么讨厌什么、花钱和精力的习惯。\n"
-            # 原句是「设定里没写的，按最合理、最省心的方式补一个出来，并且每天都沿用同一个答案」——
-            # 那是在命令模型给她造一份身份。改成：设定里有的照用，没有的别编——
-            # 留白比凭空多一个身份安全，而“今天在做什么”本来就该由她自己说。
-            "设定里没提到的，不要替他编：那里留白即可。她的日常由她自己讲，"
-            "你只需要把“她现在这个状态大概会处在什么样的处境”排出来，不要替她定身份。\n"
+            # 原来这里是「设定里没提到的，不要替他编：那里留白即可。…不要替她定身份。」
+            # 那不是防造身份，是**在命令模型不发挥**，而效果跟字面完全一致：
+            # 每段都挑最安全最平庸的那件事，于是她的一天高度雷同，设定里写明的那些
+            # 特征（长什么样、什么物种、什么年纪、有什么偏好）一条也用不上。
+            # 画出来的小马会拿手指拿手机，就是因为「通用模板」比「按这个人」更好写。
+            #
+            # 「别替她定身份」要保留——那是对的。**「留白」要撤掉**——日常本来就该
+            # 由她自己讲，而「自己讲」的前提是模型按这个人去想象，不是按模板去填。
+            "设定里明确写到的（外貌、体型、是什么、有什么习惯），必须照着来，别写成通用的。\n"
+            "设定里没写到的地方，按她这个人的性格和处境合理地安排就行。"
+            "**别每天都挑同一个最省事的选择**——她的一天应该像她的一天，不是一张模板。\n"
+            "不要给她硬造第二份身份；她是什么样的人，上面这份设定说了算。\n"
         )
     return (
         "没有现成的人设资料可读。\n"
@@ -362,6 +387,7 @@ def segment_prompt(
     elapsed_minutes: int = 0,
     history: list[Slot] | None = None,
     history_note: str = "",
+    ongoing: list[str] | None = None,
     is_night: bool = False,
 ) -> str:
     """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
@@ -401,9 +427,16 @@ def segment_prompt(
         else ""
     )
     night_line = "现在正处在她的生物钟夜里。\n\n" if is_night else ""
+    # 「还没做完的事」——她要能有一件跨天的事，今天接着昨天做。
+    _ongoing = [str(x).strip() for x in (ongoing or []) if str(x or "").strip()][:3]
+    _ongoing_block = (
+        "【你还没做完的事（可以接着做，也可以先放一放）】\n"
+        + "\n".join(f"  - {x}" for x in _ongoing) + "\n"
+        if _ongoing else ""
+    )
 
     return (
-        persona_block(persona)
+        persona_block(persona, cfg.schedule_persona_max_chars)
         + f"\n现在是 {now_text}（星期{weekday}）。请决定她【从现在开始的这一段】在做什么——"
         "只这一段：之后的事到了时候会再决定，现在不要排。\n\n"
         + prev_line
@@ -415,20 +448,56 @@ def segment_prompt(
         + "【怎么决定】\n"
         "1. 身体读数是决策输入：饿到不行就去吃，困到不行就去睡——怎么权衡由你决定。\n"
         "2. 一件事做到一半接着做很正常（continue=true）；做很久了、或身体不允许时就换。\n"
+        # 「怎么决定」原来只有上面两条，全是「什么时候该换」。这等于只教了它何时停下，
+        # 没教它一段能有多短——于是模型把每段都当成一件大事，minutes 天然偏长。
+        "3. minutes 要真的反映这件事要多久：\n"
+        "   喝口水、吃两口、翻个身就是 15~30 分钟，不用非撑满；\n"
+        "   出门办事、见人、认真做一件事可以 1~3 小时；\n"
+        "   一次出门可以是一整段（路上→店里→回来），也可以中途换成另一件事。\n"
+        "   **别因为「反正要填一段时间」就往长的填。**\n"
+        # 粒度变细之后，段与段之间「接不接得上」就比时长更要紧了：20 分钟一段，
+        # 一天就是几十段，任何一次跳跃都会被看见。数据层已经防住了时间重叠和窟窿，
+        # 但「上一段在游泳、下一段在另一条街的书店里」这种语义跳跃只能靠这里说。
+        "4. 换一件事要接得上：\n"
+        "   上一段在哪儿、刚做完什么，上面给了。换地方最好有个说得过去的由头"
+        "（吃完了→出门、写到一半→起身倒水），别一段之内从一个地方跳到另一个；\n"
+        "   在同一个地方待着通常就是接着做，用 continue=true 就好。\n"
+        # ongoing：让她能有一件**跨天**的事。没有它，她的每一天都是互不相关的——
+        # 今天改方案、明天改方案，两边没有「还没弄完」这层，每段都像新任务。
+        "5. 一天里可以有一两段是**她自己想做的**——不是工作、不是必须，是她自己挑的"
+        "（想去哪家店、想去看什么、想学点什么）。这种时候在 JSON 里带上 \"wants\": true。"
+        "别把整天都排成工作，她得有点自己的日子。\n"
+        "6. ongoing 只在这件事**要跨好几天**时才写（一份要整理三天的个案笔记），"
+        "一次能做完的别写。写了它就一直跟着你，明天你也会接着这件事——"
+        + (_ongoing_block or "（目前没有还没做完的事。）") + "\n"
         "\n"
         "【输出格式】\n"
         "1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释文字。\n"
-        # 原来这里是 {"event": "去超市买菜", "location": "超市"}——一个有画面感的
-        # 具体事件。模型对 few-shot 示例的模仿远强于对抽象规则的服从，它会被当成
-        # 「这就是合意的答案范式」反复复用。换成占位式，格式照样清楚，但不给画面。
-        '2. 形如：{"continue": false, "event": "<她在做的事>", "location": "<在哪>", '
-        '"emotion": "<心情>", "energy_rate": -0.05, "minutes": 85}\n'
+        # 这里原来只有一个占位式示例 {"event": "<她在做的事>"}，理由写的是
+        # 「模型对 few-shot 的模仿远强于对抽象规则的服从，会被当成范式反复复用」。
+        # 那条顾虑是对的，但**矫枉过正**：把画面全删掉之后，模型手里就只剩人设 + 一堆
+        # 规则 + 一个空模板，于是每段都挑最平庸的那件事，一天下来高度雷同。
+        #
+        # 所以给回几个**有画面、长度和内容都不一样**的范例，并明说这是举例不是填空。
+        # 长度不一这件事本身就是示范：它告诉模型 22 分钟和 2 小时都是对的。
+        "2. 下面是几个**举例**，看格式和详略，不是让你照抄，也不是填空题：\n"
+        '   \u00b7 {"continue": false, "event": "啃两口昨天剩的面包", "location": "厨房", '
+        '"emotion": "有点没睡醒", "energy_rate": 0.02, "minutes": 22}\n'
+        '   \u00b7 {"continue": false, "event": "翻翻最近想去的那几家店，顺路买双袜子", '
+        '"location": "商场", "emotion": "有点期待", "energy_rate": -0.08, "minutes": 145}\n'
+        '   \u00b7 {"continue": false, "event": "拐去那家一直想去的书店", "location": "街角", '
+        '"emotion": "有点期待", "energy_rate": -0.05, "minutes": 60, "wants": true}\n'
+        '   \u00b7 {"continue": false, "event": "接着整理那份个案笔记", "location": "书桌前", '
+        '"emotion": "还差几份", "energy_rate": -0.05, "minutes": 110, '
+        '"ongoing": "整理那份个案笔记（还差 4 份）"}\n'
+        '   \u00b7 {"continue": true}\n'
         "   event 写具体在做什么、location 写她在哪，两者都要具体到能说出口的程度；\n"
         "3. continue：true = 接着做手上这件事（event/location/emotion 留空，速率沿用）；"
         "false = 换一件事。\n"
         f"4. minutes：这一段做多久。最短 {SEGMENT_MIN_MINUTES} 分钟，一般的事最长 "
         f"{SEGMENT_MAX_MINUTES} 分钟；睡觉可以睡一整夜（最长 {SEGMENT_SLEEP_MAX_MINUTES // 60} 小时，"
-        "跨过半夜也没关系）。\n"
+        "跨过半夜也没关系）。这个是**上下限，不是目标值**——"
+        "多数日常小事落在 20~60 分钟，真正要花时间的事才写长。\n"
         "5. energy_rate 是这一段对精力的作用：睡眠/休息为正（0.05~0.2），"
         "工作/外出/社交为负（-0.05~-0.15）。\n"
         "\n"
@@ -772,6 +841,54 @@ class ScheduleService:
             "energy_rate": clamp_rate(carry.get("energy_rate", 0.15)),
         }
 
+    # 「还没做完的事」最多留 3 件、每件最多记 4 天。
+    ONGOING_KEY = "ongoing_tasks"
+    ONGOING_MAX = 3
+    ONGOING_TTL_DAYS = 4
+
+    def ongoing_tasks(self) -> list[str]:
+        """她手上还没做完的那几件事（跨天跟着她）。"""
+        raw = self._scope.get_self(self.ONGOING_KEY)
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        cutoff = time.time() - self.ONGOING_TTL_DAYS * 86400.0
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("what", "") or "").strip()[:40]
+            try:
+                seen = float(item.get("at", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                seen = 0.0
+            if text and seen >= cutoff:
+                out.append(text)
+        return out[: self.ONGOING_MAX]
+
+    def _note_ongoing(self, slot: Slot) -> None:
+        """把这一段报的「还没做完」记下来。做完的事由模型不再报就自然过期。"""
+        text = str((slot or {}).get("ongoing", "") or "").strip()[:40]
+        if not text:
+            return
+        raw = self._scope.get_self(self.ONGOING_KEY)
+        items = [i for i in raw if isinstance(i, dict)] if isinstance(raw, list) else []
+        # 同一件事模型每次报的措辞会带进度（「还差 4 份」→「还差 2 份」），按字面比会
+        # 堆成好几条同一件事。这里按**前六个字**归一：那是「整理那份/那份个案/写完那
+        # 封」这种稳定前缀，进度部分在后面。
+        stem = text[:6]
+        kept, seen_stem = [], set()
+        for item in items:
+            what = str(item.get("what", "") or "").strip()
+            if not what or what[:6] == stem:
+                continue
+            seen_stem.add(what[:6])
+            kept.append(what)
+        kept.append(text)
+        self._scope.set_self(self.ONGOING_KEY, [
+            {"what": w, "at": time.time()} for w in kept[-self.ONGOING_MAX:]
+        ])
+        self._scope.mark_dirty()
+
     def current_slots(self) -> list[Slot]:
         """兼容旧接口：身体、精力、契约都从这里拿她的段。
 
@@ -1097,6 +1214,7 @@ class ScheduleService:
             elapsed_minutes=elapsed,
             history=history,
             history_note=history_note,
+            ongoing=self.ongoing_tasks(),
             is_night=self._clock.is_night(),
         )
         if self._log and cfg.debug_mode:
@@ -1210,6 +1328,8 @@ class ScheduleService:
             slot = None
         else:
             segs.append(slot)
+        if installed:
+            self._note_ongoing(installed)
         cap = max(6, min(SEGMENTS_DAY_CAP, int(self.config.schedule_max_slots)))
         if len(segs) > cap:
             segs = segs[-cap:]

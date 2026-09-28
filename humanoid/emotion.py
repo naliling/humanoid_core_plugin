@@ -16,6 +16,8 @@
 """
 
 from __future__ import annotations
+from . import ccb as _ccb
+import hashlib
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -104,15 +106,15 @@ class EmotionLayer:
         """今天的底色。按当天的波动次数算，所以一天之内不翻来覆去。"""
         ups, downs = self._today_events(user_id)
         if downs >= 2 and ups == 0:
-            return 0.86, _pick(("她今天一整天都不太顺", "她今天状态一直不好"), index)
+            return 0.86, _pick(("今天一整天都不太顺", "今天整个人蔫蔫的"), index)
         if downs == 1 and ups == 0:
-            return 0.62, _pick(("她今天有点闷", "她今天心情低落的"), index)
+            return 0.62, _pick(("今天有点闷", "今天心里堵得慌"), index)
         if downs >= 1 and ups >= 1:
-            return 0.55, _pick(("她今天情绪起起伏伏的", "她今天一会儿好一会儿不好"), index)
+            return 0.55, _pick(("今天一会儿好一会儿不好", "今天这心情说不上来"), index)
         if ups >= 2:
-            return 0.80, _pick(("她今天心情不错", "她今天挺来劲的"), index)
+            return 0.80, _pick(("今天心情不错", "今天挺来劲的"), index)
         if ups == 1:
-            return 0.50, _pick(("她今天心情还行", "她今天挺轻松的"), index)
+            return 0.50, _pick(("今天心情还行", "今天挺轻松的"), index)
         return 0.0, ""
 
     def _now_mood(self, profile: Dict[str, Any], index: int) -> Tuple[float, str]:
@@ -149,15 +151,15 @@ class EmotionLayer:
         base_aggr = _num(profile.get("base_aggression"), aggr)
 
         if downs >= GRUDGE_SAME_DAY or self._recent_negative(user_id):
-            return 0.92, _pick(("你上次的火她还没消", "你上次那事她记着呢"), index)
+            return 0.92, _pick(("上回那句话到现在都还窝火", "上次那事我还记着"), index)
         if aggr - base_aggr >= AGGRESSION_UP:
-            return 0.85, _pick(("她今天对你有点冷淡", "她不想主动理你"), index)
+            return 0.85, _pick(("今天不太想搭理你", "今天说话不太想接"), index)
         if aff - base_aff >= SHIFT_HIGH * 1.5:
-            return 0.78, _pick(("她今天对你特别有耐心", "她今天黏着你"), index)
+            return 0.78, _pick(("今天你说什么我都愿意听", "今天特别想跟你待着"), index)
         if base_aff - aff >= abs(SHIFT_LOW) * 1.5:   # 跌幅够大才算生疏
-            return 0.76, _pick(("她今天对你有点客气", "她有点想躲着你"), index)
+            return 0.76, _pick(("今天跟你说话有点生分", "今天有点想躲着你"), index)
         if ups >= 2:
-            return 0.62, _pick(("她今天心情好，看着你顺眼", "她今天挺愿意搭理你"), index)
+            return 0.62, _pick(("今天你做什么我都觉得挺好", "今天挺想跟你聊两句"), index)
         return 0.0, ""
 
     def _intimacy(self, interest: Dict[str, Any], profile: Dict[str, Any], index: int) -> Tuple[float, str]:
@@ -170,12 +172,12 @@ class EmotionLayer:
         upset = (aggr - base_aggr >= AGGRESSION_UP) or (aff - base_aff <= SHIFT_LOW)
 
         if care >= CARE_CLOSE and not upset:
-            return 0.66, _pick(("她愿意多说两句", "她愿意说点私人的"), index)
+            return 0.66, _pick(("愿意多说两句", "愿意说点私人的"), index)
         if care >= CARE_CLOSE and upset:
-            return 0.68, _pick(("她不太想多说", "她今天不太想说真心话"), index)
+            return 0.68, _pick(("不太想多说", "今天不太想说真心话"), index)
         if care < 0.35:
-            return 0.55, _pick(("她和你还有点距离", "她不太愿意提私事"), index)
-        return 0.45, _pick(("她照常", "她跟你说话挺正常的"), index)
+            return 0.55, _pick(("跟你还有点距离", "不太愿意提私事"), index)
+        return 0.45, _pick(("今天跟平时一样", "今天跟你说话挺正常的"), index)
 
     def _willingness(self, agency: Dict[str, Any], index: int) -> Tuple[float, str]:
         """主动性：她想不想开话头。"""
@@ -184,11 +186,11 @@ class EmotionLayer:
         except Exception:
             return 0.0, ""
         if value >= 0.70:
-            return 0.68, _pick(("她这会儿挺想说点什么", "话匣子是开着的"), index)
+            return 0.68, _pick(("这会儿挺想说点什么", "话匣子是开着的"), index)
         if value >= 0.45:
-            return 0.52, _pick(("她有点想说话", "接话接得住"), index)
+            return 0.52, _pick(("有点想说话", "这会儿有话想说"), index)
         if value > 0.0:
-            return 0.40, _pick(("她不太想开话头", "这会儿没什么特别想说的"), index)
+            return 0.40, _pick(("不太想开话头", "这会儿没什么特别想说的"), index)
         return 0.0, ""
 
     # ------------------------------------------------------------------
@@ -199,6 +201,8 @@ class EmotionLayer:
         *,
         interest: Dict[str, Any],
         agency: Dict[str, Any],
+        is_group: bool = False,
+        persona_prompt: str = "",
     ) -> Tuple[float, str]:
         """五个维度竞争，返回显著度最高的那一条。`(0.0, "")` = 此刻没什么特别情绪。"""
         try:
@@ -207,7 +211,29 @@ class EmotionLayer:
             return 0.0, ""
         if not profile:
             return 0.0, ""
-        index = abs(hash(str(user_id))) % 3
+        # 抽签种子必须「**一天内稳定、跨天轮换**」——这正是 `wording.pick` 那条规矩。
+        #
+        # 两版都错过：
+        #   · `abs(hash(str(user_id))) % 3`——Python 的字符串 hash 每个进程都加随机盐，
+        #     同一个用户**每次重启**就换一个维度。（这也是最早暴露出随机测试失败的原因。）
+        #   · 改成 blake2b 但种子只有 role+uid——跨进程稳了，却**一辈子只抽一种措辞**：
+        #     实测同一个用户连跑 6 天，六天全是「有点想说话」。一个人不会永远心里只说一句。
+        #
+        # 加上今天：同一天内反复渲染不换（模型看到的是同一句感受，不是两件事），
+        # 过了零点换一个（不会磨成口头禅）。`wording.pick` 早就这么干了。
+        #
+        # 另外 `role_id` 必须走 `self._core.role_id`：`candidate()` 的参数里**没有**
+        # 它，直接引用会抛 NameError，被 `_emotion_line` 的 except 吞掉 → 整句情绪消失。踩过。
+        try:
+            role = str(getattr(self._core, "role_id", "") or "")
+        except Exception:
+            role = ""
+        try:
+            today = str(self._core.clock.today_str() or "")
+        except Exception:
+            today = ""
+        raw = f"emotion:{role}:{user_id}:{today}".encode("utf-8")
+        index = int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big") % 3
 
         pools: List[Tuple[float, str]] = [
             self._day_tone(user_id, index),
@@ -216,11 +242,71 @@ class EmotionLayer:
             self._intimacy(interest or {}, profile, index),
             self._willingness(agency or {}, index),
         ]
+
+        # ccb：一个默认关的独立开关。条件全中时它**直接返回**，不参与竞争——
+        # 门槛已经很高（亲近欲 45/50 且是涨上来的），到了就是这一刻，
+        # 让它再和「有点想说话」比显著度就等于把它稀释掉了。
+        got = self._ccb_line(
+            user_id, profile, is_group=is_group, persona_prompt=persona_prompt, now=None
+        )
+        if got is not None:
+            return got
+
         best = (0.0, "")
         for score, text in pools:
             if text and score > best[0]:
                 best = (score, text)
         return best
+
+    def _ccb_line(
+        self,
+        user_id: str,
+        profile: Dict[str, Any],
+        *,
+        is_group: bool,
+        persona_prompt: str,
+        now: Optional[float],
+    ) -> Optional[Tuple[float, str]]:
+        """ccb 那一维。条件不满足就 None（连池子都不进）。"""
+        cfg = getattr(self._core, "config", None)
+        if not bool(getattr(cfg, "ccb", False)):
+            return None
+        state = self._core.mood.profile(user_id) or profile or {}
+        try:
+            energy = float(self._core.energy.energy)
+        except (TypeError, ValueError, AttributeError):
+            energy = 100.0
+        moment = now if now is not None else self._core.now_epoch()
+        raw = f"ccb:{getattr(self._core, 'role_id', '')}:{user_id}".encode("utf-8")
+        idx = int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big") % 2
+        user_state = self._core._scope.user_state(user_id)
+        res = _ccb.evaluate(
+            enabled=True,
+            is_group=is_group,
+            persona_prompt=persona_prompt,
+            affection=_num(state.get("affection"), 46.0),
+            base_affection=_num(state.get("base_affection"), 46.0),
+            libido=_num(state.get("libido"), 34.0),
+            base_libido=_num(state.get("base_libido"), 34.0),
+            energy=energy,
+            last_at=float(user_state.get("ccb_last_at", 0.0) or 0.0),
+            now=float(moment),
+            index=idx,
+        )
+        if res is None:
+            # 门槛掉下去了就把状态清掉：色欲降了就是没了，不留尾巴
+            if float(user_state.get("ccb_stage", 0.0) or 0.0) > 0:
+                _ccb.reset_state(user_state)
+            return None
+        score, text, stage = res
+        user_state["ccb_stage"] = float(stage)
+        user_state["ccb_last_at"] = float(moment)
+        user_state["ccb_turns"] = float(user_state.get("ccb_turns", 0.0) or 0.0) + 1.0
+        user_state["ccb_peak"] = max(
+            float(user_state.get("ccb_peak", 0.0) or 0.0), float(stage)
+        )
+        self._core._scope.mark_dirty()
+        return score, text
 
 
 def bracket(text: str) -> str:
@@ -232,10 +318,19 @@ def bracket(text: str) -> str:
     body = str(text or "").strip()
     if not body:
         return ""
-    # 已经是完整句（「她今天对你有点冷淡」）就直接括起来，括号本身就是内心独白的标记；
-    # 只给了内容的（「心里有点堵」）才补主语——补成「（她的内心：她心里有点堵。）」的话，
-    # 同一个主语说两遍。
+    # **一律补「她的内心：」**，不按首字决定。
+    #
+    # 原来的规则是「以她/你开头就不补」——于是同一个维度里有的带前缀、有的不带，
+    # 模型读到的是格式不统一的东西。更糟的是 `_attitude` / `_day_tone` / `_intimacy`
+    # 三整池都以「她」开头，**全都没拿到内心标记，直接混进外面的事实句里**：
+    # 「（你上次的火她还没消）」——角色在讲自己心里想什么，却用第三人称说自己。
+    #
+    # 措辞那边已经全部改成不带「她/你」的第一人称感受了，这里统一补前缀，
+    # 内外两层的格式就一致了：外面是事实，里面是心情。
+    #
     # 结尾**不加句号**：外层 join 时会补，否则拼出「（…。）。」这种双句号。
-    if body[0] in ("她", "你"):
-        return f"（{body}）"
+    # 已经包过的不要再包一层：套两次会变成
+    # 「（她的内心：（她的内心：心里有点堵））」——模型读到的是明显的脏数据。
+    if body.startswith("（她的内心：") and body.endswith("）"):
+        return body
     return f"（她的内心：{body}）"

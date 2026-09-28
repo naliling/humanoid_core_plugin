@@ -207,7 +207,13 @@ class SchedulePersonaTest(unittest.TestCase):
         # 原来这里断言的是「每天都沿用同一个答案」——那句出自
         # 「设定里没写的，按最合理、最省心的方式补一个出来」，是在命令模型替她造身份。
         # 现在人设照旧整段进 prompt，但没提到的部分要求留白。
-        self.assertIn("不要替他编", prompt)
+        # 这一条原来是「设定里没提到的，不要替他编：那里留白即可」。
+        # 那不是防造身份，是命令模型不发挥——效果跟字面一致：每段都挑最安全那件事，
+        # 一天下来高度雷同，设定里的特征一条也用不上（小马会拿手指拿手机就是从这来的）。
+        # 现在留的是「不造第二份身份」，撤掉的是「留白」。
+        self.assertNotIn("留白", prompt, "别再命令模型留白——那是日程雷同的根因")
+        self.assertIn("不要给她硬造第二份身份", prompt)
+        self.assertIn("别写成通用的", prompt)
 
     def test_prompt_without_persona_stays_sane(self):
         for persona in (None, Persona(), Persona(name="空壳", prompt="", source="未取到人设")):
@@ -224,7 +230,7 @@ class SchedulePersonaTest(unittest.TestCase):
 
         resolve_persona 已经截过一次，但生成日程这段不该信任调用方递进来的东西。
         """
-        from humanoid.persona import PERSONA_PROMPT_MAX
+        from humanoid.persona import PERSONA_PROMPT_MAX, truncate
         from humanoid.prompt_builder import estimate_tokens
 
         unit = "你是一个温柔体贴的女孩子，说话很短。"
@@ -235,18 +241,40 @@ class SchedulePersonaTest(unittest.TestCase):
         # 真正要保证的是「不随输入膨胀」：再大十倍，请求不该跟着变大
         self.assertLessEqual(estimate_tokens(segment_prompt(cfg(), now_text="15:20", weekday="六", persona=bigger)),
                              estimate_tokens(prompt) + 50)
-        # 绝对量：日程一天只跑 1~2 次，输入留在两千 token 内就够安全
-        self.assertLessEqual(estimate_tokens(prompt), 2000, f"实测 {estimate_tokens(prompt)}")
-        # 人设最多只能把 prompt 撑大它自己那点上界，超出部分该被截掉
-        self.assertLessEqual(len(prompt) - len(segment_prompt(cfg(), now_text="15:20", weekday="六")),
-                             PERSONA_PROMPT_MAX + 120)
+        # 绝对量：日程一天只跑 1~2 次，输入要留在预算内。
+        # 上界是「配置的人设上限 + 任务本身的固定开销」，不再写死 2000——
+        # 人设上限从 1200 提到 3000 就是为了让人设写细的人不被砍掉尾巴，
+        # 那个魔法数字跟着调，但**不随输入膨胀**这条不变。
+        # +300 是人设块的包装文字（「她是「X」。下面是她在 AstrBot 里的人格设定…」
+        # 以及下面那几条要求），它不随人设长度变，但确实要算进请求。
+        ceiling = estimate_tokens(segment_prompt(cfg(), now_text="15:20", weekday="六")) \
+            + cfg().schedule_persona_max_chars + 300
+        self.assertLessEqual(estimate_tokens(prompt), ceiling, f"实测 {estimate_tokens(prompt)}")
+        # 人设正文本身必须被截到上限内。
+        #
+        # 原来这里量的是「整个 prompt 比没人设时多出多少字」，那个差值里混着人设块的
+        # 包装文字和下面那几条要求——我改一次指示语，它就红一次，而它本来要守的是
+        # 「人设超长时被截断」这件事。直接量注入的人设正文，跟包装文字解耦。
+        injected = truncate(huge.prompt, cfg().schedule_persona_max_chars)
+        self.assertIn(injected[:80], prompt, "被截断后的人设正文应该原样出现在 prompt 里")
+        # truncate 会在末尾补一句「（以上是完整人设的开头部分。）」告诉模型被砍过，
+        # 那十几个字不算在人设正文里，但确实进了请求。
+        marker = len("（以上是完整人设的开头部分。）") + 8
+        self.assertLessEqual(
+            len(injected), cfg().schedule_persona_max_chars + marker,
+            "注入的人设正文超过了配置的上限",
+        )
         self.assertIn("以上是完整人设的开头部分", prompt)
         # 带换行的人设也要按行边界切，不能把一句话砍一半
-        lines = Persona("小娜", "\n".join(["第%d行人设内容" % i for i in range(2000)]), "x")
+        lines = Persona("小娜", "\n".join(["第%d行人设内容" % n for n in range(2000)]), "x")
         cut = segment_prompt(cfg(), now_text="15:20", weekday="六", persona=lines)
-        self.assertLessEqual(len(cut) - len(segment_prompt(cfg(), now_text="15:20", weekday="六")),
-                             PERSONA_PROMPT_MAX + 120)
-        self.assertFalse(cut.rstrip().endswith("内容写"), "不该切在一句话中间")
+        cut_injected = truncate(lines.prompt, cfg().schedule_persona_max_chars)
+        self.assertIn(cut_injected[:60], cut, "被截断的人设正文应该原样出现")
+        self.assertLessEqual(
+            len(cut_injected), cfg().schedule_persona_max_chars + marker,
+            "按行边界切完仍然超过上限",
+        )
+        self.assertFalse(cut_injected.rstrip().endswith("内容写"), "不该切在一句话中间")
 
     def test_extra_preference_still_applies(self):
         prompt = segment_prompt(cfg(schedule_prompt_extra="最近在准备考研"), now_text="15:20", weekday="六")

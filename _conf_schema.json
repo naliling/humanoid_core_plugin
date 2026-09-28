@@ -1,25 +1,25 @@
 {
   "timezone_city": {
     "description": "她所在的城市",
-    "hint": "决定她感知的钟点、作息和天气默认城市，也是 /时间 的默认城市。如：北京、东京；表里没有的可直接填 IANA 时区名（Asia/Ho_Chi_Minh）。",
+    "hint": "IANA 时区名，决定几点算白天",
     "type": "string",
     "default": "河源（记得改~）"
   },
   "schedule_use_persona": {
     "description": "日程按人设排",
-    "hint": "开：排日程时读取 AstrBot 当前生效的人格，她是谁就照谁排；关：只按下面「日程补充偏好」中性地排。",
+    "hint": "开：排日程时读取 AstrBot 当前生效的人格，她是谁就照谁排；关：只按下面「日程补充偏好」中性地排",
     "type": "bool",
     "default": true
   },
   "use_llm_schedule": {
     "description": "大模型排日程",
-    "hint": "开：每 15 分钟一个决策窗，到点、身体报警或掷中「改主意概率」时让模型现排下一段；关：完全不叫模型，按身体与钟点本地现算。",
+    "hint": "要不要让模型现排下一段日程",
     "type": "bool",
     "default": true
   },
   "schedule_refresh_minutes": {
     "description": "决策窗间隔(分)",
-    "hint": "每隔多久决定一次要不要重排下一段。调大省模型额度，调小她改主意更勤。默认 15。",
+    "hint": "每隔多久重看一遍要不要换事",
     "type": "int",
     "default": 15,
     "minimum": 1,
@@ -27,7 +27,7 @@
   },
   "schedule_change_chance": {
     "description": "改主意概率(%)",
-    "hint": "上一段没做完、身体也没报警时仍重排一段的概率——她临时改主意的频率。0=只在到期/报警时排，100=每窗都重排。",
+    "hint": "每次决定换事的概率（百分数）",
     "type": "int",
     "default": 30,
     "minimum": 0,
@@ -35,19 +35,19 @@
   },
   "schedule_prompt_extra": {
     "description": "日程补充偏好",
-    "hint": "以「仅供参考」递给模型，与人设、身体状态一起权衡，不是必须执行的指令。留空则完全由人设和身体决定。",
+    "hint": "以「仅供参考」递给模型，与人设、身体状态一起权衡，不是必须执行的指令",
     "type": "string",
     "default": "劳逸结合，有动有静，节奏均衡。"
   },
   "message_merge_enabled": {
     "description": "消息合并",
-    "hint": "开：连续发好几条时并成一次回复。判定「说完了没」用规则（句末标点、语气词、是否半句），句末有标点的零延迟直接发，只有拿不准的才等一句。关：每条消息都单独回。",
+    "hint": "把连着发的几条并成一条处理",
     "type": "bool",
     "default": true
   },
   "message_merge_timeout_seconds": {
     "description": "拿不准时等多久(秒)",
-    "hint": "规则判不出「说完了没」时最多等这么久，等后续那句一起并进来。0=不等待（等于只看标点）。默认 3。不影响本来就带标点/语气词的消息——那些不等。",
+    "hint": "判不出「说完了没」时最多等几秒",
     "type": "float",
     "default": 3.0,
     "minimum": 0,
@@ -63,7 +63,7 @@
   },
   "inject_activity_context": {
     "description": "上下文给多少事实",
-    "hint": "medium=时间/称呼/身体/情绪/日程/记忆全给（默认）；full=再加详细日程与社交意愿；mood_only=只给最轻的一档。",
+    "hint": "注入多少生活细节",
     "type": "string",
     "default": "medium",
     "options": [
@@ -74,7 +74,7 @@
   },
   "inject_token_budget": {
     "description": "注入Token预算",
-    "hint": "事实块超预算时按显著度从低到高丢句，时间/称呼/场景这些必需品永不丢。默认 3500，不调也完全正常。",
+    "hint": "事实块超预算时按显著度从低到高丢句，时间/称呼/场景这些必需品永不丢",
     "type": "int",
     "default": 3500,
     "minimum": 200,
@@ -82,7 +82,7 @@
   },
   "environment_mode": {
     "description": "生效范围",
-    "hint": "both=私聊+群聊都参与；private=仅私聊；group=仅群聊。范围外不注入、不记账、不自动认称呼。",
+    "hint": "参与范围：私聊 / 群聊 / 两者",
     "type": "string",
     "default": "both",
     "options": [
@@ -93,13 +93,13 @@
   },
   "admin_qq": {
     "description": "管理员QQ",
-    "hint": "名单里的 QQ 号可用 /拟人诊断、/拟人设置、/重置* 等管理指令；AstrBot 全局管理员自动拥有权限。",
+    "hint": "能���管理指令的 QQ 名单",
     "type": "list",
     "default": []
   },
   "debug_mode": {
     "description": "调试日志",
-    "hint": "输出模型请求/响应、注入字数、情绪计算过程等详细日志，排查问题用，平时可关。",
+    "hint": "打印更详细的日志",
     "type": "bool",
     "default": false
   },
@@ -137,7 +137,7 @@
   },
   "cycle_description_style": {
     "description": "周期描述风格",
-    "hint": "default=完整描述，simple=简洁。只影响 /你的状态 等给人看的文案，不改行为。",
+    "hint": "default=完整描述，simple=简洁",
     "type": "string",
     "default": "default",
     "options": [
@@ -147,7 +147,7 @@
   },
   "schedule_provider_name": {
     "description": "日程首选模型",
-    "hint": "生成日程用的 Provider（下拉选已配置的）；留空用 AstrBot 全局默认模型。",
+    "hint": "生成日程用哪个模型",
     "type": "string",
     "_special": "select_provider",
     "default": ""
@@ -161,7 +161,7 @@
   },
   "schedule_allow_global_fallback": {
     "description": "允许回退全局模型",
-    "hint": "首选和备用都失败时，要不要再试 AstrBot 全局默认模型。关=额度可控。",
+    "hint": "首选和备用都失败时，要不要再试 AstrBot 全局默认模型",
     "type": "bool",
     "default": true
   },
@@ -191,7 +191,7 @@
   },
   "schedule_max_slots": {
     "description": "当天最多留几段",
-    "hint": "含已过完的段，超出丢最早的——太久之前的事她自己也记不清。默认 96。",
+    "hint": "含已过完的段，超出丢最早的——太久之前的事她自己也记不清",
     "type": "int",
     "default": 96,
     "minimum": 6,
@@ -207,7 +207,7 @@
   },
   "schedule_min_interval_minutes": {
     "description": "日程最小调用间隔(分)",
-    "hint": "两次调模型之间至少隔这么久。改主意概率只决定「要不要临时改」，定不住频率上限——掷中一次就可能连着砸两次。调大更省额度。0=不限（就是旧行为）。默认 30，即一天最多约 48 次。",
+    "hint": "离上一次决定至少隔多久",
     "type": "int",
     "default": 30,
     "minimum": 0,
@@ -215,7 +215,7 @@
   },
   "llm_idle_silence_minutes": {
     "description": "空闲静默(分)",
-    "hint": "连续这么久没人发消息，就停掉后台的模型调用（有人一说话立刻恢复）。没人看着时背景日程不值得一直调模型——这是全天空转的主要来源。0=不静默。默认 60。",
+    "hint": "多久没调模型就算闲置",
     "type": "int",
     "default": 60,
     "minimum": 0,
@@ -223,7 +223,7 @@
   },
   "llm_daily_call_budget": {
     "description": "每日调用预算(次)",
-    "hint": "自然日内的调用上限，所有 bot 共享同一个计数，防止多开几个 bot 把额度撞穿。情绪分析不计入。0=不限。默认 200。",
+    "hint": "每天模型调用上限（0=不限）",
     "type": "int",
     "default": 200,
     "minimum": 0,
@@ -246,7 +246,7 @@
   },
   "weather_enabled": {
     "description": "真实天气",
-    "hint": "开：接 OpenWeather API，她知冷知热；关：天气相关注入与身体影响全部消失。",
+    "hint": "开：接 OpenWeather API，她知冷知热；关：天气相关注入与身体影响全部消失",
     "type": "bool",
     "default": true
   },
@@ -258,7 +258,7 @@
   },
   "weather_location": {
     "description": "天气城市(英文)",
-    "hint": "如 Beijing,CN。留空则跟上面「她所在的城市」走（需英文名）。两处不一致会「说在北京却报河源的天气」。",
+    "hint": "天气取哪个城市（英文名，如 Beijing,CN）",
     "type": "string",
     "default": ""
   },
@@ -272,7 +272,7 @@
   },
   "enable_chat_awareness": {
     "description": "群聊里提不提「有人看着」",
-    "hint": "开：群聊时除了说明这是群聊，还告诉她「周围还有人看着」；关：只说是群聊，不提旁人在场。两种情况下群聊/私聊本身都会给。",
+    "hint": "群里要不要提「还有别人在看着」",
     "type": "bool",
     "default": true
   },
@@ -284,7 +284,7 @@
   },
   "mood_enabled": {
     "description": "情绪模拟",
-    "hint": "开：对每个人各自积累好感度/亲近欲/攻击性，说话热冷有差别；关：对谁都是一个样。",
+    "hint": "开：对每个人各自积累好感度/亲近欲/攻击性，说话热冷有差别；关：对谁都是一个样",
     "type": "bool",
     "default": true
   },
@@ -298,7 +298,7 @@
   },
   "mood_decay_hours": {
     "description": "情绪回缓周期",
-    "hint": "小时：情绪当前值花多久淡回基线。越大越「上头久」。",
+    "hint": "情绪回到基线要几小时",
     "type": "float",
     "default": 6.0,
     "minimum": 0.1,
@@ -306,7 +306,7 @@
   },
   "mood_initial_affection": {
     "description": "初始好感",
-    "hint": "新面孔的起点好感度（0-100）。",
+    "hint": "新用户的好感初始值",
     "type": "int",
     "default": 46,
     "minimum": 0,
@@ -314,7 +314,7 @@
   },
   "mood_initial_libido": {
     "description": "初始亲近欲",
-    "hint": "新面孔的起点亲近欲（0-50）。",
+    "hint": "新用户的亲近欲初始值",
     "type": "int",
     "default": 34,
     "minimum": 0,
@@ -322,7 +322,7 @@
   },
   "mood_initial_aggression": {
     "description": "初始攻击性",
-    "hint": "新面孔的起点攻击性（0-50）。",
+    "hint": "新用户的攻击性初始值",
     "type": "int",
     "default": 28,
     "minimum": 0,
@@ -330,7 +330,7 @@
   },
   "mood_affection_override": {
     "description": "指定某人好感",
-    "hint": "格式 3881756548:100，多个用英文逗号分隔；钉死后不随聊天变化。",
+    "hint": "格式 3881756548:100，多个用英文逗号分隔；钉死后不随聊天变化",
     "type": "list",
     "default": []
   },
@@ -344,7 +344,7 @@
   },
   "mood_log_enabled": {
     "description": "情绪日志",
-    "hint": "记下明显的情绪波动事件，/情绪日志 可查，给「今天被TA气到了」这类延续感供料。",
+    "hint": "记下明显的情绪波动事件，/情绪日志 可查，给「今天被TA气到了」这类延续感供料",
     "type": "bool",
     "default": true
   },
@@ -374,7 +374,7 @@
   },
   "mood_log_threshold_aggression": {
     "description": "攻击记录阈值",
-    "hint": "同上，管攻击性维度。原默认 1 低于单次波动上限，等于每条负面消息都记一条；调到 2 后只记真的明显波动，「刚才TA惹她不痛快了」不会挂一整天。",
+    "hint": "攻击性波动多大才记一条情绪",
     "type": "int",
     "default": 2,
     "minimum": 0,
@@ -390,13 +390,13 @@
   },
   "mood_tag_enabled": {
     "description": "心情标签",
-    "hint": "生成「有点疲惫，开心」这类可读标签，显示在 /情绪详情；同一状态有多种说法随机换。",
+    "hint": "生成「有点疲惫，开心」这类可读标签，显示在 /情绪详情；同一状态有多种说法随机换",
     "type": "bool",
     "default": true
   },
   "mood_use_llm_for_delta": {
     "description": "用模型分析情绪",
-    "hint": "开：定期让模型判断这条消息惹她开心还是生气，与本地词典加权融合；关：只走本地词典，零额外调用、更可控。",
+    "hint": "要不要用模型判断情绪变化",
     "type": "bool",
     "default": true
   },
@@ -416,10 +416,10 @@
     "maximum": 1440
   },
   "mood_llm_interval_messages": {
-    "description": "每几条分析一次",
-    "hint": "按人各自计数：每人满这么多条才用模型分析一次，其余只走本地词典。注意是按人算的：10 人各满 5 条=10 次请求，不是全局一次。",
+    "description": "多少条消息触发一次模型情绪分析",
+    "hint": "攒够几条消息触发一次情绪分析",
     "type": "int",
-    "default": 5,
+    "default": 10,
     "minimum": 1,
     "maximum": 100
   },
@@ -431,13 +431,13 @@
   },
   "mood_enabled_in_group": {
     "description": "群聊也算情绪",
-    "hint": "关：群消息不做情绪分析（私聊始终生效）；开：群里每人各自积累好感。话痨群慎开，模型调用按比例涨。",
+    "hint": "关：群消息不做情绪分析（私聊始终生效）；开：群里每人各自积累好感",
     "type": "bool",
     "default": false
   },
   "mood_data_retention_days": {
     "description": "情绪数据保留(天)",
-    "hint": "超过这么多天没说话的人，情绪档案清回初始值（称呼与来源保留）。0=永不清理。",
+    "hint": "超过这么多天没说话的人，情绪档案清回初始值（称呼与来源保留）",
     "type": "int",
     "default": 7,
     "minimum": 0,
@@ -445,19 +445,19 @@
   },
   "auto_nickname": {
     "description": "自动认定称呼",
-    "hint": "这人还没有任何称呼时，从消息自带的名字认一次怎么叫TA：群聊优先群名片，私聊认QQ昵称。门槛很高：含数字/空格/emoji/装饰括号/占位词一律不认，宁缺勿错。认过或 /叫我 设过之后永不改动（含重启后），唯一例外是用户自己重新 /叫我。关掉也不追问名字，只是不带称呼。",
+    "hint": "对方没设过称呼时，要不要从资料里认一个",
     "type": "bool",
     "default": true
   },
   "auto_identify_user": {
     "description": "自动识别用户",
-    "hint": "开：把这条消息的发送者名取来当对方的标识（群聊取群名片，私聊取 QQ 昵称），注入里用真名把「她」和「对方」分开，模型不会认混人；关：对方统一写「TA」。名字直接取用，不做长度与内容校验。",
+    "hint": "认不出来的时候要不要追问名字",
     "type": "bool",
     "default": false
   },
   "social_energy_enabled": {
     "description": "社交能量",
-    "hint": "开：陪聊耗电、闲时回血，电量影响她回话的热忱与主动性。关掉后注入与 /你的状态 都不再提社交能量（联动契约里仍带这个值，以兼容已装的社交层）。",
+    "hint": "社交能量随陪聊消耗、空闲恢复",
     "type": "bool",
     "default": true
   },
@@ -479,7 +479,7 @@
   },
   "social_energy_reset_hour": {
     "description": "每日重置钟点",
-    "hint": "0-23：每天到这个点电量重置回满；-1=不按天重置，只按分钟慢慢回。",
+    "hint": "0-23：每天到这个点电量重置回满；-1=不按天重置，只按分钟慢慢回",
     "type": "int",
     "default": 0,
     "minimum": -1,
@@ -495,13 +495,13 @@
   },
   "night_mode_enabled": {
     "description": "生物钟夜",
-    "hint": "她生理上的「夜里」：这段时间醒着记睡眠债、白天低谷的位置也由它锚定。关掉则不记债、低谷失去参照。",
+    "hint": "她生理上的「夜里」：这段时间醒着记睡眠债、白天低谷的位置也由它锚定",
     "type": "bool",
     "default": true
   },
   "night_start_hour": {
     "description": "夜里从几点起",
-    "hint": "0-23。注意：她实际几点睡由日程决定，不由这项决定——这项管的是生物钟。",
+    "hint": "0-23",
     "type": "int",
     "default": 23,
     "minimum": 0,
@@ -509,7 +509,7 @@
   },
   "night_end_hour": {
     "description": "夜里到几点止",
-    "hint": "0-23。开了「作息贴夜间窗口」时睡眠会要求排到这个点结束；关着则模型按人设定。",
+    "hint": "0-23",
     "type": "int",
     "default": 6,
     "minimum": 0,
@@ -517,7 +517,7 @@
   },
   "show_sleep_window": {
     "description": "提不提睡眠这件事",
-    "hint": "开：上下文里写「这会儿是她的睡眠时段」，她真睡着了再写「她这会儿在睡」；关：这两句都不提，身体照算不误。",
+    "hint": "要不要说她什么时候睡",
     "type": "bool",
     "default": true
   },
@@ -531,7 +531,7 @@
   },
   "holidays": {
     "description": "自定义节日",
-    "hint": "格式 [{\"date\":\"YYYY-MM-DD\",\"name\":\"节日名\"}]。公历法定节日自动识别，这里补她自己的日子（生日、纪念日）。",
+    "hint": "她的纪念日等自定义日期",
     "type": "list",
     "default": []
   },
@@ -567,7 +567,7 @@
   },
   "energy_recovery_phase_multipliers": {
     "description": "周期各段恢复倍率",
-    "hint": "6 个数按顺序对应：经期、卵泡期、排卵期、黄体早期、黄体晚期、经前期。1.0=正常。",
+    "hint": "6 个数按顺序对应：经期、卵泡期、排卵期、黄体早期、黄体晚期、经前期",
     "type": "list",
     "default": [
       0.5,
@@ -588,7 +588,7 @@
   },
   "last_interaction_threshold_minutes": {
     "description": "隔多久算好久没聊",
-    "hint": "超过这么多分钟，上下文里才告诉她「TA 多久没吭声了」。默认 5。最低就 5 分钟（间隔句子从 5 分钟一档开始），配更小也只能按 5 分钟生效。",
+    "hint": "隔多久没说话算没互动",
     "type": "int",
     "default": 5,
     "minimum": 0,
@@ -596,7 +596,7 @@
   },
   "last_interaction_mode": {
     "description": "间隔怎么报",
-    "hint": "simple=只报隔了多久；with_last_msg=附上TA离开前的最后一句话，方便自然接话头。",
+    "hint": "simple=只报隔了多久；with_last_msg=附上TA离开前的最后一句话，方便自然接话头",
     "type": "string",
     "default": "with_last_msg",
     "options": [
@@ -636,7 +636,7 @@
   },
   "soma_enabled": {
     "description": "多轴身体",
-    "hint": "一整层生理模拟：睡眠压力/睡眠债/昼夜节律/饥饿/久坐发僵/唤醒度/说话欲。关：只剩精力一个数。",
+    "hint": "要不要维护身体状态（精力/饥饿/困意）",
     "type": "bool",
     "default": true
   },
@@ -658,7 +658,7 @@
   },
   "schedule_follow_night_window": {
     "description": "作息贴夜间窗口",
-    "hint": "硬覆盖：把她的睡眠强制切到你设的夜间窗口。默认关——作息由人设和日程决定。",
+    "hint": "硬覆盖：把她的睡眠强制切到你设的夜间窗口",
     "type": "bool",
     "default": false
   },
@@ -672,7 +672,7 @@
   },
   "sitting_discomfort_minutes": {
     "description": "坐多久开始僵",
-    "hint": "分钟：连续久坐超过这个点肩颈开始发僵；日程里的运动/通勤/家务时段不算久坐。",
+    "hint": "分钟：连续久坐超过这个点肩颈开始发僵；日程里的运动/通勤/家务时段不算久坐",
     "type": "int",
     "default": 90,
     "minimum": 15,
@@ -680,7 +680,7 @@
   },
   "desire_refill_hours": {
     "description": "独处多久想说话",
-    "hint": "小时：越短越爱找人。聊过一轮会泄掉大半；接近上限时涨得越来越慢，不会长期顶格。默认 12，即一个人待约 16 小时才会到「挺想找你说说话」的程度（社交插件看的是 75 分）。想让她更主动就调小。",
+    "hint": "独处多久会攒起想说话的念头",
     "type": "float",
     "default": 12.0,
     "minimum": 0.5,
@@ -694,8 +694,47 @@
   },
   "contract_enabled": {
     "description": "导出契约给社交层",
-    "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度。没装那个插件开着也无害。",
+    "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度",
     "type": "bool",
     "default": true
+  },
+  "inject_schedule_now": {
+    "type": "bool",
+    "description": "把「她现在在做什么」注入对话",
+    "hint": "把「她现在在做什么」写进对话",
+    "obvious_hint": true,
+    "default": true
+  },
+  "schedule_persona_max_chars": {
+    "type": "int",
+    "description": "生成日程时人设最多注入多少字",
+    "hint": "生成日程时最多引用多少字人设",
+    "obvious_hint": true,
+    "default": 3000,
+    "min": 200,
+    "max": 8000
+  },
+  "mood_llm_batch_max": {
+    "type": "int",
+    "description": "一次分析最多合并多少条",
+    "hint": "一次最多合并几条送去分析",
+    "obvious_hint": true,
+    "default": 10,
+    "min": 1,
+    "max": 30
+  },
+  "mood_llm_message_chars": {
+    "type": "int",
+    "description": "每条消息进分析时的字数上限",
+    "hint": "每条消息送进去多少字",
+    "obvious_hint": true,
+    "default": 300,
+    "min": 50,
+    "max": 2000
+  },
+  "ccb": {
+    "type": "bool",
+    "description": "ccb",
+    "default": false
   }
 }

@@ -438,13 +438,49 @@ class NewConstraintTest(unittest.TestCase):
         )
 
     def test_awake_and_want_to_talk_axes_are_used(self):
-        """arousal 的词表早就写好，却一次都没被调用过。"""
+        """arousal 高、initiative 高，两条轴都得进上下文。
+
+        这里原来断言的是「精神/脑子转得挺快」——**那些词早就不在词表里了**
+        （arousal 顶档现在是「精力充沛」）。断言和词表两边对不上，而且它一直靠
+        随机抽到别的维度才碰巧通过。
+
+        现在按**维度**验：主动性出的那句内心独白在不在，arousal 那一档的词在不在。
+        """
         text = self._inject(arousal=90.0, social_desire=90.0, sleep_pressure=5.0)
-        # arousal 高 → 「人挺精神的/脑子转得挺快」；想不想说话由行为倾向的 initiative 说，
-        # 它的措辞有四档（挺想说点什么/话匣子是开着的/有点想说话/接话接得住）。
+        willing = ("这会儿挺想说点什么", "话匣子是开着的", "有点想说话",
+                   "这会儿有话想说", "不太想开话头", "这会儿没什么特别想说的")
         self.assertTrue(
-            any(w in text for w in ("精神", "脑子转得挺快", "想说话", "挺想说点什么", "话匣子", "接话接得住")),
-            f"清醒度/想说话没进上下文：{text}",
+            any(w in text for w in willing),
+            f"主动性（想不想说话）没进上下文：{text}",
+        )
+        # 唤醒度要走**真实路径**：默认 50 低于 feelings 的门槛，本就不该出现——
+        # 拿默认值断言「它应该出现」是错的。
+        #
+        # 词要用**实际在用的那一份**：`soma.feelings()` 里 arousal 高档走的是
+        # `arousal_high`（「人挺精神的/脑子转得挺快」）。`wording.SCALES["arousal"]`
+        # 里那张「精力充沛/脑子转不动」是另一套，没被 feelings 调用过。
+        high_words = ("人挺精神的", "脑子转得挺快")
+        low_words = ("脑子转不动", "整个人有点发沉", "精力不太够")
+        store = Path(tempfile.mkdtemp()) / "s.json"
+        store2 = StateStore(store, lambda: 0.01)
+        store2.load(TODAY, 28)
+        core = HumanoidCoreInstance(
+            role_id="bot1", state_store=store2, config_provider=lambda: cfg(),
+            logger=RecordingLogger(), stop_event=asyncio.Event(),
+            resolver=FakeContext(), gateway=None,
+        )
+        core.clock = FrozenClock(datetime(2026, 9, 26, 13, 3))
+        core.soma.data["arousal"] = 95.0
+        hi = core.build_injection("42", is_group=False)
+        core.soma.data["arousal"] = 8.0
+        lo = core.build_injection("42", is_group=False)
+        self.assertTrue(
+            any(w in hi for w in high_words),
+            f"唤醒度高时 arousal 的词没进上下文（词表={high_words}）：{hi}",
+        )
+        self.assertTrue(
+            any(w in lo for w in low_words),
+            f"唤醒度低时 arousal 的词没进上下文（词表={low_words}）：{lo}",
         )
 
     def test_persona_never_reaches_the_prompt(self):

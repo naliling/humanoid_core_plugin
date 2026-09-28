@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any, Optional
 
@@ -31,7 +32,7 @@ MAINTENANCE_INTERVAL_SECONDS = 3600.0
 
 
 class _EngineCompat:
-    def __init__(self, core: HumanoidCoreInstance):
+    def __init__(self, core: "HumanoidCoreInstance"):
         self._core = core
 
     def reset_state(self):
@@ -45,6 +46,69 @@ class _EngineCompat:
         cycle_day = random.randint(1, cycle_length)
         cycle_day = self._core.energy.reset_cycle(cycle_day)
         return energy, social, cycle_day
+
+
+# 从人设正文里找「她叫什么」。
+#
+# 这里不叠正则——试过，两个方向都不行：
+#   · 只认「你是X」会把「你是一个温柔体贴的女孩子」整个当成名字；
+#   · 剥量词之后「温柔体贴的女孩子」还是像名字，因为中文里形容词连缀和名字长得一样。
+# 所以改成**按顺序抽词 + 逐个否决**，判据写在明处，改起来一眼能看懂。
+
+# 「你是/你叫/我是/我叫」后面的候选，只能是这些字（人名里出现的）
+_NAME_CHARS = re.compile(r"^[\u4e00-\u9fa5A-Za-z][\u4e00-\u9fa5A-Za-z0-9·\-]{0,11}$")
+
+# 抽候选：取「你是」后面到第一个标点为止的那一串
+# 抽候选。四种写法都要覆盖（少一种就漏一条真实人设）：
+#   「你是X」「你叫X」「我的名字是X」「名字是X」
+# 前面不再要求句首——「你叫小白，今年刚搬」这种写在行中间的也会被抓到，
+# 而行首要求会把「我叫阿澄」在多行人设里的第二行漏掉。
+_NAME_PICK = re.compile(
+    r"(?:你|我)(?:的)?(?:的名字是|的名字叫|名字是|名字叫|是|叫)?\s*"
+    r"([^\n，,。、；;：:！？!?\s]{1,14})"
+)
+# 「名字是X」没有主语，单独一条
+_NAME_PICK_BARE = re.compile(
+    r"名字(?:是|叫)[\s「\"\u201c]*([^\n，,。、；;：:！？!?\s]{1,14})"
+)
+
+# 抽到之后要否掉的：量词开头、通用词、纯描述
+_NAME_QUANTIFIER = re.compile(r"^(?:一|这|那|每|某)(?:个|只|位|名|条|张|头|匹|棵|朵|把|双|对|群|种|位)?")
+_NAME_STOP = {
+    "助手", "机器人", "AI", "ai", "学生", "老师", "女孩", "男孩", "女生", "男生",
+    "普通", "温柔", "体贴", "内向", "外向", "活泼", "安静", "普通人",
+    "人工", "智能", "虚拟", "二次元", "角色", "人物", "人", "猫", "狗", "马", "龙",
+}
+
+# 名字不该以这些收尾——那是形容/副词结构（「安静的」「像你的」）
+_NAME_TAIL_BAD = re.compile(r"(的|地|着|般|一样|似的|风格|样子|脾气|性格)$")
+
+# 名字里出现这些字，多半是把描述句整个吃进来了
+_NAME_DESC_WORDS = ("的", "很", "非常", "有点", "特别", "比较", "而且", "并且")
+
+
+def _name_from_text(text: str) -> str:
+    """从人设正文里抽一个像名字的词。抽不到就返回空串。"""
+    head = str(text or "")[:400]
+    for pattern in (_NAME_PICK, _NAME_PICK_BARE):
+        for m in pattern.finditer(head):
+            raw = (m.group(1) or "").strip("「」\"'\u201c\u201d ")
+            if not raw:
+                continue
+            # 「一个温柔体贴的女孩子」：量词开头的一律不是名字
+            if _NAME_QUANTIFIER.match(raw) and len(raw) > 2:
+                continue
+            # 描述句特征词
+            if any(w in raw for w in _NAME_DESC_WORDS):
+                continue
+            if not _NAME_CHARS.match(raw):
+                continue
+            if raw in _NAME_STOP or _NAME_TAIL_BAD.search(raw):
+                continue
+            if len(raw) < 1:
+                continue
+            return raw
+    return ""
 
 
 class HumanoidCoreInstance:
@@ -104,6 +168,9 @@ class HumanoidCoreInstance:
         # 重启后、第一条消息到来之前也要能按人设生成日程：把上次记账的代表会话先恢复。
         if persona_source is not None:
             persona_source.restore(role_id, self._scope.get_self("last_umo", ""))
+        # 人设可能换了 → 之前自动补的名字作废，下次重新从新的人设里取。
+        # （`char_name_auto` 是记忆项，不清的话改了人设还是叫旧名字。）
+        self._scope.set_self("char_name_auto", "")
 
         # 身体（生理层）的日程与天气都是惰性取数，避开构造顺序上的环形依赖。
         # 时间源统一走 `now_epoch()`：身体积分跟她的钟（含角色级城市覆盖）同源，
@@ -213,8 +280,17 @@ class HumanoidCoreInstance:
     def char_name(self) -> str:
         """注入里代表角色的那个名字。
 
-        优先用管理员 `/设置参照名称` 设的；没设就用人设里的名字。两者都拿不到时返回
-        空串，注入退回「她」——功能不受影响，只是代入感弱一点。
+        三级，**都不用管理员动手**：
+
+        1. 管理员 `/拟人 参照名称` 显式设的（保底手段，通常用不上）；
+        2. AstrBot 那边缓存的角色名（人设面板里填的那个）；
+        3. 人设正文里写了自称（「你是小马利亚」「我的名字是林小满」）→ **自己取出来记下来**。
+        抽不到就还是空串，注入退回「她」——**不用 role_id 顶上**，那是内部标识不是名字。
+
+        第 3 条是补上的。原来拿不到就返回空串，注入退回「她」——功能不受影响，
+        但代入感弱一大截，而且要多一个管理员指令才能补。这里让它自己选一次：人设的
+        正文里如果有「你是叫X」这类自述就用它，否则用角色自己的会话名，最后才退回角色 ID
+        的可读部分。取到的名字写进 `char_name_auto`，面板上看得见是谁、什么时候补的。
         """
         try:
             override = str(self._scope.get_self("char_name_override", "") or "").strip()
@@ -223,12 +299,76 @@ class HumanoidCoreInstance:
         if override:
             return override
         source = getattr(self, "persona_source", None)
-        if source is None:
-            return ""
+        if source is not None:
+            try:
+                cached = str(source.cached_name(self.role_id) or "").strip()
+            except Exception:
+                cached = ""
+            if cached:
+                return cached
+        # 已经补过一次就直接用，别每条消息重跑一遍正则。
+        # `char_name()` 在注入热路径上（每条消息一次），而人设不会每条都变。
         try:
-            return source.cached_name(self.role_id)
+            memo = str(self._scope.get_self("char_name_auto", "") or "").strip()
+        except Exception:
+            memo = ""
+        if memo:
+            return memo
+        auto = self._auto_char_name()
+        if auto:
+            try:
+                self._scope.set_self("char_name_auto", auto)
+            except Exception:
+                pass
+        return auto
+
+    def _auto_char_name(self) -> str:
+        """自动取名：只从人设正文里抽自称的名字。
+
+        **抽不到就返回空串**，不用 role_id 顶上。role_id 是内部标识（`bot1`、
+        `3632823490` 这种），拿它当名字会让注入变成「（bot1的内心：心里有点堵）」
+        ——比不补更糟：不补的时候注入退回「她」，那是对的。
+
+        这里必须走**同步的缓存读取**（`cached_persona`），不能调 async 的
+        `persona_source.persona()`：`char_name()` 在注入热路径上，每条消息都会调一次。
+        第一版就是调了 async 那个——拿到的是协程对象，`getattr(coro, "prompt")` 永远
+        是空，于是自动补名**从来没生效过**，还留下一堆未 await 的协程。
+        """
+        try:
+            snap = self.persona_source.cached_persona(self.role_id) if self.persona_source else None
+        except AttributeError:
+            # 老的 persona 源没有缓存读取接口，退回只取名字
+            try:
+                return str(self.persona_source.cached_name(self.role_id) or "").strip()
+            except Exception:
+                return ""
         except Exception:
             return ""
+        return _name_from_text(str(getattr(snap, "prompt", "") or ""))
+
+    def char_name_info(self) -> dict:
+        """面板上显示参照名称是从哪来的：手动设的、人设里的、还是自动补的。"""
+        try:
+            override = str(self._scope.get_self("char_name_override", "") or "").strip()
+        except Exception:
+            override = ""
+        if override:
+            return {"name": override, "source": "管理员设定"}
+        try:
+            auto = str(self._scope.get_self("char_name_auto", "") or "").strip()
+        except Exception:
+            auto = ""
+        current = self.char_name()
+        if auto and current == auto:
+            return {"name": current, "source": "自动补的（人设里没写名字）"}
+        return {"name": current, "source": "跟随人设里的名字"}
+
+    def forget_auto_char_name(self) -> None:
+        """人设换了就把自动补的名字丢掉，下次重新从新的人设里取。"""
+        try:
+            self._scope.set_self("char_name_auto", "")
+        except Exception:
+            pass
 
     def set_char_name(self, name: str) -> str:
         """管理员设定参照名称。传空/「清除」= 去掉设定，回到跟随人设名。"""
@@ -553,7 +693,7 @@ class HumanoidCoreInstance:
         if not self.config.soma_enabled:
             return
         try:
-            _, at = self.signals.last_proactive()
+            _, at = self.signals.last_proactive(self.role_id)
             streak = self.signals.ignored_streak()
         except Exception as exc:
             if self._log:
@@ -679,6 +819,12 @@ class HumanoidCoreInstance:
 
         out: list[str] = [f"Humanoid Core · {self.role_id}"]
         out.append(f"{now.strftime('%Y-%m-%d %H:%M')} 星期{s['weekday']}  ·  {s['city']}")
+        # 参照名称从哪来的：手动设的、人设里的、还是自动补的。补的也要看得见，
+        # 不然「她怎么知道我叫她什么」这种事只能靠猜。
+        info = self.char_name_info()
+        if info.get("name"):
+            out.append(row("她的名字", info["name"], info["source"]))
+
 
         out.append("")
         out.append("身体")

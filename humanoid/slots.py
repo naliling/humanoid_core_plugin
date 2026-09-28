@@ -92,7 +92,7 @@ def _snap(minutes: int, step: int) -> int:
 
 
 def _make_slot(start: int, end: int, template: Mapping[str, Any]) -> Slot:
-    return {
+    slot = {
         "start": format_time(start),
         "end": format_time(end),
         "event": str(template.get("event", "") or FILLER_SLOT["event"]),
@@ -100,6 +100,19 @@ def _make_slot(start: int, end: int, template: Mapping[str, Any]) -> Slot:
         "emotion": str(template.get("emotion", "") or FILLER_SLOT["emotion"]),
         "energy_rate": clamp_rate(template.get("energy_rate", 0.0)),
     }
+    # 「还没做完」：这件是不是一件要跨几天的事（整理那份个案笔记）。
+    #
+    # 没有它，她的每一天都是**互不相关**的——今天改方案、明天改方案，两边没有
+    # 「还没弄完」这层，于是每段都像新任务。有它，跨天就有连续性，而且它也是
+    # social 那边最好的由头来源（比天气有意思得多）。
+    ongoing = str(template.get("ongoing", "") or "").strip()[:40]
+    if ongoing:
+        slot["ongoing"] = ongoing
+    # 「她自己想做的」——一天里可以有一两段不是工作、不是必须，是她自己挑的。
+    # 以前她的日程全是 duty（门诊接待、写记录、外出），于是她像个只有日程没有生活的人。
+    if template.get("wants"):
+        slot["wants"] = True
+    return slot
 
 
 def _parse_entries(raw: Iterable[Any]) -> list[tuple[int, int, Mapping[str, Any]]]:
