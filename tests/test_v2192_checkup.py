@@ -139,9 +139,19 @@ class SceneAwarenessTest(unittest.TestCase):
         off = wrecked(self.MOMENT, enable_chat_awareness=False)
         said_on = on.build_injection("42", is_group=True)
         said_off = off.build_injection("42", is_group=True)
-        self.assertIn("周围还有人看着", said_on, said_on)
-        self.assertNotIn("周围还有人看着", said_off, said_off)
+        self.assertIn("这个会话里还有别人", said_on, said_on)
+        self.assertNotIn("这个会话里还有别人", said_off, said_off)
         self.assertIn("群聊", said_off, "关掉这一层也不能把「这是群聊」一并抹掉")
+
+    def test_group_scene_never_states_a_distance(self):
+        """群里那句不能带空间断言。
+
+        「旁边」「身边」「看着」都等于告诉模型有人在贴身盯着，模型于是戒备而不是害羞；
+        群成员可能分散在不同城市，这个断言本身就是假的。事实要给，距离不给。
+        """
+        said = wrecked(self.MOMENT, enable_chat_awareness=True).build_injection("42", is_group=True)
+        for w in ("旁边", "身边", "看着", "盯着"):
+            self.assertNotIn(w, said, f"群聊场景带了空间断言「{w}」：{said}")
 
     def test_private_chat_is_untouched_by_the_toggle(self):
         off = wrecked(self.MOMENT, enable_chat_awareness=False)
@@ -445,3 +455,42 @@ class NicknameGateTest(unittest.TestCase):
         for name in ("小明", "阿哲", "老王", "欧阳娜娜", "Lily", "李雷-韩梅"):
             with self.subTest(name=name):
                 self.assertEqual(validate_auto_nickname(name), name)
+
+
+class GroupMoodReadBoundary(unittest.TestCase):
+    """v2.24.1：群里「读」放开了，「写」没放开。
+
+    原来的闸是一刀切的——`mood_enabled_in_group` 关着时，群里连读也一并关掉，
+    于是熟人进群手里只剩「这是个群」，没有关系、没有内心、没有心情，模型只能
+    按最保险的方式推开（表现成「强硬拒绝」）。现在改成：**建过档的人照常读，
+    陌生人照旧不建档**。所以这里盯的正是那条分界线。
+    """
+
+    MOMENT = datetime(2026, 9, 25, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    def test_stranger_in_group_gets_no_mood_record(self):
+        """陌生人进群：读不到、也不该被建档。"""
+        core = wrecked(self.MOMENT, mood_enabled_in_group=False)
+        core.build_injection("stranger", is_group=True)
+        self.assertFalse(core.mood.has_profile("stranger"),
+                         "读一次就把陌生人建了档——这正是原开关要防的事")
+
+    def test_has_profile_never_creates(self):
+        core = wrecked(self.MOMENT)
+        self.assertFalse(core.mood.has_profile("nobody"))
+        self.assertFalse(core.mood.has_profile("nobody"))
+        self.assertFalse(core.mood.has_profile("nobody"))
+
+    def test_known_person_in_group_keeps_relation(self):
+        """熟人进群：关系句要给。"""
+        core = wrecked(self.MOMENT, mood_enabled_in_group=False)
+        core.mood.profile("42")["affection"] = 85.0
+        text = core.build_injection("42", is_group=True)
+        self.assertIn("对TA", text, "熟人群聊里没有关系句，模型只能退到最保险的写法")
+
+    def test_writes_stay_gated_in_group(self):
+        """写口（TA 说过什么、情绪分析）仍然要拦——不然群里每个人都会长出档案。"""
+        core = wrecked(self.MOMENT, mood_enabled_in_group=False)
+        core.on_message("stranger2", "在吗", is_group=True)
+        self.assertFalse(core.mood.has_profile("stranger2"),
+                         "群里说一句就建档，陌生人档案会无限增长")

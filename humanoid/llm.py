@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -251,6 +253,8 @@ class CallGate:
         "_log",
         "_mono",
         "_used_today",
+        "_used_by_purpose",
+        "_ledger_path",
         "_warned",
         "_wall",
     )
@@ -274,6 +278,12 @@ class CallGate:
         self._last_call: float | None = None
         self._day = ""
         self._used_today = 0
+        # 按用途分开记：日程生成和情绪分析原来是共用一个数，预算被谁吃掉了看不出来。
+        # 诊断里只给总数的时候，「今天为什么只剩 20 次」是没法回答的问题。
+        self._used_by_purpose: dict[str, int] = {}
+        # 每日额度必须落盘。以前只在内存里，AstrBot 重启一次就归零——200 次的预算
+        # 重启一次又变 200 次，这个额度形同虚设，而且诊断里看不出任何痕迹。
+        self._ledger_path = None
         self._warned: dict[str, float] = {}
 
     def note_interaction(self, now: float | None = None) -> None:
@@ -289,11 +299,71 @@ class CallGate:
         self._roll_day()
         return self._used_today
 
+    def bind_ledger(self, path) -> None:
+        """给每日额度一个落盘位置，并立刻把当天已用的读回来。
+
+        没有这一步的话，额度只活在内存里：AstrBot 重启（更新插件、崩溃恢复、容器重启）
+        都会让它归零，于是「一天 200 次」实际上是「每次重启再来 200 次」。
+        """
+        self._ledger_path = str(path)
+        # 先把 `_day` 定下来再读账本：`used_today` 是个 property，访问它会调
+        # `_roll_day()`，而 `_load_ledger` 要拿 `_day` 和账本里的 day 比对。
+        # 顺序反了的话 `_day` 还是空串，账本会被当成「别的日子」丢掉——
+        # 于是重启后额度照旧归零，而这个洞在测试里长得和「代码写错了」一模一样。
+        self._roll_day()
+        self._load_ledger()
+
+    def _load_ledger(self) -> None:
+        if not self._ledger_path:
+            return
+        try:
+            with open(self._ledger_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError):
+            # 账本读不出来就当今天还没用过。宁可多放行一次，也不要因为一个坏文件
+            # 让所有日程和情绪分析永久停摆——那比超预算严重得多。
+            return
+        if not isinstance(data, dict):
+            return
+        day = str(data.get("day") or "")
+        if day != self._day:
+            return
+        try:
+            self._used_today = max(0, int(data.get("used") or 0))
+        except (TypeError, ValueError):
+            self._used_today = 0
+        by = data.get("by_purpose")
+        if isinstance(by, dict):
+            self._used_by_purpose = {
+                str(k): int(v) for k, v in by.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+
+    def _save_ledger(self) -> None:
+        if not self._ledger_path:
+            return
+        payload = {
+            "day": self._day,
+            "used": self._used_today,
+            "by_purpose": dict(self._used_by_purpose),
+        }
+        try:
+            # 先写临时文件再改名：写到一半掉电时留下半个文件，明天就再也读不回来了。
+            tmp = f"{self._ledger_path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp, self._ledger_path)
+        except OSError:
+            pass
+
     def _roll_day(self) -> None:
         today = time.strftime("%Y-%m-%d", time.localtime(self._wall()))
         if today != self._day:
             self._day = today
             self._used_today = 0
+            self._used_by_purpose = {}
 
     def _idle_minutes(self) -> float:
         return max(0.0, float(getattr(self._config(), "llm_idle_silence_minutes", 0) or 0))
@@ -368,6 +438,8 @@ class CallGate:
         self._roll_day()
         self._last_call = self._mono()
         self._used_today += 1
+        self._used_by_purpose[purpose] = self._used_by_purpose.get(purpose, 0) + 1
+        self._save_ledger()
 
     def log_block(self, purpose: str, verdict: GateVerdict) -> None:
         """记录一次拦截。同一理由限速，否则每 30 秒一条能把日志刷爆。"""
@@ -401,6 +473,7 @@ class CallGate:
             "interval_minutes": interval,
             "budget": budget,
             "used_today": self._used_today,
+            "used_by_purpose": dict(self._used_by_purpose),
             "verdict": self.check(PURPOSE_SCHEDULE),
         }
 

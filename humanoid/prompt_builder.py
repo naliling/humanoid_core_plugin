@@ -341,9 +341,8 @@ class PromptBuilder:
         一次给三四条，模型会当成要复述的清单。
         """
         cfg = self.config
-        if not (cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group)):
-            # 群聊没开情绪时直接不给：情绪层要读 mood.profile()，那个方法**会建档**，
-            # 于是群里每个说过话的人都凭空多一份情绪档案。
+        if not self._core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
+                                        in_group=cfg.mood_enabled_in_group):
             return ""
         # ccb 需要知道「这是不是群」和「她是谁」——两条都是它的硬闸，
         # 拿不到就走安全侧（不出）。
@@ -380,7 +379,8 @@ class PromptBuilder:
         """
         cfg = self.config
         core = self._core
-        if not (cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group)):
+        if not self._core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
+                                        in_group=cfg.mood_enabled_in_group):
             return []
         seed = self._seed(user_id)
         try:
@@ -605,7 +605,12 @@ class PromptBuilder:
         cfg = self.config
         if is_group:
             # 「这是群聊」永远给；这一层「周围还有人看着」由 enable_chat_awareness 定。
-            lines: List[str] = ["群聊，周围还有人看着" if cfg.enable_chat_awareness else "群聊"]
+            # 「有人看着」是监视语气，模型读到的是「所以不许聊」——于是群里她变成
+            # 强硬拒绝。害羞要留着，但得是「这件事存在」而不是「这是禁令」，
+            # 剩下的让她按自己人设去反应。
+            # 用「会话」而不是「旁边」：群成员可能分布在不同城市，说「旁边」等于
+            # 给了距离断言，模型会当成贴身盯着，害羞就变成戒备。
+            lines: List[str] = ["群聊，这个会话里还有别人" if cfg.enable_chat_awareness else "群聊"]
         else:
             lines = ["私聊，只有她和TA"]
         now = self._core.clock.now()

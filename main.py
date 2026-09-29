@@ -287,6 +287,9 @@ class HumanoidCore(Star):
         # 闸门建在网关这一层：网关全局只有一份，所有 bot 共用它，
         # 所以每日预算与最小间隔是整个插件一起算的，不是每个 bot 各有一份。
         self.call_gate = CallGate(lambda: self._config, logger)
+        # 每日额度落盘。以前只在内存里，重启一次就归零——「一天 N 次」实际上
+        # 是「每次重启再来 N 次」，而诊断页里看不出来。
+        self.call_gate.bind_ledger(data_dir / "llm_usage.json")
         self.gateway = LLMGateway(
             self.resolver, lambda: self._config, logger, gate=self.call_gate
         )
@@ -896,6 +899,15 @@ class HumanoidCore(Star):
             if not text:
                 # 只对纯文本消息做合并；图片/语音这类照常单独回复。
                 return
+            # **跳过自己发的**。`on_message` 有这道检查，合并这里原来没有——
+            # 于是她自己在群里说的每句话（尤其是主动消息插件发的那���）都可能被
+            # 攒进 buffer 当成「用户刚说了什么」，表现出来就是**随时都在触发**，
+            # 而且模型分不清那是不是在回对方。
+            try:
+                if self._sender(event) == self._self_id(event):
+                    return
+            except Exception:
+                pass
             try:
                 umo = str(getattr(event, "unified_msg_origin", "") or "")
             except Exception:
@@ -903,7 +915,8 @@ class HumanoidCore(Star):
             if not umo:
                 return
             proceed = await self._debounce.hold(
-                event, key=umo, text=text, stop_event=event.stop_event
+                event, key=umo, text=text, stop_event=event.stop_event,
+                sender=_sender_name(event) or "TA",
             )
             if not proceed:
                 return

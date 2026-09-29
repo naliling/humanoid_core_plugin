@@ -428,6 +428,14 @@ def build_report(
             if budget > 0
             else f"- 今日预算：未限制（今天已用 {used} 次）"
         )
+        # 按用途拆开。以前只有一个总数，「今天为什么只剩 20 次」是没法回答的问题——
+        # 可能是日程排太满，也可能是情绪分析在批量跑，处置方式完全不同。
+        by = snap.get("used_by_purpose") or {}
+        if by:
+            # 用途常量本身就是中文（`PURPOSE_SCHEDULE = "日程生成"`），不用再翻。
+            parts = "、".join(f"{k} {v}" for k, v in
+                              sorted(by.items(), key=lambda kv: -kv[1]))
+            lines.append(f"- 花在哪：{parts}")
         verdict = snap["verdict"]
         lines.append(
             f"- 当前判定：{OK_MARK} {verdict.describe()}"

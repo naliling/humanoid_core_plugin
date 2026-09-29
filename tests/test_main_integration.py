@@ -439,7 +439,9 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(t1, t2)
         self.assertTrue(e1.is_stopped(), "先到的被后到的取代，不单独回")
         self.assertFalse(e2.is_stopped(), "后到的胜出，负责合并回复")
-        self.assertEqual(e2.get_extra(main_module.MERGE_EXTRA_KEY), ["我今天"])
+        got = e2.get_extra(main_module.MERGE_EXTRA_KEY)
+        self.assertIn("已合并成一条", got[0], "两条合并也要标明，否则模型会当成两个人")
+        self.assertEqual(got[1:], ["TA：我今天"], "合并后每条都带说话人——不然模型分不清自己在回谁")
 
     async def test_merge_answered_complete_sentence_is_not_delayed(self):
         """句末语气词的消息零延迟：「在吗」是两三个字，但它是完整的一问。"""
@@ -469,7 +471,11 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*[feed(ev) for ev in events])
         alive = [ev for ev in events if not ev.is_stopped()]
         self.assertEqual(len(alive), 1, f"应该只有一条胜出，实际 {len(alive)} 条")
-        self.assertEqual(alive[0].get_extra(main_module.MERGE_EXTRA_KEY), ["你", "今天"])
+        got = alive[0].get_extra(main_module.MERGE_EXTRA_KEY)
+        # 合并结果现在带说话人，且开头标明「这是合并出来的一条」。两条都要有：
+        # 没标明的话模型会当成几个人各说各的，写一条长消息把人一个个回一遍。
+        self.assertIn("已合并成一条", got[0], "必须标明这是合并出来的一条")
+        self.assertEqual(got[1:], ["TA：你", "TA：今天"], "每条都要标明是谁说的")
         self.assertEqual(
             self.star._debounce.peek_text(alive[0], ""), "你 今天 我好累啊",
             "三句应该拼成一条完整的话",
@@ -496,10 +502,21 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_merge_prepends_earlier_into_prompt(self):
         ev = FakeEvent("帮我看个问题", sender="557")
-        ev.set_extra(main_module.MERGE_EXTRA_KEY, ["在吗", "有空吗"])
+        # 合并结果现在带说话人，而且**开头会标一句「这是合并出来的」**。
+        # 不标的话模型会当成几个人各说各的，于是写一条长消息把人一个个回一遍。
+        ev.set_extra(main_module.MERGE_EXTRA_KEY, [
+            "（下面这 3 句是同一个人连着发的，已合并成一条；回一条就行，不用逐句回应）",
+            "小鱼：在吗", "小鱼：有空吗",
+        ])
         req = FakeProviderRequest(prompt="帮我看个问题")
         await self.star.inject_context(ev, req)
-        self.assertEqual(req.prompt, "在吗\n有空吗\n帮我看个问题", "更早几条按时间正序前置进 prompt")
+        text = req.prompt
+        self.assertIn("在吗", text)
+        self.assertIn("有空吗", text)
+        self.assertIn("帮我看个问题", text)
+        self.assertLess(text.index("在吗"), text.index("帮我看个问题"),
+                        "更早几条按时间正序前置进 prompt")
+        self.assertIn("已合并成一条", text, "必须标明这是合并出来的一条")
 
     async def test_merge_disabled_is_noop(self):
         self._set_merge(message_merge_enabled=False, message_merge_timeout_seconds=0.05)
@@ -558,3 +575,110 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergeKnowsWhoIsTalking(MainIntegrationTest):
+    """合并这一层的两个洞。群里回错人、或者对着合并结果逐个回应，都出在这里。
+
+    复用 `MainIntegrationTest` 的 `self.star` 与 `self._set_merge`——这两个是
+    真实的合并配置，手搓一个 `Debouncer` 测不到 `debounce_merge` 里的那道
+    「跳过自己发的」检查（它在外层，不在 Debouncer 里）。
+    """
+
+    async def _merge(self, sender, texts, sender_name="小鱼"):
+        events = [FakeEvent(t, sender=sender) for t in texts]
+        for ev in events:
+            ev.get_sender_name = lambda n=sender_name: n
+        tasks = [asyncio.create_task(self.star.debounce_merge(ev)) for ev in events]
+        for t in tasks[:-1]:
+            await asyncio.sleep(0.03)
+        await asyncio.gather(*tasks)
+        return events[-1].get_extra(main_module.MERGE_EXTRA_KEY)
+
+    async def test_each_merged_line_carries_its_speaker(self):
+        self._set_merge(message_merge_timeout_seconds=0.2)
+        got = await self._merge("557", ["我今天", "特别累", "想找人说说话"])
+        self.assertIn("已合并成一条", got[0], "必须标明是合并出来的，否则模型会当成两个人")
+        self.assertEqual(got[1:], ["小鱼：我今天", "小鱼：特别累"],
+                         "每条都要带说话人——不然模型不知道自己在回谁")
+
+    async def test_it_tells_the_model_to_reply_once(self):
+        self._set_merge(message_merge_timeout_seconds=0.2)
+        got = await self._merge("557", ["我今天", "特别累", "想找人说说话"])
+        self.assertIn("回一条就行", got[0])
+        self.assertIn("不用逐句回应", got[0],
+                      "不明确禁掉逐句回应，模型看到两句话就会写长消息挨个回")
+
+    async def test_her_own_message_is_never_buffered(self):
+        """**「随时都在触发」的真凶。**
+
+        `on_message` 有一道「跳过自己发的」检查，`debounce_merge` 原来没有——
+        所以她自己在群里说的每句（尤其主动消息插件发的那几条）都被当成
+        「用户刚说了什么」攒进 buffer。表现出来就是随时都在触发，而且分不清
+        那是不是在回对方。
+
+        这条钉的是**那道检查存在**，不是它的效果：效果断了顶多少是慢一点，
+        缺了它则是「她在等自己说话」。
+        """
+        import inspect
+        src = inspect.getsource(main_module.HumanoidCore.debounce_merge)
+        self.assertIn("_self_id", src,
+                      "合并这一层必须跳过自己发的，否则她自己的话会被当成用户的话")
+        self.assertLess(src.index("_self_id"), src.index("self._debounce.hold"),
+                        "必须在进 hold 之前就跳掉")
+
+
+class ProactiveMessageMustNotFeedTheDebouncer(unittest.TestCase):
+    """端到端复现：**主动消息发出去 → 事件回到事件总线 → 不该进防抖 buffer**。
+
+    这个洞是这么发现的：容器里她「随时都在触发」，而触发量远超用户的实际发言。
+    原因不在 social——它发消息走 `send_message`，不经过 Core 的
+    `on_waiting_llm_request`。真正的原因在 Core 这一层：
+
+      · `on_message` 有一道「跳过自己发的」检查
+      · `debounce_merge` 原来**没有**
+
+    所以她自己在群里说的每一句（尤其主动消息插件发的那几条）都被当成
+    「用户刚说了什么」攒进 buffer。表现出来就是：她没在等用户，她在等自己。
+
+    这条测试不复述代码里有没有那句话，而是**真的走一遍**——把自己的话当事件
+    送进 `debounce_merge`，断言它没被攒下、也没挡住下一条真人消息。
+    """
+
+    def setUp(self):
+        self._raw = {"llm_daily_call_budget": 0, "message_merge_enabled": True,
+                     "message_merge_timeout_seconds": 0.2}
+        self.ctx = FakeContext()
+        self.star = main_module.HumanoidCore(self.ctx, self._raw)
+        self.ctx.star = self.star
+
+    def test_her_own_line_is_dropped_and_the_next_real_one_still_merges(self):
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.star.initialize())
+
+            # 她自己刚发出去的那条（主动消息插件发的），被平台当成事件派发回来。
+            mine = FakeEvent("今天吃的好饱", sender="bot1")
+            mine._self_id = "bot1"
+            mine._sender_name = "小夜"
+            loop.run_until_complete(self.star.debounce_merge(mine))
+            self.assertIsNone(mine.get_extra(main_module.MERGE_EXTRA_KEY),
+                              "她自己的话被当成用户消息攒起来了——这是随时都在触发的真凶")
+
+            # 紧跟着真人来两条真话：这两个人**该**被合并。
+            a = FakeEvent("我今天", sender="557")
+            a._self_id = "bot1"
+            b = FakeEvent("特别累", sender="557")
+            b._self_id = "bot1"
+            t1 = loop.create_task(self.star.debounce_merge(a))
+            loop.run_until_complete(asyncio.sleep(0.03))
+            t2 = loop.create_task(self.star.debounce_merge(b))
+            loop.run_until_complete(asyncio.gather(t1, t2))
+            got = b.get_extra(main_module.MERGE_EXTRA_KEY)
+            self.assertIsNotNone(got, "真人消息该照常合并——别为了挡自己发的把功能一起关了")
+            self.assertIn("已合并成一条", got[0])
+            loop.run_until_complete(self.star.terminate())
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()

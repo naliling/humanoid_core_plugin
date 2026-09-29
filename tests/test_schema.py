@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -127,3 +128,42 @@ class MetadataTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadmeCommandsMatchCode(unittest.TestCase):
+    """README 里的指令表必须和**实际注册**的一致。
+
+    v2.24.2 修了这一处：v2.x 把 8 个常用指令从 `/拟人` 组里拆成了顶层命令
+    （`/你的状态` 而不是 `/拟人 状态`），但 README 那张表没跟着改——照着 README 打的
+    **一条都执行不了**，而且命令名本身也全错（`状态` vs `你的状态`、
+    `日程` vs `查看日程`、`帮助` vs `拟人帮助`）。
+
+    文档漂移是这类项目最容易反复发作的问题：改了代码忘了改文档，或者反过来。
+    这里直接从 `main.py` 里解析出真实的注册名，反查 README 有没有漏。
+    """
+
+    def _registered(self) -> tuple:
+        import re
+        src = (SCHEMA_PATH.parent / "main.py").read_text(encoding="utf-8")
+        top = set(re.findall(r'@filter\.command\("([^"]+)"\)', src))
+        grouped = set(re.findall(r'@humanoid_group\.command\("([^"]+)"\)', src))
+        return top, grouped
+
+    def test_readme_lists_every_registered_command(self):
+        top, grouped = self._registered()
+        self.assertTrue(top and grouped, "从 main.py 解析不到命令，测试本身失效了")
+        readme = (SCHEMA_PATH.parent / "README.md").read_text(encoding="utf-8")
+        # 顶部那张表是「不带前缀」的区段：从标题到管理员表为止。
+        head = readme.split("**管理员 · 改配置**")[0]
+        for name in top:
+            self.assertIn(f"/{name}", head,
+                          f"README 顶部表里没有顶层指令 /{name}（实际已注册）")
+        for name in grouped:
+            self.assertIn(f"/拟人 {name}", readme,
+                          f"README 里没有管理员指令 /拟人 {name}（实际已注册）")
+
+    def test_readme_does_not_promise_removed_prefixes(self):
+        """不能出现 `/拟人 状态` 这种已经拆掉的写法（历史说明那一行除外）。"""
+        readme = (SCHEMA_PATH.parent / "README.md").read_text(encoding="utf-8")
+        bad = re.findall(r"`/拟人 (状态|日程|时间|好感度|情绪详情|情绪日志|叫我|帮助)`", readme)
+        self.assertEqual(bad, [], f"README 仍写着已拆掉的旧指令：{bad}")

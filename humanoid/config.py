@@ -231,6 +231,12 @@ class HumanoidConfig:
     mood_sensitivity: int = 60
     mood_decay_hours: float = 6.0
     mood_initial_affection: int = 46
+    # ccb 的四个门槛，与 ccb.py 里的同名常量保持一致（schema 有测试钉住）。
+    # 面板上不解释它们是什么：那是用户自己去试的事，写清楚反而是替他们做判断。
+    ccb_libido_min: float = 38.0
+    ccb_libido_rise: float = 4.0
+    ccb_affection_min: float = 78.0
+    ccb_affection_rise: float = 12.0
     mood_initial_libido: int = 34
     mood_initial_aggression: int = 28
     mood_affection_override: tuple[str, ...] = ()
@@ -390,6 +396,10 @@ class HumanoidConfig:
             mood_sensitivity=i("mood_sensitivity", 0, 100),
             mood_decay_hours=f("mood_decay_hours", 0.1, 720.0),
             mood_initial_affection=i("mood_initial_affection", 0, 100),
+            ccb_libido_min=f("ccb_libido_min", 0.0, 50.0),
+            ccb_libido_rise=f("ccb_libido_rise", 0.0, 20.0),
+            ccb_affection_min=f("ccb_affection_min", 0.0, 100.0),
+            ccb_affection_rise=f("ccb_affection_rise", 0.0, 50.0),
             mood_initial_libido=i("mood_initial_libido", 0, 50),
             mood_initial_aggression=i("mood_initial_aggression", 0, 50),
             mood_affection_override=_as_str_tuple(pick("mood_affection_override")),

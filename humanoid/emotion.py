@@ -280,8 +280,15 @@ class EmotionLayer:
         raw = f"ccb:{getattr(self._core, 'role_id', '')}:{user_id}".encode("utf-8")
         idx = int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big") % 2
         user_state = self._core._scope.user_state(user_id)
+        _cfg = self._core.config
         res = _ccb.evaluate(
             enabled=True,
+            # 门槛从配置取。写死在这个模块里的话，用户看到「够不着」却无处可调——
+            # 而这个开关默认的 affection 门槛对多数人是永远够不着的。
+            libido_min=getattr(_cfg, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN),
+            libido_rise=getattr(_cfg, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE),
+            affection_min=getattr(_cfg, "ccb_affection_min", _ccb.CCB_AFFECTION_MIN),
+            affection_rise=getattr(_cfg, "ccb_affection_rise", _ccb.CCB_AFFECTION_RISE),
             is_group=is_group,
             persona_prompt=persona_prompt,
             affection=_num(state.get("affection"), 46.0),
@@ -291,6 +298,7 @@ class EmotionLayer:
             energy=energy,
             last_at=float(user_state.get("ccb_last_at", 0.0) or 0.0),
             now=float(moment),
+            turns_today=float(user_state.get("ccb_turns", 0.0) or 0.0),
             index=idx,
         )
         if res is None:
@@ -302,9 +310,13 @@ class EmotionLayer:
         user_state["ccb_stage"] = float(stage)
         user_state["ccb_last_at"] = float(moment)
         user_state["ccb_turns"] = float(user_state.get("ccb_turns", 0.0) or 0.0) + 1.0
-        user_state["ccb_peak"] = max(
-            float(user_state.get("ccb_peak", 0.0) or 0.0), float(stage)
-        )
+        # 推进场景。跨天的回落和次数重算都发生在这一步里，所以只在真进场景时
+        # 才付这个代价——没进场景的日子不该把状态改掉。
+        if _ccb.advance_satisfy(user_state, float(moment)):
+            # 刚到顶：这一次是收场，扣一次体力。
+            self._core._scope.set_self(
+                "energy", max(0.0, float(self._core.energy.energy) - _ccb.CCB_ENERGY_COST)
+            )
         self._core._scope.mark_dirty()
         return score, text
 

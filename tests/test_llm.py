@@ -619,3 +619,84 @@ class GateIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DailyBudgetSurvivesRestart(unittest.TestCase):
+    """每日额度必须落盘——以前它只活在内存里。
+
+    `CallGate._used_today` 是纯内存字段，AstrBot 重启（改配置、崩溃恢复、容器重启）
+    都会让它归零。于是「一天 200 次」实际是「每次重启再来 200 次」，额度形同虚设，
+    而诊断页里 `_used_today` 归零，看起来一切正常。**查不出来的那种洞。**
+    """
+
+    # 用真实的日期推导而不是写死：`_day` 是 CallGate 自己从墙钟算出来的，
+    # 这里手写一个值会绕过 `_roll_day`，测试就测不到真实路径了（写死过一次，
+    # 测出来的失败是假的）。
+    DAY_NOW = 1758844800.0     # 2025-09-26
+    DAY_TOMORROW = 1758844800.0 + 86400.0
+
+    def _gate(self, ledger, wall=None):
+        from humanoid.llm import CallGate
+
+        class Cfg:
+            llm_daily_call_budget = 5
+            schedule_min_interval_minutes = 0
+            llm_idle_silence_minutes = 0
+
+        t = self.DAY_NOW if wall is None else wall
+        g = CallGate(lambda: Cfg(), None, wall_clock=lambda: t, monotonic=lambda: t)
+        g.bind_ledger(ledger)
+        return g
+
+    def test_used_count_is_restored_in_a_fresh_gate(self):
+        import tempfile
+        from pathlib import Path
+        ledger = Path(tempfile.mkdtemp()) / "llm_usage.json"
+        first = self._gate(ledger)
+        for _ in range(3):
+            first.consume("schedule")
+        self.assertEqual(first.used_today, 3)
+
+        # 用满预算（上限 5）。用 3 次的话根本撞不到上限，测不出「重启后还认不认账」。
+        for _ in range(2):
+            first.consume("schedule")
+        self.assertEqual(first.used_today, 5)
+
+        # 模拟重启：全新的 CallGate，同一个账本文件
+        second = self._gate(ledger)
+        self.assertEqual(second.used_today, 5,
+                         "重启后额度归零 = 预算形同虚设")
+        self.assertFalse(second.check("schedule").allowed,
+                         "重启后应该仍然撞上预算上限")
+
+    def test_ledger_rolls_over_at_midnight(self):
+        import tempfile
+        from pathlib import Path
+        ledger = Path(tempfile.mkdtemp()) / "llm_usage.json"
+        self._gate(ledger).consume("schedule")          # 今天用掉一次
+        g2 = self._gate(ledger, wall=self.DAY_TOMORROW)  # 同一个账本，明天
+        self.assertEqual(g2.used_today, 0, "换了一天就该重新给额度")
+
+    def test_usage_is_broken_down_by_purpose(self):
+        import tempfile
+        from pathlib import Path
+        ledger = Path(tempfile.mkdtemp()) / "llm_usage.json"
+        g = self._gate(ledger)
+        g.consume("schedule")
+        g.consume("schedule")
+        g.consume("mood")
+        self.assertEqual(g.snapshot()["used_by_purpose"], {"schedule": 2, "mood": 1},
+                         "预算被谁吃掉了必须查得到")
+
+    def test_corrupt_ledger_does_not_freeze_the_plugin(self):
+        """坏账本按「今天还没用过」处理。
+
+        反过来做（读不出来就当超预算）会让所有日程和情绪分析永久停摆——那比
+        多放行几次严重得多。"""
+        import tempfile
+        from pathlib import Path
+        ledger = Path(tempfile.mkdtemp()) / "llm_usage.json"
+        ledger.write_text("{半个文件", encoding="utf-8")
+        g = self._gate(ledger)
+        self.assertEqual(g.used_today, 0)
+        self.assertTrue(g.check("schedule").allowed)

@@ -193,6 +193,33 @@ class MoodService:
     def config(self) -> HumanoidConfig:
         return self._config()
 
+    def has_profile(self, user_id: str) -> bool:
+        """这个对话对象建过情绪档案没——**不建档的判据**。
+
+        `profile()` 会给没档案的人现建一份，群聊里拿它读状态就意味着
+        每个在群里说过话的人都凭空多一份档案，于是 `mood_enabled_in_group`
+        被关成默认 False。代价是熟人也没了关系感，群里她只剩「这是个群」，
+        于是模型按最保险的方式推开——这是「群里强硬拒绝」的由来。
+        """
+        record = self._scope.user_state(user_id).get("mood")
+        return isinstance(record, dict)
+
+    def readable(self, user_id: str, is_group: bool, *, enabled: bool, in_group: bool) -> bool:
+        """此刻能不能读 TA 的情绪层。
+
+        `mood_enabled_in_group=False` 挡的是**写**（情绪分析、记住 TA 说过什么），
+        不是**读**。原先读也被一并关掉，于是熟人进群手里只剩「这是个群」，
+        没有关系、没有内心、没有心情，模型只能按最保险的方式推开。
+
+        规则只有一条，所以只写在这一个地方——情绪层、关系层、行为层三处都调它。
+        抄三份的代价是改一处漏两处，漏的那处会静悄悄地给陌生人建档。
+        """
+        if not enabled:
+            return False
+        if not is_group or in_group:
+            return True
+        return self.has_profile(user_id)
+
     def profile(self, user_id: str) -> dict[str, Any]:
         user_state = self._scope.user_state(user_id)
         record = user_state.get("mood")
@@ -876,6 +903,14 @@ class MoodService:
             '{"affection_delta": 0, "libido_delta": 0, "aggression_delta": 0}.\n'
             "数值范围：affection -10~10，libido -5~5，aggression -5~5。\n"
             "给的是**这一整段的净变化**，不是每条的平均，也不是最后一条的影响。\n"
+            # 以前 libido 和另外两根轴一样只给了范围，模型不知道什么时候该给正数，
+            # 于是它多半给 0 或者负数——这根轴常年卡在基线附近，ccb 的门槛
+            # （绝对值 + 涨幅）就永远过不了。实测长期停在 32~33 就是这么来的。
+            # 方向性必须写明：**只说什么时候涨，不说什么时候跌**。给跌也写了引导的话，
+            # 她会在正常聊天里自己把欲望扣下去，于是永远起不来。
+            "libido 只看有没有亲近的信号：对方想挨着、想念、暧昧、调情这类，"
+            "给正数（最多 +5，越明确越接近满）；没有这类信号就给 0。"
+            "除非对方明显冷淡、推开或者在拒绝，否则不给负数。\n"
             + (
                 "尤其要看语气怎么变的：铺垫、反转、先热后冷、说完又推翻——"
                 "只看最后一句会判反，这正是原来只看一条时的毛病。\n"

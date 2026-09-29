@@ -41,12 +41,20 @@ MERGE_EXTRA_KEY = "humanoid_merge_earlier"
 MERGE_TEXT_EXTRA_KEY = "humanoid_merge_text"
 
 
+def join_texts(buffer: list, limit: int) -> str:
+    """判断「说完了吗」时用：只要文本，说话人不参与。"""
+    return join([b if isinstance(b, str) else b[1] for b in buffer], limit=limit)
+
+
 @dataclass
 class _Session:
     """一个会话的合并状态。`seq` 是单调递增的入场序号，用来判「我是不是最后一条」。"""
 
     seq: int = 0
-    buffer: List[str] = field(default_factory=list)
+    # (说话人, 文本)。**必须带说话人**：群里同一个 umo 下所有人是共用一格的，
+    # 原来只存文本，于是 A 和 B 的话被并成一段、模型看到两句话却没有归属，
+    # 分不清自己在回谁——「他不知道是不是在回他还是在回别人」。
+    buffer: List[tuple] = field(default_factory=list)
     last_active: float = field(default_factory=time.monotonic)
 
 
@@ -88,7 +96,8 @@ class Debouncer:
 
     # ------------------------------------------------------------------
 
-    async def hold(self, event: Any, *, key: str, text: str, stop_event: Callable[[], None]) -> str:
+    async def hold(self, event: Any, *, key: str, text: str, stop_event: Callable[[], None],
+                 sender: str = "") -> str:
         """处理一条「即将调 LLM」的消息。
 
         返回值是**这条消息要不要继续往下走**：False 表示已经被合并掉了（调用方直接返回）。
@@ -106,13 +115,13 @@ class Debouncer:
         sess = self._sessions.setdefault(key, _Session())
         sess.seq += 1
         my_seq = sess.seq
-        sess.buffer.append(body)
+        sess.buffer.append((sender, body))
         sess.last_active = time.monotonic()
         if len(sess.buffer) > max_count:
             del sess.buffer[:-max_count]
         self._sweep()
 
-        verdict = judge(join(sess.buffer, limit=max_count), buffer_len=len(sess.buffer))
+        verdict = judge(join_texts(sess.buffer, limit=max_count), buffer_len=len(sess.buffer))
         if verdict.complete and verdict.sure:
             self._release(event, sess, max_count)
             self._debug(f"直接放行（{verdict.why}）：{body[:20]}")
@@ -149,7 +158,16 @@ class Debouncer:
         sess.last_active = time.monotonic()
         if not batch:
             return
-        earlier = batch[:-1]
+        if len(batch) <= 1:
+            earlier = []
+        else:
+            # 明确告诉模型这是**一条合并出来的消息**。不标的话它会当成几个人在
+            # 各说各的，于是写一条长消息把人一个个回一遍——那比不合并还糟。
+            earlier = [
+                f"（下面这 {len(batch)} 句是同一个人连着发的，已合并成一条；"
+                f"回一条就行，不用逐句回应）"
+            ]
+            earlier += [f"{who}：{body}" if who else body for who, body in batch[:-1]]
         setter = getattr(event, "set_extra", None)
         if not callable(setter):
             return

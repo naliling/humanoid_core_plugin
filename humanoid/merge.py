@@ -128,7 +128,10 @@ def join(messages: List[str], *, limit: int = 6) -> str:
     按原样用空格连接，不加分隔符：模型看到的是用户连着打的那几句话本身。
     """
     limit = max(1, int(limit))
-    parts = [normalize(m) for m in (messages or []) if normalize(m)]
+    # buffer 里存的是 (说话人, 文本)。**说话人不参与拼接**——它只给注入层标
+    # 归属用；混进正文里就成了「A：… B：…」这种样子，模型会当成对话。
+    flat = [m[1] if isinstance(m, tuple) else m for m in (messages or [])]
+    parts = [normalize(m) for m in flat if normalize(m)]
     if not parts:
         return ""
     return " ".join(parts[-limit:])

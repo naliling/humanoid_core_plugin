@@ -417,8 +417,12 @@ class BehaviorService:
         群聊里没开成员情绪档案时返回空：那条路上连关系都不记，注意力更不该去建用户条目。
         """
         cfg = self.config
-        if cfg.mood_enabled and is_group and not cfg.mood_enabled_in_group:
-            return {}
+        # 下面走的是 `mood.profile()`，那个方法**会建档**，所以陌生人在群里不能读——
+        # 否则群成员只要一开口就凭空多一份情绪档案。判据统一走 `mood.readable`。
+        if not self._core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
+                                        in_group=cfg.mood_enabled_in_group):
+            if cfg.mood_enabled:
+                return {}
         if not cfg.mood_enabled:
             return {"care": 0.5, "focus": self._focus(user_id, text, {}), "spare": self._spare(now)}
         try:

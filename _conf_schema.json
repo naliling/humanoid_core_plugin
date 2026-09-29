@@ -736,5 +736,25 @@
     "type": "bool",
     "description": "ccb",
     "default": false
+  },
+  "ccb_libido_min": {
+    "type": "float",
+    "default": 38.0,
+    "description": "ccb 阈值（0~50）"
+  },
+  "ccb_libido_rise": {
+    "type": "float",
+    "default": 4.0,
+    "description": "ccb 阈值（0~20）"
+  },
+  "ccb_affection_min": {
+    "type": "float",
+    "default": 78.0,
+    "description": "ccb 阈值（0~100）"
+  },
+  "ccb_affection_rise": {
+    "type": "float",
+    "default": 12.0,
+    "description": "ccb 阈值（0~50）"
   }
 }
