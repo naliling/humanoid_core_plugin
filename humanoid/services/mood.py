@@ -26,9 +26,67 @@ NEGATIVE_PATTERN = re.compile(
 )
 POSITIVE_PATTERN = re.compile(r"(爱|喜欢|好|棒|厉害|赞|开心|谢谢|感谢|乖|可爱|聪明)", re.IGNORECASE)
 
+# **冷淡/敷衍**——和脏话是两类东西，不能塞进 NEGATIVE_PATTERN。
+#
+# 原来只有脏话能让她掉分，于是「嗯」「哦」「随你」「不想说」这类真正让人心里
+# 一沉的敷衍什么都匹配不上，走那个 `random.uniform(-0.5, 0.5)` 的中性分支——
+# 均值是 0，攒一百次也攒不出变化。**能让她掉分的是骂她的人，不是冷她的人。**
+#
+# 权重刻意轻（脏话是 -2~-4，这里只有 -0.4~-1.2）：日常冷淡是**一滴滴**的，不是
+# 一记重拳。真正让它显形的是账本的累积——单句几乎不动，连着两周的敷衍才会把
+# 好感拉下来。这比在文本里猜「TA 是不是故意的」可靠得多。
+_COLD_PATTERN = re.compile(
+    r"(嗯+|哦+|唔+|随便|随你|都行|无所谓|不用了|没必要|不想说|没什么好说的|"
+    r"再说吧|下次吧|算了吧|随便你|你爱怎样|关我什么事|懒得理|不想理|别烦我|"
+    r"没什么|不重要|无所谓了|就那样吧|反正你也不|算了)",
+    re.IGNORECASE,
+)
+
+# **对方在说自己今天的状态**，不是在冷我们。
+#
+# 这一条是冷淡识别里最难的部分，也是最容易做错的地方：「我今天有点烦」「我好累」
+# 里有「烦」「累」，跟冷淡词长得像。但那是 TA 自己难受，不是 TA 对我们冷淡——
+# 记成负分就是冤枉人，而且会让「她今天不顺所以对我冷」和「她对我冷」分不开。
+#
+# 所以先排掉这一类，再看冷淡词。宁可漏判（只是少扣一点分），不可错判。
+_SELF_STATE_PATTERN = re.compile(
+    r"(我|今天我|最近我)[^。！？\n]{0,6}"
+    r"(烦|累|累死|难过|想哭|没劲|心情不好|不开心|难受|不想说话|状态不好|"
+    r"失眠|头疼|不舒服|倒霉|心累|丧)",
+    re.IGNORECASE,
+)
+
 AFFECTION_RANGE = (0.0, 100.0)
 LIBIDO_RANGE = (0.0, 50.0)
 AGGRESSION_RANGE = (0.0, 50.0)
+# 账本在 mood record 里的键。存的是「发生过的事」，不是累加结果。
+LEDGER_KEY = "ledger"
+
+
+# 「很敷衍」这个词只留给**真的被骂/被明确推拒**——被不回不是被骂。
+# 区分靠来源标记：消息里的辱骂带 `from_msg`，主动联系没被回带 `from_silence`。
+def _event_kind(weight: float, kind: str = "") -> str:
+    """一笔账的**性质**——她要能说出「你最近在敷衍我」，就得知道这是敷衍。
+
+    「很敷衍」留给**骂人**，被不回不是被骂：发出去没人理是很伤人，可对方多半
+    只是没看见。把两者混成同一个词，她嘴上就会说出比心里更重的 judgment。
+    """
+    try:
+        w = float(weight)
+    except (TypeError, ValueError):
+        return ""
+    if kind == "没被理":
+        # 主动发出去没人回，再多次也只是「被冷落」，不该升级成「很敷衍」。
+        return "一直没被理" if w <= -3.0 else "有点冷"
+    if w >= 3.0:
+        return "很上心"
+    if w > 0:
+        return "温和"
+    if w <= -3.0:
+        return "很敷衍"
+    return "有点冷"
+
+
 DIMENSIONS = (
     ("affection", "base_affection", AFFECTION_RANGE),
     ("libido", "base_libido", LIBIDO_RANGE),
@@ -131,10 +189,25 @@ class Delta:
         )
 
 def local_delta(text: str) -> Delta:
+    # 自我状态**最先**判，而且它一票否决后面所有分支。
+    #
+    # 它必须排在 NEGATIVE 前面：「我今天有点烦」里有「烦」，会命中负面那条，
+    # 于是对方说自己难受、却被记成「TA 对我冷淡」——冤枉人。
+    # 顺带修掉一个更老的错：「我好累」里的「好」会命中正向，给了 +1 分。
+    #   自我状态 = TA 自己难受，跟我们没关系，不该进账本任何一边。
+    if _SELF_STATE_PATTERN.search(text):
+        return Delta(random.uniform(-0.5, 0.5), random.uniform(-0.3, 0.3), random.uniform(-0.3, 0.3))
     if NEGATIVE_PATTERN.search(text):
         return Delta(random.uniform(-4, -2), random.uniform(-2, -1), random.uniform(2, 4))
     if POSITIVE_PATTERN.search(text):
         return Delta(random.uniform(1, 3), random.uniform(0.5, 2), random.uniform(-1, -0.5))
+    if _COLD_PATTERN.search(text):
+        # 轻。一句「嗯」几乎不推好感，但连着两周的敷衍会在账本里攒成一条。
+        #
+        # 区间必须和中性分支**不重叠**：中性是 (-0.5, 0.5)，原来这里写的是
+        # (-1.2, -0.4)——两段在 (-0.5, -0.4) 交叠，于是「敷衍」和「没说话」
+        # 从数值上根本分不开，测试都没法判断一条到底属于哪边。留一条缝。
+        return Delta(random.uniform(-1.2, -0.6), 0.0, random.uniform(-0.6, 0.2))
     return Delta(random.uniform(-0.5, 0.5), random.uniform(-0.3, 0.3), random.uniform(-0.3, 0.3))
 
 
@@ -835,24 +908,166 @@ class MoodService:
 
         return delta.capped(float(cfg.mood_affection_delta_cap))
 
+    # 账本条目数上限。够记住「最近这阵子都发生了什么」，又不至于让 state.json
+    # 随时间膨胀。按 6 小时时衰，半衰期 3 天的话 60 条约等于两三周。
+    LEDGER_MAX = 60
+    # 时衰半衰期（小时）。3 天：上个月的事基本不参与了，但「他一直很耐心」那种
+    # 靠的是最近几笔的叠加，不是靠单笔记很久。
+    LEDGER_HALF_LIFE_HOURS = 72.0
+
+    def _ledger_append(self, record: dict, delta: Delta, now: float,
+                       kind: str = "") -> None:
+        """记下这一笔**发生过的事**，而不是把它直接加到好感上。
+
+        原来 `record[key] = clamp(before[key] + values[key])` 是纯累加器——
+        只能往上，因为没有任何机制把「他已经不来了」这件事记成负的。于是好感只涨
+        不跌，最后被衰减拉回 base 就算完事。
+        """
+        weight = float(delta.affection)
+        if abs(weight) < 1e-3:
+            return
+        # **负向更重**：「下的快上的也快」。
+        # 对称的话，一段冷淡期抵不过之前十几句好话——好感就永远悬在设定值之上，
+        # 那还是「只涨不跌」换了个说法。真人也是这样：暖起来要一阵子，冷下去
+        # 一次就够了。
+        if weight < 0:
+            weight *= 1.6
+        led = record.get(LEDGER_KEY)
+        if not isinstance(led, list):
+            led = []
+        led.append({
+            "t": round(float(now), 1),
+            "w": round(weight, 3),
+            "k": _event_kind(weight, kind),
+        })
+        if len(led) > self.LEDGER_MAX:
+            del led[:-self.LEDGER_MAX]
+        record[LEDGER_KEY] = led
+
+    def _ledger_total(self, record: dict, now: float) -> float:
+        """账本在**此刻**的净值。每笔按距今时长时衰。
+
+        这是「只涨不跌」的正解：她三个月前对你好，今天不理你了——那三笔早就衰到
+        接近 0，而**今天这一笔负的还在**。累加器做不到这一点，因为累加器只
+        记得「曾经加过」，不记得「那件事已经过去了」。
+        """
+        led = record.get(LEDGER_KEY)
+        if not isinstance(led, list) or not led:
+            return 0.0
+        half = self.LEDGER_HALF_LIFE_HOURS
+        total = 0.0
+        for item in led:
+            if not isinstance(item, dict):
+                continue
+            try:
+                age = max(0.0, (now - float(item.get("t", now))) / 3600.0)
+                w = float(item.get("w", 0.0))
+            except (TypeError, ValueError):
+                continue
+            total += w * (0.5 ** (age / half))
+        return total
+
+    def recent_events(self, user_id: str, limit: int = 3) -> List[Tuple[str, str]]:
+        """最近那几件**具体的事**——她能说得出「你最近老是敷衍我」的原因。
+
+        原来她只有数字：70 分和 88 分在她眼里是同一个数，只是换了一句措辞。
+        这就是「好感度不好用」的根源——它不记事。
+        """
+        try:
+            record = self._scope.user_state(user_id).get("mood")
+        except Exception:
+            return []
+        if not isinstance(record, dict):
+            return []
+        led = record.get(LEDGER_KEY)
+        if not isinstance(led, list):
+            return []
+        out: List[Tuple[str, str]] = []
+        for item in reversed(led[-max(1, limit) * 2:]):
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("k") or "")
+            if not kind:
+                continue
+            out.append((kind, str(item.get("t", ""))))
+            if len(out) >= limit:
+                break
+        return out
+
+    def note_ignored_by_peer(self, user_id: str, streak: int) -> None:
+        """她主动找了 TA、没被回——**记进账本**。
+
+        原来这条链路是断的：社交层把「被冷落」写进信号文件，Core 读到之后
+        `soma.set_social_feedback(streak)`——接的是**社交能量**（她少想找人说话），
+        不是**好感度**。于是「他对TA爱搭不理」这件事会让她变得冷淡，
+        但**不会让她对 TA 少一分喜欢**。那不对。
+
+        只在 streak **真的多了一次**时记一笔：streak 是不回就累加的，不看增量的话
+        每轮结算都会重复扣同一个数，一天下来能把好感扣到 0。
+        """
+        try:
+            now_streak = max(0, int(streak))
+        except (TypeError, ValueError):
+            return
+        if now_streak <= 0:
+            return
+        try:
+            user_state = self._scope.user_state(user_id)
+            record = self.profile(user_id)
+        except Exception:
+            return
+        try:
+            seen = int(user_state.get("ignored_seen", 0) or 0)
+        except (TypeError, ValueError):
+            seen = 0
+        if now_streak <= seen:
+            return
+        gain = now_streak - seen
+        user_state["ignored_seen"] = float(now_streak)
+        # 一次比一次重：连着不理比偶尔不理更伤人。前三次线性，之后按对数，
+        # 免得连着几天不回直接把好感打到 0——那不像记仇，像迁怒。
+        weight = -min(4.0, 0.8 * gain + 0.6 * min(gain, 3) + 0.15 * max(0, gain - 3))
+        self._ledger_append(record, Delta(weight, 0.0, 0.0), self._time(), "没被理")
+        net = self._ledger_total(record, self._time())
+        _k, _bk, bounds = DIMENSIONS[0]
+        base = float(record.get("base_affection", 50.0))
+        record["affection"] = max(bounds[0], min(bounds[1], base + net))
+        user_state["mood"] = record
+        self._scope.mark_dirty()
+        self._refresh_tag(user_id, record)
+
     def _commit(self, user_id: str, record: dict, user_state: dict, delta: Delta):
+        now = self._time()
         before = {k: float(record[k]) for k, _, _ in DIMENSIONS}
         values = {
             "affection": delta.affection,
             "libido": delta.libido,
             "aggression": delta.aggression,
         }
-        for key, _, bounds in DIMENSIONS:
+        # **不是累加**，是把这一笔记进账本，然后按「base + 账本此刻的净值」重算。
+        # 累加器只记得「曾经加过」，不记得「那件事已经过去了」——于是好感只涨不跌。
+        self._ledger_append(record, delta, now)
+        net = self._ledger_total(record, now)
+        _key, _base_key, aff_bounds = DIMENSIONS[0]
+        record["affection"] = max(
+            aff_bounds[0], min(aff_bounds[1], float(record["base_affection"]) + net)
+        )
+        for key, _bk, bounds in DIMENSIONS[1:]:
             record[key] = max(bounds[0], min(bounds[1], before[key] + values.get(key, 0)))
 
         turn = int(record.get("turn_count", 0)) + 1
-        base_coef = 1.0 if turn <= 10 else 0.2
-        for key, base_key, bounds in DIMENSIONS:
-            drift = values.get(key, 0) * base_coef * 0.5
-            record[base_key] = max(bounds[0], min(bounds[1], float(record[base_key]) + drift))
+        # **base 不再逐条漂移。**
+        # 原来每条消息都按 delta 的一半推 base，而那一条已经进账本了——同一件事
+        # 算两遍，单次变化于是超过 delta 的 cap（实测 2.07 > 2.0）。
+        #
+        # 现在 base 是**长期水平**：用户设定的那个值就是地板也是中线，好感在它
+        # 周围按「最近发生过什么」浮动。这正是「设定的好感度」该有的样子——
+        # 设定值是起点，不是天花板。
+        #
+        # 想让 base 跟着长期表现走，另说；现在先保证「每条消息只算一次」。
 
         record["turn_count"] = turn
-        record["last_interaction"] = self._time()
+        record["last_interaction"] = now
         user_state["mood"] = record
         self._scope.mark_dirty()
         self._refresh_tag(user_id, record)

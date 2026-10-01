@@ -279,6 +279,39 @@ class SocialSignals:
         except (TypeError, ValueError):
             return 0
 
+    def ignored_by_uid(self, uid: str, role_id: str = "") -> int:
+        """社交层记的「这个人累计没理我几次」。
+
+        原来只有角色级的 `ignored_streak`——说得清「她最近有点冷清」，说不清是谁。
+        而好感是用户级的，没有这个数就没法把被冷落换算成「对 TA 的好感下降」。
+        """
+        try:
+            data = self.read()
+        except Exception:
+            return 0
+        for key in self._slots(data, role_id):
+            per = data.get(key) if isinstance(data, dict) else None
+            if not isinstance(per, dict):
+                continue
+            by = per.get("ignored_by")
+            if isinstance(by, dict):
+                try:
+                    return max(0, int(by.get(str(uid or "")) or 0))
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    def _slots(self, data: Any, role_id: str = "") -> list:
+        """单 Bot 时信号写顶层，多 Bot 写在 roles 下。两处都要看。"""
+        out = []
+        if isinstance(data, dict) and isinstance(data.get("roles"), dict):
+            role = data["roles"].get(str(role_id or "")) or {}
+            if isinstance(role, dict):
+                out.append(role)
+        if isinstance(data, dict):
+            out.append(data)
+        return out
+
     def status(self) -> dict[str, Any]:
         """对接到底卡在哪一步。只说「没读到」会把三种完全不同的情况当成一种。
 

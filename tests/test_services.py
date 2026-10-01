@@ -688,3 +688,216 @@ class WeatherTest(unittest.IsolatedAsyncioTestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class AffectionIsALedgerNotAnAccumulator(unittest.TestCase):
+    """好感必须**能跌**，而且她要**记得发生过什么**。
+
+    原来 `_commit` 是纯累加器：`record[key] = clamp(before[key] + values[key])`。
+    只能往上——因为没有任何机制把「他已经不来了」记成负的。衰减把它拉回 base 就
+    算完事，于是表现成「涨得太快、只涨不跌、设定值也不动」。
+
+    改成账本：每一笔记进「发生过的事」，好感 = base + **账本此刻的净值**（每笔
+    按距今时衰）。于是三件事同时成立：
+      · 她三个月前对你好、今天不理你了 → 旧的衰到 0，新的负的还在 → **会跌**
+      · 设定的值是起点不是天花板
+      · 她能说得出「你最近老是敷衍我」，因为她知道那件事
+    """
+
+    def build(self, **kw):
+        t = MoodTest("test_profile_uses_configured_initials")
+        t.setUp()
+        svc, _store, _log = t.build(cfg(mood_initial_affection=50, mood_sensitivity=100, **kw))
+        svc.profile("1")
+        return t, svc
+
+    def _run(self, svc, text, energy, n, step=3600.0):
+        async def go():
+            for _ in range(n):
+                await svc.update_from_message("1", text, energy, 14)
+                self.t.time_value += step
+        asyncio.run(go())
+
+    def test_affection_falls_when_they_go_cold(self):
+        t, svc = self.build()
+        self.t = t
+        self._run(svc, "你好棒，我最喜欢你了", 95.0, 12)
+        up = svc.profile("1")["affection"]
+        self._run(svc, "你好烦 真讨厌", 40.0, 5)
+        down = svc.profile("1")["affection"]
+        self.assertLess(down, up, "敷衍之后好感必须跌——原来这里是纯累加，只会涨")
+        self.assertGreater(down, 30.0, "也不能跌穿设定基线太多")
+
+    def test_the_set_value_is_a_starting_point_not_a_ceiling(self):
+        t, svc = self.build()
+        self.t = t
+        self.assertEqual(svc.profile("1")["base_affection"], 50.0)
+        self._run(svc, "你好棒，我最喜欢你了", 95.0, 12)
+        self.assertGreater(svc.profile("1")["affection"], 50.0,
+                           "好感该能浮在设定值之上")
+        # 「下的快上的也快」：负向账目更重，所以几笔冷淡就足以压回设定值附近
+        self._run(svc, "你好烦 真讨厌", 40.0, 8)
+        got = svc.profile("1")["affection"]
+        self.assertLess(got, 56.0,
+                        f"冷下来之后仍悬在 {got:.1f}，负向不够重（'下的快'没兑现）")
+        self._run(svc, "你好烦 真讨厌", 40.0, 8)
+        self.assertLess(svc.profile("1")["affection"], 50.0,
+                        "继续冷淡就该跌回设定值以下")
+
+    def test_she_remembers_what_happened(self):
+        t, svc = self.build()
+        self.t = t
+        self._run(svc, "你好棒，我最喜欢你了", 95.0, 4)
+        self._run(svc, "你好烦 真讨厌", 40.0, 3)
+        kinds = [k for k, _ in svc.recent_events("1")]
+        self.assertTrue(kinds, "账本是空的——那她就只知道分数、不知道原因")
+        self.assertTrue(any(k in ("有点冷", "很敷衍") for k in kinds),
+                        f"最近几件里有敷衍，账本却记成 {kinds}")
+
+    def test_one_message_is_counted_once(self):
+        """base 不再逐条漂移。
+
+        原来每条消息除了进累加器、还按 delta 的一半推 base——同一件事算两遍，
+        单次变化于是超过 delta 的 cap（实测 2.07 > 2.0）。
+        """
+        t, svc = self.build(mood_affection_delta_cap=2)
+        self.t = t
+        for _ in range(6):
+            before = svc.profile("1")["affection"]
+            self._run(svc, "你好棒，我最喜欢你了", 95.0, 1)
+            after = svc.profile("1")["affection"]
+            self.assertLessEqual(abs(after - before), 2.0 + 1e-6,
+                                 f"单条把好感推动了 {abs(after - before):.2f}，超过 cap")
+
+
+class ColdnessIsNotInsults(unittest.TestCase):
+    """**能让她掉分的不该只有骂她的人。**
+
+    原来 `NEGATIVE_PATTERN` 只认脏话，于是「嗯」「哦」「随你」「不想说」这类
+    真正让人心里一沉的敷衍全都走中性分支（`uniform(-0.5, 0.5)`，均值 0）——
+    攒一百次也攒不出变化。冷淡识别必须单独一份，而且要和脏话分开。
+
+    更难的是**别冤枉人**：「我今天有点烦」「我好累」里有「烦」「累」，跟冷淡词
+    长得像，但那是 TA 自己难受，不是 TA 对我们冷淡。自我状态**一票否决**在所有
+    分支之前。
+    """
+
+    def _kind(self, text):
+        from humanoid.services.mood import local_delta
+        v = local_delta(text).affection
+        if v <= -1.5:
+            return "负"
+        if v <= -0.55:
+            return "冷"
+        if v >= 0.8:
+            return "正"
+        return "中性"
+
+    def test_dismissive_tone_counts_as_cold(self):
+        for t in ("嗯", "哦", "随你", "算了吧", "我不想说", "关我什么事", "随便"):
+            self.assertEqual(self._kind(t), "冷", f"「{t}」该算冷淡")
+
+    def test_insults_still_land_harder(self):
+        for t in ("你好烦 真讨厌", "你真烦", "滚"):
+            self.assertEqual(self._kind(t), "负", f"「{t}」该算骂人，不是冷淡")
+
+    def test_their_own_bad_day_is_not_coldness_toward_us(self):
+        """**最容易做错的一条。**"""
+        for t in ("我今天有点烦", "我好累啊", "我最近状态不好", "我有点难过"):
+            self.assertEqual(self._kind(t), "中性",
+                             f"「{t}」是 TA 自己难受，不该记成对方冷淡")
+
+    def test_warmth_still_lands(self):
+        for t in ("你真棒", "谢谢你", "我最喜欢你了"):
+            self.assertEqual(self._kind(t), "正", f"「{t}」该算暖")
+
+    def test_cold_and_silent_ranges_do_not_overlap(self):
+        """冷淡 (-1.2,-0.6) 与中性 (-0.5,0.5) 之间**必须留缝**。
+
+        原来冷淡写的是 (-1.2,-0.4)，和中性在 (-0.5,-0.4) 交叠——于是「敷衍」和
+        「没说话」从数值上分不开，测试都没法判断一条属于哪边。
+        """
+        from humanoid.services import mood as M
+        seen = {round(M.local_delta("嗯").affection, 2) for _ in range(300)}
+        self.assertTrue(all(-1.5 < v <= -0.55 for v in seen),
+                        f"冷淡里混进了中性值：{sorted(seen)[:5]}")
+
+    def test_repeated_dismissal_eventually_shows(self):
+        """单句几乎不推好感，靠账本累积。"""
+        t = MoodTest("test_profile_uses_configured_initials")
+        t.setUp()
+        svc, _s, _l = t.build(cfg(mood_initial_affection=50, mood_sensitivity=100))
+        svc.profile("1")
+
+        async def spam(words, hours=6.0):
+            for w in words:
+                await svc.update_from_message("1", w, 60.0, 14)
+                t.time_value += hours * 3600
+
+        asyncio.run(spam(["嗯"] * 3))
+        few = svc.profile("1")["affection"]
+        asyncio.run(spam(["嗯", "哦", "随你"] * 10))
+        many = svc.profile("1")["affection"]
+        self.assertLess(few, 50.0)
+        self.assertGreater(few, 40.0, f"三句就掉了 {50 - few:.1f}，太重了")
+        self.assertLess(many, 25.0, "连着两周敷衍该把好感拉下来")
+        kinds = [k for k, _ in svc.recent_events("1", 5)]
+        self.assertTrue(all(k in ("有点冷", "很敷衍") for k in kinds),
+                        f"账本记的是 {kinds}")
+
+
+class ProactiveSilenceCostsAffection(unittest.TestCase):
+    """她主动找了 TA、没被回 → **好感要降**。
+
+    原来这条链路是断的：社交层把「被冷落」写进信号文件，Core 读到之后
+    `soma.set_social_feedback(streak)` 接的是**社交能量**（她少想找人说话），
+    不是**好感度**。于是「他对TA爱搭不理」会让她变得冷淡，
+    但**不会让她对 TA 少一分喜欢**——那不对。
+    """
+
+    def _svc(self, base=70):
+        t = MoodTest("test_profile_uses_configured_initials")
+        t.setUp()
+        svc, _s, _l = t.build(cfg(mood_initial_affection=base))
+        svc.profile("1")
+        return svc
+
+    def test_being_ignored_lowers_affection(self):
+        svc = self._svc(70)
+        start = svc.profile("1")["affection"]
+        for k in (1, 2, 3, 4, 5):
+            svc.note_ignored_by_peer("1", k)
+        self.assertLess(svc.profile("1")["affection"], start,
+                        "连着五次主动发出去没被回，好感却一点没降")
+
+    def test_the_same_streak_is_not_counted_twice(self):
+        """**最容易出的错。** streak 是不回就累加的，看增量而不是看绝对值——
+        每轮结算都调一次的话，一天下来同一个数会被扣十几次，好感直接打到 0。"""
+        svc = self._svc(70)
+        svc.note_ignored_by_peer("1", 3)
+        once = svc.profile("1")["affection"]
+        for _ in range(50):
+            svc.note_ignored_by_peer("1", 3)
+        self.assertAlmostEqual(svc.profile("1")["affection"], once, places=6,
+                               msg="同一个 streak 反复上报被重复扣了")
+        svc.note_ignored_by_peer("1", 5)
+        self.assertLess(svc.profile("1")["affection"], once,
+                        "streak 涨到 5 时该再扣一次")
+
+    def test_it_can_really_go_down_but_stays_above_zero(self):
+        """掉到 0 是可能的，但不该轻轻一下就归零——那不像记仇，像迁怒。"""
+        svc = self._svc(50)
+        for k in range(1, 40):
+            svc.note_ignored_by_peer("1", k)
+        got = svc.profile("1")["affection"]
+        self.assertGreaterEqual(got, 0.0)
+        self.assertLess(got, 25.0, f"连着 39 次没回只掉到 {got:.1f}，太温和了")
+
+    def test_ignored_is_not_the_same_as_insulted(self):
+        """被冷落记的是「有点冷」，不是「很敷衍」——它们轻重不同。"""
+        svc = self._svc(70)
+        svc.note_ignored_by_peer("1", 2)
+        kinds = [k for k, _ in svc.recent_events("1", 3)]
+        self.assertTrue(kinds, "账本里该留下这一笔")
+        self.assertTrue(all(k in ("温和", "有点冷", "一直没被理") for k in kinds),
+                        f"被不回不该记成 {kinds}——「很敷衍」是骂人的分量")
