@@ -3,7 +3,8 @@
 分工（v2.16.4 起）：
 
 * 这个文件只产出**事实块**：此刻几点/在哪/跟TA是群聊还是私聊、她的身体现在是什么状态、
-  今天到这会她过了什么、TA隔了多久没说话、这三样在她心里各占多重。
+  TA隔了多久没说话、这几样在她心里各占多重。**她今天在做什么不进这里**——日程是插件的
+  背景信息，不是要她汇报的内容；给什么日程都照着说，RP 角色会变成旁白。
 * 「这些事实该怎么被理解」不写在事实里，由 `FRAMING_TEXT` 一次性放进 system_prompt
   （见 `main.py`）。事实每条消息都在变，读它的方式不该变。
 * 数值（百分比、好感度、UTC 偏移）一律不进上下文：那是体检单，人聊天时不念体检单。
@@ -34,7 +35,6 @@ if TYPE_CHECKING:
 from .config import HumanoidConfig
 from .data.mood_map import get_mood_label
 from .emotion import EmotionLayer, bracket
-from .services.schedule import day_lines, day_phrases, done_between, just_done
 from .wording import (
     AGENCY_CONTINUATION,
     CARE_WORDS,
@@ -51,7 +51,7 @@ _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef
 # 所以每次注入前要把历史里旧的块抹掉（`main.py` 负责），标记就是给这一步认路用的。
 # 换文案时把 v 后面的数字加一，老会话里的旧块会被当成不认识的内容直接清掉。
 MARK_PREFIX = "〔她的身体与生活"
-MARK_VERSION = "v11"
+MARK_VERSION = "v12"
 
 # 给 system_prompt 的那段话：说明下面这些是什么、按什么方式读它。稳定文本，不含事实。
 # 只划参考边界，不下指令：说什么、怎么说、说多长，都由她自己判断。
@@ -86,7 +86,7 @@ def build_framing(char_name: str = "", user_name: str = "") -> str:
         "\n\n【她的身体与生活】\n"
         f"下面提到的{role}指你自己，{peer}指正在和{role}说话的那个人。"
         "这些不是让你转述的资料，是你现在身上的事实："
-        "累的时候话就短，忙起来就不追问，心思在对方身上时才会主动往下接。不必逐条报备。"
+        "累的时候话就短，心思在对方身上时才会主动往下接。不必逐条报备。"
         "如何回应、说什么、说多长，由你自己判断。"
     )
 
@@ -210,7 +210,6 @@ class PromptBuilder:
                 (self._sentence(relation), 8.0),
                 (self._emotion_line(user_id, interest, agency, is_group), 8.5),
                 (self._sentence(self._feelings_lines(max_items=1, threshold=0.7)), 7.0),
-                (self._sentence(self._day_lines(detailed=False)), 5.0),
                 (self._sentence(self._memory_lines(user_id, detailed=False)), 6.0),
             ]
             return self._finish(sents, cfg, char_name, user_name)
@@ -477,10 +476,10 @@ class PromptBuilder:
         return f"认识 {int(days // 365)} 年"
 
     def _echo_lines(self) -> List[str]:
-        """她刚：带着上一件事的余韵进来。全是刚发生的时间性事实。
+        """她刚：带着上一件事的余韵进来。剩的只有身体事实。
 
-        刚睡醒和睡了两小时后是两回事，刚在运动和上午在运动也是两回事——
-        余韵只在刚发生的那段时间里存在，过了就不提。
+        刚睡醒和睡了两小时后是两回事——余韵只在刚发生的那段时间里存在，过了就不提。
+        日程性的余韵（她刚在做完什么）不进这里：日程是背景，不往对话里报。
         """
         core = self._core
         lines: List[str] = []
@@ -497,89 +496,7 @@ class PromptBuilder:
                     lines.append(
                         f"她刚睡醒，睡了{slept:.0f}小时" if slept >= 1.0 else "她刚睡醒"
                     )
-        try:
-            slots = core.schedule.current_slots()
-        except Exception:
-            slots = []
-        if slots:
-            now = core.clock.now()
-            just = just_done(slots, now.hour * 60 + now.minute)
-            if just:
-                lines.append(f"她刚在{just}")
-        # 做事进度：刚开始和做了一阵了不是一回事，时长从 process 现算。
-        try:
-            dur = float((core.process.current() or {}).get("duration_minutes", 0) or 0)
-        except Exception:
-            dur = 0.0
-        if 0 < dur < 15:
-            lines.append("手上这事刚开始")
-        elif dur > 60:
-            lines.append("手上这事做了一阵了")
         return lines
-
-    @staticmethod
-    def _drop_echoed_in_day(echo: List[str], day_lines: List[str]) -> List[str]:
-        """「她刚在X」与「今天上午X」说的是同一件事时，只留后者的那一份。
-
-        日程里刚结束的那段会同时落进这两处：「她刚在起身去厨房准备水果」+
-        「她今天上午起身去厨房准备水果」。不滤就是同一件事在一句话里说两遍。
-        """
-        day_text = "".join(day_lines or [])
-        if not day_text:
-            return echo
-        out: List[str] = []
-        for line in echo:
-            if line.startswith("她刚在") and line[len("她刚在"):] in day_text:
-                continue
-            out.append(line)
-        return out
-
-    def _day_lines(
-        self, detailed: bool, include_doing: bool = True, exclude: Optional[List[str]] = None
-    ) -> List[str]:
-        """今天到这会过了什么：刚做完的事、手上正在做的事。全是日程事实。
-
-        只报她这一天实际经过的事，不写「接着聊这个话题」之类的过程要求。
-        """
-        try:
-            slots = self._core.schedule.current_slots()
-        except Exception:
-            return []
-        if not slots:
-            return []
-        now = self._core.clock.now()
-        now_minutes = now.hour * 60 + now.minute
-        # 「现在在做什么」可以被关掉（`inject_schedule_now`）。关掉时 include_doing=False，
-        # 于是只留「今天做过什么」——她手上在忙什么不进上下文，模型也就没东西可照着发挥。
-        # 日程照常生成、照常推进，只是不往对话里报。
-        want_now = include_doing and bool(getattr(self._core.config, "inject_schedule_now", True))
-        try:
-            phrases = day_phrases(
-                slots, now_minutes,
-                past_limit=3 if detailed else 2,
-                future_limit=1,
-            )
-            return self._day_prose(
-                day_lines(phrases, max_items=2 if detailed else 1, include_doing=want_now)
-            )
-        except Exception:
-            return []
-
-    @staticmethod
-    def _day_prose(lines: List[str]) -> List[str]:
-        """把 day_lines 的清单头削成自然句：她今天上午在改海报，现在在跟客户过方案。
-
-        不写「今天到这会」：时段词本身就在每一项里（「下午在吃午饭」），加上去反而成了
-        「今天到这会下午在吃午饭」这种不像人话的句子，而模型会照抄。"""
-        out: List[str] = []
-        for line in lines:
-            body = str(line).split("：", 1)[-1].replace("；", "，")
-            # 「现在空着」不值得占一条消息的形状：拼出来是「她今天上午在改海报，现在空着」。
-            # 原来只有 medium 档在外层拦，full 档没拦，会漏出这种不像人话的句子
-            if not body or "现在空着" in body:
-                continue
-            out.append(f"她今天{body}")
-        return out
 
     def _memory_lines(self, user_id: str, detailed: bool) -> List[str]:
         """TA 之前说过什么。没记过就不注入，而不是编一个。"""
@@ -766,11 +683,14 @@ class PromptBuilder:
             previous = str(data.get("previous_message") or "").strip()
             if previous:
                 lines.append(f"TA离开前说的最后一句：「{previous[:60]}」")
-        lines.extend(self._during_gap_lines(seconds))
         # 聊天频率：TA今天话不少/很少，中间档不给。
         # 只在私聊给：这个计数挂在角色上（`daily_msg_count` 是 self 级），群聊里 A 会看到
         # 「TA今天话不少」，而那句话可能是 B、C 在私聊里刷出来的——同一条注入发给不同的人，
         # 说的却是同一件事。
+        #
+        # v2.27.2 加「不早报」条件：每天头几条消息（≤3）时不报「话很少」——
+        # 早上刚开口就被告知「TA今天话很少」，模型会演「你怎么这么冷淡」。
+        # 等当天过了半天（≥12:00）还少，才是真的少。
         if not is_group:
             try:
                 count = int(self._core.scope.get_self("daily_msg_count", 0) or 0)
@@ -779,7 +699,12 @@ class PromptBuilder:
             if count >= 20:
                 lines.append("TA今天话不少")
             elif 0 < count <= 3:
-                lines.append("TA今天话很少")
+                try:
+                    hour = self._core.clock.now().hour
+                except Exception:
+                    hour = 12
+                if hour >= 12:
+                    lines.append("TA今天话很少")
         # 几天没说话：隔 3 小时和隔 5 天是两回事，关系层面的分量。
         if seconds is not None:
             try:
@@ -789,34 +714,6 @@ class PromptBuilder:
             if gap_seconds > 48 * 3600:
                 lines.append(f"你们有{int(gap_seconds // 86400)}天没说话了")
         return lines
-
-    def _during_gap_lines(self, seconds: Any) -> List[str]:
-        """间隔期间她在过自己的日子：按日程报这期间做过了什么，纯事实。
-
-        只说「这期间她在上课」，不说「所以别提这个间隔」——怎么接由她自己定。
-        """
-        try:
-            gap = float(seconds)
-        except (TypeError, ValueError):
-            return []
-        if gap < 1800.0:
-            return []
-        try:
-            slots = self._core.schedule.current_slots()
-        except Exception:
-            return []
-        if not slots:
-            return []
-        now = self._core.clock.now()
-        now_minutes = now.hour * 60 + now.minute
-        start_minutes = now_minutes - gap / 60.0
-        try:
-            done = done_between(slots, start_minutes, now_minutes, limit=1)
-        except Exception:
-            return []
-        if not done:
-            return []
-        return [f"这期间她{done[0]}"]
     # ------------------------------------------------------------------
     # 三档组装
     # ------------------------------------------------------------------
@@ -891,14 +788,9 @@ class PromptBuilder:
         if body:
             sents.append((self._sentence(body), 8.0))
 
-        day_list = self._day_lines(detailed=False)
-        echo = self._sentence(self._drop_echoed_in_day(self._echo_lines(), day_list))
+        echo = self._sentence(self._echo_lines())
         if echo:
             sents.append((echo, 6.0))
-
-        # 显著度浮动：今天只在手上真有事时给；「现在空着」不值得占一条消息的形状。
-        if day_list and not any("现在空着" in line for line in day_list):
-            sents.append((self._sentence(day_list), 5.0))
 
         relation = self._relation_lines(user_id, is_group, detailed=False, interest=interest)
         nickname = self._nickname_line(user_id, is_group)
@@ -960,13 +852,9 @@ class PromptBuilder:
             body = body + [sleep_cause]
         if body:
             sents.append((self._sentence(body), 8.0))
-        day_list = self._day_lines(detailed=True)
-        echo = self._sentence(self._drop_echoed_in_day(self._echo_lines(), day_list))
+        echo = self._sentence(self._echo_lines())
         if echo:
             sents.append((echo, 6.0))
-        day = self._sentence(day_list)
-        if day:
-            sents.append((day, 5.0))
         relation = self._relation_lines(user_id, is_group, detailed=True, interest=interest)
         nickname = self._nickname_line(user_id, is_group)
         if nickname:

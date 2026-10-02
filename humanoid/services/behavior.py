@@ -9,7 +9,7 @@
   以及一个按用户 ID 稳锚的错位推出来），往目标值指数逼近。以前所有人第一面都是
   同一个 50 分，那正是「数值全是单一的」的根源。
 * `focus` —— 上心程度：对**TA正在讲的这件事**。不算不写盘，每条消息现推：问句、
-  长度、是否推到她今天在做的事、是否推到她自己记着的事、心情好不好。
+  长度、是否推到她自己记着的事、心情好不好。
 * `spare` —— 注意力余量：**她自己手里还剩多少**。从身体的困/难受/唤醒与手上在做的
   事推。这一轴跟 TA 无关，只跟她自己有关——真人不是随时都能接住话的。
 
@@ -24,7 +24,6 @@ import math
 from typing import Any, Dict, List, Optional
 
 from ..config import HumanoidConfig
-from ..slots import is_meal_event, is_sleep_event
 
 
 # 在意度往目标值逼近的半衰期（小时）。太快的话一句好话就能把关系拉满，不像人。
@@ -338,9 +337,6 @@ class BehaviorService:
             value += 0.06
         if any(ch in body for ch in "!！😭😡❤️"):
             value += 0.06
-        # 推到她今天正在做的事上：这是最强的上心信号。
-        if self._touches_her_day(body):
-            value += 0.20
         # 推到 TA 自己之前说过、她记着的事。
         if self._touches_recalled(user_id, body):
             value += 0.16
@@ -352,23 +348,6 @@ class BehaviorService:
         value -= min(0.20, max(0.0, aggression - 40.0) / 100.0 * 0.7)
         value += min(0.10, max(0.0, libido - 42.0) / 100.0 * 0.4)
         return round(max(0.0, min(1.0, value)), 3)
-
-    def _her_today_keywords(self) -> List[str]:
-        """她今天日程里的事件名（呷掉“睡眠/吃饭”这类不算话题的）。"""
-        words: List[str] = []
-        try:
-            slots = self._core.schedule.current_slots()
-        except Exception:
-            return words
-        for slot in slots or []:
-            event = str(slot.get("event") or "").strip()
-            if not event or is_sleep_event(event) or is_meal_event(event):
-                continue
-            words.extend(_chunks(event))
-        return words[:60]
-
-    def _touches_her_day(self, body: str) -> bool:
-        return any(word and word in body for word in self._her_today_keywords())
 
     def _touches_recalled(self, user_id: str, body: str) -> bool:
         try:
@@ -383,7 +362,11 @@ class BehaviorService:
         return False
 
     def _spare(self, now: float) -> float:
-        """注意力余量：身体与手上在做的事给她剩多少。"""
+        """注意力余量：身体状态给她剩多少。
+
+        只看身体，不看她在做什么：日程事件（开会、通勤…）不进这里——她今天在干什么
+        是插件给她的背景，不是要在对话里报的。何况 process 的「忙」判定靠关键词猜
+        事件名，猜没猜中全凭运气。"""
         core = self._core
         value = 0.85
         try:
@@ -396,15 +379,6 @@ class BehaviorService:
             value -= max(0.0, float(body.get("hunger", 0.0)) - 65.0) / 100.0 * 0.3
             if float(body.get("asleep", 0.0)) >= 1.0:
                 value -= 0.45
-        try:
-            proc = core.process.current()
-        except Exception:
-            proc = {}
-        name = str(proc.get("name") or "").strip()
-        phase = str(proc.get("phase") or "").strip()
-        busy = any(word in f"{name}{phase}" for word in ("会", "通勤", "开车", "上课", "上班", "做饭", "排队", "加班", "考试", "开会"))
-        if busy:
-            value -= 0.30
         try:
             value -= max(0.0, 40.0 - float(core.energy.energy)) / 100.0 * 0.5
         except Exception:

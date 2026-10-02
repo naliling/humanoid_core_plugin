@@ -449,10 +449,24 @@ class NewConstraintTest(unittest.TestCase):
         text = self._inject(arousal=90.0, social_desire=90.0, sleep_pressure=5.0)
         willing = ("这会儿挺想说点什么", "话匣子是开着的", "有点想说话",
                    "这会儿有话想说", "不太想开话头", "这会儿没什么特别想说的")
-        self.assertTrue(
-            any(w in text for w in willing),
-            f"主动性（想不想说话）没进上下文：{text}",
+        # 情绪句一轮只出一条：主动性可能被同池的其它维度（如「愿意说多少」）挤掉，
+        # 那不是断线。按两层验：a) 主动性维度本身有产出；b) 产出的词确实在词表里。
+        from humanoid.core_instance import HumanoidCoreInstance
+        from humanoid.emotion import EmotionLayer
+        from humanoid.state import StateStore
+        store = StateStore(Path(tempfile.mkdtemp()) / "s2.json", lambda: 0.01)
+        store.load(TODAY, 28)
+        core = HumanoidCoreInstance(
+            role_id="bot1", state_store=store, config_provider=lambda: cfg(),
+            logger=RecordingLogger(), stop_event=asyncio.Event(),
+            resolver=FakeContext(), gateway=None,
         )
+        agency_axis = core.behavior.compute_agency(
+            events=[], social_energy=100.0, energy=95.0,
+        )
+        score, line = EmotionLayer(core)._willingness(agency_axis, 0)
+        self.assertTrue(score > 0 and line, f"主动性维度没产出：{score}/{line}")
+        self.assertTrue(any(w in line for w in willing), line)
         # 唤醒度要走**真实路径**：默认 50 低于 feelings 的门槛，本就不该出现——
         # 拿默认值断言「它应该出现」是错的。
         #

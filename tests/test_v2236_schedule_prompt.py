@@ -108,17 +108,55 @@ class ScheduleTransitionContinuity(unittest.TestCase):
 
 
 class ScheduleNowToggle(unittest.TestCase):
-    """`inject_schedule_now=False` 时，「现在在做什么」不进对话。"""
+    """`inject_schedule_now` 已删除：日程全面不进对话，不再需要开关。"""
 
-    def _day_line(self, **kw):
-        from humanoid.prompt_builder import PromptBuilder  # noqa: F401
-        return None
+    def test_config_item_is_gone(self):
+        from humanoid.config import DEFAULTS
 
-    def test_config_item_exists(self):
-        self.assertTrue(cfg().inject_schedule_now, "默认应该是开着的")
+        self.assertFalse(
+            hasattr(DEFAULTS, "inject_schedule_now"),
+            "开关又回来了：日程该是全面不进对话，而不是可选项",
+        )
 
-    def test_config_can_turn_it_off(self):
-        self.assertFalse(cfg(inject_schedule_now=False).inject_schedule_now)
+    def test_schedule_text_never_reaches_injection(self):
+        """日程事件名不许出现在注入里（三档一起验）。"""
+        import asyncio
+        import tempfile
+        from pathlib import Path
+
+        from humanoid.core_instance import HumanoidCoreInstance
+        from humanoid.state import StateStore
+        from tests.fakes import FakeContext, FrozenClock, RecordingLogger
+
+        from datetime import datetime
+
+        moment = datetime(2026, 9, 26, 15, 20)
+        for mode in ("medium", "full", "mood_only"):
+            with self.subTest(mode=mode):
+                store = StateStore(Path(tempfile.mkdtemp()) / "s.json", lambda: 0.01)
+                store.load("2026-09-26", 28)
+                conf = cfg(inject_activity_context=mode)
+                core = HumanoidCoreInstance(
+                    role_id="bot1", state_store=store, config_provider=lambda: conf,
+                    logger=RecordingLogger(), stop_event=asyncio.Event(),
+                    resolver=FakeContext(), gateway=None,
+                )
+                frozen = FrozenClock(moment)
+                core.clock = frozen
+                for name in ("schedule", "soma", "energy", "social", "process", "mood"):
+                    svc = getattr(core, name, None)
+                    if svc is not None and hasattr(svc, "_clock"):
+                        svc._clock = frozen
+                core.scope.update_self(
+                    today_date="2026-09-26",
+                    daily_schedule=[{
+                        "start": "13:30", "end": "17:30", "event": "跟客户过方案",
+                        "location": "会议室", "emotion": "紧绷", "energy_rate": -0.1,
+                    }],
+                )
+                text = core.build_injection("42", is_group=False)
+                self.assertNotIn("跟客户过方案", text, f"{mode} 档漏出日程：\n{text}")
+                self.assertNotIn("她今天", text, f"{mode} 档漏出日程：\n{text}")
 
 
 if __name__ == "__main__":

@@ -306,9 +306,9 @@
   },
   "mood_initial_affection": {
     "description": "初始好感",
-    "hint": "新用户的好感初始值",
+    "hint": "新用户的好感初始值（35 是中性起点，关系靠相处慢慢长）",
     "type": "int",
-    "default": 46,
+    "default": 35,
     "minimum": 0,
     "maximum": 100
   },
@@ -360,7 +360,7 @@
     "description": "好感记录阈值",
     "hint": "一次变化超过多少才值得记一条日志。",
     "type": "int",
-    "default": 2,
+    "default": 3,
     "minimum": 0,
     "maximum": 100
   },
@@ -376,7 +376,7 @@
     "description": "攻击记录阈值",
     "hint": "攻击性波动多大才记一条情绪",
     "type": "int",
-    "default": 2,
+    "default": 3,
     "minimum": 0,
     "maximum": 50
   },
@@ -696,13 +696,6 @@
     "description": "导出契约给社交层",
     "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度",
     "type": "bool",
-    "default": true
-  },
-  "inject_schedule_now": {
-    "type": "bool",
-    "description": "把「她现在在做什么」注入对话",
-    "hint": "把「她现在在做什么」写进对话",
-    "obvious_hint": true,
     "default": true
   },
   "schedule_persona_max_chars": {

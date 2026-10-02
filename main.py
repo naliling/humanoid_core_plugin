@@ -107,6 +107,37 @@ def _sender_name(event: AstrMessageEvent) -> str:
         return ""
 
 
+# 本插件注册的全部指令名（顶层 + 「拟人」组前缀）。
+# 用于区分「指令」与「聊天」——**绝不能按「有没有 /」判**：
+# 群聊里 `/` 是唤醒前缀（waking_check 会把它从 message_str 上剪掉再交给我们），
+# 用户用 `/今天好累` 打招呼时 message_str 是「今天好累」——按 `/` 判会把
+# 唤醒词聊天全部误伤成指令、不进情绪记账；而 `/好感度` 被剪成「好感度」也不带 `/`。
+# 正确判据与框架的 CommandFilter 一致：剪掉唤醒前缀后的文本（message_str）
+# 是否**等于或空格接续**某个已注册指令名。`/今天好累` → 不匹配 → 当聊天；
+# `/查看日程` → 「查看日程」→ 命中 → 当指令。
+COMMAND_NAMES = (
+    "你的状态", "好感度", "情绪详情", "情绪日志", "查看日程", "时间", "叫我", "拟人帮助",
+    "拟人",
+)
+
+
+def _is_command_message(text: str, wake_command: bool = True) -> bool:
+    """这条（已被唤醒阶段剪掉前缀的）消息是不是一次**真的要执行的指令**。
+
+    两条闸：
+    1. 文本等于/以「指令名+空格」开头——与框架 CommandFilter 同口径；
+    2. 这条消息是唤醒消息（`is_at_or_wake_command`）——框架只在唤醒时才执行指令，
+       群里没 @ 的普通发言说「好感度」不会被当命令，这里也不该拿名单误伤它。
+    """
+    body = (text or "").strip()
+    if not body or not wake_command:
+        return False
+    for cmd in COMMAND_NAMES:
+        if body == cmd or body.startswith(f"{cmd} "):
+            return True
+    return False
+
+
 def _append_framing(req: Any, char_name: str = "", user_name: str = "") -> None:
     """把「这些事实该怎么读、指的是谁」放进 system_prompt，一个请求只放一次。
 
@@ -196,6 +227,29 @@ def _apply_merged_prompt(event: Any, req: Any) -> None:
     if current:
         lines.append(current)
     req.prompt = "\n".join(lines)
+
+
+def _response_text(response: Any) -> str:
+    """从 LLM 响应里取她真正输出的话。取不到就空串——**不拿对象 repr 冒充**。
+
+    AstrBot 的 LLMResponse 用 completion_text；旧版/兼容对象可能只有 result_chain。
+    """
+    if response is None:
+        return ""
+    for attr in ("completion_text", "text"):
+        value = getattr(response, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    chain = getattr(response, "result_chain", None)
+    getter = getattr(chain, "get_plain_text", None)
+    if callable(getter):
+        try:
+            plain = getter()
+            if isinstance(plain, str) and plain.strip():
+                return plain
+        except Exception:
+            pass
+    return ""
 
 
 # 常用项里各类型的写法：布尔能接受 开/关/是/否/true/false，枚举认面板那几个值。
@@ -813,17 +867,6 @@ class HumanoidCore(Star):
             _apply_merged_prompt(event, req)
             core = self.role_manager.get_or_create(self._self_id(event))
             user_id = self._sender(event)
-            # 她这条要发出去的话，先记一笔（等下一条用户消息进来才知道对方接没接）。
-            #
-            # 情绪分析以前**只看得见用户说的话**——于是「她说完没人接」和「她说完对方
-            # 认真回了」算成同一件事，而前者其实是件挺难受的事。这里是 Core 里唯一能
-            # 看到「她说了什么」的地方：进 LLM 之前。
-            try:
-                _out = str(getattr(req, "prompt", "") or "").strip()
-                if _out:
-                    core.mood.note_spoke(user_id, _out[-300:])
-            except Exception:
-                pass
             text = (getattr(event, "message_str", "") or "").strip()
             # 注意力（上心程度）要看用户到底说了什么：合并了几条时看合并后的全貌，
             # 否则前几条里的问句、提到的话题都不参与判断，注意力会被算低。
@@ -867,6 +910,97 @@ class HumanoidCore(Star):
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 注入失败: {e}")
 
+    # -------------------- LLM 响应钩子 --------------------
+
+    @filter.on_llm_response()
+    async def note_her_reply(self, event: AstrMessageEvent, response: Any):
+        """把她**真正说出口的话**记一笔，供情绪分析判断「她说的这句对方接没接」。
+
+        这个记录以前挂在 `on_llm_request` 上、拿 `req.prompt` 当「她要发的话」——
+        但那是**用户刚发来的消息**（AstrBot 里 `req.prompt = event.message_str`）。
+        于是整段记录张冠李戴：分析器看到「她说『在吗』——对方还没回应」，
+        实际是用户在说话、她在回。错误记录比不记更糟——它直接搅她对这段关系的感受。
+        响应钩子拿到的 `response` 才是她的回复本身。
+
+        第三方 Agent runner 不触发本钩子（见 `tool_loop_agent_runner` 只在自己完稿时
+        调 `on_agent_done`）——那种部署由 `capture_reply_on_send` 在发送前兜底。
+        两边用 `note_spoke` 自带的短窗去重，不会双重记账。
+        """
+        try:
+            is_group = not _is_private_chat(event)
+            if not self.engine.environment_allows(not is_group):
+                return
+            text = _response_text(response)
+            if not text:
+                return
+            cfg = self._config
+            core = self.role_manager.get_or_create(self._self_id(event))
+            user_id = self._sender(event)
+            if not core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
+                                      in_group=cfg.mood_enabled_in_group):
+                return
+            core.mood.note_spoke(user_id, text)
+            # 给发送前兜底留一个「这轮已记过」的标记：本地 runner 两条路径都会经过，
+            # 没有它的时候，若框架给回复加了前缀（先发设置里有「回复前缀」），
+            # 兜底看到的文本与 completion_text 不同、去重拦不住，同一句话会被记两遍。
+            setter = getattr(event, "set_extra", None)
+            if callable(setter):
+                try:
+                    setter("_hcore_reply_captured", True)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 记录她的发言失败: {e}")
+
+    # -------------------- 发送前兜底（第三方 runner / 流式） --------------------
+
+    @filter.on_decorating_result()
+    async def capture_reply_on_send(self, event: AstrMessageEvent):
+        """发送前把她的回复再兑一道底——只在 `on_llm_response` 没记到时生效。
+
+        为什么需要它：第三方 Agent runner（`agent_runner_type != "local"`）的流程
+        不触发 `OnLLMResponseEvent`，本地 runner 的流式收尾也绕开了它。那两种部署下
+        「她说了什么」会一片空白，情绪分析就退化回只看见用户的话。发送前钩子在
+        所有模式都会经过，拿 `event.get_result()` 里的纯文本当素材。
+
+        只收 LLM 类结果（`LLM_RESULT` / 流式收尾）：指令回复、报错回显这类
+        不是她的发言。
+        """
+        try:
+            read_extra = getattr(event, "get_extra", None)
+            if callable(read_extra):
+                try:
+                    if read_extra("_hcore_reply_captured"):
+                        return
+                except Exception:
+                    pass
+            result = event.get_result()
+            if result is None:
+                return
+            ctype = getattr(result, "result_content_type", None)
+            name = getattr(ctype, "name", "")
+            if name not in ("LLM_RESULT", "STREAMING_FINISH"):
+                return
+            getter = getattr(result, "get_plain_text", None)
+            if not callable(getter):
+                return
+            text = str(getter() or "").strip()
+            if not text:
+                return
+            is_group = not _is_private_chat(event)
+            if not self.engine.environment_allows(not is_group):
+                return
+            cfg = self._config
+            core = self.role_manager.get_or_create(self._self_id(event))
+            user_id = self._sender(event)
+            if not core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
+                                      in_group=cfg.mood_enabled_in_group):
+                return
+            # note_spoke 带 90 秒同文去重：on_llm_response 已经记过时这一步是空操作。
+            core.mood.note_spoke(user_id, text)
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 发送前记录她的发言失败: {e}")
+
     # -------------------- 多消息合并（消息防抖） --------------------
 
     @filter.on_waiting_llm_request()
@@ -899,8 +1033,12 @@ class HumanoidCore(Star):
             if not text:
                 # 只对纯文本消息做合并；图片/语音这类照常单独回复。
                 return
+            # 防御：真指令不该进合并（框架上指令不走到 LLM 阶段，但插件委托的
+            # provider_request 可能从其他路径进来）。命中指令名单时直接放行。
+            if _is_command_message(text, bool(getattr(event, "is_at_or_wake_command", True))):
+                return
             # **跳过自己发的**。`on_message` 有这道检查，合并这里原来没有——
-            # 于是她自己在群里说的每句话（尤其是主动消息插件发的那���）都可能被
+            # 于是她自己在群里说的每句话（尤其是主动消息插件发的那些）都可能被
             # 攒进 buffer 当成「用户刚说了什么」，表现出来就是**随时都在触发**，
             # 而且模型分不清那是不是在回对方。
             try:
@@ -950,6 +1088,11 @@ class HumanoidCore(Star):
             text = (getattr(event, "message_str", "") or "").strip()
             if not text:
                 return
+            # 指令不是交谈：命中了真指令的消息不进聊天记账。
+            # 唤醒标志跟框架一致——只有「这条真会被当指令执行」时才跳过；
+            # 群里没 @ 的普通发言（唤醒=False）说「好感度」不会被误伤。
+            wake_command = bool(getattr(event, "is_at_or_wake_command", True))
+            is_command = _is_command_message(text, wake_command)
             try:
                 umo = str(getattr(event, "unified_msg_origin", "") or "")
             except Exception:
@@ -965,6 +1108,6 @@ class HumanoidCore(Star):
                         await source.persona(core.role_id)
             except Exception:
                 pass
-            core.on_message(user_id, text, is_group=is_group, umo=umo)
+            core.on_message(user_id, text, is_group=is_group, umo=umo, is_command=is_command)
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 消息记账失败: {e}")

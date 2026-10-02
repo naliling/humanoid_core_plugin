@@ -103,14 +103,22 @@ class EmotionLayer:
     # ------------------------------------------------------------------
 
     def _day_tone(self, user_id: str, index: int) -> Tuple[float, str]:
-        """今天的底色。按当天的波动次数算，所以一天之内不翻来覆去。"""
+        """今天的底色。按当天的波动次数算，所以一天之内不翻来覆去。
+
+        「一会儿好一会儿不好」要求正负各 ≥2 次（v2.27.2）：原来各 1 次就亮，
+        而日志阈值只有 2 分、单条消息都能触发——一句玩笑话加一句抱怨，
+        当天底色就变成「说不上来」。正负各两次以上，才真是反复的一天。
+        """
         ups, downs = self._today_events(user_id)
         if downs >= 2 and ups == 0:
             return 0.86, _pick(("今天一整天都不太顺", "今天整个人蔫蔫的"), index)
         if downs == 1 and ups == 0:
             return 0.62, _pick(("今天有点闷", "今天心里堵得慌"), index)
-        if downs >= 1 and ups >= 1:
+        if downs >= 2 and ups >= 2:
             return 0.55, _pick(("今天一会儿好一会儿不好", "今天这心情说不上来"), index)
+        # 单次互有：不出「说不上来」，用轻量版的当天基调。
+        if downs >= 1 and ups >= 1:
+            return 0.45, _pick(("今天有点起有落", "今天平平常常"), index)
         if ups >= 2:
             return 0.80, _pick(("今天心情不错", "今天挺来劲的"), index)
         if ups == 1:

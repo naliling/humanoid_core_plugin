@@ -113,6 +113,12 @@ class _Filter:
     def on_llm_request(self):
         return self._register("on_llm_request", "")
 
+    def on_llm_response(self):
+        return self._register("on_llm_response", "")
+
+    def on_decorating_result(self):
+        return self._register("on_decorating_result", "")
+
     def on_waiting_llm_request(self):
         return self._register("on_waiting_llm_request", "")
 

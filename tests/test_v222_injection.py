@@ -235,8 +235,12 @@ class InjectionLayerTest(unittest.TestCase):
         self.assertLessEqual(len(phrase), 24, f"硬截超出上限：{phrase}")
         self.assertTrue(phrase.startswith("坐在客厅沙发"), phrase)
 
-    def test_finished_segment_is_not_said_twice(self):
-        """日程里刚结束的那段，不该既说「她刚在X」又说「她今天上午X」。"""
+    def test_schedule_segments_never_reach_the_context(self):
+        """日程不进上下文——不管是「刚结束」还是「今天」那层。
+
+        v2.27.1 收紧：之前这里守住的是「同一件事不说两遍」，但它两边都不该出现。
+        日程是插件的背景参考，不是要让角色拿出来说的。
+        """
         core = self.core()
         core.scope.update_self(
             today_date=TODAY,
@@ -246,8 +250,8 @@ class InjectionLayerTest(unittest.TestCase):
             ],
         )
         text = core.build_injection("42", is_group=False)
-        self.assertNotIn("她刚在起身去厨房", text, f"同一件事在一句里说了两遍：\n{text}")
-        self.assertIn("起身去厨房准备水果和下午茶", text, f"「今天」那层把这件事丢了：\n{text}")
+        for banned in ("她刚在起身去厨房", "起身去厨房准备水果和下午茶", "她今天"):
+            self.assertNotIn(banned, text, f"日程事件漏进上下文「{banned}」：\n{text}")
 
     # ------------------------------------------------------------------
     # 默认状态不能被说成消极 / 自相矛盾
@@ -278,22 +282,25 @@ class InjectionLayerTest(unittest.TestCase):
         )
 
     def test_first_meeting_is_not_labelled_distant(self):
-        """新认识的人第一面不该被说成「有点距离」。
+        """新认识的人第一面不该被说成「疏远/有距离」。
 
-        默认初始好感 46 折算出的在意度约 0.35~0.47，旧门槛 0.45 会让一半的人
-        第一句就拿到「较为生疏／有点距离」——常和「你管TA叫宝宝」并列在同一句里。
+        v2.27.2 起默认初始好感是 35（中性起点）——第一面说「不太熟/还在认识」是
+        正确的，但不能说成「关系疏远」「不常联系」（那是陌生人甚至反感档的词）。
+        本测试盯的是后者：35 起点不该滑到那两档。
         """
         core = self.core()
-        self.assertEqual(core.config.mood_initial_affection, 46)
+        self.assertEqual(core.config.mood_initial_affection, 35)
         for uid in ("555", "777", "3881756548", "1423008208"):
             core.scope.user_state(uid)["mood"] = {
-                "affection": 46.0, "libido": 34.0, "aggression": 28.0,
-                "base_affection": 46.0, "base_libido": 34.0, "base_aggression": 28.0,
+                "affection": 35.0, "libido": 34.0, "aggression": 28.0,
+                "base_affection": 35.0, "base_libido": 34.0, "base_aggression": 28.0,
                 "first_met": core.now_epoch(), "last_interaction": core.now_epoch(),
                 "last_decay": core.now_epoch(), "turn_count": 0, "messages_since_llm": 0,
             }
             core.scope.set_user(uid, "attention", {"care": 0.40, "care_at": core.now_epoch()})
         text = core.build_injection("555", is_group=False, text="你好")
+        for distant in ("关系疏远", "不常联系", "有点距离"):
+            self.assertNotIn(distant, text, f"初始好感 35 却给出「{distant}」：\n{text}")
         for distant in ("较为生疏", "有点距离", "关系疏远", "不常联系"):
             self.assertNotIn(distant, text, f"初始好感 46 却给出「{distant}」：\n{text}")
 

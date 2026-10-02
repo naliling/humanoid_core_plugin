@@ -216,7 +216,7 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
     async def test_profile_honours_override(self):
         service, _, _ = self.build(cfg(mood_affection_override=["777:95"]))
         self.assertEqual(service.profile("777")["affection"], 95.0)
-        self.assertEqual(service.profile("888")["affection"], 46.0)
+        self.assertEqual(service.profile("888")["affection"], 35.0)
 
     async def test_first_message_uses_local_rules_only(self):
         """新面孔的第一条消息不调模型，但走本地词典规则产生正常波动。"""
@@ -377,7 +377,7 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.profile("1")["base_affection"], 77.0)
         self.assertEqual(service.set_affection_batch([("2", 10.0), ("3", 500.0)]), 1)
         reset = service.reset("1")
-        self.assertEqual(reset["affection"], 46.0)
+        self.assertEqual(reset["affection"], 35.0)
         self.assertEqual(reset["turn_count"], 0)
 
     async def test_disabled_mood_is_noop(self):

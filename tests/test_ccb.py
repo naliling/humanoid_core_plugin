@@ -312,7 +312,7 @@ class SceneState(unittest.TestCase):
         u = {"ccb_satisfy": 100.0, "ccb_day": float(day)}
         ccb.decay_satisfy(u, (day + 1) * 86400.0)
         self.assertEqual(u["ccb_satisfy"], 100.0 - ccb.CCB_SATISFY_DECAY_PER_DAY)
-        self.assertGreater(u["ccb_satisfy"], 0.0, "不该一���天就清零")
+        self.assertGreater(u["ccb_satisfy"], 0.0, "不该一天就清零")
 
     def test_daily_counter_resets_next_day(self):
         from humanoid import ccb

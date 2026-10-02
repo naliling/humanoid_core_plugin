@@ -63,6 +63,8 @@ class FakeEvent:
         private: bool = True,
         admin: bool = False,
         sender_name: str = "",
+        raw_text: str = "",
+        wake_command: bool = True,
     ) -> None:
         self.message_str = message
         self._sender = sender
@@ -70,6 +72,14 @@ class FakeEvent:
         self._private = private
         self._admin = admin
         self._sender_name = sender_name
+        # 唤醒标志：真实框架在 waking_check 里设置，指令只有当它为真时才执行。
+        self.is_at_or_wake_command = wake_command
+        # 消息链里的原始文本（未经唤醒前缀裁剪）。空时不造 message_obj，
+        # 与旧版测试保持兼容。
+        if raw_text:
+            self.message_obj = type("MsgObj", (), {
+                "message": [type("Plain", (), {"text": raw_text})()],
+            })()
         self.unified_msg_origin = f"aiocqhttp:{'private' if private else 'group'}:{sender}"
         self.sent: list[str] = []
         self._extras: dict = {}

@@ -18,7 +18,6 @@ from humanoid.persona import Persona, PersonaSource, resolve_persona, truncate
 from humanoid.services.schedule import (
     SOURCE_LLM,
     ScheduleService,
-    day_lines,
     day_phrases,
     segment_prompt,
 )
@@ -353,10 +352,6 @@ class DayNarrativeTest(unittest.TestCase):
         self.assertEqual(got["doing"], "跟客户过方案")
         self.assertIn("中午在午餐与午休", got["done"])
         self.assertTrue(got["next"], "15:20 离 17:30 不到三小时，该有「接下来」")
-        lines = day_lines(got)
-        self.assertEqual(len(lines), 1)
-        self.assertIn("今天到这会：", lines[0])
-        self.assertIn("现在在跟客户过方案", lines[0])
 
     def test_sleep_block_is_not_reported_as_an_activity(self):
         got = self.phrases_at(8, 0)
@@ -369,11 +364,17 @@ class DayNarrativeTest(unittest.TestCase):
         self.assertNotIn("做饭与看剧", " ".join(got["done"]))
 
     def test_empty_schedule_produces_no_line(self):
-        self.assertEqual(day_lines({"doing": "", "done": [], "next": []}), [])
-        self.assertEqual(day_lines(day_phrases([], 600)), [])
+        got = day_phrases([], 600)
+        self.assertEqual(got["doing"], "")
+        self.assertEqual(got["done"], [])
+        self.assertEqual(got["next"], [])
 
     def test_injection_does_not_narrate_the_day(self):
-        """日程进上下文的是事实（今天到这会过了什么），不带任何过程要求。"""
+        """日程**不进聊天上下文**：她今天干了什么、手上在忙什么，都不报给模型。
+
+        v2.27.1 起全面收紧：日程是插件的背景信息，不是要念给对方听的内容。
+        日程本身照常生成、身体照常按它走（`day_phrases` 供契约/诊断），只是不再进对话。
+        """
         import asyncio
         import tempfile
         from pathlib import Path
@@ -394,11 +395,8 @@ class DayNarrativeTest(unittest.TestCase):
         slots = normalize_slots(DAY_SCHEDULE, max_slots=16)
         core.scope.update_self(today_date=TODAY, daily_schedule=slots, schedule_source=SOURCE_LLM)
         text = core.build_injection("42", is_group=False)
-        self.assertIn("她今天", text)
-        self.assertIn("跟客户过方案", text)
-        # 只给事实，不给规矩：不出现「要/别/不要」这类过程指令。
-        self.assertNotIn("不要", text)
-        self.assertNotIn("接着聊", text)
+        for banned in ("她今天", "跟客户过方案", "改第三季度", "通勤与买菜", "她刚在"):
+            self.assertNotIn(banned, text, f"日程事件漏进上下文「{banned}」：\n{text}")
         # 数据源还在：day_phrases 照常能算出今天干了什么（契约/诊断用）。
         got = day_phrases(slots, 15 * 60 + 20)
         self.assertIn("跟客户过方案", got["doing"])

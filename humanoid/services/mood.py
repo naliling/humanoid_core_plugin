@@ -24,7 +24,46 @@ NEGATIVE_PATTERN = re.compile(
     r"(傻|蠢|笨|白痴|废物|垃圾|去死|死吧|滚蛋|操|妈|逼|贱|恶心|讨厌|恨|烦|骂|吵|滚|弱智|脑残|sb|煞笔)",
     re.IGNORECASE,
 )
-POSITIVE_PATTERN = re.compile(r"(爱|喜欢|好|棒|厉害|赞|开心|谢谢|感谢|乖|可爱|聪明)", re.IGNORECASE)
+POSITIVE_PATTERN = re.compile(
+    # 顺序有讲究：长的组合词放前面，否则「好」会抢在「真好」前命中。
+    # 单字「好」已从词表移除：日常里「早上好」「挺好的」「好开心」一天命中十几次。
+    # 它不是亲昵，是口语填充——实测它把当日暖额吃光，真话反而没额度。
+    # 「棒」字（你真棒）加了限定前缀，「棒」单字不做词（「很棒」类先由「好棒」类覆盖）。
+    r"(真好|最好了|太好了|好棒|真棒|很棒|好厉害|好可爱|辛苦|爱|喜欢|厉害|赞|开心|"
+    r"谢谢|感谢|乖|可爱|聪明|棒)",
+    re.IGNORECASE,
+)
+
+# **否定语境**——必须先于夸奖词判。中文里「不 + 好/错」这类组合极为常见，
+# 「不好意思」「不好说」「不用了」「没什么好的」都在正/负词表里带着钩子，
+# 不先拦就会把道歉、推拒、否定全部读成夸奖（实测「不好意思」+2.17）。
+# 做法：正向词前一个窗口内有否定词（不/没/别/无/莫）时，**把这段划走**，
+# 交给后面的分支当普通文本处理。宁可少扣少加，不可反向。
+_NEGATED_POSITIVE = re.compile(
+    r"(不|没|别|无|莫|休想|不要|不用)[^。！？\n]{0,3}"
+    r"(好|爱|喜欢|棒|厉害|赞|开心|谢谢|感谢|乖|可爱|聪明)"
+)
+
+# **问候/应答/客套**——这些不是感情信号，不该进情绪账。
+# 「你好」「好的」「嗯」「在吗」本质是打招呼或应答，不是「喜欢」。
+# KEEP：「嗯/哦/唔」不在这里——它们是敷衍信号（_COLD_PATTERN 已管），
+# 不是客套，别被这一条洗成 0。
+# 只匹配**整句就是它（或几乎就是它）**的情形：句里另有内容时不走这条。
+_SMALL_TALK_PATTERN = re.compile(
+    r"^(你?好(呀|啊|哇|哈|的|啦|嘛|嘞|滴|呢|吗|了|吧)?|您好|哈喽|hi|hello|hey|"
+    r"不好意思|抱歉|对不起|没事(的|儿)?|没关系|别在意|"
+    r"好(的|呀|吧|啊|啦|嘛|嘞|滴|哇)?|"
+    r"在吗|在么|在不在|在的|收到|知道了|明白|行吧?|可以|ok|好的呢)[。！？.!?~～…\s]*$",
+    re.IGNORECASE,
+)
+
+# **亲近信号**——原来是它们被漏判：「抱抱」「亲亲」「贴贴」不在正向词表里，
+# 走中性随机（实测±0.2）。这类才是 libido 该涨的地方。
+_INTIMATE_PATTERN = re.compile(
+    r"(抱抱|抱抱你|想抱|亲亲|亲一下|么么|贴贴|蹭蹭|拉手|牵手|想你|想你了|"
+    r"喜欢你|爱你|好想你|在干嘛|想见你|陪我)",
+    re.IGNORECASE,
+)
 
 # **冷淡/敷衍**——和脏话是两类东西，不能塞进 NEGATIVE_PATTERN。
 #
@@ -49,10 +88,21 @@ _COLD_PATTERN = re.compile(
 # 记成负分就是冤枉人，而且会让「她今天不顺所以对我冷」和「她对我冷」分不开。
 #
 # 所以先排掉这一类，再看冷淡词。宁可漏判（只是少扣一点分），不可错判。
+#
+# v2.27.2 扩面：口语里最常说的「今天好累」「烦死了」「emo 了」都**没有主语**，
+# 旧模式要求「我/今天我/最近我」开头，全部漏网——「今天好累」会被「好」
+# 抓成夸奖（实测 +2.58 好感）。现在两类都收：有主语窗口 + 无主语强状态词。
+# 无主语分支要排除指向对方的句子（「你好烦」是骂人不是自述）。
+_SELF_STATE_WORDS = (
+    r"累死|累坏|累瘫|好累|心累|想哭|emo|失眠|头疼|头晕|发烧|感冒|胃疼|"
+    r"不舒服|难受死|不开心|丧死|烦死|好烦|不想说话|不想动|没力气"
+)
 _SELF_STATE_PATTERN = re.compile(
-    r"(我|今天我|最近我)[^。！？\n]{0,6}"
+    r"(我|自己|今天|最近|这边)[^。！？\n]{0,6}"
     r"(烦|累|累死|难过|想哭|没劲|心情不好|不开心|难受|不想说话|状态不好|"
-    r"失眠|头疼|不舒服|倒霉|心累|丧)",
+    r"失眠|头疼|不舒服|倒霉|心累|丧)"
+    r"|"
+    r"(?:^|[^你您他她TA])(?:" + _SELF_STATE_WORDS + r")",
     re.IGNORECASE,
 )
 
@@ -104,6 +154,30 @@ MOOD_WARN_INTERVAL_SECONDS = 300.0
 # ——见 `_resolve_delta`。这条消息就**别调模型了**：结果一模一样，省掉一次网络往返。
 # 注意两处必须用同一个值，否则会出现"调了但没用"或"没调却被当成算了"。
 LLM_SKIPPABLE_AFFECTION = -1.5
+
+# ── 攻略速度（v2.27.2）──
+#
+# 反馈：「发几个指令，好感度就能提升两度」「重复刷同一句话也不变便宜」。
+# 原来的单句正收益上限是 2 分，配上每句都生效的夸奖词表，一天就能把任意角色
+# 刷成「满分依恋」。感情该是慢变量：一周以上才到「关系明显变好」。
+#
+# 三道闸叠加：单句上限 → 同类话递减 → 每日封顶。
+# 单句正收益上限。
+# 注意这是「上限」：普通暖话落在 1~1.8，只有亲近类顶到 2.4。
+# 一天正常聊（含 6~10 次暖话、扣除冷淡误伤）净增 ~4~5，12~14 天到「关系明显变好」。
+POSITIVE_MESSAGE_CAP = 2.4
+# 亲近欲的同款上限（甜话不但在刷好感，也在刷亲近欲，ccb 门槛全靠它）。
+LIBIDO_MESSAGE_CAP = 1.2
+# 甜话压脾气也要慢：单句最多压 0.25 分，否则几十句甜话就把攻击性打到 0。
+AGGRESSION_DOWN_CAP = 0.3
+# 每日净增封顶（按她城市的自然日计）。封顶值与时衰半衰期是**配套**的：
+# 168h 半衰期 + 日净增 5 的实测曲线约在 12~14 天到 70（正常强度聊天），
+# 封顶 6.5 时给「高光日」留了余量，又不会让刷屏一天爆涨。
+DAILY_NET_GAIN_CAP = 6.5
+DAILY_LIBIDO_GAIN_CAP = 4.5
+# 同类话递减系数：同一天里第 1/2/3/4+ 次只有对应比例生效。
+# 「新话题不受限」——它只打在反复刷的同类话上（本地词典命中类别）。
+REPEAT_DECAY = (1.0, 0.6, 0.35, 0.2)
 
 # 长期不活跃用户会被丢掉的历史字段。nickname/nickname_src 故意保留：那是用户自己让 bot
 # 怎么称呼自己（或是自动认定后不再改口的依据），丢了会当场改变说话方式；last_interaction
@@ -188,27 +262,77 @@ class Delta:
             self.aggression * (1 - weight) + other.aggression * weight,
         )
 
+def _warm_key(cleaned: str) -> str:
+    """命中的「具体暖词」——同类话递减的键。
+
+    只认词典实际命中的那个词（「喜欢你」→ `intimate:喜欢你`），不按方向堆大类：
+    「谢谢你」「抱抱」「你真棒」是不同的话，不该互相递减；要治的是同一句反复刷。
+    """
+    intimate = _INTIMATE_PATTERN.search(cleaned)
+    if intimate:
+        return f"intimate:{intimate.group()}"
+    positive = POSITIVE_PATTERN.search(cleaned)
+    if positive:
+        return f"warm:{positive.group()}"
+    return ""
+
+
+def _warm_key_for(text: str) -> str:
+    """对一条原文算递减键（否定段先划掉，和 local_delta 同一口径）。"""
+    cleaned = _NEGATED_POSITIVE.sub("", str(text or ""))
+    return _warm_key(cleaned)
+
+
 def local_delta(text: str) -> Delta:
+    body = str(text or "")
     # 自我状态**最先**判，而且它一票否决后面所有分支。
     #
     # 它必须排在 NEGATIVE 前面：「我今天有点烦」里有「烦」，会命中负面那条，
     # 于是对方说自己难受、却被记成「TA 对我冷淡」——冤枉人。
     # 顺带修掉一个更老的错：「我好累」里的「好」会命中正向，给了 +1 分。
     #   自我状态 = TA 自己难受，跟我们没关系，不该进账本任何一边。
-    if _SELF_STATE_PATTERN.search(text):
-        return Delta(random.uniform(-0.5, 0.5), random.uniform(-0.3, 0.3), random.uniform(-0.3, 0.3))
-    if NEGATIVE_PATTERN.search(text):
+    if _SELF_STATE_PATTERN.search(body):
+        # 自我状态 = TA 自己难受，跟我们没关系，不该进账本任何一边。
+        # 原来是随机小漂 ±0.5：均值 0、但方差会随条数累积，一整天诉苦会无端
+        # 搅动关系（实测「今天好累」类消息每天能带 ±1.5 的无意义漂移）。归零。
+        return Delta(0.0, 0.0, 0.0)
+
+    # 否定语境**先于正负词判**：「不好意思」「不好说」「不用了」带着正词的钩子，
+    # 不划走就会被读成夸奖（实测「不好意思」+2.17）。划走后由后面的分支处理——
+    # 这些句子多半落到中性或冷淡，不会反向加分。
+    # 只在「确实有正词且被否定」时划掉那段；句子剩下的部分继续走正常判定。
+    cleaned = _NEGATED_POSITIVE.sub("", body)
+
+    if NEGATIVE_PATTERN.search(cleaned):
         return Delta(random.uniform(-4, -2), random.uniform(-2, -1), random.uniform(2, 4))
-    if POSITIVE_PATTERN.search(text):
-        return Delta(random.uniform(1, 3), random.uniform(0.5, 2), random.uniform(-1, -0.5))
-    if _COLD_PATTERN.search(text):
+
+    # 问候/应答/客套整句归零：不是感情信号。排在正词判定之前。
+    if _SMALL_TALK_PATTERN.match(body):
+        return Delta(0.0, 0.0, 0.0)
+
+    # 亲近信号：走 libido 通道，好感涨得少。排在正向词之前——
+    # 「喜欢你」既命中「喜欢」也命中亲近，亲近通道更准（原来纯正词通道）。
+    if _INTIMATE_PATTERN.search(cleaned):
+        return Delta(random.uniform(1.4, 2.1), random.uniform(0.8, 1.4), random.uniform(-0.6, -0.3))
+
+    if POSITIVE_PATTERN.search(cleaned):
+        return Delta(random.uniform(1.2, 1.8), random.uniform(0.4, 0.9), random.uniform(-0.7, -0.4))
+
+    if _COLD_PATTERN.search(body):
         # 轻。一句「嗯」几乎不推好感，但连着两周的敷衍会在账本里攒成一条。
         #
-        # 区间必须和中性分支**不重叠**：中性是 (-0.5, 0.5)，原来这里写的是
-        # (-1.2, -0.4)——两段在 (-0.5, -0.4) 交叠，于是「敷衍」和「没说话」
-        # 从数值上根本分不开，测试都没法判断一条到底属于哪边。留一条缝。
-        return Delta(random.uniform(-1.2, -0.6), 0.0, random.uniform(-0.6, 0.2))
-    return Delta(random.uniform(-0.5, 0.5), random.uniform(-0.3, 0.3), random.uniform(-0.3, 0.3))
+        # 区间必须和中性分支**不重叠**：中性现在是 0，而这里 (-1.5, -0.6]——
+        # 冷淡与「没说话」从数值上分得开。
+        # v2.27.2 校准：均值 -0.78（×账本 1.6 加成后 ≈ -1.24/句）。
+        # 33 句敷衍 → 50 跌到 ~13（显形但不归零）。
+        # 下限必须 ≤ -0.6：测试与产品词都把「≤ -0.55」定义为冷淡档。
+        return Delta(random.uniform(-0.95, -0.6), 0.0, random.uniform(-0.6, 0.2))
+    # 无信号的中性闲聊：**零**，不是随机小漂。
+    #
+    # 原来是 `uniform(-0.5, 0.5)`：均值虽然是 0，但每天四五十条闲话的方差积累
+    # 会把当天的正向积累吃掉一大半（实测 day1 净增 -2.45——认真聊一天反而变疏远）。
+    # 「今天吃了面」不该让她更喜欢你，也不该更不喜欢；让它老老实实是 0。
+    return Delta(0.0, 0.0, 0.0)
 
 
 class MoodService:
@@ -430,6 +554,9 @@ class MoodService:
     # 以前情绪分析只看得见「用户说了什么」——于是「她说完没人接」和「她说完对方认真
     # 回了」对情绪的影响完全一样，而前者其实是件挺难受的事。分析器必须知道这头。
     SPOKE_MAX = 5
+    # 同一条回复的短窗口去重：工具循环、重试会让同一个回复过多次响应钩子，
+    # 不防的话同一句话会攒成几条「她说…」进去。
+    SPOKE_DEDUP_SECONDS = 90.0
 
     def spoke(self, user_id: str) -> list:
         return self._scope.get_user(user_id, "spoke_log") or []
@@ -444,6 +571,15 @@ class MoodService:
         stamp = self._time() if now is None else now
         # 先 append 再截。原来是 append 之前切，于是存进去的是上限 +1 条。
         rows = [r for r in self.spoke(user_id) if isinstance(r, dict)]
+        # 短窗口同文去重：同一个回复被多个钩子（工具循环、重试）各记一次时不重复攒。
+        if rows:
+            last = rows[-1]
+            try:
+                last_at = float(last.get("at", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                last_at = 0.0
+            if str(last.get("text", "")) == body and (stamp - last_at) < self.SPOKE_DEDUP_SECONDS:
+                return rows
         rows.append({"text": body, "at": stamp, "pending": bool(pending)})
         kept = rows[-self.SPOKE_MAX:]
         self._scope.set_user(user_id, "spoke_log", kept)
@@ -711,6 +847,7 @@ class MoodService:
             return None
 
         base_delta = self._local_delta(text)
+        warm_key = _warm_key_for(text)
 
         # 使用用户级锁代替全局锁
         lock = self._get_user_lock(user_id)
@@ -745,12 +882,12 @@ class MoodService:
             # 单测不看请求内容就发现不了。
             if not should_call_llm:
                 self._append_llm_batch(user_id, text)
-                # 用户又说话了 → 上一条她说的那句有人接了。
-                # 「她说完没人接」和「她说完对方认真回了」对情绪的影响完全不同，
-                # 而分析器以前**只看得见用户说的话**，这头信息一点都没有。
-                self.close_last_spoke(user_id)
             else:
                 record["messages_since_llm"] = 0
+            # 用户又说话了 → 上一条她说的话有人接了。两个分支都要做：原来只在
+            # 「不调模型」那条里关，正好凑够条数触发分析的那条用户消息就漏了，
+            # 她那句话会永远挂着「对方还没回应」。
+            self.close_last_spoke(user_id)
             self._scope.mark_dirty()
             if cfg.mood_verbose_log and self._log is not None:
                 self._log.debug(
@@ -781,7 +918,7 @@ class MoodService:
                 return None
 
             delta = self._resolve_delta(base_delta, llm_delta)
-            delta = self._apply_modifiers(delta, user_id)
+            delta = self._apply_modifiers(delta, user_id, warm_key)
             self._commit(user_id, record, user_state, delta)
             return delta
 
@@ -875,7 +1012,7 @@ class MoodService:
             return base.scaled(1.2)
         return base.blend(llm, 0.3)
 
-    def _apply_modifiers(self, delta: Delta, user_id: str) -> Delta:
+    def _apply_modifiers(self, delta: Delta, user_id: str, warm_key: str = "") -> Delta:
         cfg = self.config
         record = self.profile(user_id)
         factor = cfg.mood_sensitivity / 100.0
@@ -906,14 +1043,102 @@ class MoodService:
                 delta.aggression * (1.4 if delta.aggression > 0 else 1.0),
             )
 
-        return delta.capped(float(cfg.mood_affection_delta_cap))
+        delta = delta.capped(float(cfg.mood_affection_delta_cap))
+        # 三道闸（v2.27.2）依次过：单句封顶 → 同类递减 → 每日净增封顶。
+        return self._throttle_positive(delta, record, user_id, warm_key)
+
+    def _positive_category(self, delta: Delta, warm_key: str = "") -> str:
+        """给一条暖反馈归个「同类话」的键。
+
+        **按命中的具体词分**，而不是把「所有暖话」堆成一类：
+        真人聊天里「谢谢你」「抱抱」「你真棒」是不同的话，不该互相递减；
+        要治的是**同一句反复刷**（连发「我喜欢你」×50）——那种才每次打同一个键。
+        没有命中词但方向是暖的（如 LLM 分析结果）时用「warm-other」兜底。
+        """
+        if warm_key:
+            return warm_key
+        # 只有「整体是暖的」才归暖类：affection 与 libido 全非负、且没有明显负向。
+        # 旧写法（affection>0 or libido>0 / aggression<0）会把混合 delta 也卷进来，
+        # 比如「冷淡中含一点亲昵」被当 calm 类递减，负向就不再稳定。
+        if delta.affection < 0:
+            return ""
+        if delta.affection > 0 or delta.libido > 0:
+            return "warm-other"
+        return ""
+
+    def _throttle_positive(self, delta: Delta, record: dict, user_id: str,
+                           warm_key: str = "") -> Delta:
+        """把「她还能被暖到多少」的三道闸依次施加到一条正向上。
+
+        1. **单句封顶**：好感最多 +0.8、亲近欲最多 +0.5、脾气最多压 -0.25。
+           原来是 2.0（面板 cap）——单句太厚，十句话就能感到关系变了。
+        2. **同类递减**：同一天里同类话第 2 次 ×0.6、第 3 次 ×0.35、第 4 次起 ×0.2。
+           刷一百句「喜欢你」和说一句「喜欢你」没有区别。
+        3. **每日净增封顶**：按她城市的自然日，正向上的净增封顶 3.5 / 3.0。
+           刷屏一天也不会比认真聊一天额外收获多少。
+        只削正向；负向（骂人/冷淡）不动——那个该疼就疼。
+        """
+        category = self._positive_category(delta, warm_key)
+        if not category:
+            return delta
+        affection = min(delta.affection, POSITIVE_MESSAGE_CAP)
+        libido = min(delta.libido, LIBIDO_MESSAGE_CAP)
+        aggression = max(delta.aggression, -AGGRESSION_DOWN_CAP)
+
+        today = ""
+        try:
+            today = str(self._clock.today_str() or "") if self._clock else ""
+        except Exception:
+            today = ""
+        # 当日累计计数器（不是滑窗日志）：滑窗会把放不下的行丢出去，丢一行封顶就漏一分，
+        # 刷得足够多照样能超顶。累计数一旦当天定下就不再丢，闸门才真的封得住。
+        day = record.get("warm_day")
+        if not isinstance(day, dict) or str(day.get("date") or "") != today:
+            day = {"date": today, "counts": {}, "gain": 0.0, "libido_gain": 0.0}
+        counts = day.get("counts")
+        if not isinstance(counts, dict):
+            counts = {}
+        try:
+            count = int(counts.get(category, 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        factor = REPEAT_DECAY[min(count, len(REPEAT_DECAY) - 1)]
+        affection *= factor
+        libido *= factor
+        aggression *= factor
+
+        # 每日净增封顶：当日累计（只算正向真实加了多少；负向不算，它自己会拖低）。
+        try:
+            gained = float(day.get("gain", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            gained = 0.0
+        try:
+            gained_libido = float(day.get("libido_gain", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            gained_libido = 0.0
+        affection = min(affection, max(0.0, DAILY_NET_GAIN_CAP - gained))
+        libido = min(libido, max(0.0, DAILY_LIBIDO_GAIN_CAP - gained_libido))
+
+        counts[category] = count + 1
+        day["counts"] = counts
+        day["gain"] = gained + max(0.0, affection)
+        day["libido_gain"] = gained_libido + max(0.0, libido)
+        record["warm_day"] = day
+        return Delta(affection, libido, aggression)
 
     # 账本条目数上限。够记住「最近这阵子都发生了什么」，又不至于让 state.json
     # 随时间膨胀。按 6 小时时衰，半衰期 3 天的话 60 条约等于两三周。
-    LEDGER_MAX = 60
-    # 时衰半衰期（小时）。3 天：上个月的事基本不参与了，但「他一直很耐心」那种
-    # 靠的是最近几笔的叠加，不是靠单笔记很久。
-    LEDGER_HALF_LIFE_HOURS = 72.0
+    #
+    # v2.27.2：60 → 120。60 条在「每天 40 句、每 4 句左右入账一笔」的节奏下只存得下
+    # 6 天，持续聊天时**最早的正分被截断丢掉**，而负账留着——账本会越用越偏负。
+    # 120 条约等于 12 天，和「12~14 天到 70」的校准窗口对齐。
+    LEDGER_MAX = 120
+    # 时衰半衰期（小时）。
+    #
+    # 120h（5 天）时，日净增 4.5 与时衰恰好在 ledger≈25（aff≈60）处平衡——
+    # 持续认真聊天也到不了 70。168h（7 天）把平衡点推高到 ledger≈33（aff≈68）；
+    # 再配上偶发的高光互动（亲密类单句收益更高）即可到 70 上下。
+    LEDGER_HALF_LIFE_HOURS = 168.0
 
     def _ledger_append(self, record: dict, delta: Delta, now: float,
                        kind: str = "") -> None:

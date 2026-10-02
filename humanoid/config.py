@@ -209,16 +209,6 @@ class HumanoidConfig:
     message_merge_max_count: int = 6
 
     inject_activity_context: str = "medium"
-    # 日程的「现在在做什么」要不要进对话上下文。
-    #
-    # 开着时模型知道她此刻在做什么，能对上话；关掉时只保留「今天做过什么」，
-    # 手上在忙这件事完全不提。
-    #
-    # 有人反馈过：日程出现在上下文里，模型会照着它「无缘无故出去干这干那」——
-    # 看到「现在在整理个案笔记」就开始安排出门之类的事。**我不能确定这确实是日程
-    # 导致的**（模型自己有那份冲动，日程也可能只是给了它一个理由），所以这里只给
-    # 开关，不替用户猜。默认开着；真被驱使了就关掉，日程照常生成，只是不往对话里报。
-    inject_schedule_now: bool = True
     # 注入的 Token 硬预算：超了按显著度从低到高丢句，必需品（时间/称呼/场景）永不丢。
     inject_token_budget: int = 3500
     environment_mode: str = "both"
@@ -230,7 +220,7 @@ class HumanoidConfig:
     mood_provider_name: str = ""
     mood_sensitivity: int = 60
     mood_decay_hours: float = 6.0
-    mood_initial_affection: int = 46
+    mood_initial_affection: int = 35
     # ccb 的四个门槛，与 ccb.py 里的同名常量保持一致（schema 有测试钉住）。
     # 面板上不解释它们是什么：那是用户自己去试的事，写清楚反而是替他们做判断。
     ccb_libido_min: float = 38.0
@@ -243,12 +233,12 @@ class HumanoidConfig:
     mood_affection_delta_cap: int = 2
     mood_log_enabled: bool = True
     mood_log_max_entries: int = 28
-    mood_log_threshold_affection: int = 2
+    mood_log_threshold_affection: int = 3
     mood_log_threshold_libido: int = 2
     # 原为 1：单次 delta 上限是 2，所以每一条负面消息的攻击性变化都跨过这个门槛，
     # 情绪日志被单条对话刷满，而 last_emotional_event 只看最新一条——于是「今天TA惹她
     # 不痛快了」会连续挂一整天。提到 2 后只有真的明显波动才记。
-    mood_log_threshold_aggression: int = 2
+    mood_log_threshold_aggression: int = 3
     mood_update_timeout: float = 120.0
     mood_tag_enabled: bool = True
     mood_use_llm_for_delta: bool = True
@@ -382,7 +372,6 @@ class HumanoidConfig:
             message_merge_timeout_seconds=f("message_merge_timeout_seconds", 0.0, 30.0),
             message_merge_max_count=i("message_merge_max_count", 1, 50),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
-            inject_schedule_now=bool(src.get("inject_schedule_now", True)),
             schedule_persona_max_chars=max(
                 200, min(8000, int(src.get("schedule_persona_max_chars", 3000) or 3000))
             ),
@@ -596,6 +585,9 @@ LEGACY_WEATHER_LOCATION = "Heyuan,CN"
 # v2.16.7 之前的日程默认：时段数 16、旧偏好文案。只迁移仍停在旧默认值的用户。
 LEGACY_SCHEDULE_MAX_SLOTS = 16
 LEGACY_SCHEDULE_PROMPT_EXTRA = "休闲日常，愉快的生活。"
+# v2.27.2 之前的初始好感默认值。46 起步偏亲（叠加当时的单句 2 分收益，“几个指令”就能起两度）；
+# 改成中性起点 35，只动仍停在 46 的配置——自己改过的一律不碰。
+LEGACY_MOOD_INITIAL_AFFECTION = 46
 
 
 def plan_default_migrations(raw: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -630,6 +622,10 @@ def plan_default_migrations(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     # 用户自己改成 full/mood_only 的不碰。
     if str(src.get("inject_activity_context") or "").strip() == "low":
         changes["inject_activity_context"] = "medium"
+    # v2.27.2：初始好感默认 46 → 35。只动仍停在 46 的项——手动设过 46 以外值的不碰。
+    # **用户现有的好感数据（state.json）一律不动**，这条只影响新档案的起点。
+    if src.get("mood_initial_affection") == LEGACY_MOOD_INITIAL_AFFECTION:
+        changes["mood_initial_affection"] = DEFAULTS.mood_initial_affection
     return changes
 
 

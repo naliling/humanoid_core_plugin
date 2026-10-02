@@ -522,7 +522,14 @@ class HumanoidCoreInstance:
         task.add_done_callback(self._tasks.discard)
         return task
 
-    def on_message(self, user_id: str, text: str, is_group: bool = False, umo: str = "") -> None:
+    def on_message(self, user_id: str, text: str, is_group: bool = False, umo: str = "",
+                   is_command: bool = False) -> None:
+        """一条真实用户消息的记账。
+
+        `is_command=True` 时只推进时钟与「人在用」，**不记任何互动**：
+        指令不是交谈——`/好感度` 这几个字里带着「好」，当聊天记会直接涨好感
+        （实测连发 5 次 46→49.92），而且指令文本会混进情绪分析批。
+        """
         now = self.now_epoch()
         self.last_activity = now
         cfg = self.config
@@ -536,57 +543,63 @@ class HumanoidCoreInstance:
 
         # 时间间隔属于“事件”，必须先读取旧状态，再写入当前时间。
         # 新用户回合开始，上一回合的“回来事件”到此结束，避免后续消息反复追问同一件事。
-        self.behavior.clear_user_events(user_id)
+        # 指令不参与：发个 /查看日程 不该重置「TA多久没说话了」，也不该产生“回来”事件。
+        if not is_command:
+            self.behavior.clear_user_events(user_id)
 
-        last_ts = self._scope.get_user(user_id, "last_interaction")
-        previous_message = self._scope.get_user(user_id, "last_message")
-        event = self.behavior.process_interval(
-            user_id=user_id,
-            now=now,
-            last_ts=last_ts,
-            last_message=previous_message,
-        )
-        if event is not None:
-            self.behavior.add_event(user_id, event)
+            last_ts = self._scope.get_user(user_id, "last_interaction")
+            previous_message = self._scope.get_user(user_id, "last_message")
+            event = self.behavior.process_interval(
+                user_id=user_id,
+                now=now,
+                last_ts=last_ts,
+                last_message=previous_message,
+            )
+            if event is not None:
+                self.behavior.add_event(user_id, event)
 
-        # 当前消息成为下一次“回来时”可参考的上一条消息。
-        self._scope.set_user(user_id, "last_interaction", now)
-        if text:
-            self._scope.set_user(user_id, "last_message", {
-                "text": text[:120],
-                "timestamp": now,
-            })
-            # 记住 TA 说过什么：注入里一句「TA之前说过『我猫今天吐了』」就能让她像个
-            # 一直在听的人，而不是每条都重新认识你。本地采样，零额外调用。
-            if cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group):
-                self.mood.note_said(user_id, text, now)
+            # 当前消息成为下一次“回来时”可参考的上一条消息。
+            self._scope.set_user(user_id, "last_interaction", now)
+            if text:
+                self._scope.set_user(user_id, "last_message", {
+                    "text": text[:120],
+                    "timestamp": now,
+                })
+                # 记住 TA 说过什么：注入里一句「TA之前说过『我猫今天吐了』」就能让她像个
+                # 一直在听的人，而不是每条都重新认识你。本地采样，零额外调用。
+                if cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group):
+                    self.mood.note_said(user_id, text, now)
 
         self.energy.advance()
-        self.energy.consume_for_message()
+        if not is_command:
+            self.energy.consume_for_message()
 
-        # 聊天频率感靠这个计数：TA今天话不少/很少，中间档不给。
-        today = self.clock.today_str()
-        if str(self._scope.get_self("daily_msg_date", "") or "") != today:
-            self._scope.update_self(daily_msg_date=today, daily_msg_count=1)
-        else:
-            try:
-                count = int(self._scope.get_self("daily_msg_count", 0) or 0)
-            except (TypeError, ValueError):
-                count = 0
-            self._scope.set_self("daily_msg_count", count + 1)
+        # 聊天频率感靠这个计数：TA今天话不少/很少，中间档不给。指令不该算「话」。
+        if not is_command:
+            today = self.clock.today_str()
+            if str(self._scope.get_self("daily_msg_date", "") or "") != today:
+                self._scope.update_self(daily_msg_date=today, daily_msg_count=1)
+            else:
+                try:
+                    count = int(self._scope.get_self("daily_msg_count", 0) or 0)
+                except (TypeError, ValueError):
+                    count = 0
+                self._scope.set_self("daily_msg_count", count + 1)
 
-        if cfg.soma_enabled:
+        if cfg.soma_enabled and not is_command:
             self.soma.note_message()
 
-        if cfg.social_energy_enabled:
+        if cfg.social_energy_enabled and not is_command:
             self.social.consume_for_message()
 
         self.process.tick()
         self.mood.decay_user(user_id)
-        if cfg.soma_enabled and not is_group:
+        if cfg.soma_enabled and not is_group and not is_command:
             # 私聊算「有人陪」，把想说话的程度泄掉；群聊里潜水不等于被陪。
+            # 指令不算陪伴。
             self.soma.note_chat(now)
-        self._dispatch_async(user_id, text, is_group=is_group)
+        if not is_command:
+            self._dispatch_async(user_id, text, is_group=is_group)
 
     def _dispatch_async(self, user_id: str, text: str, is_group: bool = False):
         cfg = self.config

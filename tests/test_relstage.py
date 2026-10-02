@@ -60,7 +60,7 @@ class InInjection(unittest.TestCase):
 
     def test_each_stage_shows_its_own_line(self):
         markers = {
-            50: "互相试探", 60: "讲点自己的事",
+            50: "互相认识", 60: "讲点自己的事",
             80: "不用绕弯子", 92: "几乎没有边界",
         }
         for aff, mark in markers.items():
