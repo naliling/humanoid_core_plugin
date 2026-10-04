@@ -26,6 +26,7 @@ from .humanoid.role_manager import RoleManager
 from .humanoid.state import StateStore
 from .humanoid.clock import Clock
 from .humanoid.debounce import MERGE_EXTRA_KEY, Debouncer
+from .humanoid.input_state import InputStateNotifier
 
 DATA_SUBDIR = ("plugin_data", "humanoid_core")
 
@@ -36,7 +37,7 @@ HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 /你的状态 - 精力、身体轴（困意/睡眠债/饥饿/不适）、生理、天气、日程、关系、注意力
 /查看日程 - 她今天过出来的日程（动态现排，不预排未来）
 /时间 城市 - 查看指定城市当前时间
-/好感度 - 情绪档案总览
+/好感度 - 情绪档案总览（管理员加「排行榜」看所有人的排名）
 /情绪详情 - 含基线值与交互轮次
 /情绪日志 - 情绪波动记录
 /叫我 昵称 - 设置她对你的称呼（没设过时她会自动认一次，认过之后不再改）
@@ -69,12 +70,19 @@ LOG_PREFIX = "[humanoid_core] "
 DEFAULTS_MIGRATION_MARK = ".defaults-migrated-v2.16.7"
 
 
-def _arg_after(text: str, command: str) -> str:
+def _arg_after(text: str, *commands: str) -> str:
+    """取指令名之后的剩余文本。
+
+    组指令在真实会话里到达的写法是「拟人 设置 …」（组名和指令名之间一个空格），
+    直接调用（旧写法、测试）里是「拟人设置 …」——两种都认，按给的顺序找第一个命中的。
+    一个都没命中时退回整串（保留老的兜底行为）。
+    """
     raw = (text or "").strip()
-    index = raw.find(command)
-    if index == -1:
-        return raw.lstrip("/").strip()
-    return raw[index + len(command) :].strip()
+    for command in commands:
+        index = raw.find(command)
+        if index != -1:
+            return raw[index + len(command) :].strip()
+    return raw.lstrip("/").strip()
 
 
 def _is_private_chat(event: AstrMessageEvent) -> bool:
@@ -327,6 +335,12 @@ class HumanoidCore(Star):
 
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
+        # 输入状态（正在输入）：按会话跑一个高频上报的小任务，纯装饰，出错不影响回复。
+        self._input_state = InputStateNotifier(
+            logger,
+            interval=self._config.input_state_interval_seconds,
+            timeout=self._config.input_state_timeout_seconds,
+        )
         # 多消息合并（防抖）的按会话状态；进程内内存，键是 unified_msg_origin。
         self._debounce = Debouncer(lambda: self._config, logger)
 
@@ -411,6 +425,7 @@ class HumanoidCore(Star):
         # 合并缓冲里可能还压着没发出的内容（用户发了半句就没下文了）。卸载时丢掉是对的：
         # 它的主人已经不在了，放到下一个会话里说出去反而是惊吓。
         self._debounce.reset()
+        await self._input_state.stop_all()
         await self.role_manager.stop()
         await self._state_store.stop()
         session, self._session = self._session, None
@@ -487,9 +502,17 @@ class HumanoidCore(Star):
 
     @filter.command("好感度")
     async def cmd_mood(self, event: AstrMessageEvent):
-        """查看当前用户的好感度、亲近欲、攻击性及情绪标签。"""
+        """查看当前用户的好感度；带「排行榜」看所有人的排名（管理员）。"""
         if not self._config.mood_enabled:
             yield event.plain_result("情绪系统未开启。")
+            return
+        argument = _arg_after(event.message_str, "好感度")
+        if argument in ("排行榜", "排行", "排名", "榜"):
+            if not self._is_admin(event):
+                yield event.plain_result(NO_PERMISSION)
+                return
+            core = self._core(event)
+            yield event.plain_result(self.engine.affection_ranking_text(core))
             return
         core = self._core(event)
         yield event.plain_result(core.mood.profile_text(self._sender(event)))
@@ -566,13 +589,13 @@ class HumanoidCore(Star):
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
-        value = _arg_after(event.message_str, "设置参照名称")
+        value = _arg_after(event.message_str, "参照名称")
         core = self._core(event)
         if not value:
             current = core.char_name()
             yield event.plain_result(
                 f"当前参照名称：{current or '（未设定）'}"
-                + "\n（没设时自动跟用人设里的名字；写「/设置参照名称 清除」可以去掉设定）"
+                + "\n（没设时自动跟用人设里的名字；写「/拟人 参照名称 清除」可以去掉设定）"
             )
             return
         if value in ("清除", "默认", "跟随", "跟随人设", "无"):
@@ -629,12 +652,12 @@ class HumanoidCore(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("设置")
     async def cmd_settings(self, event: AstrMessageEvent):
-        """`/拟人设置` 看常用项；`/拟人设置 城市 大阪` 改一项，改完立即生效。"""
+        """`/拟人 设置` 看常用项；`/拟人 设置 城市 大阪` 改一项，改完立即生效。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
         raw = event.message_str or ""
-        argument = _arg_after(raw, "拟人设置")
+        argument = _arg_after(raw, "拟人 设置", "拟人设置")
         core = self._core(event)
         if not argument:
             yield event.plain_result(self._settings_summary(core))
@@ -646,16 +669,16 @@ class HumanoidCore(Star):
         if not key:
             yield event.plain_result(
                 "不认识这一项。能改的：" + "、".join(self.SETTINGS_ALIASES)
-                + "\n例：/拟人设置 城市 大阪"
+                + "\n例：/拟人 设置 城市 大阪"
             )
             return
         # 城市按机器人分离：写当前这个 bot 自己的覆盖，不动全局配置。
-        # 两个机器人各发各的 /拟人设置 城市，互不影响（以前共一份全局，改一个另一个也变）。
+        # 两个机器人各发各的 /拟人 设置 城市，互不影响（以前共一份全局，改一个另一个也变）。
         if key == "timezone_city":
             if not value:
                 yield event.plain_result(
-                    "用法：/拟人设置 城市 大阪（只改当前这个机器人）；"
-                    "写「/拟人设置 城市 默认」可取消单独设置、回到跟随全局。"
+                    "用法：/拟人 设置 城市 大阪（只改当前这个机器人）；"
+                    "写「/拟人 设置 城市 默认」可取消单独设置、回到跟随全局。"
                 )
                 return
             effective = core.set_city_override(value)
@@ -674,6 +697,11 @@ class HumanoidCore(Star):
             yield event.plain_result("配置不是可写的字典，这次没改。请去面板里改。")
             return
         current = raw_config.get(key)
+        if not value:
+            yield event.plain_result(
+                f"「{key_word}」现在是 {current!r}；要改就写：/拟人 设置 {key_word} 新值"
+            )
+            return
         new_value = _coerce_setting(key, value, current)
         if new_value is None:
             yield event.plain_result(f"「{value}」不是这一项能接受的值。当前值：{current!r}")
@@ -696,23 +724,23 @@ class HumanoidCore(Star):
 
     def _settings_summary(self, core=None) -> str:
         cfg = self._config
-        lines = [f"⚙️ 常用设置（共 89 项，其余标了【进阶】，在面板里改）"]
+        lines = [f"⚙️ 常用设置（共 {len(HumanoidConfig.__dataclass_fields__)} 项，其余标了【进阶】，在面板里改）"]
         # 城市是每个机器人独立的：优先显示当前 bot 生效城市，并标明是否单独设。
         if core is not None:
             override = str(core.scope.get_self("tz_city_override", "") or "")
             effective = core.clock.city or "（未定）"
             tag = "当前 bot 单独设" if override else f"跟随全局 {cfg.timezone_city or '（未定）'}"
-            lines.append(f"- 城市：{effective}（{tag}）　→ /拟人设置 城市 大阪")
+            lines.append(f"- 城市：{effective}（{tag}）　→ /拟人 设置 城市 大阪")
         else:
-            lines.append(f"- 城市（全局默认）：{cfg.timezone_city or '（未定）'}　→ /拟人设置 城市 大阪")
-        lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人设置 人设 开")
+            lines.append(f"- 城市（全局默认）：{cfg.timezone_city or '（未定）'}　→ /拟人 设置 城市 大阪")
+        lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人 设置 人设 开")
         lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（每 {cfg.schedule_refresh_minutes} 分钟决定一次要不要排下一段，变动概率 {cfg.schedule_change_chance}%）")
         lines.append(
             f"- 调用节流：最短间隔 {cfg.schedule_min_interval_minutes} 分钟"
             f"，空闲 {cfg.llm_idle_silence_minutes} 分钟静默"
             f"，今日已用 {self.call_gate.used_today}/"
             f"{cfg.llm_daily_call_budget or '不限'} 次（所有 bot 共享）"
-            f"　→ /拟人设置 间隔 30"
+            f"　→ /拟人 设置 间隔 30"
         )
         lines.append(f"- 日程额外偏好：{cfg.schedule_prompt_extra or '（空）'}")
         lines.append(f"- 上下文详略：{cfg.inject_activity_context}（medium/full/mood_only）")
@@ -720,7 +748,7 @@ class HumanoidCore(Star):
         admins = "、".join(cfg.admin_qq) if cfg.admin_qq else "（未设，靠 AstrBot 全局 admins_id）"
         lines.append(f"- 管理员：{admins}")
         lines.append(f"- 调试日志：{'开' if cfg.debug_mode else '关'}")
-        lines.append("改完立即生效；进阶项用 /重载配置 刷新。")
+        lines.append("改完立即生效；进阶项用 /拟人 重载 刷新。")
         return "\n".join(lines)
 
     @humanoid_group.command("重载")
@@ -732,6 +760,10 @@ class HumanoidCore(Star):
         self._config_box.reload()
         # 合并等待秒数可能被改了，把压着的半句清掉，免得它按旧配置等完才发。
         self._debounce.reset()
+        self._input_state.configure(
+            self._config.input_state_interval_seconds,
+            self._config.input_state_timeout_seconds,
+        )
         yield event.plain_result(f"✅ 配置已重载。当前注入档位：{self._config.inject_activity_context}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -755,10 +787,10 @@ class HumanoidCore(Star):
                 detail = f"：{what}（到 {until}）" if what else ""
                 yield event.plain_result(f"✅ 新的一段已排好{detail}。")
             else:
-                yield event.plain_result("✅ 已按身体现排一段（模型不可用，可用 /拟人诊断 查看配置）。")
+                yield event.plain_result("✅ 已按身体现排一段（模型不可用，可用 /拟人 诊断 查看配置）。")
         else:
             yield event.plain_result(
-                f"❌ 生成失败：{core.schedule.last_error}（可用 /拟人诊断 查看模型配置）"
+                f"❌ 生成失败：{core.schedule.last_error}（可用 /拟人 诊断 查看模型配置）"
             )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -842,6 +874,43 @@ class HumanoidCore(Star):
         ]
         yield event.plain_result("📋 昵称列表：\n" + "\n".join(lines))
 
+    # -------------------- 输入状态（正在输入） --------------------
+    #
+    # 做法照市场插件 astrbot_plugin_input_state_by_nc：LLM 请求开始起一个高频上报的小任务，
+    # 响应回来就停。只需 NapCat（aiocqhttp）私聊；其它平台/群聊在 is_supported 里直接跳过。
+
+    @filter.on_llm_request(priority=1)
+    async def show_input_state(self, event: AstrMessageEvent, req: ProviderRequest):
+        """她要开始写回复了：给 QQ 报「正在输入」。
+
+        priority=1 是为了比其它插件的 on_llm_request 先跑，不然得等它们做完准备工作
+        才开始显示（参考插件也是这么标的）。
+        """
+        try:
+            if not self._config.input_state_enabled:
+                return
+            await self._input_state.start(event.unified_msg_origin, event)
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 启动输入状态失败: {e}")
+
+    @filter.on_llm_response()
+    async def hide_input_state(self, event: AstrMessageEvent, response: Any):
+        """回复生成了：停上报。"""
+        try:
+            await self._input_state.stop(event.unified_msg_origin)
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 停止输入状态失败: {e}")
+
+    @filter.on_decorating_result()
+    async def keep_input_state_before_send(self, event: AstrMessageEvent):
+        """马上要发消息了：再补一帧，别在「写好了、还没发」的空档里断掉。"""
+        try:
+            if not self._config.input_state_enabled:
+                return
+            await self._input_state.refresh(event.unified_msg_origin, event)
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 补齐输入状态失败: {e}")
+
     # -------------------- LLM 请求注入钩子 --------------------
 
     @filter.on_llm_request()
@@ -868,6 +937,14 @@ class HumanoidCore(Star):
             core = self.role_manager.get_or_create(self._self_id(event))
             user_id = self._sender(event)
             text = (getattr(event, "message_str", "") or "").strip()
+            # 兄弟 bot 的发言不该被回复：合并层那道只是不合并，不拦的话另一台 bot
+            # 在群里 @ 一下，本台照样会正经回它一条（多 bot 串台）。
+            # 必须 stop_event 才能真的挡下本轮 LLM，光 return 挡不住。
+            if user_id and user_id in self._known_role_ids(exclude=self._self_id(event)):
+                stopper = getattr(event, "stop_event", None)
+                if callable(stopper):
+                    stopper()
+                return
             # 注意力（上心程度）要看用户到底说了什么：合并了几条时看合并后的全貌，
             # 否则前几条里的问句、提到的话题都不参与判断，注意力会被算低。
             said = self._debounce.peek_text(event, text)
@@ -1003,6 +1080,25 @@ class HumanoidCore(Star):
 
     # -------------------- 多消息合并（消息防抖） --------------------
 
+    def _known_role_ids(self, exclude: str = "") -> set:
+        """本插件状态里已经见过的其它角色 id（多 bot 同进程部署时的「兄弟」）。
+
+        它们发出来的消息在事件层看起来就是普通用户——另一台 bot 的自发消息、
+        被平台回灌过来时，sender 是那台 bot 的 id，不等于本台，所以「跳过自己发的」
+        那道闸挡不住。叠进合并 buffer 就会变成「她分不清自己在回谁」。
+        只认状态里出现过的 id；跨进程的 bot 认不出，README 里写清了边界。
+        """
+        out: set = set()
+        try:
+            roles = self._state_store.data.get("roles", {}) or {}
+            for rid in roles:
+                rid = str(rid or "")
+                if rid and rid != "default" and rid != str(exclude):
+                    out.add(rid)
+        except Exception:
+            pass
+        return out
+
     @filter.on_waiting_llm_request()
     async def debounce_merge(self, event: AstrMessageEvent):
         """把同一会话连续触发机器人的多条消息合并成一次回复。
@@ -1015,8 +1111,9 @@ class HumanoidCore(Star):
            所以等的时候后面的消息能进来把自己顶掉。
 
         判定「这句话说完了吗」用 `humanoid/merge.py` 的规则而不是固定时间窗：句末有标点或
-        语气词的消息**零延迟**直接发（旧的固定 1.5 秒窗口会让每条回复都平白晚 1.5 秒），
-        只有「今天真的好累啊」这种拿不准的才等一句。状态机与取舍见 `humanoid/debounce.py`。
+        语气词的消息等一个短确认窗口（`message_merge_settle_seconds`），拿不准的等满
+        `message_merge_timeout_seconds`。两者都会把等待期间到达的后续句并进来——
+        「用户发三条、他就回三条」正是因为第一条说完就被零延迟放走了。
 
         被合并掉的旧消息走 `stop_event()`，它**没有走到 on_llm_request**（所以不会被注入
         事实块），但 `on_message` 照旧逐条记账——身体/情绪/记忆按每条真实发言算，
@@ -1037,23 +1134,33 @@ class HumanoidCore(Star):
             # provider_request 可能从其他路径进来）。命中指令名单时直接放行。
             if _is_command_message(text, bool(getattr(event, "is_at_or_wake_command", True))):
                 return
-            # **跳过自己发的**。`on_message` 有这道检查，合并这里原来没有——
-            # 于是她自己在群里说的每句话（尤其是主动消息插件发的那些）都可能被
-            # 攒进 buffer 当成「用户刚说了什么」，表现出来就是**随时都在触发**，
-            # 而且模型分不清那是不是在回对方。
-            try:
-                if self._sender(event) == self._self_id(event):
-                    return
-            except Exception:
-                pass
+            # 只对同一会话做合并，但**分桶的键要带上发送者**：
+            # 群里一个 umo 下所有人共用一格，原来只按 umo 合并，会把 A 一句 B 一句
+            # 拼成一条批处理——模型拿到两个不相干的人的话，分不清在回谁，
+            # 于是写一条长消息把人逐个回一遍（比不合并还糟）。
+            # 按（会话, 发送者）分开：同一个人连发才合并，不同的人各回各的。
             try:
                 umo = str(getattr(event, "unified_msg_origin", "") or "")
             except Exception:
                 umo = ""
+            try:
+                sender_id = str(self._sender(event) or "")
+            except Exception:
+                sender_id = ""
+            # **跳过自己发的**。`on_message` 有这道检查，合并这里原来没有——
+            # 于是她自己在群里说的每句话（尤其是主动消息插件发的那些）都可能被
+            # 攒进 buffer 当成「用户刚说了什么」，表现出来就是**随时都在触发**，
+            # 而且模型分不清那是不是在回对方。
+            if sender_id and sender_id == str(self._self_id(event)):
+                return
+            # 兄弟 bot 的消息也不进合并：那是机器人，不是「用户刚说了什么」。
+            if sender_id and sender_id in self._known_role_ids(exclude=str(self._self_id(event))):
+                return
             if not umo:
                 return
+            key = f"{umo}|{sender_id}" if sender_id else umo
             proceed = await self._debounce.hold(
-                event, key=umo, text=text, stop_event=event.stop_event,
+                event, key=key, text=text, stop_event=event.stop_event,
                 sender=_sender_name(event) or "TA",
             )
             if not proceed:
@@ -1073,6 +1180,11 @@ class HumanoidCore(Star):
             role_id = self._self_id(event)
             user_id = self._sender(event)
             if user_id == role_id:
+                return
+            # 兄弟 bot 的消息不是「用户说了什么」：不记账、也不该触发回复。
+            # 多台 bot 同进程部署时，另一台 bot 的群发言在事件层就是普通成员，
+            # sender 不等于本台，前面那道「跳过自己」挡不住。只认状态里见过的角色 id。
+            if user_id and user_id in self._known_role_ids(exclude=role_id):
                 return
             # 任何一条真实用户消息都算「有人在用」：松开空闲静默，让日程重新跟上。
             # 放在后续所有早退之前，否则「被过滤的环境」会把静默一直吊着。

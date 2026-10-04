@@ -18,7 +18,7 @@
     "default": true
   },
   "schedule_refresh_minutes": {
-    "description": "决策窗间隔(分)",
+    "description": "【进阶】决策窗间隔(分)",
     "hint": "每隔多久重看一遍要不要换事",
     "type": "int",
     "default": 15,
@@ -26,7 +26,7 @@
     "maximum": 1440
   },
   "schedule_change_chance": {
-    "description": "改主意概率(%)",
+    "description": "【进阶】改主意概率(%)",
     "hint": "每次决定换事的概率（百分数）",
     "type": "int",
     "default": 30,
@@ -45,16 +45,46 @@
     "type": "bool",
     "default": true
   },
+  "input_state_enabled": {
+    "description": "输入状态（正在输入）",
+    "hint": "私聊里她写回复的那几秒，QQ 会显示她正在输入。仅 NapCat（aiocqhttp）生效，其它平台自动跳过",
+    "type": "bool",
+    "default": true
+  },
+  "input_state_interval_seconds": {
+    "description": "输入状态上报间隔（秒）",
+    "hint": "每这么久向 QQ 报一次「正在输入」。QQ 的状态约 8~10 秒自己会消失，隔太久会闪",
+    "type": "float",
+    "default": 0.5,
+    "minimum": 0.1,
+    "maximum": 10.0
+  },
+  "input_state_timeout_seconds": {
+    "description": "输入状态超时（秒）",
+    "hint": "万一响应钩子没回来，最多显示这么久就自己停，免得「正在输入」一直闪",
+    "type": "float",
+    "default": 120.0,
+    "minimum": 10.0,
+    "maximum": 600.0
+  },
   "message_merge_timeout_seconds": {
-    "description": "拿不准时等多久(秒)",
+    "description": "【进阶】拿不准时等多久(秒)",
     "hint": "判不出「说完了没」时最多等几秒",
     "type": "float",
     "default": 3.0,
     "minimum": 0,
     "maximum": 30
   },
+  "message_merge_settle_seconds": {
+    "description": "【进阶】说完了也再等一拍(秒)",
+    "hint": "已经说完的消息也等这么点时间，看有没有连发的下一句——不然用户快速发三条完整消息会被回三次。设 0 = 说完就发（旧行为）。",
+    "type": "float",
+    "default": 1.5,
+    "minimum": 0,
+    "maximum": 10
+  },
   "message_merge_max_count": {
-    "description": "一批最多几条",
+    "description": "【进阶】一批最多几条",
     "hint": "防止刷屏把上下文撑爆，只保留最近这么多条。默认 6。",
     "type": "int",
     "default": 6,
@@ -73,7 +103,7 @@
     ]
   },
   "inject_token_budget": {
-    "description": "注入Token预算",
+    "description": "【进阶】注入Token预算",
     "hint": "事实块超预算时按显著度从低到高丢句，时间/称呼/场景这些必需品永不丢",
     "type": "int",
     "default": 3500,
@@ -104,19 +134,19 @@
     "default": false
   },
   "max_energy": {
-    "description": "精力上限",
+    "description": "【进阶】精力上限",
     "hint": "她的精力条顶格值，默认 100。",
     "type": "float",
     "default": 100.0
   },
   "enable_cycle": {
-    "description": "生理周期",
+    "description": "【进阶】生理周期",
     "hint": "开：按周期调制精力恢复与情绪幅度；关：没有周期这回事。",
     "type": "bool",
     "default": true
   },
   "cycle_length": {
-    "description": "周期天数",
+    "description": "【进阶】周期天数",
     "hint": "一轮生理周期的长度，默认 28 天。",
     "type": "int",
     "default": 28,
@@ -124,7 +154,7 @@
     "maximum": 365
   },
   "energy_decay_rate": {
-    "description": "精力变化倍率",
+    "description": "【进阶】精力变化倍率",
     "hint": "所有精力涨落速度的总乘数：越大越容易累、歇起来也快。",
     "type": "string",
     "default": "0.5",
@@ -136,7 +166,7 @@
     ]
   },
   "cycle_description_style": {
-    "description": "周期描述风格",
+    "description": "【进阶】周期描述风格",
     "hint": "default=完整描述，simple=简洁",
     "type": "string",
     "default": "default",
@@ -146,27 +176,27 @@
     ]
   },
   "schedule_provider_name": {
-    "description": "日程首选模型",
+    "description": "【进阶】日程首选模型",
     "hint": "生成日程用哪个模型",
     "type": "string",
     "_special": "select_provider",
     "default": ""
   },
   "schedule_fallback_provider_name": {
-    "description": "日程备用模型",
+    "description": "【进阶】日程备用模型",
     "hint": "首选「未找到/超时/报错」时自动切到这个。",
     "type": "string",
     "_special": "select_provider",
     "default": ""
   },
   "schedule_allow_global_fallback": {
-    "description": "允许回退全局模型",
+    "description": "【进阶】允许回退全局模型",
     "hint": "首选和备用都失败时，要不要再试 AstrBot 全局默认模型",
     "type": "bool",
     "default": true
   },
   "schedule_retry_interval_seconds": {
-    "description": "同模型重试间隔(秒)",
+    "description": "【进阶】同模型重试间隔(秒)",
     "hint": "同一个模型两次尝试之间歇多久。",
     "type": "int",
     "default": 2,
@@ -174,7 +204,7 @@
     "maximum": 600
   },
   "schedule_llm_timeout_seconds": {
-    "description": "单次生成超时(秒)",
+    "description": "【进阶】单次生成超时(秒)",
     "hint": "一次日程生成最多等多久，超时按失败处理并切下一个模型。",
     "type": "int",
     "default": 60,
@@ -182,7 +212,7 @@
     "maximum": 300
   },
   "schedule_generation_max_attempts": {
-    "description": "每模型试几次",
+    "description": "【进阶】每模型试几次",
     "hint": "同一个模型失败几次才放弃切下一个。默认 2。",
     "type": "int",
     "default": 2,
@@ -190,7 +220,7 @@
     "maximum": 5
   },
   "schedule_max_slots": {
-    "description": "当天最多留几段",
+    "description": "【进阶】当天最多留几段",
     "hint": "含已过完的段，超出丢最早的——太久之前的事她自己也记不清",
     "type": "int",
     "default": 96,
@@ -198,7 +228,7 @@
     "maximum": 96
   },
   "schedule_provider_cooldown_minutes": {
-    "description": "日程模型冷却(分)",
+    "description": "【进阶】日程模型冷却(分)",
     "hint": "模型失败后歇这么久，期间直接用本地现算，不反复砸模型。",
     "type": "int",
     "default": 30,
@@ -230,7 +260,7 @@
     "maximum": 1000000
   },
   "schedule_time_granularity": {
-    "description": "段起点对齐",
+    "description": "【进阶】段起点对齐",
     "hint": "15min=每段起点对到一刻钟整点；flexible=不要求对齐。",
     "type": "string",
     "default": "15min",
@@ -263,7 +293,7 @@
     "default": ""
   },
   "weather_refresh_minutes": {
-    "description": "天气刷新(分)",
+    "description": "【进阶】天气刷新(分)",
     "hint": "多久重新拉一次天气数据。默认 60。",
     "type": "int",
     "default": 60,
@@ -271,13 +301,13 @@
     "maximum": 1440
   },
   "enable_chat_awareness": {
-    "description": "群聊里提不提「有人看着」",
+    "description": "【进阶】群聊里提不提「有人看着」",
     "hint": "群里要不要提「还有别人在看着」",
     "type": "bool",
     "default": true
   },
   "show_city_time_in_low_intrusion": {
-    "description": "提她在哪个城市",
+    "description": "【进阶】提她在哪个城市",
     "hint": "开：上下文里写「她在XX」；关：只剩日期与钟点，不提城市名。",
     "type": "bool",
     "default": true
@@ -289,7 +319,7 @@
     "default": true
   },
   "mood_sensitivity": {
-    "description": "情绪敏感度",
+    "description": "【进阶】情绪敏感度",
     "hint": "0-100：越高，一条消息激起的情绪波动越大。",
     "type": "int",
     "default": 60,
@@ -297,7 +327,7 @@
     "maximum": 100
   },
   "mood_decay_hours": {
-    "description": "情绪回缓周期",
+    "description": "【进阶】情绪回缓周期",
     "hint": "情绪回到基线要几小时",
     "type": "float",
     "default": 6.0,
@@ -305,7 +335,7 @@
     "maximum": 720
   },
   "mood_initial_affection": {
-    "description": "初始好感",
+    "description": "【进阶】初始好感",
     "hint": "新用户的好感初始值（35 是中性起点，关系靠相处慢慢长）",
     "type": "int",
     "default": 35,
@@ -313,7 +343,7 @@
     "maximum": 100
   },
   "mood_initial_libido": {
-    "description": "初始亲近欲",
+    "description": "【进阶】初始亲近欲",
     "hint": "新用户的亲近欲初始值",
     "type": "int",
     "default": 34,
@@ -321,7 +351,7 @@
     "maximum": 50
   },
   "mood_initial_aggression": {
-    "description": "初始攻击性",
+    "description": "【进阶】初始攻击性",
     "hint": "新用户的攻击性初始值",
     "type": "int",
     "default": 28,
@@ -329,13 +359,13 @@
     "maximum": 50
   },
   "mood_affection_override": {
-    "description": "指定某人好感",
+    "description": "【进阶】指定某人好感",
     "hint": "格式 3881756548:100，多个用英文逗号分隔；钉死后不随聊天变化",
     "type": "list",
     "default": []
   },
   "mood_affection_delta_cap": {
-    "description": "单次好感变化上限",
+    "description": "【进阶】单次好感变化上限",
     "hint": "1-10：越低，一条消息能带来的好感变化越小，感情升温越平缓。",
     "type": "int",
     "default": 2,
@@ -343,13 +373,13 @@
     "maximum": 10
   },
   "mood_log_enabled": {
-    "description": "情绪日志",
+    "description": "【进阶】情绪日志",
     "hint": "记下明显的情绪波动事件，/情绪日志 可查，给「今天被TA气到了」这类延续感供料",
     "type": "bool",
     "default": true
   },
   "mood_log_max_entries": {
-    "description": "日志每人几条",
+    "description": "【进阶】日志每人几条",
     "hint": "超过丢最早的。默认 28。",
     "type": "int",
     "default": 28,
@@ -357,7 +387,7 @@
     "maximum": 1000
   },
   "mood_log_threshold_affection": {
-    "description": "好感记录阈值",
+    "description": "【进阶】好感记录阈值",
     "hint": "一次变化超过多少才值得记一条日志。",
     "type": "int",
     "default": 3,
@@ -365,7 +395,7 @@
     "maximum": 100
   },
   "mood_log_threshold_libido": {
-    "description": "亲近记录阈值",
+    "description": "【进阶】亲近记录阈值",
     "hint": "同上，管亲近欲维度。",
     "type": "int",
     "default": 2,
@@ -373,7 +403,7 @@
     "maximum": 50
   },
   "mood_log_threshold_aggression": {
-    "description": "攻击记录阈值",
+    "description": "【进阶】攻击记录阈值",
     "hint": "攻击性波动多大才记一条情绪",
     "type": "int",
     "default": 3,
@@ -381,7 +411,7 @@
     "maximum": 50
   },
   "mood_update_timeout": {
-    "description": "情绪请求超时(秒)",
+    "description": "【进阶】情绪请求超时(秒)",
     "hint": "单次模型情绪分析最多等多久；调大更不容易超时。",
     "type": "float",
     "default": 120,
@@ -389,26 +419,26 @@
     "maximum": 600
   },
   "mood_tag_enabled": {
-    "description": "心情标签",
+    "description": "【进阶】心情标签",
     "hint": "生成「有点疲惫，开心」这类可读标签，显示在 /情绪详情；同一状态有多种说法随机换",
     "type": "bool",
     "default": true
   },
   "mood_use_llm_for_delta": {
-    "description": "用模型分析情绪",
+    "description": "【进阶】用模型分析情绪",
     "hint": "要不要用模型判断情绪变化",
     "type": "bool",
     "default": true
   },
   "mood_provider_name": {
-    "description": "情绪分析模型",
+    "description": "【进阶】情绪分析模型",
     "hint": "情绪分析专用 Provider；留空沿用日程那条模型链。",
     "type": "string",
     "_special": "select_provider",
     "default": ""
   },
   "mood_provider_cooldown_minutes": {
-    "description": "情绪模型冷却(分)",
+    "description": "【进阶】情绪模型冷却(分)",
     "hint": "分析失败后歇这么久再试；0=不冷却。",
     "type": "int",
     "default": 5,
@@ -416,7 +446,7 @@
     "maximum": 1440
   },
   "mood_llm_interval_messages": {
-    "description": "多少条消息触发一次模型情绪分析",
+    "description": "【进阶】多少条消息触发一次模型情绪分析",
     "hint": "攒够几条消息触发一次情绪分析",
     "type": "int",
     "default": 10,
@@ -424,19 +454,19 @@
     "maximum": 100
   },
   "mood_verbose_log": {
-    "description": "情绪计数日志",
+    "description": "【进阶】情绪计数日志",
     "hint": "打印每人攒了几条待分析，排查用；平时关着避免刷屏。",
     "type": "bool",
     "default": false
   },
   "mood_enabled_in_group": {
-    "description": "群聊也算情绪",
+    "description": "【进阶】群聊也算情绪",
     "hint": "关：群消息不做情绪分析（私聊始终生效）；开：群里每人各自积累好感",
     "type": "bool",
     "default": false
   },
   "mood_data_retention_days": {
-    "description": "情绪数据保留(天)",
+    "description": "【进阶】情绪数据保留(天)",
     "hint": "超过这么多天没说话的人，情绪档案清回初始值（称呼与来源保留）",
     "type": "int",
     "default": 7,
@@ -456,13 +486,13 @@
     "default": false
   },
   "social_energy_enabled": {
-    "description": "社交能量",
+    "description": "【进阶】社交能量",
     "hint": "社交能量随陪聊消耗、空闲恢复",
     "type": "bool",
     "default": true
   },
   "social_energy_consumption_per_msg": {
-    "description": "每条消息耗能",
+    "description": "【进阶】每条消息耗能",
     "hint": "0.05~1.0：越小越耐聊。高频聊天场景建议 0.05。",
     "type": "float",
     "default": 0.05,
@@ -470,7 +500,7 @@
     "maximum": 100
   },
   "social_energy_recovery_per_minute": {
-    "description": "每分钟回血",
+    "description": "【进阶】每分钟回血",
     "hint": "0.1~3.0：越大，冷场后越快缓过来。",
     "type": "float",
     "default": 1.5,
@@ -478,7 +508,7 @@
     "maximum": 100
   },
   "social_energy_reset_hour": {
-    "description": "每日重置钟点",
+    "description": "【进阶】每日重置钟点",
     "hint": "0-23：每天到这个点电量重置回满；-1=不按天重置，只按分钟慢慢回",
     "type": "int",
     "default": 0,
@@ -486,7 +516,7 @@
     "maximum": 23
   },
   "social_energy_recovery_interval_seconds": {
-    "description": "回血检查间隔(秒)",
+    "description": "【进阶】回血检查间隔(秒)",
     "hint": "多久结算一次恢复量，范围 60~300。",
     "type": "int",
     "default": 60,
@@ -494,13 +524,13 @@
     "maximum": 300
   },
   "night_mode_enabled": {
-    "description": "生物钟夜",
+    "description": "【进阶】生物钟夜",
     "hint": "她生理上的「夜里」：这段时间醒着记睡眠债、白天低谷的位置也由它锚定",
     "type": "bool",
     "default": true
   },
   "night_start_hour": {
-    "description": "夜里从几点起",
+    "description": "【进阶】夜里从几点起",
     "hint": "0-23",
     "type": "int",
     "default": 23,
@@ -508,7 +538,7 @@
     "maximum": 23
   },
   "night_end_hour": {
-    "description": "夜里到几点止",
+    "description": "【进阶】夜里到几点止",
     "hint": "0-23",
     "type": "int",
     "default": 6,
@@ -516,13 +546,13 @@
     "maximum": 23
   },
   "show_sleep_window": {
-    "description": "提不提睡眠这件事",
+    "description": "【进阶】提不提睡眠这件事",
     "hint": "要不要说她什么时候睡",
     "type": "bool",
     "default": true
   },
   "night_deep_sleep_ratio": {
-    "description": "深睡占比",
+    "description": "【进阶】深睡占比",
     "hint": "0.1~1.0：夜间窗口里深度睡眠的比例，剩下的按浅睡/半醒算。",
     "type": "float",
     "default": 0.5,
@@ -530,19 +560,19 @@
     "maximum": 1.0
   },
   "holidays": {
-    "description": "自定义节日",
-    "hint": "她的纪念日等自定义日期",
+    "description": "【进阶】自定义节日",
+    "hint": "她的纪念日等自定义日期。日期写 MM-DD（如 05-20）每年生效，或 YYYY-MM-DD（如 2026-05-20）只在当年那天",
     "type": "list",
     "default": []
   },
   "enable_energy_natural_recovery": {
-    "description": "精力自然恢复",
+    "description": "【进阶】精力自然恢复",
     "hint": "开：日程处于休息类时段时慢慢回血。",
     "type": "bool",
     "default": true
   },
   "energy_natural_recovery_per_minute": {
-    "description": "每分钟恢复量",
+    "description": "【进阶】每分钟恢复量",
     "hint": "休息时段每分钟涨多少精力，0.05~0.9。",
     "type": "float",
     "default": 0.15,
@@ -550,7 +580,7 @@
     "maximum": 100
   },
   "energy_natural_recovery_interval_minutes": {
-    "description": "恢复计费间隔(分)",
+    "description": "【进阶】恢复计费间隔(分)",
     "hint": "不足一个间隔的碎片休息不结算，防「躺 3 分钟回一半」。",
     "type": "int",
     "default": 1,
@@ -558,7 +588,7 @@
     "maximum": 1440
   },
   "energy_consumption_per_msg": {
-    "description": "聊天耗精力",
+    "description": "【进阶】聊天耗精力",
     "hint": "每来一条消息掉多少精力，0.01~0.9。",
     "type": "float",
     "default": 0.04,
@@ -566,20 +596,22 @@
     "maximum": 100
   },
   "energy_recovery_phase_multipliers": {
-    "description": "周期各段恢复倍率",
-    "hint": "6 个数按顺序对应：经期、卵泡期、排卵期、黄体早期、黄体晚期、经前期",
+    "description": "【进阶】周期各段恢复倍率",
+    "hint": "8 个数按顺序对应：月经期、卵泡早期、卵泡中期、卵泡晚期、排卵期、黄体早期、黄体中期、黄体晚期",
     "type": "list",
     "default": [
       0.5,
       1.0,
+      1.6,
+      1.9,
       2.0,
-      1.0,
-      0.8,
+      1.1,
+      0.9,
       0.7
     ]
   },
   "state_flush_interval_seconds": {
-    "description": "写盘间隔(秒)",
+    "description": "【进阶】写盘间隔(秒)",
     "hint": "状态文件的最小落盘间隔。越小断电丢得越少、IO 越多。默认 5。",
     "type": "int",
     "default": 5,
@@ -587,7 +619,7 @@
     "maximum": 60
   },
   "last_interaction_threshold_minutes": {
-    "description": "隔多久算好久没聊",
+    "description": "【进阶】隔多久算好久没聊",
     "hint": "隔多久没说话算没互动",
     "type": "int",
     "default": 5,
@@ -595,7 +627,7 @@
     "maximum": 1440
   },
   "last_interaction_mode": {
-    "description": "间隔怎么报",
+    "description": "【进阶】间隔怎么报",
     "hint": "simple=只报隔了多久；with_last_msg=附上TA离开前的最后一句话，方便自然接话头",
     "type": "string",
     "default": "with_last_msg",
@@ -605,7 +637,7 @@
     ]
   },
   "process_min_duration": {
-    "description": "过程最短持续(分)",
+    "description": "【进阶】过程最短持续(分)",
     "hint": "「她手上正在做的那件事」最少挂多久，防频繁跳变。",
     "type": "int",
     "default": 15,
@@ -613,7 +645,7 @@
     "maximum": 60
   },
   "process_max_duration": {
-    "description": "过程最长持续(分)",
+    "description": "【进阶】过程最长持续(分)",
     "hint": "超过这个时长强制换下一件，防一件事挂一整天。",
     "type": "int",
     "default": 90,
@@ -621,13 +653,13 @@
     "maximum": 240
   },
   "process_auto_update": {
-    "description": "自动更新过程",
+    "description": "【进阶】自动更新过程",
     "hint": "当前过程过期就自动换新的；关：留在原地直到日程换段。",
     "type": "bool",
     "default": true
   },
   "process_history_limit": {
-    "description": "过程历史条数",
+    "description": "【进阶】过程历史条数",
     "hint": "留几条「最近做过什么」供延续感；0=不留。",
     "type": "int",
     "default": 5,
@@ -641,7 +673,7 @@
     "default": true
   },
   "body_tick_seconds": {
-    "description": "身体推进间隔(秒)",
+    "description": "【进阶】身体推进间隔(秒)",
     "hint": "没人找她她也会变困变饿——多久结算一次。默认 60。",
     "type": "int",
     "default": 60,
@@ -649,7 +681,7 @@
     "maximum": 600
   },
   "sleep_need_hours": {
-    "description": "一晚该睡多久",
+    "description": "【进阶】一晚该睡多久",
     "hint": "小时：睡够这个数刚好把一夜的困意清干净；熬夜欠的债按它放大。",
     "type": "float",
     "default": 8.0,
@@ -657,13 +689,13 @@
     "maximum": 14.0
   },
   "schedule_follow_night_window": {
-    "description": "作息贴夜间窗口",
+    "description": "【进阶】作息贴夜间窗口",
     "hint": "硬覆盖：把她的睡眠强制切到你设的夜间窗口",
     "type": "bool",
     "default": false
   },
   "meal_interval_hours": {
-    "description": "多久不吃算饿",
+    "description": "【进阶】多久不吃算饿",
     "hint": "小时：超过就饿到位。日程里写着用餐的时段会自动把饥饿度消化掉。",
     "type": "float",
     "default": 4.5,
@@ -671,7 +703,7 @@
     "maximum": 12.0
   },
   "sitting_discomfort_minutes": {
-    "description": "坐多久开始僵",
+    "description": "【进阶】坐多久开始僵",
     "hint": "分钟：连续久坐超过这个点肩颈开始发僵；日程里的运动/通勤/家务时段不算久坐",
     "type": "int",
     "default": 90,
@@ -679,7 +711,7 @@
     "maximum": 600
   },
   "desire_refill_hours": {
-    "description": "独处多久想说话",
+    "description": "【进阶】独处多久想说话",
     "hint": "独处多久会攒起想说话的念头",
     "type": "float",
     "default": 12.0,
@@ -687,20 +719,20 @@
     "maximum": 72.0
   },
   "weather_affects_body": {
-    "description": "冷热算进身体",
+    "description": "【进阶】冷热算进身体",
     "hint": "天气的冷热计入躯体不适轴（需要天气功能可用）。",
     "type": "bool",
     "default": true
   },
   "contract_enabled": {
-    "description": "导出契约给社交层",
+    "description": "【进阶】导出契约给社交层",
     "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度",
     "type": "bool",
     "default": true
   },
   "schedule_persona_max_chars": {
     "type": "int",
-    "description": "生成日程时人设最多注入多少字",
+    "description": "【进阶】生成日程时人设最多注入多少字",
     "hint": "生成日程时最多引用多少字人设",
     "obvious_hint": true,
     "default": 3000,
@@ -709,7 +741,7 @@
   },
   "mood_llm_batch_max": {
     "type": "int",
-    "description": "一次分析最多合并多少条",
+    "description": "【进阶】一次分析最多合并多少条",
     "hint": "一次最多合并几条送去分析",
     "obvious_hint": true,
     "default": 10,
@@ -718,7 +750,7 @@
   },
   "mood_llm_message_chars": {
     "type": "int",
-    "description": "每条消息进分析时的字数上限",
+    "description": "【进阶】每条消息进分析时的字数上限",
     "hint": "每条消息送进去多少字",
     "obvious_hint": true,
     "default": 300,
@@ -733,21 +765,21 @@
   "ccb_libido_min": {
     "type": "float",
     "default": 38.0,
-    "description": "ccb 阈值（0~50）"
+    "description": "【进阶】ccb 阈值（0~50）"
   },
   "ccb_libido_rise": {
     "type": "float",
     "default": 4.0,
-    "description": "ccb 阈值（0~20）"
+    "description": "【进阶】ccb 阈值（0~20）"
   },
   "ccb_affection_min": {
     "type": "float",
     "default": 78.0,
-    "description": "ccb 阈值（0~100）"
+    "description": "【进阶】ccb 阈值（0~100）"
   },
   "ccb_affection_rise": {
     "type": "float",
     "default": 12.0,
-    "description": "ccb 阈值（0~50）"
+    "description": "【进阶】ccb 阈值（0~50）"
   }
 }

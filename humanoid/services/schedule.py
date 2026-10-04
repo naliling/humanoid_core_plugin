@@ -45,7 +45,9 @@ SEGMENT_MAX_MINUTES = 180
 SEGMENT_SLEEP_MAX_MINUTES = 720
 SEGMENT_DEFAULT_MINUTES = 60
 # 一天最多留这么多段（超出丢最早的：三十段之前的事她自己也记不清）。
-SEGMENTS_DAY_CAP = 48
+# 这只是**硬天花板**：真正生效的是配置项 `schedule_max_slots`（面板上限就是 96）。
+# 以前这里写死 48，把用户填 96 砍成 48——面板上写着却不起作用的数比没有更糟。
+SEGMENTS_DAY_CAP = 96
 # prompt 里带多少段「已经过完的时段」。
 SEGMENTS_PROMPT_HISTORY = 8
 # 上一段结束到新一段之间隔了这么久以内，才把它顺延补上；隔得更久说明插件停机了，
@@ -60,6 +62,18 @@ LOCAL_NIGHT_SLEEP_PRESSURE = 70.0
 
 # 睡觉跨午夜时，今天这半截之后接到明天的那一截。
 CARRY_KEY = "segment_carry"
+
+# 「被打断」的三道比例尺：
+#
+# - 安静间隔：上一条私聊与这条之间至少隔这么久，才算「打破了一段安静、有人来访」。
+#   很多人同时聊的部署里消息源源不断，这一条会让它自然不再触发——她正忙着，
+#   不该被「又有人发消息了」整天重排。这是多用户下它不失控的关键。
+# - 冷却：两次被算作「来访」之间至少隔这么久（安静间隔之外的第二道闸）。
+# - 保鲜期：来访标记超过这么久还没用上就不算数——「刚刚」不能对着几小时前的事说。
+# 只看私聊：群消息不是「有人来找她说话」。
+INTERRUPT_QUIET_GAP_SECONDS = 2700.0
+INTERRUPT_COOLDOWN_SECONDS = 3600.0
+INTERRUPT_TTL_SECONDS = 3600.0
 
 
 def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
@@ -319,6 +333,7 @@ def segment_prompt(
     history_note: str = "",
     ongoing: list[str] | None = None,
     is_night: bool = False,
+    interrupted: bool = False,
 ) -> str:
     """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
 
@@ -357,6 +372,13 @@ def segment_prompt(
         else ""
     )
     night_line = "现在正处在她的生物钟夜里。\n\n" if is_night else ""
+    # 有人突然找她说话/事情临时插进来：给模型一个「现在可以改主意」的时机，
+    # 但改不改仍由它按人设与身体判断——不替它决定"被打断了就一定得停下手里的"。
+    interrupt_line = (
+        "【刚刚发生了个小插曲】刚才有人来找她说话、或者有件小事插了进来。"
+        "她可以放下手上的事去应付，也可以先继续做、回头再说——看哪样更像她。\n\n"
+        if interrupted else ""
+    )
     # 「还没做完的事」——她要能有一件跨天的事，今天接着昨天做。
     _ongoing = [str(x).strip() for x in (ongoing or []) if str(x or "").strip()][:3]
     _ongoing_block = (
@@ -375,6 +397,7 @@ def segment_prompt(
         + history_block
         + extra_block
         + night_line
+        + interrupt_line
         + "【怎么决定】\n"
         "1. 身体读数是决策输入：饿到不行就去吃，困到不行就去睡——怎么权衡由你决定。\n"
         "2. 一件事做到一半接着做很正常（continue=true）；做很久了、或身体不允许时就换。\n"
@@ -392,12 +415,21 @@ def segment_prompt(
         "   上一段在哪儿、刚做完什么，上面给了。换地方最好有个说得过去的由头"
         "（吃完了→出门、写到一半→起身倒水），别一段之内从一个地方跳到另一个；\n"
         "   在同一个地方待着通常就是接着做，用 continue=true 就好。\n"
+        # 「中途被打断/临时起意」以前完全没有：每段都像一件排好的任务，
+        # 做完了才换。真人不是这样的——她会被事情打断、会临时想干点别的。
+        "5. 她的一天是可以被打断的：\n"
+        "   能被一件小事打断（快递到了下楼取、朋友顺路叫住、锅里水开了、看见一条想回的消息）；\n"
+        "   也可以临时起意（突然想出去走走、拐进一家店、给谁打个电话）——\n"
+        "   这种段不用长，十几到四十分钟都正常，做完再回去继续原来那件事也行。\n"
+        "6. 别把一天排成流程模板（起床→上班→午休→下班→晚饭→睡觉那一条龙），"
+        "每天也不该长得差不多。**午睡/小憩不是每天必须有的一站**："
+        "没到那个困劲就别排睡，改成歇会儿、发发呆、听两首歌也行。\n"
         # ongoing：让她能有一件**跨天**的事。没有它，她的每一天都是互不相关的——
         # 今天改方案、明天改方案，两边没有「还没弄完」这层，每段都像新任务。
-        "5. 一天里可以有一两段是**她自己想做的**——不是工作、不是必须，是她自己挑的"
+        "7. 一天里可以有一两段是**她自己想做的**——不是工作、不是必须，是她自己挑的"
         "（想去哪家店、想去看什么、想学点什么）。这种时候在 JSON 里带上 \"wants\": true。"
         "别把整天都排成工作，她得有点自己的日子。\n"
-        "6. ongoing 只在这件事**要跨好几天**时才写（一份要整理三天的个案笔记），"
+        "8. ongoing 只在这件事**要跨好几天**时才写（一份要整理三天的个案笔记），"
         "一次能做完的别写。写了它就一直跟着你，明天你也会接着这件事——"
         + (_ongoing_block or "（目前没有还没做完的事。）") + "\n"
         "\n"
@@ -666,10 +698,13 @@ class ScheduleService:
 
     - 到期（这一段过完了 / 今天还没有段）必须生成；
     - 身体跟手上的事明显打架（饿到发慌还在做事、困到不行还醒着）当场生成；
+    - 有人打破一段安静来找她（私聊，见 `note_interruption`）：给一次「要不要
+      停下手上的事」的时机，整天消息不断的部署里这条自然很少触发；
     - 其余时候按 `schedule_change_chance` 的概率掷骰子：掷中才生成（她临时改
       主意），没掷中就接着做手上的事，一次模型都不调；
-    - 睡着的那一段不重掷：一觉睡到这段结束为止，夜里不会被打扰；跨午夜的
-      一觉由结转（carry）原样接到明天，零点不需要再问一次模型。
+    - 睡着的那一段不重掷：一觉睡到这段结束为止，夜里不会被打扰（消息也不算，
+      多用户部署里夜里总有人发消息）；跨午夜的一觉由结转（carry）原样接到明天，
+      零点不需要再问一次模型。
     """
 
     def __init__(
@@ -705,6 +740,13 @@ class ScheduleService:
         self._random = random_source or random.random
         self._roll_window = -1
         self._roll_hit = False
+        # 待处理的「来访」（有人打破安静来找她）：一次性，refresh_due 消费掉。
+        self._interrupt_at = 0.0
+        # 上一条私聊消息的时刻 / 上一次「算作来访」的时刻。用于安静间隔与冷却；
+        # None = 还没有。**不拿 0 当哨兵**：开机后第一小时 monotonic 还很小，
+        # 拿 0 当基准会把第一条来访白白挡掉。
+        self._last_message_at: float | None = None
+        self._last_interrupt_at: float | None = None
 
         self.resolver = None
         self.gateway = None
@@ -991,8 +1033,59 @@ class ScheduleService:
             return True
         return gate.check(PURPOSE).allowed
 
+    def note_interruption(self, *, is_group: bool = False, now: float | None = None) -> None:
+        """一条私聊消息来了——满足条件时记一次「有人打破安静来找她」。
+
+        两道比例尺：距上一条私聊至少隔 `INTERRUPT_QUIET_GAP_SECONDS`（否则算
+        「消息还热着」，很多人同时聊时这个口子就自然不再触发），且距上次
+        算作来访至少隔 `INTERRUPT_COOLDOWN_SECONDS`。群消息不算「来找她」。
+
+        只设不排：真正的决定在下一次 refresh_due 里做（还要过闸门/频率/预算）。
+        冷却基准 `_last_interrupt_at` 与待处理的标记分开：消费掉标记不能
+        顺手把冷却也清了。
+        """
+        if is_group:
+            return
+        t = float(self._monotonic() if now is None else now)
+        previous = self._last_message_at
+        self._last_message_at = t
+        if previous is not None and t - previous < INTERRUPT_QUIET_GAP_SECONDS:
+            return
+        if (
+            self._last_interrupt_at is not None
+            and t - self._last_interrupt_at < INTERRUPT_COOLDOWN_SECONDS
+        ):
+            return
+        self._last_interrupt_at = t
+        self._interrupt_at = t
+
+    def _fresh_interruption(self) -> bool:
+        """有没有还新鲜（未过期）的待处理「来访」；过期的顺手清掉。
+
+        不设保鲜期时，标记可以一睡几个小时（睡着时不被消费）或卡在闸门后面，
+        等到下一次重排才被取用——那时提示词里那句「刚刚有人来找她」就是假话。
+        """
+        if self._interrupt_at <= 0:
+            return False
+        if self._monotonic() - self._interrupt_at > INTERRUPT_TTL_SECONDS:
+            self._interrupt_at = 0.0
+            return False
+        return True
+
+    def _consume_interruption(self) -> float:
+        """取走一次待处理的来访（一次性）；过期的/没有的返回 0.0。不改冷却基准。
+
+        返回的是**原始时间戳**：生成被闸门挡回时要原样还回（见 `_generate_segment`），
+        只把标记放回去、不重新计时，否则反复被挡就能把保鲜期一次次续满。
+        """
+        if not self._fresh_interruption():
+            return 0.0
+        ts = self._interrupt_at
+        self._interrupt_at = 0.0
+        return ts
+
     def refresh_due(self) -> bool:
-        """该不该决定下一段：没段/这一段过完了/身体打架/还没排上大模型/掷中骰子。"""
+        """该不该决定下一段：没段/这一段过完了/身体打架/刚被打断/还没排上大模型/掷中骰子。"""
         cfg = self.config
         segs = self.segments()
         if not segs:
@@ -1005,6 +1098,9 @@ class ScheduleService:
         event = str(active.get("event") or "")
         if is_sleep_event(event):
             # 睡着：这一觉睡到这段结束为止，夜里不重掷、不越线打断。
+            # **消息也不算**：多用户部署里夜里总有人发消息，让消息能撕被子，
+            # 她就没有一个完整的觉了（这个口子原来只按「一个话多的人」设计，
+            # 没扛住「很多人」——现在只走睡觉保护，起床由这段自然结束）。
             return False
         body = self._body_snapshot()
         if body:
@@ -1014,6 +1110,13 @@ class ScheduleService:
                 return True
             if pressure >= CHANGE_TRIGGER_SLEEP_PRESSURE:
                 return True
+        # 刚有人打破安静来找过她：给她一个「要不要停下手上这件事」的时机。
+        # 这是「中途被打断 / 去干点别的」唯一的人工触发口，以前完全没有，
+        # 所以一天下来每段都像排好的任务，从来没有中途变过。
+        # 只有走大模型日程时才有意义：纯模板兜底没有「让模型改主意」这一层，
+        # 放它进来只会白白重排一次模板。
+        if cfg.use_llm_schedule and self._fresh_interruption() and self._gate_allows():
+            return True
         if cfg.use_llm_schedule and self.source != SOURCE_LLM:
             # 本地兜底段还占着位：尽快让大模型接手（退避会挡住砸模型的频率）。
             due = True
@@ -1101,8 +1204,13 @@ class ScheduleService:
             slot: Slot | None = None
             if cfg.use_llm_schedule and self.gateway is not None:
                 if force or ignore_cooldown or self.retry_after <= 0:
+                    # 「这次是不是被人打断触发的」只在**真的要去生成**时才取走；
+                    # 退避中不取，留到下一轮。取走时拿到原始时间戳，被闸门挡回时
+                    # 原样还回（不重新计时，保鲜期才拦得住无限续命）。
+                    interrupted_ts = self._consume_interruption()
                     slot = await self._generate_segment(
-                        cfg, now, minutes, prev, elapsed, ignore_cooldown
+                        cfg, now, minutes, prev, elapsed, ignore_cooldown,
+                        interrupted_ts=interrupted_ts,
                     )
             if slot is None and (active is None or force or not cfg.use_llm_schedule):
                 slot = dynamic_segment(
@@ -1127,7 +1235,9 @@ class ScheduleService:
         prev: Slot | None,
         elapsed: int,
         ignore_cooldown: bool,
+        interrupted_ts: float = 0.0,
     ) -> Slot | None:
+        interrupted = interrupted_ts > 0.0
         if self.gateway is None:
             self.last_error = "LLM Gateway 未初始化"
             return None
@@ -1146,6 +1256,7 @@ class ScheduleService:
             history_note=history_note,
             ongoing=self.ongoing_tasks(),
             is_night=self._clock.is_night(),
+            interrupted=interrupted,
         )
         if self._log and cfg.debug_mode:
             self._log.debug(
@@ -1177,6 +1288,10 @@ class ScheduleService:
                 # 被节流跳过不是 provider 故障，不能进 30 分钟退避——那会让
                 # 「用户一说话就恢复」也一起失效。也不往 last_error 上挂：
                 # 那是给用户看的诊断位，不该长期显示一个无须处理的节流提示。
+                if interrupted:
+                    # 这次「来访」只是没挤进队列（闸门被别的调用占着），**原样**还回去：
+                    # 保留原始时间戳，不重新计时——否则反复被挡就能一直续命、突破保鲜期。
+                    self._interrupt_at = interrupted_ts
                 if self._log and cfg.debug_mode:
                     self._log.debug(f"[humanoid_core] 日程被节流跳过: {result.detail}")
                 return None

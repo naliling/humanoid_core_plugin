@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+import random
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -40,6 +41,16 @@ SITTING_DISCOMFORT_PER_HOUR = 6.0  # 久坐每小时累积的僵硬感
 COLD_DISCOMFORT_PER_DEGREE = 1.6   # 低于舒适温度每摄氏度累积的不适
 HEAT_DISCOMFORT_PER_DEGREE = 1.2
 DESIRE_CAP = 100.0
+# ── 着凉/感冒 ──────────────────────────────────────────────
+# 受冻或长时间缺觉之后小概率着凉；一旦着了，持续一两天。这套是**状态**，
+# 不是给她的台词：只变体感与形式倾向，说什么由她自己决定。
+# 每次推进的着凉概率：基础率 × 暴露程度（取受冻/缺觉里更重的那个，按分钟计）。
+CHILL_CHANCE_BASE = 0.00008     # 每分钟基础概率（暴露满值时）
+CHILL_CHANCE_DOUBLE = 0.00006   # 又冷又缺觉时每分钟额外加这么多
+CHILL_EXPOSURE_MIN = 0.35       # 暴露低于这个值不会着凉
+CHILL_MIN_UNCOMFORT = 25.0      # 不适低于这个值不会着凉——不能只因为冷就生病
+CHILL_RECOVER_PER_HOUR = 1.6    # 一旦着了，每小时好这么多（40 分约 25 小时好完）
+CHILL_COMFORT_COOL = 12.0       # 低于这个温度算「冻着」
 # 身体量落盘的最小间隔（秒）。饥饿这类轴每分钟都在动，不节流就等于每分钟写一次全量文件。
 MIN_PERSIST_INTERVAL_SECONDS = 300.0
 
@@ -81,6 +92,7 @@ class SomaService:
         self._schedule = schedule_provider
         self._weather = weather_provider
         self._time = time_source
+        self._random = random.random
         # 上一次落盘的快照：只有它变了才 mark_dirty，否则 60 秒一次的 tick 会把
         # 状态文件写成常驻磁盘写入。
         self._persisted: dict[str, Any] | None = None
@@ -285,6 +297,7 @@ class SomaService:
         cycle = self._cycle_discomfort(moment)
         discomfort = _clamp(stiffness * 0.45 + thermal * 0.35 + cycle * 0.4 + self._get("hunger", 0.0) * 0.12)
         self._set("discomfort", discomfort)
+        self._maybe_chill(minutes, moment, discomfort)
 
         # --- 唤醒度：白天高、深夜低，深夜还醒着会留下「累但睡不着」的尾巴 ---
         target = self._arousal_target(moment, hour_of_day)
@@ -371,15 +384,19 @@ class SomaService:
         event = str(self.slot_at(moment).get("event", ""))
         return any(k in event for k in ("运动", "跑步", "健身", "通勤", "外出", "家务", "散步", "社交", "聚会"))
 
-    def _thermal_discomfort(self) -> float:
+    def _temp_celsius(self) -> float | None:
+        """当前气温（℃）。拿不到（没开天气/没取到）返回 None。"""
         if not self.config.weather_affects_body or self._weather is None:
-            return 0.0
+            return None
         try:
             snapshot = self._weather() or {}
             text = str(snapshot.get("env", ""))
         except Exception:
-            return 0.0
-        temp = _extract_celsius(text)
+            return None
+        return _extract_celsius(text)
+
+    def _thermal_discomfort(self) -> float:
+        temp = self._temp_celsius()
         if temp is None:
             return 0.0
         if temp <= 12.0:
@@ -388,14 +405,45 @@ class SomaService:
             return _clamp((temp - 30.0) * HEAT_DISCOMFORT_PER_DEGREE)
         return 0.0
 
+    def _maybe_chill(self, minutes: float, moment: datetime, discomfort: float) -> None:
+        """受冻或长时间缺觉之后小概率着凉；着了就持续一两天。
+
+        起头靠的是**客观量**：暴露程度取「受冻有多重」与「欠觉有多重」里更重的那个，
+        两者同时成立再加一点。一旦着了就随时间自己好。它只变体感与形式倾向，
+        说什么由她自己决定。
+        """
+        level = self._get("chill", 0.0)
+        if level > 0.0:
+            self._set("chill", level - CHILL_RECOVER_PER_HOUR * minutes / 60.0)
+            return
+        if discomfort < CHILL_MIN_UNCOMFORT:
+            return
+        temp = self._temp_celsius()
+        cold = (
+            min(1.0, (CHILL_COMFORT_COOL - temp) / CHILL_COMFORT_COOL)
+            if temp is not None and temp <= CHILL_COMFORT_COOL
+            else 0.0
+        )
+        debt = min(1.0, self._get("sleep_debt", 0.0) / 8.0)
+        exposure = max(cold, debt)
+        if exposure < CHILL_EXPOSURE_MIN:
+            return
+        chance = CHILL_CHANCE_BASE * exposure * minutes
+        if cold >= 0.5 and debt >= 0.5:
+            chance += CHILL_CHANCE_DOUBLE * minutes
+        if chance > 0 and self._random() < chance:
+            self._set("chill", _clamp(30.0 + discomfort * 0.2, 30.0, 50.0))
+
     def _cycle_discomfort(self, moment: datetime) -> float:
         cfg = self.config
         if not cfg.enable_cycle:
             return 0.0
         day = int(self._scope.get_self("current_cycle_day", 1) or 1)
         phase = cfg.cycle_phase_index(day)
-        # 0=经期 5=经前期：这两段身体本身不舒服，其余阶段基本没有。
-        return {0: 60.0, 5: 28.0, 4: 18.0}.get(phase, 6.0)
+        # 8 阶段里身体本身不舒服的几段（按 28 天标准轴）：
+        # 0 月经期最重、7 黄体晚期（PMS）次之、6 黄体中（乳房胀/犯困）轻一些、
+        # 4 排卵期可能有一侧小腹的隐痛；其余阶段基本没有。
+        return {0: 60.0, 4: 12.0, 6: 22.0, 7: 38.0}.get(phase, 6.0)
 
     def _desire_modifier(self) -> float:
         """很困/很不舒服时，「想找人说话」涨得慢一点。
@@ -453,6 +501,7 @@ class SomaService:
             "sleep_debt": _rounded(self._get("sleep_debt", 0.0)),
             "hunger": _rounded(self._get("hunger", 0.0)),
             "discomfort": _rounded(self._get("discomfort", 0.0)),
+            "chill": _rounded(self._get("chill", 0.0)),
             "arousal": _rounded(self._get("arousal", 50.0)),
             "social_desire": _rounded(self._get("social_desire", 0.0)),
             "asleep": 1.0 if data.get("asleep_since") else 0.0,
@@ -559,6 +608,10 @@ class SomaService:
         elif discomfort >= 38:
             out.append((0.5, "略有不适"))
 
+        chill = snap.get("chill", 0.0)
+        if chill >= 28:
+            say("chill", chill, 28.0, 60.0, 0.8)
+
         # 清醒度：精力掉了人会发懵，精力足了人才清醒。两者现在合在一起看，
         # 因为 arousal 本身也是从精力和作息推出来的，单独用会让同一件事说两遍。
         arousal = float(snap.get("arousal", 50.0) or 0.0)
@@ -606,6 +659,8 @@ class SomaService:
             max_chars = 40
         elif snap["discomfort"] >= 62:
             max_chars = 45
+        elif snap.get("chill", 0.0) >= 45:
+            max_chars = 60
         elif energy < 25:
             max_chars = 60
         if snap["sleep_debt"] >= 4.0:
@@ -614,6 +669,8 @@ class SomaService:
         question_bias = 0.35
         if snap["hunger"] >= 88 or snap["discomfort"] >= 62:
             question_bias = 0.05
+        if snap.get("chill", 0.0) >= 45:
+            question_bias = min(question_bias, 0.15)
         if snap["sleep_pressure"] >= 72:
             question_bias = 0.1
         if snap["social_desire"] >= 70 and energy >= 50:
@@ -631,6 +688,7 @@ class SomaService:
                 energy >= 55
                 and snap["sleep_pressure"] < 72
                 and snap["discomfort"] < 62
+                and snap.get("chill", 0.0) < 45
                 and snap["asleep"] < 1.0
             ),
         }
@@ -687,6 +745,7 @@ class SomaService:
             100.0
             - max(0.0, pressure - 45.0) * 0.9
             - max(0.0, discomfort - 50.0) * 0.25
+            - max(0.0, self._get("chill", 0.0) - 30.0) * 0.15
         )
         return _clamp(ceiling, 15.0, 100.0)
 

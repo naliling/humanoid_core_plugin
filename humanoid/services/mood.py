@@ -184,7 +184,7 @@ REPEAT_DECAY = (1.0, 0.6, 0.35, 0.2)
 # 也保留，它是下次判定过期的依据。first_met 同样保留（prune 时从 mood 里搬上来），
 # 否则会出现「你管TA叫小明，你们刚认识上」。
 # attention 也在清理范围内：它是 `behavior.care()` 算在意度时写的，那条路径必然经过
-# mood.profile，所以它是「有真实互动」的标记；而 `/拟人诊断` 为了量 token 会拿一个
+# mood.profile，所以它是「有真实互动」的标记；而 `/拟人 诊断` 为了量 token 会拿一个
 # status-probe 的假用户去跑 build_injection，留下一个清不掉的空壳。
 # mood 删掉即可：profile() 会用配置里的初始值重建，正是文档承诺的「好感度清回初始值」。
 RETENTION_DROPPED_FIELDS = ("mood", "mood_logs", "mood_tag", "last_message", "said", "attention")
@@ -1030,13 +1030,15 @@ class MoodService:
 
         cycle_day = self._scope.get_self("current_cycle_day", 1)
         phase = cfg.cycle_phase_index(cycle_day)
+        # 8 阶段索引：0 月经期（消极放大）、4 排卵期（积极放大）。
+        # 其余阶段不调制——以前给「卵泡期」一个统一口径，而它其实是三段不同状态。
         if phase == 0:
             delta = Delta(
                 delta.affection * (0.5 if delta.affection > 0 else 1.5),
                 delta.libido * (0.5 if delta.libido > 0 else 1.5),
                 delta.aggression * (0.5 if delta.aggression > 0 else 1.5),
             )
-        elif phase == 2:
+        elif phase == 4:
             delta = Delta(
                 delta.affection * (1.4 if delta.affection > 0 else 1.0),
                 delta.libido * (1.4 if delta.libido > 0 else 1.0),

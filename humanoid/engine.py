@@ -189,3 +189,34 @@ class HumanoidEngine:
 
     def reset_state(self):
         return 80.0, 100.0, 1
+
+    def affection_ranking_text(self, core, limit: int = 15) -> str:
+        """按当前好感度给认识的人排个榜（管理员视角）。
+
+        读的是还没被过期清理丢掉的条目，所以长时间没说话的人一旦被清就
+        不在榜上了——榜反映的是「此刻还记得的关系」，不是一张永久名单。
+        先按好感降序取前 limit 名，再在**展示的这些人里**按好感升序列出：
+        好感最高的人放在最靠近输入框的一行，发完指令不用往上翻。
+        序号是**真实名次**（1 = 好感最高），不随展示顺序变——否则序号 1 反而是榜内最低的。
+        """
+        scope = core.scope
+        rows: list[tuple[float, str, str]] = []
+        for uid in scope.all_user_ids():
+            record = scope.user_state(uid).get("mood")
+            if not isinstance(record, dict):
+                continue
+            try:
+                aff = float(record.get("affection", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                aff = 0.0
+            name = str(scope.peek_user(uid, "nickname", "") or "")
+            rows.append((aff, str(uid), name))
+        if not rows:
+            return "（还没有认识的人）"
+        top = sorted(rows, key=lambda r: -r[0])[: max(1, int(limit))]
+        ranked = [(index, row) for index, row in enumerate(top, 1)]
+        lines = [f"当前好感度排名（按当前值，共 {len(rows)} 人）："]
+        for rank, (aff, uid, name) in sorted(ranked, key=lambda x: x[1][0]):
+            who = f"{name}（{uid}）" if name else uid
+            lines.append(f"{rank:>3}. {aff:>5.1f}  {who}")
+        return "\n".join(lines)

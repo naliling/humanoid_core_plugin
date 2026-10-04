@@ -110,16 +110,16 @@ class _Filter:
     def event_message_type(self, kind: Any):
         return self._register("event_type", kind)
 
-    def on_llm_request(self):
+    def on_llm_request(self, **kw):
         return self._register("on_llm_request", "")
 
-    def on_llm_response(self):
+    def on_llm_response(self, **kw):
         return self._register("on_llm_response", "")
 
-    def on_decorating_result(self):
+    def on_decorating_result(self, **kw):
         return self._register("on_decorating_result", "")
 
-    def on_waiting_llm_request(self):
+    def on_waiting_llm_request(self, **kw):
         return self._register("on_waiting_llm_request", "")
 
     def at(self, *a, **k):

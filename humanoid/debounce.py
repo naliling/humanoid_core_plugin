@@ -30,9 +30,9 @@ from .merge import judge, join, normalize
 SESSION_CAP = 512
 # 多久没动静就把一个会话从表里清掉（秒）。有 buffer 的会话不按这个清——那里面有等着发的内容。
 SESSION_IDLE_SECONDS = 900.0
-# 「只是攒够条数」时的确认窗口上限（秒）：再看一眼还有没有后续。用户逐字连发
-# （「你」「今天」「我好累啊」）时，攒够两条就发等于把一句切成两半。
-SETTLE_CAP_SECONDS = 0.6
+# 缺省「说完也再等一拍」的窗口（秒）。配置项 message_merge_settle_seconds 会在
+# 非 0 时覆盖它；这是拿不到配置时的兼底值。
+DEFAULT_SETTLE_SECONDS = 1.5
 
 # 挂到事件上的键：合并进来的更早几条原话。
 MERGE_EXTRA_KEY = "humanoid_merge_earlier"
@@ -102,11 +102,16 @@ class Debouncer:
 
         返回值是**这条消息要不要继续往下走**：False 表示已经被合并掉了（调用方直接返回）。
 
-        `key` 是会话标识（`unified_msg_origin`）。调用方要保证配置里 `message_merge_enabled`
+        `key` 是会话标识。调用方要保证配置里 `message_merge_enabled`
         为真、消息有正文、且属于生效范围——这三条都判断过再进来。
         """
         cfg = self._config()
         timeout = max(0.0, float(getattr(cfg, "message_merge_timeout_seconds", 0.0) or 0.0))
+        # 缺省值只在**拿不到这一项**时兜底；用户显式设的 0 要如实保留（0 = 说完就发）。
+        # 用 `or` 会把 0 吞成默认值，等于面板上「设 0」这个开关按不动。
+        raw_settle = getattr(cfg, "message_merge_settle_seconds", None)
+        settle = DEFAULT_SETTLE_SECONDS if raw_settle is None else float(raw_settle)
+        settle = max(0.0, settle)
         max_count = max(1, int(getattr(cfg, "message_merge_max_count", 6) or 6))
         body = normalize(text)
         if not body:
@@ -122,15 +127,12 @@ class Debouncer:
         self._sweep()
 
         verdict = judge(join_texts(sess.buffer, limit=max_count), buffer_len=len(sess.buffer))
-        if verdict.complete and verdict.sure:
-            self._release(event, sess, max_count)
-            self._debug(f"直接放行（{verdict.why}）：{body[:20]}")
-            return True
-
-        # 走到这里只有两种情况：没判定完（「肯定没说完」或「拿不准」），或者只是攒够了条数。
-        # 等多久：攒够条数的只等一个短的确认窗口（用户可能还在一个字一个字发），
-        # 其它等满 timeout。
-        wait = min(SETTLE_CAP_SECONDS, timeout) if verdict.complete else timeout
+        # 先说完了的也要等一个短确认窗口：后面可能还有连发。
+        # 零延迟放行看起来很爽，但连发三条完整消息时第一条就已经被放走了，
+        # 后面两条只能各自回一次——那正是「用户发三条、他就回三条」的根。
+        # 没说完的等 timeout（更长）；说完的等 settle，但一样不超过 timeout——
+        # 否则把 settle 配得比 timeout 大时，「说完的」反而比「没说完的」等得更久。
+        wait = timeout if not verdict.complete else min(settle, timeout)
         if wait <= 0:
             self._release(event, sess, max_count)
             self._debug(f"不等待直接放行（{verdict.why}）：{body[:20]}")
@@ -163,10 +165,20 @@ class Debouncer:
         else:
             # 明确告诉模型这是**一条合并出来的消息**。不标的话它会当成几个人在
             # 各说各的，于是写一条长消息把人一个个回一遍——那比不合并还糟。
-            earlier = [
-                f"（下面这 {len(batch)} 句是同一个人连着发的，已合并成一条；"
-                f"回一条就行，不用逐句回应）"
-            ]
+            # 正常已按发送者分桶，这一批应该是同一个人；万一还是混进了不同人
+            # （发送者取不到、或配置改了），就不能说「同一个人连着发」——
+            # 那会直接把「这是谁说的」传给错误的模型。
+            senders = {who for who, _body in batch if who}
+            if len(senders) > 1:
+                earlier = [
+                    f"（下面这 {len(batch)} 句是群里先后说的，已合并成一条；"
+                    f"回一条就行，不用逐句回应）"
+                ]
+            else:
+                earlier = [
+                    f"（下面这 {len(batch)} 句是同一个人连着发的，已合并成一条；"
+                    f"回一条就行，不用逐句回应）"
+                ]
             earlier += [f"{who}：{body}" if who else body for who, body in batch[:-1]]
         setter = getattr(event, "set_extra", None)
         if not callable(setter):

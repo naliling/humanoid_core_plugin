@@ -116,6 +116,17 @@ def _as_float_tuple(value: Any, default: tuple[float, ...]) -> tuple[float, ...]
     return tuple(out) if out else default
 
 
+def _phase_multipliers(value: Any, default: tuple[float, ...]) -> tuple[float, ...]:
+    """周期恢复倍率：长度不等于阶段数（8）时按默认值走。
+
+    老版本是 6 段，本版索引语义改成了 8 段（月经/卵泡早中晚/排卵/黄体早中晚）。
+    旧列表留着会**静默错位**：面板显示 8 段顺序，代码却按旧顺序取值，
+    中间几段的恢复倍率对不上。长度对不上就整体用新默认（6 个数本来就写不出 8 段）。
+    """
+    out = _as_float_tuple(value, default)
+    return out if len(out) == len(default) else default
+
+
 def _as_mapping_tuple(value: Any) -> tuple[dict[str, Any], ...]:
     if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
         return ()
@@ -137,7 +148,9 @@ class HumanoidConfig:
     energy_natural_recovery_per_minute: float = 0.15
     energy_natural_recovery_interval_minutes: int = 1
     energy_consumption_per_msg: float = 0.04
-    energy_recovery_phase_multipliers: tuple[float, ...] = (0.5, 1.0, 2.0, 1.0, 0.8, 0.7)
+    energy_recovery_phase_multipliers: tuple[float, ...] = (
+        0.5, 1.0, 1.6, 1.9, 2.0, 1.1, 0.9, 0.7
+    )
 
     use_llm_schedule: bool = True
     schedule_provider_name: str = ""
@@ -201,10 +214,26 @@ class HumanoidConfig:
     # 四个依赖、运行时再从 ModelScope 拉模型），本机实测装那几个包跑了 5 分钟没装完，
     # 拉不到模型还会静默失效，所以不引入。
     message_merge_enabled: bool = True
+    # 输入状态（正在输入）。
+    #
+    # 回复期间向 QQ 报「正在输入」，做法照市场插件 astrbot_plugin_input_state_by_nc：
+    # 只在 NapCat（aiocqhttp）私聊里生效，其他平台/群聊自动跳过。
+    # QQ 的输入状态约 8~10 秒自己会消失，所以要按 interval 高频重报；
+    # timeout 是兜底：万一响应钩子没回来，别让「正在输入」一直闪下去。
+    input_state_enabled: bool = True
+    input_state_interval_seconds: float = 0.5
+    input_state_timeout_seconds: float = 120.0
     # 规则判不出来时（没标点、长度中等）最多等这么久，等后续那句一起并进来。
-    # 只在这条「拿不准」的路上付延迟：句末有标点/语气词的消息零延迟直接发。
     # 0 = 不等待，等于只看标点。
     message_merge_timeout_seconds: float = 3.0
+    # 已经说完的消息也再等一小拍，看有没有连发。
+    #
+    # 原来「句末有标点/语气词」是零延迟直接发的——那对「一句话」确实最快，
+    # 但用户快速连发三条完整消息时，第一条立刻就被放走了，时机已经错过，
+    # 后两条只能各自回一次，防抖等于没开。所以完整消息也要等一个短确认窗口：
+    # 窗口内没有新消息就发（只多这么多延迟），有新消息就把它们并成一条。
+    # 0 = 恢复到旧行为（完整消息零延迟）。
+    message_merge_settle_seconds: float = 1.5
     # 一批最多合并多少条：防刷屏把 prompt 撑爆，只保留最近这么多条。
     message_merge_max_count: int = 6
 
@@ -341,7 +370,7 @@ class HumanoidConfig:
             energy_natural_recovery_per_minute=f("energy_natural_recovery_per_minute", 0.0, 100.0),
             energy_natural_recovery_interval_minutes=i("energy_natural_recovery_interval_minutes", 1, 1440),
             energy_consumption_per_msg=f("energy_consumption_per_msg", 0.0, 100.0),
-            energy_recovery_phase_multipliers=_as_float_tuple(
+            energy_recovery_phase_multipliers=_phase_multipliers(
                 pick("energy_recovery_phase_multipliers"), d.energy_recovery_phase_multipliers
             ),
             use_llm_schedule=b("use_llm_schedule"),
@@ -369,7 +398,11 @@ class HumanoidConfig:
             weather_location=s_opt("weather_location"),
             weather_refresh_minutes=i("weather_refresh_minutes", 1, 1440),
             message_merge_enabled=b("message_merge_enabled"),
+            input_state_enabled=b("input_state_enabled"),
+            input_state_interval_seconds=f("input_state_interval_seconds", 0.1, 10.0),
+            input_state_timeout_seconds=f("input_state_timeout_seconds", 10.0, 600.0),
             message_merge_timeout_seconds=f("message_merge_timeout_seconds", 0.0, 30.0),
+            message_merge_settle_seconds=f("message_merge_settle_seconds", 0.0, 10.0),
             message_merge_max_count=i("message_merge_max_count", 1, 50),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
             schedule_persona_max_chars=max(
@@ -554,12 +587,19 @@ class HumanoidConfig:
         return None
 
     def cycle_phase_index(self, cycle_day: int) -> int:
+        """把周期第几天映到 8 个阶段之一（按 28 天标准轴缩放，返回值 0..7）。
+
+        阶段划分（标准 28 天）：
+          1-5 月经期 / 6-8 卵泡早期 / 9-11 卵泡中期 / 12-13 卵泡晚期 /
+          14 排卵期 / 15-19 黄体早期 / 20-22 黄体中期 / 23-28 黄体晚期。
+        cycle_length 不是 28 时按比例缩放到这条标准轴上，所以自定义周期照样能用。
+        """
         length = max(1, self.cycle_length)
         day = ((int(cycle_day) - 1) % length) * 28.0 / length + 1
-        for upper, idx in ((5, 0), (12, 1), (15, 2), (21, 3), (26, 4)):
+        for upper, idx in ((5, 0), (8, 1), (11, 2), (13, 3), (14, 4), (19, 5), (22, 6)):
             if day <= upper:
                 return idx
-        return 5
+        return 7
 
     def phase_recovery_multiplier(self, cycle_day: int) -> float:
         idx = self.cycle_phase_index(cycle_day)
@@ -632,7 +672,7 @@ def plan_default_migrations(raw: Mapping[str, Any] | None) -> dict[str, Any]:
 class ConfigBox:
     """可热重载的配置持有者。
 
-    插件里所有地方都拿 `lambda: box()` 读配置，/重载配置 只需换掉内部实例就全链路生效。
+    插件里所有地方都拿 `lambda: box()` 读配置，/拟人 重载 只需换掉内部实例就全链路生效。
     v2.13.2 里 main.py 自有一份 `self._config`，engine 又拿原始 dict 自己重新解析，
     于是 `HumanoidEngine.reload_config()` 看起来能热重载、实际影响不到任何行为，而且
     `environment_allows()` 这种每条消息都会走的方法在每条消息上重新解析一遍 90 个字段。

@@ -33,7 +33,7 @@ DEFAULTS = HumanoidConfig()
 # 列表项要按各自的元素格式造，不能一律塞字符串。
 LIST_PROBES = {
     "admin_qq": ["13579"],
-    "energy_recovery_phase_multipliers": [0.5, 1.5, 2.5, 1.5, 0.5, 0.5],
+    "energy_recovery_phase_multipliers": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
     "mood_affection_override": ["13579:33"],
     "holidays": [{"date": "2026-10-01", "name": "体检节"}],
 }

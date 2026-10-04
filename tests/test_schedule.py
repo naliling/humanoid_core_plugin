@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from humanoid.clock import Clock
 from humanoid.config import HumanoidConfig
 from humanoid.jsonx import extract_json_array, extract_json_object
 from humanoid.llm import CallGate, LLMGateway, ProviderResolver
+from humanoid.llm import LLMResult, OUTCOME_GATED
 from humanoid.services.process import ProcessService
 from humanoid.services.schedule import (
     SOURCE_LLM,
@@ -1133,6 +1135,203 @@ class ThrottleTest(unittest.IsolatedAsyncioTestCase):
         )
         await self.run_day(conf, provider, gate)
         self.assertGreater(provider.calls, 20, "关掉节流就该回到旧的高频行为")
+
+
+class TestInterruption(unittest.TestCase):
+    """「中途被打断 / 去干点别的」以前完全没有，现在有一条人工触发口。"""
+
+    def _service(self, **overrides):
+        conf = cfg(**overrides)
+        tmp = Path(tempfile.mkdtemp()) / "state.json"
+        store = ScopeStore(tmp)
+        store.load(FIXED_MOMENT.strftime("%Y-%m-%d"), conf.cycle_length)
+        log = RecordingLogger()
+        clock = FrozenClock(FIXED_MOMENT)
+        service = ScheduleService(
+            store.scope, lambda: conf, clock, logger=log, monotonic=lambda: 10_000.0
+        )
+        service.seed_first_segment()
+        return service
+
+    def test_interruption_makes_a_midsegment_refresh_due(self):
+        """没有打断时，一段进行中有概率才重排；有人来找她则直接给一个时机。"""
+        service = self._service(schedule_min_interval_minutes=0,
+                                llm_idle_silence_minutes=0,
+                                llm_daily_call_budget=0,
+                                schedule_change_chance=0)  # 骰子永不中
+        self.assertFalse(service._consume_interruption())
+        service.note_interruption()
+        self.assertTrue(service.refresh_due(), "有人来找她时应该给一个可重排的时机")
+
+    def test_interruption_is_consumed_once(self):
+        service = self._service(schedule_min_interval_minutes=0, llm_idle_silence_minutes=0,
+                                llm_daily_call_budget=0, schedule_change_chance=0)
+        service.note_interruption()
+        self.assertTrue(service._consume_interruption())
+        self.assertFalse(service._consume_interruption(), "一次打断只能顶一次重排")
+
+    def test_interruption_has_a_cooldown(self):
+        """过了安静间隔，但离上次来访不足 1 小时：仍不算。"""
+        clock = [100_000.0]
+        service = self._service()
+        service._monotonic = lambda: clock[0]
+        service.note_interruption()
+        self.assertTrue(service._consume_interruption())
+        clock[0] += 2700.0  # 安静 45 分钟（刚好过线），但冷却未到
+        service.note_interruption()
+        self.assertFalse(service._consume_interruption(), "冷却期内的第二次来访不算数")
+        clock[0] += 2700.0  # 再安静 45 分钟：这次冷却过了
+        service.note_interruption()
+        self.assertTrue(service._consume_interruption(), "过了冷却就该重新算一次")
+
+    def test_burst_traffic_does_not_rearm(self):
+        """很多人同时聊、消息不断时：消息没断过就不算「有人来访」。
+
+        这是多用户部署下的关键比例尺——上一条私聊还热着，就不该反复重排。
+        一直有人说话时它自然不触发；安静下来后的第一条才可能算。
+        """
+        clock = [100_000.0]
+        service = self._service()
+        service._monotonic = lambda: clock[0]
+        service.note_interruption()          # 首条：上一条是 None，算来访
+        self.assertTrue(service._consume_interruption())
+        for _ in range(3):                   # 之后每 10 分钟来一条：没有安静过
+            clock[0] += 600.0
+            service.note_interruption()
+            self.assertFalse(service._consume_interruption(), "消息没断过，不该再来一次来访")
+        clock[0] += 3000.0                   # 安静 50 分钟（>45），又来一条
+        service.note_interruption()
+        self.assertTrue(service._consume_interruption(), "打破安静的消息该算一次来访")
+
+    def test_group_messages_are_not_visits(self):
+        """群消息不是「有人来找她说话」：不记来访，也不动私聊的安静刻度。"""
+        service = self._service()
+        service.note_interruption(is_group=True)
+        self.assertFalse(service._consume_interruption())
+        self.assertIsNone(service._last_message_at, "群消息不该刷新私聊安静刻度")
+
+    def test_stale_interruption_expires(self):
+        """「刚刚」不能对着几小时前的事说：过期标记作废并清掉。"""
+        clock = [100_000.0]
+        service = self._service()
+        service._monotonic = lambda: clock[0]
+        service.note_interruption()
+        clock[0] += 3600.0 + 1
+        self.assertFalse(service._consume_interruption(), "超过保鲜期的来访不该还算数")
+        self.assertFalse(service._interrupt_at, "过期的标记要顺手清掉")
+
+    def test_sleep_is_not_interrupted(self):
+        """睡着时消息也不掀被子：多用户部署里夜里总有人发消息。"""
+        service = self._service(schedule_min_interval_minutes=0,
+                                llm_idle_silence_minutes=0,
+                                llm_daily_call_budget=0,
+                                schedule_change_chance=0)
+        service._scope.update_self(daily_schedule=[{
+            "start": "08:00", "end": "12:00", "event": "睡一觉",
+            "location": "卧室", "emotion": "沉睡", "energy_rate": 0.15,
+        }])
+        self.assertFalse(service.refresh_due(), "睡着时本来就不重掷")
+        service.note_interruption()
+        self.assertFalse(service.refresh_due(), "有人发消息也不能掀被子")
+
+    def test_prompt_says_something_was_interrupted(self):
+        from humanoid.services.schedule import segment_prompt
+        conf = cfg()
+        plain = segment_prompt(conf, now_text="14:00", weekday="周一")
+        hit = segment_prompt(conf, now_text="14:00", weekday="周一", interrupted=True)
+        self.assertNotIn("插曲", plain)
+        self.assertIn("插曲", hit, "被打断时 prompt 要告诉模型")
+
+    def test_prompt_discourages_template_and_naps(self):
+        """一天不该是流程模板，午睡不是固定一站——这是「每个 bot 中午都睡」的对策。"""
+        from humanoid.services.schedule import segment_prompt
+        prompt = segment_prompt(cfg(), now_text="12:30", weekday="周三")
+        self.assertIn("午睡", prompt)
+        self.assertIn("流程模板", prompt)
+        self.assertIn("打断", prompt)
+
+    def test_day_cap_follows_config(self):
+        """面板上填的 schedule_max_slots 必须真的生效（原来被写死的 48 压住）。"""
+        from humanoid.services import schedule as schedule_mod
+        self.assertGreaterEqual(schedule_mod.SEGMENTS_DAY_CAP, 96,
+                                "硬上限不能低于面板可填的最大值")
+        service = self._service(schedule_max_slots=96)
+        for i in range(120):
+            from humanoid.services.schedule import dynamic_segment
+            slot = dynamic_segment(service.config, {}, now_minute=(i * 7) % 1440,
+                                   step=5, seed=["x", i])
+            service._append_segment(dict(slot), service._clock.today_str())
+        n = len(service._segments_raw() if hasattr(service, "_segments_raw")
+                else service._stored_slots())
+        self.assertGreater(n, 48, "段上限被写死的 48 卡住了")
+        self.assertLessEqual(n, 96)
+
+
+class TestInterruptionIsNotLeaked(unittest.IsolatedAsyncioTestCase):
+    """「来访」只能在**真的去生成**那一步被取走，否则会被白白吞掉。"""
+
+    def _service(self, **overrides):
+        conf = cfg(**overrides)
+        tmp = Path(tempfile.mkdtemp()) / "state.json"
+        store = ScopeStore(tmp)
+        store.load(FIXED_MOMENT.strftime("%Y-%m-%d"), conf.cycle_length)
+        log = RecordingLogger()
+        clock = FrozenClock(FIXED_MOMENT)
+        service = ScheduleService(
+            store.scope, lambda: conf, clock, logger=log, monotonic=lambda: 10_000.0
+        )
+        service.seed_first_segment()
+        return service
+
+    async def test_not_consumed_when_it_never_reaches_the_model(self):
+        """没有网关（或退避中）的一轮根本到不了模型层，来访要留着。
+
+        旧实现把 `_consume_interruption()` 放在生成块**外面**，只要 refresh_due
+        点头就被取走；这一次既没重排也没还回，来访直接丢了。
+        """
+        service = self._service(schedule_min_interval_minutes=0,
+                                llm_idle_silence_minutes=0,
+                                llm_daily_call_budget=0, schedule_change_chance=0)
+        self.assertIsNone(service.gateway)
+        service.note_interruption()
+        await service.ensure_fresh()
+        self.assertTrue(service._consume_interruption(), "到不了模型层的这一轮不该吞掉来访")
+
+    async def test_not_consumed_in_pure_template_mode(self):
+        """纯模板（不用大模型日程）时没有「让模型改主意」这一层，来访不该被取走。"""
+        service = self._service(use_llm_schedule=False, schedule_min_interval_minutes=0,
+                                llm_idle_silence_minutes=0,
+                                llm_daily_call_budget=0, schedule_change_chance=0)
+        service.note_interruption()
+        await service.ensure_fresh()
+        self.assertTrue(service._consume_interruption(), "纯模板模式下不该把来访吞掉")
+
+    async def test_restored_unchanged_when_gated(self):
+        """生成被闸门挡回时：原样还回（保留原始时间戳，不重新计时）。"""
+        class _GatedGateway:
+            def __init__(self):
+                self.gate = SimpleNamespace(
+                    check=lambda *a, **k: SimpleNamespace(allowed=True)
+                )
+                self.last_prompt = ""
+
+            async def generate(self, **kw):
+                self.last_prompt = kw.get("prompt", "")
+                return LLMResult(ok=False, outcome=OUTCOME_GATED, detail="被节流")
+
+        service = self._service()
+        gateway = _GatedGateway()
+        service.gateway = gateway
+        service.note_interruption()
+        original = service._interrupt_at
+        self.assertGreater(original, 0.0)
+        slot = await service._generate_segment(
+            service.config, service._clock.now(), 9 * 60, None, 0, False,
+            interrupted_ts=original,
+        )
+        self.assertIsNone(slot)
+        self.assertEqual(service._interrupt_at, original, "还回时不能重新计时")
+        self.assertIn("插曲", gateway.last_prompt, "被打断的信息要能到 prompt")
 
 
 if __name__ == "__main__":

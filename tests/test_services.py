@@ -157,14 +157,29 @@ class EnergyTest(unittest.TestCase):
     def test_cycle_description_styles(self):
         service, store, _ = self.build()
         store.data["current_cycle_day"] = 1
-        self.assertIn("经期", service.cycle_description())
+        self.assertIn("月经期", service.cycle_description())
         conf = cfg(cycle_description_style="simple")
         service2, store2, _ = self.build(conf)
         store2.data["current_cycle_day"] = 8
-        self.assertEqual(service2.cycle_description(), "卵泡期（第8天）")
+        self.assertEqual(service2.cycle_description(), "卵泡早期（第8天）")
         conf3 = cfg(enable_cycle=False)
         service3, _, _ = self.build(conf3)
         self.assertEqual(service3.cycle_description(), "")
+
+    def test_cycle_has_eight_phases(self):
+        """周期按 8 阶段分，且描述是有画面的角色扮演式体感（不是仪表盘读数）。"""
+        service, store, _ = self.build()
+        seen = set()
+        for day in range(1, 29):
+            store.data["current_cycle_day"] = day
+            text = service.cycle_description()
+            self.assertTrue(text)
+            seen.add(text.split("，")[0])
+        self.assertEqual(len(seen), 8, f"28 天应该覆盖 8 个阶段，实际 {len(seen)} 个")
+        store.data["current_cycle_day"] = 1
+        body = service.cycle_description()
+        # 描述要写身体感受，而不是只报一个档位名
+        self.assertGreater(len(body), 20, f"描述太干巴：{body!r}")
 
     def test_describe_energy_bands(self):
         """档位要对得上，但措辞按天抽签，所以不能钉死某一句。"""

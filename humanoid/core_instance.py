@@ -241,9 +241,9 @@ class HumanoidCoreInstance:
         这里取的是**生效城市**（`clock.city`）：角色单独设了就是它自己的，没设才是全局。
         因此只改某一个机器人的城市时，只有它会 rebase，另一个不受影响。
 
-        **从 `now_epoch()` 随时自查**，而不只在构造与 `/拟人设置 城市` 时调一次：
+        **从 `now_epoch()` 随时自查**，而不只在构造与 `/拟人 设置 城市` 时调一次：
         管理员在**面板**上改全局 `timezone_city` 时不会经过 `set_city_override`，
-        旧代码就完全不知道时区变了（`/拟人诊断` 也不会报），于是下一次精力结算会按新
+        旧代码就完全不知道时区变了（`/拟人 诊断` 也不会报），于是下一次精力结算会按新
         时区去解释旧时区写的墙上时间，可能凭空来一次「新的一天」——精力 20 突然跳到 80。
         """
         current = self.clock.city
@@ -264,7 +264,7 @@ class HumanoidCoreInstance:
         self._scope.set_self("tz_city", current)
 
     def set_city_override(self, city: str) -> str:
-        """单独设这个机器人的城市（`/拟人设置 城市` 走这里）。
+        """单独设这个机器人的城市（`/拟人 设置 城市` 走这里）。
 
         传空串或「默认/清除」意思的词 = 取消单独设置，回到跟随全局配置。
         写完立即 rebase，让精力与天气计时按新时区起算。返回生效城市（展示用）。
@@ -535,6 +535,16 @@ class HumanoidCoreInstance:
         cfg = self.config
 
         self.note_umo(umo)
+
+        # 有人来找她了：给日程一个「要不要停下手上的事」的时机。
+        # 只记账不重排——真正要不要重排由 refresh_due 与闸门（频率/预算/冷却）决定。
+        # 只认私聊（群消息不是「有人来找她说话」），且要打破一段安静才算来访。
+        # 指令不当成打断（发个 /查看日程 不是「有人来找你说话」）。
+        if not is_command:
+            try:
+                self.schedule.note_interruption(is_group=is_group)
+            except Exception:
+                pass
 
         # 先把身体推进到「现在」，再记账：否则本轮用的是上一轮的困意与饥饿。
         if cfg.soma_enabled:
@@ -925,10 +935,14 @@ class HumanoidCoreInstance:
         except Exception:
             state = {}
         link_state = str(state.get("state", "") or "").strip("-")
+        # 与 link.SocialSignals.status() 真实会给出的五种状态一一对应：
+        # no_data_root / not_installed / never_written / stale / fresh。
+        # 以前这里漏了中间两种，会把英文原文直接吐到中文状态页上。
         friendly = {
             "no_data_root": "未装 / 没有数据目录",
-            "no_contract": "已装，但没读到契约",
-            "stale": "已装，契约已过期",
+            "not_installed": "未安装（本插件单独也能跑）",
+            "never_written": "已装，还没写过信号（等它跑一轮）",
+            "stale": "已装，信号超时未刷新",
             "fresh": "已装，正在联动",
         }.get(link_state, link_state or "状态未知")
         out.append(row("社交插件", friendly))

@@ -14,7 +14,7 @@
   事推。这一轴跟 TA 无关，只跟她自己有关——真人不是随时都能接住话的。
 
 三轴只进 `interest_state()`，写进上下文的是措辞（见 `wording.py`），数值只进
-`/她的状态` 与 `/拟人诊断`。
+`/你的状态` 与 `/拟人 诊断`。
 """
 
 from __future__ import annotations

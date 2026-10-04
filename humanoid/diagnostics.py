@@ -1,4 +1,4 @@
-"""`/拟人诊断` 的报告生成。"""
+"""`/拟人 诊断` 的报告生成。"""
 
 from __future__ import annotations
 
@@ -153,7 +153,7 @@ def _timezone_lines(cfg: HumanoidConfig, zone: Any, moment: Any) -> list[str]:
     if zone.note:
         lines.append(f"  {WARN_MARK} {zone.note}")
         if "tzdata" in zone.note:
-            lines.append("  → 在这台机器里装一份时区数据库（或 `pip install tzdata`）然后 /重载配置")
+            lines.append("  → 在这台机器里装一份时区数据库（或 `pip install tzdata`）然后 /拟人 重载")
     elif not city or city == DEFAULT_CITY_PLACEHOLDER:
         lines.append(
             f"  {WARN_MARK} 还没定所在城市（`timezone_city` 仍是默认的「{DEFAULT_CITY_PLACEHOLDER}」）："

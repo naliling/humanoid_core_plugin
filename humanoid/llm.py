@@ -386,7 +386,7 @@ class CallGate:
         `budget_only=True` 是给「用户此刻明确要求」用的（`/重置日程`、人设重排）：那种调用
         要绕开**空闲静默与最小间隔**——那是后台自动决策的节奏，不该把管理员手下的命令
         驳回——但**仍然要占每日预算**。额度是硬约束，绕过它等于开了个不限量的口子：
-        反复点 `/重置日程` 就能把当天的额度撞穿，而 `/拟人诊断` 里看不出任何痕迹。
+        反复点 `/拟人 重置日程` 就能把当天的额度撞穿，而 `/拟人 诊断` 里看不出任何痕迹。
         """
         if purpose in GATE_EXEMPT_PURPOSES:
             return GateVerdict(True, _GATE_OFF, "情绪分析不参与节流")
@@ -452,7 +452,7 @@ class CallGate:
         self._log.info(f"[humanoid_core] {purpose} {verdict.describe()}，本次跳过")
 
     def snapshot(self) -> dict[str, Any]:
-        """给 /拟人诊断 用：让用户看得见钱花在哪儿、被什么挡住了。"""
+        """给 /拟人 诊断 用：让用户看得见钱花在哪儿、被什么挡住了。"""
         self._roll_day()
         wall = self._wall()
         idle_limit = self._idle_minutes()
@@ -749,7 +749,7 @@ class LLMGateway:
         ids = self._resolver.available_ids()
         self._warn(
             f"{purpose} {label} 配置的 id '{provider_id}' 不存在。"
-            f"当前可用 id: {ids or '（无）'}。请在插件配置里重新选择，或用 /拟人诊断 查看详情"
+            f"当前可用 id: {ids or '（无）'}。请在插件配置里重新选择，或用 /拟人 诊断 查看详情"
         )
 
     def _info(self, message: str) -> None:

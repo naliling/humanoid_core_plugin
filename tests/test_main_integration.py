@@ -173,22 +173,46 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("城市", out[0])
 
     async def test_settings_writes_throttle_numbers_as_ints(self):
-        """/拟人设置 间隔 45 必须存成 int 45，不能是字符串 "45"。"""
-        out = await collect(self.star.cmd_settings(FakeEvent("/拟人设置 间隔 45")))
+        """/拟人 设置 间隔 45 必须存成 int 45，不能是字符串 "45"。"""
+        out = await collect(self.star.cmd_settings(FakeEvent("拟人 设置 间隔 45")))
         self.assertIn("已设为", out[-1])
         self.assertIsInstance(self.star._config_box.raw["schedule_min_interval_minutes"], int)
         self.assertEqual(self.star._config.schedule_min_interval_minutes, 45)
         self.assertEqual(self.star._config_box.raw["schedule_min_interval_minutes"], 45)
 
+    async def test_settings_accepts_the_legacy_no_space_form(self):
+        """老的连写形式（直接调用/旧文本）也认，别把已经能用的写法规坏。"""
+        out = await collect(self.star.cmd_settings(FakeEvent("/拟人设置 间隔 30")))
+        self.assertIn("已设为", out[-1])
+        self.assertEqual(self.star._config.schedule_min_interval_minutes, 30)
+
     async def test_settings_rejects_non_numeric_throttle_value(self):
-        out = await collect(self.star.cmd_settings(FakeEvent("/拟人设置 预算 一堆")))
+        out = await collect(self.star.cmd_settings(FakeEvent("拟人 设置 预算 一堆")))
         self.assertIn("不是这一项能接受的值", out[-1])
         self.assertNotIn("llm_daily_call_budget", self.star._config_box.raw)
 
     async def test_settings_shows_throttle_line(self):
-        out = await collect(self.star.cmd_settings(FakeEvent("/拟人设置")))
+        # 真实会话里组指令是「拟人 设置」（中间一个空格），这里按真形态驱动。
+        out = await collect(self.star.cmd_settings(FakeEvent("拟人 设置")))
         self.assertIn("调用节流", out[0])
         self.assertIn("最短间隔", out[0])
+
+    async def test_settings_missing_value_shows_current(self):
+        """不带值时友好回显当前值，而不是报「不是这一项能接受的值」。"""
+        out = await collect(self.star.cmd_settings(FakeEvent("拟人 设置 间隔")))
+        self.assertIn("现在是", out[-1])
+        self.assertIn("拟人 设置 间隔", out[-1])
+
+    async def test_char_name_uses_the_argument_only(self):
+        """真形态 `/拟人 参照名称 小雨` 只把「小雨」当名字，别把整串塞进去。"""
+        out = await collect(self.star.cmd_set_char_name(FakeEvent("拟人 参照名称 小雨")))
+        self.assertIn("小雨", out[-1])
+        core = self.star._core(FakeEvent("/你的状态"))
+        self.assertEqual(core.char_name(), "小雨")
+        # 不带参数：显示当前名字 + 用法，不改名字
+        shown = await collect(self.star.cmd_set_char_name(FakeEvent("拟人 参照名称")))
+        self.assertIn("当前参照名称：小雨", shown[0])
+        self.assertEqual(core.char_name(), "小雨")
 
     async def test_gate_is_installed_and_shared(self):
         """闸门挂在全局网关上：所有 bot 共用同一份预算。"""
@@ -246,17 +270,17 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
     # ---------- 权限 ----------
 
     async def test_admin_commands_reject_outsiders(self):
-        stranger = FakeEvent("/拟人诊断", sender="777")
+        stranger = FakeEvent("拟人 诊断", sender="777")
         out = await collect(self.star.cmd_diagnose(stranger))
         self.assertIn("权限不足", out[0])
 
     async def test_astrbot_admin_is_accepted(self):
-        event = FakeEvent("/拟人诊断", sender="777", admin=True)
+        event = FakeEvent("拟人 诊断", sender="777", admin=True)
         out = await collect(self.star.cmd_diagnose(event))
         self.assertIn("拟人诊断", out[0])
 
     async def test_diagnose_report_content(self):
-        out = await collect(self.star.cmd_diagnose(FakeEvent("/拟人诊断")))
+        out = await collect(self.star.cmd_diagnose(FakeEvent("拟人 诊断")))
         report = out[0]
         self.assertIn("可用对话模型 id", report)
         self.assertIn("p1", report)
@@ -280,7 +304,7 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.star.engine.reload_config(self.raw)
         out = await collect(self.star.cmd_reset_schedule(FakeEvent("/重置日程")))
         self.assertIn("按身体现排", out[-1])
-        self.assertIn("拟人诊断", out[-1])
+        self.assertIn("拟人 诊断", out[-1])
 
     async def test_reset_state_and_mood(self):
         out = await collect(self.star.cmd_reset_state(FakeEvent("/重置状态")))
@@ -431,11 +455,12 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.star._config_box.reload(self.raw)
 
     async def test_merge_lone_message_proceeds(self):
-        """带句末标点的消息零延迟直接走：不为它白等一拍。"""
-        self._set_merge(message_merge_timeout_seconds=5.0)
+        """单条消息等完确认窗口就发；只有一条时不挂合并块。"""
+        self._set_merge(message_merge_timeout_seconds=5.0,
+                        message_merge_settle_seconds=0.1)
         ev = FakeEvent("你好呀。", sender="555")
         await self.star.debounce_merge(ev)
-        self.assertFalse(ev.is_stopped(), "孤消息不该被停，正常回复")
+        self.assertFalse(ev.is_stopped(), "孤消息等完就该正常回复")
         self.assertIsNone(ev.get_extra(main_module.MERGE_EXTRA_KEY), "只有一条时不挂合并块")
 
     async def test_merge_two_messages_only_last_replies(self):
@@ -453,26 +478,75 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已合并成一条", got[0], "两条合并也要标明，否则模型会当成两个人")
         self.assertEqual(got[1:], ["TA：我今天"], "合并后每条都带说话人——不然模型分不清自己在回谁")
 
-    async def test_merge_answered_complete_sentence_is_not_delayed(self):
-        """句末语气词的消息零延迟：「在吗」是两三个字，但它是完整的一问。"""
-        self._set_merge(message_merge_timeout_seconds=5.0)
+    async def test_merge_answered_complete_sentence_waits_a_beat(self):
+        """句末语气词的消息也等一小拍（防连发），而不是零延迟。
+
+        「在吗」是两三个字，但它是完整的一问——等一个短短的确认窗口，
+        窗口内没新消息就发（只多这么多延迟），有新消息就能并成一条。
+        """
+        self._set_merge(message_merge_timeout_seconds=5.0,
+                        message_merge_settle_seconds=0.1)
         ev = FakeEvent("在吗", sender="5563")
         await self.star.debounce_merge(ev)
         self.assertFalse(ev.is_stopped())
         self.assertEqual(self.star._debounce.peek_text(ev, ""), "在吗")
 
+    async def test_merge_burst_of_complete_sentences_collapses_to_one(self):
+        """用户连发三条**完整**消息，必须并成一次回复（v2.27.4 的核心修复）。
+
+        旧行为：第一条说完（带句号）零延迟放走，时机已错过，后两条只能各自回一次
+        ——用户发三条、他就回三条。现在三条都在确认窗口内到达，只有最后一条胜出。
+        """
+        self._set_merge(message_merge_timeout_seconds=0.3,
+                        message_merge_settle_seconds=0.3)
+        texts = ["今天天气不错。", "你吃饭了吗？", "我好累。"]
+        events = [FakeEvent(t, sender="9001") for t in texts]
+
+        async def feed(ev):
+            await asyncio.sleep(0.05)
+            await self.star.debounce_merge(ev)
+
+        await asyncio.gather(*[feed(ev) for ev in events])
+        alive = [ev for ev in events if not ev.is_stopped()]
+        self.assertEqual(len(alive), 1, f"三条完整消息应该只回一次，实际 {len(alive)} 条")
+        self.assertEqual(
+            self.star._debounce.peek_text(alive[0], ""),
+            "今天天气不错。 你吃饭了吗？ 我好累。",
+        )
+
+    async def test_settle_zero_means_send_immediately(self):
+        """把 settle 设成 0 = 说完就发（旧行为）。
+
+        面板 hint 与配置注释都承诺 0 能关掉这个新延迟，但 `0 or 默认值` 会把 0
+        吞成 1.5——用户根本关不掉。这里用一条完整消息验证 0 生效。
+        """
+        self._set_merge(message_merge_timeout_seconds=5.0, message_merge_settle_seconds=0)
+        ev = FakeEvent("你好呀。", sender="7771")
+        started = asyncio.get_event_loop().time()
+        await self.star.debounce_merge(ev)
+        elapsed = asyncio.get_event_loop().time() - started
+        self.assertLess(elapsed, 0.5, f"settle=0 应立即放行，实际等了 {elapsed:.2f}s")
+        self.assertFalse(ev.is_stopped())
+
+    async def test_settle_is_capped_by_timeout(self):
+        """settle 配得比 timeout 还大时，也不能比「没说完」等得更久。"""
+        self._set_merge(message_merge_timeout_seconds=0.3, message_merge_settle_seconds=5.0)
+        ev = FakeEvent("你好呀。", sender="7772")
+        started = asyncio.get_event_loop().time()
+        await self.star.debounce_merge(ev)
+        elapsed = asyncio.get_event_loop().time() - started
+        self.assertLess(elapsed, 1.0, f"应以 timeout（0.3s）为上限，实际等了 {elapsed:.2f}s")
+
     async def test_merge_swallows_typing_one_by_one(self):
         """逐字连发（「你」「今天」「我好累啊」）不能被切成两半。
 
-        「攒够两条就发」不算数：用户可能还在一个字一个字打。所以攒够条数只等一个短的
-        确认窗口（Debouncer.SETTLE_CAP_SECONDS），期间来的后续都并进同一句。
+        用户还在一个字一个字打，确认窗口期间来的后续都并进同一句。
         """
-        from humanoid import debounce as debounce_mod
-
-        self._set_merge(message_merge_timeout_seconds=0.3)
+        self._set_merge(message_merge_timeout_seconds=0.3,
+                        message_merge_settle_seconds=0.3)
         texts = ["你", "今天", "我好累啊"]
         events = [FakeEvent(t, sender="5561") for t in texts]
-        gap = debounce_mod.SETTLE_CAP_SECONDS / 4
+        gap = 0.05
 
         async def feed(ev):
             await asyncio.sleep(gap)
@@ -606,11 +680,41 @@ class MergeKnowsWhoIsTalking(MainIntegrationTest):
         return events[-1].get_extra(main_module.MERGE_EXTRA_KEY)
 
     async def test_each_merged_line_carries_its_speaker(self):
-        self._set_merge(message_merge_timeout_seconds=0.2)
+        self._set_merge(message_merge_timeout_seconds=0.2, message_merge_settle_seconds=0.2)
         got = await self._merge("557", ["我今天", "特别累", "想找人说说话"])
         self.assertIn("已合并成一条", got[0], "必须标明是合并出来的，否则模型会当成两个人")
         self.assertEqual(got[1:], ["小鱼：我今天", "小鱼：特别累"],
                          "每条都要带说话人——不然模型不知道自己在回谁")
+
+    async def test_two_speakers_are_not_merged_together(self):
+        """群里两个不同人的话不能并成一条批处理（那就是「在回谁」分不清的根）。
+
+        一个 umo 下所有人共用一格。按发送者分桶后，A 连发归 A、B 连发归 B，
+        各自合并、各自回复。
+        """
+        self._set_merge(message_merge_timeout_seconds=0.2, message_merge_settle_seconds=0.2)
+        a1 = FakeEvent("晚上吃什么", sender="501", private=False)
+        a2 = FakeEvent("我想吃面", sender="501", private=False)
+        b1 = FakeEvent("我在加班", sender="502", private=False)
+        tasks = [asyncio.create_task(self.star.debounce_merge(ev)) for ev in (a1, a2, b1)]
+        await asyncio.gather(*tasks)
+        # A 的两句合在一起，B 单独一条，两边都不带对方的字。
+        merged_a = a2.get_extra(main_module.MERGE_EXTRA_KEY)
+        self.assertIsNotNone(merged_a, "A 的两句应该合并在一起")
+        self.assertIn("晚上吃什么", " ".join(merged_a))
+        self.assertNotIn("加班", " ".join(merged_a), "B 的话混进了 A 的批次")
+        self.assertIsNone(b1.get_extra(main_module.MERGE_EXTRA_KEY), "B 只有一句，不该挂合并块")
+
+    async def test_sibling_bot_message_is_not_merged(self):
+        """兄弟 bot（同一插件状态里的另一个角色）的发言不进合并。"""
+        self._set_merge(message_merge_timeout_seconds=0.2, message_merge_settle_seconds=0.2)
+        # 先在状态里登记一个兄弟角色，再让它发一句。
+        self.star._state_store.data.setdefault("roles", {})["bot2"] = {"users": {}}
+        ev = FakeEvent("（另一台 bot 的自发消息）", sender="bot2", self_id="bot1", private=False)
+        await self.star.debounce_merge(ev)
+        self.assertFalse(ev.is_stopped(), "不该被合并层拦住（只是不进 buffer）")
+        self.assertIsNone(ev.get_extra(main_module.MERGE_EXTRA_KEY),
+                          "兄弟 bot 的话被当成用户消息攒起来了")
 
     async def test_it_tells_the_model_to_reply_once(self):
         self._set_merge(message_merge_timeout_seconds=0.2)
