@@ -59,8 +59,23 @@ class Gate(unittest.TestCase):
         self.assertIsNotNone(ccb.evaluate(**_ok(libido=45.0, base_libido=40.0)))
 
     def test_affection_gate(self):
-        self.assertIsNone(ccb.evaluate(**_ok(affection=70.0, base_affection=46.0)))
+        # E1 三档：<50 拒绝/岔开；50~74 擦边；≥75 深入。
+        self.assertIsNone(ccb.evaluate(**_ok(affection=45.0, base_affection=40.0)))
+        self.assertIsNotNone(ccb.evaluate(**_ok(affection=70.0, base_affection=46.0)))
         self.assertIsNone(ccb.evaluate(**_ok(affection=92.0, base_affection=90.0)))
+
+    def test_deep_affection_unlocks_deeper_stage(self):
+        # 好感没到「深入」档时只给最浅一档（擦边）。
+        shallow = ccb.evaluate(**_ok(affection=60.0, base_affection=46.0, libido=49.0, base_libido=34.0))
+        deep = ccb.evaluate(**_ok(affection=90.0, base_affection=46.0, libido=49.0, base_libido=34.0))
+        self.assertIsNotNone(shallow)
+        self.assertIsNotNone(deep)
+        self.assertEqual(shallow[2], 1)
+        self.assertEqual(deep[2], 3)
+
+    def test_coerced_never_fires(self):
+        # E4/E6：刚被强迫过 → 不进入。
+        self.assertIsNone(ccb.evaluate(**_ok(coerced=True)))
 
     def test_energy_floor(self):
         self.assertIsNone(ccb.evaluate(**_ok(energy=10.0)))
@@ -253,7 +268,7 @@ class State(unittest.TestCase):
         # 排在配置面板最底下才不显眼。v2.25.0 往后它跟了四个门槛参数（都可调，
         # 调的是「够不够得着」而不是「开不开」），所以断言从「必须是最后一个」
         # 放宽成「必须落在最后五个里，且开关在参数之前」。
-        self.assertIn("ccb", keys[-5:], "ccb 这一组应该待在配置项最底下")
+        self.assertIn("ccb", keys[-6:], "ccb 这一组应该待在配置项最底下")
         self.assertLess(keys.index("ccb"), keys.index("ccb_libido_min"),
                         "开关应当在它的参数之前")
         self.assertEqual(data["ccb"]["default"], False)
@@ -265,6 +280,7 @@ class State(unittest.TestCase):
         self.assertEqual(data["ccb_libido_rise"]["default"], _c.CCB_LIBIDO_RISE)
         self.assertEqual(data["ccb_affection_min"]["default"], _c.CCB_AFFECTION_MIN)
         self.assertEqual(data["ccb_affection_rise"]["default"], _c.CCB_AFFECTION_RISE)
+        self.assertEqual(data["ccb_affection_deep"]["default"], _c.CCB_AFFECTION_DEEP)
 
     def test_not_mentioned_in_public_docs(self):
         """ccb 是隐藏开关：README 和 CHANGELOG 都不许出现。"""

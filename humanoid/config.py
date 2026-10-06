@@ -254,12 +254,24 @@ class HumanoidConfig:
     # 面板上不解释它们是什么：那是用户自己去试的事，写清楚反而是替他们做判断。
     ccb_libido_min: float = 38.0
     ccb_libido_rise: float = 4.0
-    ccb_affection_min: float = 78.0
-    ccb_affection_rise: float = 12.0
+    ccb_affection_min: float = 50.0
+    ccb_affection_rise: float = 8.0
+    ccb_affection_deep: float = 75.0
     mood_initial_libido: int = 34
     mood_initial_aggression: int = 28
     mood_affection_override: tuple[str, ...] = ()
     mood_affection_delta_cap: int = 2
+    # v2.27.8：一句孤立的难听话只动心情不动好感，连着说才扣（A12）。
+    mood_negative_streak_required: int = 2
+    # v2.27.8：底部减速 + 情绪韧性（A7/A11）。
+    mood_negative_softening: bool = True
+    # v2.27.8：恢复侧——道歉回温 + 低于基线时暖话加成 + 连着哄加速消气（B1/B2/B3）。
+    mood_recovery_bonus: bool = True
+    # v2.27.8：冷静期（D）——好感跌破门槛后她带情绪冷着，并在这段时间里不主动找 TA。
+    cooling_enabled: bool = True
+    cooling_affection: int = 10
+    cooling_minutes: int = 15
+    cooling_no_proactive_days: int = 3
     mood_log_enabled: bool = True
     mood_log_max_entries: int = 28
     mood_log_threshold_affection: int = 3
@@ -422,10 +434,18 @@ class HumanoidConfig:
             ccb_libido_rise=f("ccb_libido_rise", 0.0, 20.0),
             ccb_affection_min=f("ccb_affection_min", 0.0, 100.0),
             ccb_affection_rise=f("ccb_affection_rise", 0.0, 50.0),
+            ccb_affection_deep=f("ccb_affection_deep", 0.0, 100.0),
             mood_initial_libido=i("mood_initial_libido", 0, 50),
             mood_initial_aggression=i("mood_initial_aggression", 0, 50),
             mood_affection_override=_as_str_tuple(pick("mood_affection_override")),
             mood_affection_delta_cap=i("mood_affection_delta_cap", 1, 10),
+            mood_negative_streak_required=i("mood_negative_streak_required", 1, 10),
+            mood_negative_softening=b("mood_negative_softening"),
+            mood_recovery_bonus=b("mood_recovery_bonus"),
+            cooling_enabled=b("cooling_enabled"),
+            cooling_affection=i("cooling_affection", 0, 100),
+            cooling_minutes=i("cooling_minutes", 1, 1440),
+            cooling_no_proactive_days=i("cooling_no_proactive_days", 0, 30),
             mood_log_enabled=b("mood_log_enabled"),
             mood_log_max_entries=i("mood_log_max_entries", 1, 1000),
             mood_log_threshold_affection=i("mood_log_threshold_affection", 0, 100),

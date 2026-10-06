@@ -372,6 +372,56 @@
     "minimum": 1,
     "maximum": 10
   },
+  "mood_negative_streak_required": {
+    "description": "【进阶】连着几句难听话才扣好感",
+    "hint": "1-10：默认 2。1=每句难听话都扣好感；2=一句孤立的难听话只动脾气不动好感，连着说才扣。",
+    "type": "int",
+    "default": 2,
+    "minimum": 1,
+    "maximum": 10
+  },
+  "mood_negative_softening": {
+    "description": "【进阶】负向软化",
+    "hint": "开：好感越低扣得越少（底部减速），关系越深越抗打击（韧性）；关：按原样扣。",
+    "type": "bool",
+    "default": true
+  },
+  "mood_recovery_bonus": {
+    "description": "【进阶】回温加成",
+    "hint": "开：她低于基线时，明确道歉会快速回温、暖话更管用、连着哄消气更快；关：不加成。",
+    "type": "bool",
+    "default": true
+  },
+  "cooling_enabled": {
+    "description": "冷静期",
+    "hint": "开：好感跌破门槛后她会冷着一段时间（带情绪、想让他先别来吵），且这段时间不主动找他；关：无冷静期。",
+    "type": "bool",
+    "default": true
+  },
+  "cooling_affection": {
+    "description": "【进阶】冷静期门槛",
+    "hint": "0-100：好感低于这个值就进入冷静期（默认 10）。",
+    "type": "int",
+    "default": 10,
+    "minimum": 0,
+    "maximum": 100
+  },
+  "cooling_minutes": {
+    "description": "【进阶】冷静期语气时长",
+    "hint": "分钟：她带着情绪冷着多久（默认 15）。",
+    "type": "int",
+    "default": 15,
+    "minimum": 1,
+    "maximum": 1440
+  },
+  "cooling_no_proactive_days": {
+    "description": "【进阶】冷静期不主动找 TA 的天数",
+    "hint": "天：冷静期里社交层不主动找这个人（默认 3）。",
+    "type": "int",
+    "default": 3,
+    "minimum": 0,
+    "maximum": 30
+  },
   "mood_log_enabled": {
     "description": "【进阶】情绪日志",
     "hint": "记下明显的情绪波动事件，/情绪日志 可查，给「今天被TA气到了」这类延续感供料",
@@ -774,12 +824,17 @@
   },
   "ccb_affection_min": {
     "type": "float",
-    "default": 78.0,
+    "default": 50.0,
     "description": "【进阶】ccb 阈值（0~100）"
   },
   "ccb_affection_rise": {
     "type": "float",
-    "default": 12.0,
+    "default": 8.0,
     "description": "【进阶】ccb 阈值（0~50）"
+  },
+  "ccb_affection_deep": {
+    "type": "float",
+    "default": 75.0,
+    "description": "【进阶】ccb 阈值（0~100）"
   }
 }

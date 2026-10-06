@@ -163,6 +163,7 @@ class HumanoidCoreInstance:
             logger,
             persona_provider=self._persona_for_schedule,
             body_provider=self._schedule_body,
+            world_provider=self._schedule_world,
         )
         self.schedule.set_resolver_gateway(resolver, gateway)
         # 重启后、第一条消息到来之前也要能按人设生成日程：把上次记账的代表会话先恢复。
@@ -464,6 +465,29 @@ class HumanoidCoreInstance:
         if cycle:
             body["cycle"] = cycle
         return body
+
+    def _schedule_world(self) -> dict:
+        """日程重排用的外界信息：今天真天气 + 节日。
+
+        拿不到就不给——天气服务没配好时 `snapshot()` 给的是「为什么没天气」的说明书，
+        那句是给主人看的，递进 prompt 会被模型当成一句天气话接着说。
+        """
+        world: dict[str, Any] = {}
+        try:
+            snap = self.weather.snapshot()
+            if isinstance(snap, dict) and not snap.get("notice"):
+                env = str(snap.get("env", "") or "").strip()
+                if env:
+                    world["weather"] = env.replace("天气：", "", 1)
+        except Exception:
+            pass
+        try:
+            holiday = self.clock.holiday()
+        except Exception:
+            holiday = ""
+        if holiday:
+            world["holiday"] = holiday
+        return world
 
     def note_umo(self, umo: str) -> bool:
         """记下该角色最近互动的会话来源，日程靠它去解析「她是谁」。

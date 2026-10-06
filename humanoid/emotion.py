@@ -19,6 +19,7 @@ from __future__ import annotations
 from . import ccb as _ccb
 import hashlib
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 # 门槛：情绪要**高于初始值**才出现。初始值是 affection 46 / libido 34 / aggression 28，
@@ -32,8 +33,8 @@ LIBIDO_UP = 8.0
 CARE_CLOSE = 0.62
 
 # 情绪记忆的门槛：单次不算（那叫记仇），重复且近期才算（那叫在意）。
+# v2.27.8（B4）：只按「同一天里 ≥2 次」判定——单次负向不再立刻亮「窝火」。
 GRUDGE_SAME_DAY = 2
-GRUDGE_RECENT_SECONDS = 2 * 3600.0
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -72,31 +73,6 @@ class EmotionLayer:
             elif "上升" in event:
                 ups += 1
         return ups, downs
-
-    def _recent_negative(self, user_id: str) -> bool:
-        """最近一次负向波动是不是就在刚才（两小时内）。"""
-        try:
-            from ..humanoid.clock import parse_state_timestamp  # type: ignore
-        except Exception:
-            return False
-        try:
-            from .clock import parse_state_timestamp
-        except Exception:
-            return False
-        entries = self._core.mood.logs(user_id, limit=1)
-        if not entries:
-            return False
-        if "下降" not in str(entries[0].get("event", "")):
-            return False
-        try:
-            stamp = parse_state_timestamp(
-                str(entries[0].get("time", "")), self._core.clock.now()
-            )
-        except Exception:
-            return False
-        if stamp is None:
-            return False
-        return (self._core.now_epoch() - stamp.timestamp()) <= GRUDGE_RECENT_SECONDS
 
     # ------------------------------------------------------------------
     # 五个维度
@@ -158,7 +134,7 @@ class EmotionLayer:
         aggr = _num(profile.get("aggression"), 28.0)
         base_aggr = _num(profile.get("base_aggression"), aggr)
 
-        if downs >= GRUDGE_SAME_DAY or self._recent_negative(user_id):
+        if downs >= GRUDGE_SAME_DAY:
             return 0.92, _pick(("上回那句话到现在都还窝火", "上次那事我还记着"), index)
         if aggr - base_aggr >= AGGRESSION_UP:
             return 0.85, _pick(("今天不太想搭理你", "今天说话不太想接"), index)
@@ -200,6 +176,146 @@ class EmotionLayer:
         if value > 0.0:
             return 0.40, _pick(("不太想开话头", "这会儿没什么特别想说的"), index)
         return 0.0, ""
+
+    def _cycle_phase(self) -> int:
+        """当前生理周期阶段（0 月经 / 4 排卵）。读不到按 -1（不调制）。"""
+        try:
+            day = int(self._core._scope.get_self("current_cycle_day", 1) or 1)
+            return int(self._core.config.cycle_phase_index(day))
+        except Exception:
+            return -1
+
+    def _extra_moods(self, profile: Dict[str, Any], index: int) -> List[Tuple[float, str]]:
+        """C1 新增维度：委屈 / 害羞 / 吃醋 / 烦 / 开心；C4 生理周期参与。
+
+        显著度刻意压在既有五维之下——它们是「没什么大事、但心里有点东西」的底色，
+        不该盖过「被惹了」「很在意你」这些更重的信号。
+        """
+        aff = _num(profile.get("affection"), 46.0)
+        base_aff = _num(profile.get("base_affection"), aff)
+        libido = _num(profile.get("libido"), 34.0)
+        base_lib = _num(profile.get("base_libido"), libido)
+        aggr = _num(profile.get("aggression"), 28.0)
+        base_aggr = _num(profile.get("base_aggression"), aggr)
+        d_aff = aff - base_aff
+        d_lib = libido - base_lib
+        d_aggr = aggr - base_aggr
+        phase = self._cycle_phase()
+        try:
+            energy_val = float(self._core.energy.energy)
+        except Exception:
+            energy_val = 60.0
+        tired = energy_val < 35.0
+        out: List[Tuple[float, str]] = []
+        # 烦：生理期（阶段 0）或精力见底
+        if phase == 0 or tired:
+            out.append((0.60, _pick(("今天有点烦", "今天没什么耐心"), index)))
+        # 委屈：被惹了、但好感也掉了——不是发火，是心里发酸
+        if d_aggr >= AGGRESSION_UP and d_aff <= SHIFT_LOW:
+            out.append((0.67, _pick(("心里有点委屈", "鼻子有点酸"), index)))
+        # 害羞：亲近欲涨了、关系还没热到可以直说
+        if d_lib >= LIBIDO_UP and d_aff < SHIFT_HIGH:
+            out.append((0.59, _pick(("有点不好意思", "不太敢看你"), index)))
+        # 吃醋：亲近欲高、对方却冷了——酸
+        if d_lib >= LIBIDO_UP and d_aff <= SHIFT_LOW:
+            out.append((0.62, _pick(("心里有点酸", "有点不是滋味"), index)))
+        # 开心：好感明显高于基线 + 精力足（排卵期更亮一点）
+        if d_aff >= SHIFT_HIGH and not tired:
+            out.append((0.73 if phase == 4 else 0.71, _pick(("今天挺开心", "心里挺敞亮"), index)))
+        # E1（v2.27.11）再加四维：疲倦 / 兴奋 / 心虚 / 期待。
+        # 显著度压得低一些，只在上面几个更重的信号都不亮时才露头。
+        if energy_val < 30.0:
+            out.append((0.55, _pick(("有点乏，提不起劲", "整个人薓薓的"), index)))
+        elif energy_val >= 85.0:
+            out.append((0.54, _pick(("今天精神头很足", "这会儿浑身是劲"), index)))
+        if d_aggr >= AGGRESSION_UP and d_aff >= 0:
+            out.append((0.56, _pick(("心里有点虚", "有点不太自在"), index)))
+        if d_lib >= LIBIDO_UP * 2:
+            out.append((0.57, _pick(("心里有点期待", "有点按捺不住"), index)))
+        # E4：关系里程碑——最近刚往上跨了一档，给一句淡淡的（不报数字、不像宣告）。
+        try:
+            rose = float(profile.get("stage_rose_at", 0.0) or 0.0)
+            if rose > 0 and (self._core.now_epoch() - rose) < 6 * 3600.0:
+                out.append((0.52, _pick(("今天好像跟TA更近了一点", "有点不一样的感觉"), index)))
+        except Exception:
+            pass
+        # M2：认识 TA 的纪念日（周年 / 整百天）——同样只给一句淡淡的，不报天数。
+        try:
+            sig, line = self._anniversary_line(profile, index)
+            if line:
+                out.append((sig, line))
+        except Exception:
+            pass
+        return out
+
+    def _anniversary_line(self, profile: Dict[str, Any], index: int) -> Tuple[float, str]:
+        """M2：认识 TA 的纪念日（周年 / 整百天）。
+
+        天数**不进上下文**——把「认识 400 天」递进去，她会拿去念一句「我们认识这么久了」，
+        那是聊天里最没劲的一句话（与「认识多久不进上下文」同一条规矩）。这里只说
+        「今天这个日子她记着」，要不要开口、怎么开口由她自己定。
+        """
+        try:
+            first = float(profile.get("first_met", 0.0) or 0.0)
+            now_epoch = float(self._core.now_epoch())
+            tz = self._core.clock.now().tzinfo
+        except Exception:
+            return 0.0, ""
+        if first <= 0 or now_epoch <= first:
+            return 0.0, ""
+        try:
+            met = datetime.fromtimestamp(first, tz)
+            today = datetime.fromtimestamp(now_epoch, tz)
+        except Exception:
+            return 0.0, ""
+        years = today.year - met.year
+        if years >= 1 and (today.month, today.day) == (met.month, met.day):
+            return 0.53, _pick(("今天这个日子她一直记着", "今天对她来说有点特别"), index)
+        days = (today.date() - met.date()).days
+        if days in (100, 200, 300, 500, 1000, 1500, 2000):
+            return 0.52, _pick(("今天好像是个该记着的日子", "今天心里有点说不清的在意"), index)
+        return 0.0, ""
+
+    def _memory_note(self, user_id: str, index: int) -> Tuple[float, str]:
+        """C3 长期情绪记忆（7 天）：记仇 + 记好。看**最近一笔**是什么。"""
+        try:
+            record = self._core.mood.profile(user_id) or {}
+        except Exception:
+            return 0.0, ""
+        led = record.get("emotion_memory")
+        if not isinstance(led, list) or not led:
+            return 0.0, ""
+        last = led[-1] if isinstance(led[-1], dict) else {}
+        kind = str(last.get("k") or "")
+        level = str(last.get("lvl") or "light")
+        # M3：分轻重——重的是「那件事还堵着」，轻的是「有点小别扭/记着你的好」。
+        if kind == "grudge":
+            if level == "heavy":
+                return 0.63, _pick(("前几天那件事我还记着", "有些事没那么容易过去"), index)
+            return 0.55, _pick(("心里还有点小别扭", "有点小疙瘩"), index)
+        if kind == "kindness":
+            if level == "heavy":
+                return 0.56, _pick(("你对我的好我记着", "一直记着你的好"), index)
+            return 0.50, _pick(("记着你的好", "这点好我记着"), index)
+        return 0.0, ""
+
+    def _cooling_line(self, user_id: str, index: int) -> Optional[Tuple[float, str]]:
+        """D 冷静期：她带着情绪冷着，直接返回、不参与竞争。"""
+        try:
+            record = self._core.mood.profile(user_id) or {}
+            until = float(record.get("cool_until", 0.0) or 0.0)
+            now = float(self._core.now_epoch())
+        except Exception:
+            return None
+        if until <= 0 or now >= until:
+            return None
+        reason = str(record.get("cool_reason") or "")
+        if reason:
+            return 0.95, _pick((
+                f"还在为{reason}的事烦着，这会儿不想好好说话，想让他先别来吵",
+                f"心里堵着{reason}那件事，先别理他，过几分钟再说",
+            ), index)
+        return 0.95, _pick(("现在很烦，想让他先别来吵", "这会儿不想说话，过几分钟再讲"), index)
 
     # ------------------------------------------------------------------
 
@@ -250,6 +366,15 @@ class EmotionLayer:
             self._intimacy(interest or {}, profile, index),
             self._willingness(agency or {}, index),
         ]
+        pools.extend(self._extra_moods(profile, index))
+        note = self._memory_note(user_id, index)
+        if note[1]:
+            pools.append(note)
+
+        # 冷静期优先于一切：她正在气头上，别的情绪都让位。
+        cool = self._cooling_line(user_id, index)
+        if cool is not None:
+            return cool
 
         # ccb：一个默认关的独立开关。条件全中时它**直接返回**，不参与竞争——
         # 门槛已经很高（亲近欲 45/50 且是涨上来的），到了就是这一刻，
@@ -289,6 +414,10 @@ class EmotionLayer:
         idx = int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big") % 2
         user_state = self._core._scope.user_state(user_id)
         _cfg = self._core.config
+        try:
+            coerced = (float(moment) - float(user_state.get("ccb_coerced_at", 0.0) or 0.0)) < 3600.0
+        except (TypeError, ValueError):
+            coerced = False
         res = _ccb.evaluate(
             enabled=True,
             # 门槛从配置取。写死在这个模块里的话，用户看到「够不着」却无处可调——
@@ -297,6 +426,8 @@ class EmotionLayer:
             libido_rise=getattr(_cfg, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE),
             affection_min=getattr(_cfg, "ccb_affection_min", _ccb.CCB_AFFECTION_MIN),
             affection_rise=getattr(_cfg, "ccb_affection_rise", _ccb.CCB_AFFECTION_RISE),
+            affection_deep=getattr(_cfg, "ccb_affection_deep", _ccb.CCB_AFFECTION_DEEP),
+            coerced=coerced,
             is_group=is_group,
             persona_prompt=persona_prompt,
             affection=_num(state.get("affection"), 46.0),
@@ -318,6 +449,8 @@ class EmotionLayer:
         user_state["ccb_stage"] = float(stage)
         user_state["ccb_last_at"] = float(moment)
         user_state["ccb_turns"] = float(user_state.get("ccb_turns", 0.0) or 0.0) + 1.0
+        # 一辈子的次数：社交层靠它判断「有没有和对方色色过」
+        user_state["ccb_done_count"] = float(user_state.get("ccb_done_count", 0.0) or 0.0) + 1.0
         # 推进场景。跨天的回落和次数重算都发生在这一步里，所以只在真进场景时
         # 才付这个代价——没进场景的日子不该把状态改掉。
         if _ccb.advance_satisfy(user_state, float(moment)):

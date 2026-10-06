@@ -159,5 +159,31 @@ class ScheduleNowToggle(unittest.TestCase):
                 self.assertNotIn("她今天", text, f"{mode} 档漏出日程：\n{text}")
 
 
+class ScheduleWorldContext(unittest.TestCase):
+    """S3：天气与节日要进日程 prompt，让她的这一天能跟着外头变。"""
+
+    def test_weather_and_holiday_reach_the_prompt(self):
+        p = segment_prompt(
+            cfg(), now_text="16:10", weekday="二",
+            weather="多云，气温 12℃", holiday="中秋节")
+        self.assertIn("今天的外界", p)
+        self.assertIn("多云，气温 12℃", p)
+        self.assertIn("中秋节", p)
+
+    def test_block_is_absent_when_nothing_known(self):
+        """没天气也没节日时不留空壳块——空块会被模型当成一条待办。"""
+        self.assertNotIn("今天的外界", build())
+
+    def test_holiday_only_still_renders(self):
+        p = segment_prompt(cfg(), now_text="09:00", weekday="一", holiday="元旦")
+        self.assertIn("元旦", p)
+        self.assertNotIn("外头：", p)
+
+    def test_world_is_a_state_not_an_order(self):
+        """只递事实，不说「所以该做什么」。"""
+        p = segment_prompt(cfg(), now_text="16:10", weekday="二", weather="雨")
+        self.assertNotIn("所以", p)
+
+
 if __name__ == "__main__":
     unittest.main()

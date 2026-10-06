@@ -51,14 +51,19 @@ CCB_LIBIDO_MIN = 38.0
 #   · 基线被运营设成 40   → 要涨到 44。初始值高的人不会天天碰到——
 #     这条挡的是「从一开始就高」，不是「涨了一点就够」。
 CCB_LIBIDO_RISE = 4.0
-CCB_AFFECTION_MIN = 78.0
-CCB_AFFECTION_RISE = 12.0
+# E1 三档（v2.27.8）：<50 拒绝/岔开；50~74 擦边暧昧；≥75 深入。
+# 原来 78/12 对多数人是永远够不着的静默开关。
+CCB_AFFECTION_MIN = 50.0
+CCB_AFFECTION_RISE = 8.0
+CCB_AFFECTION_DEEP = 75.0
 # 有精力就行——睡不睡不管（用户明确说了），但见底了不硬来
 CCB_ENERGY_MIN = 30.0
 # 门槛已经很高，冷却就该短：当天可以再来一次，只要条件仍然全中
 CCB_COOLDOWN_SECONDS = 5 * 3600.0
 
-STATE_KEYS = ("ccb_stage", "ccb_last_at", "ccb_satisfy", "ccb_day", "ccb_turns")
+# ccb_done_count：一辈子的次数（不分天）。社交层拿它判断「有没有和对方色色过」，
+# 从而决定要不要主动问一句——它不是当天次数（那是 ccb_turns）。
+STATE_KEYS = ("ccb_stage", "ccb_last_at", "ccb_satisfy", "ccb_day", "ccb_turns", "ccb_done_count")
 
 # 满足：场景里累积，到顶算「收场」。
 #
@@ -212,6 +217,8 @@ def evaluate(
     libido_rise: float = CCB_LIBIDO_RISE,
     affection_min: float = CCB_AFFECTION_MIN,
     affection_rise: float = CCB_AFFECTION_RISE,
+    affection_deep: float = CCB_AFFECTION_DEEP,
+    coerced: bool = False,
     index: int = 0,
 ) -> Optional[Tuple[float, str, int]]:
     """条件全中就返回 `(显著度, 内心话, 阶段)`；任何一条不满足都返回 None。
@@ -219,6 +226,9 @@ def evaluate(
     群里是**硬闸**：直接 None，不参与后面的竞争——按语气说的话没法在群里收场。
     """
     if not enabled:
+        return None
+    # E4/E6：刚被强迫过（无视拒绝/胁迫）→ 不进入，谈不上「享受」
+    if coerced:
         return None
     if is_group:
         return None
@@ -248,4 +258,8 @@ def evaluate(
     # 阶段跟着档位走，同样从阈值推导——写死 43/48 的话阈值一改就又出缝。
     ladder = bands(float(libido_min))
     stage = 1 + sum(1 for floor, _s, _w in ladder[1:] if libido >= floor)
+    # E1：好感没到「深入」那一档时，只给最浅一档（擦边暧昧），不往深走。
+    if affection < float(affection_deep):
+        stage = 1
+        words = ladder[0][2]
     return score, words[index % len(words)], stage

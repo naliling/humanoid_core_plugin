@@ -49,7 +49,8 @@ CHILL_CHANCE_BASE = 0.00008     # 每分钟基础概率（暴露满值时）
 CHILL_CHANCE_DOUBLE = 0.00006   # 又冷又缺觉时每分钟额外加这么多
 CHILL_EXPOSURE_MIN = 0.35       # 暴露低于这个值不会着凉
 CHILL_MIN_UNCOMFORT = 25.0      # 不适低于这个值不会着凉——不能只因为冷就生病
-CHILL_RECOVER_PER_HOUR = 1.6    # 一旦着了，每小时好这么多（40 分约 25 小时好完）
+CHILL_RISE_PER_HOUR = 6.0       # 病程前半：着凉往感冒的顶上走，比恢复快（病来如山倒）
+CHILL_RECOVER_PER_HOUR = 1.6    # 病程后半：从顶上慢慢好转（40 分约 25 小时好完）
 CHILL_COMFORT_COOL = 12.0       # 低于这个温度算「冻着」
 # 身体量落盘的最小间隔（秒）。饥饿这类轴每分钟都在动，不节流就等于每分钟写一次全量文件。
 MIN_PERSIST_INTERVAL_SECONDS = 300.0
@@ -406,15 +407,35 @@ class SomaService:
         return 0.0
 
     def _maybe_chill(self, minutes: float, moment: datetime, discomfort: float) -> None:
-        """受冻或长时间缺觉之后小概率着凉；着了就持续一两天。
+        """受冻或长时间缺觉之后小概率着凉；着了就走完整个病程：着凉→感冒→恢复。
 
         起头靠的是**客观量**：暴露程度取「受冻有多重」与「欠觉有多重」里更重的那个，
-        两者同时成立再加一点。一旦着了就随时间自己好。它只变体感与形式倾向，
-        说什么由她自己决定。
+        两者同时成立再加一点。一旦着了，先往上养几天到「感冒」的顶（`chill_peak`），
+        再从顶上慢慢好转——所以它不是一根见了就降的斜坡，而是一段有起有落的病。
+        它只变体感与形式倾向，说什么由她自己决定。
         """
         level = self._get("chill", 0.0)
         if level > 0.0:
-            self._set("chill", level - CHILL_RECOVER_PER_HOUR * minutes / 60.0)
+            # 一次推进可能跨过峰顶（插件停机后补算、测试一次推进几小时）：
+            # 先把小时数喂给「加重」那段，用不完的再喂给「恢复」那段。
+            # 用显式的「在加重」标记，而不是拿 level < peak 判——到了峰顶会先回落
+            # 一点点，那个判据会让它每轮又被拉回峰顶，永远下不来。
+            hours = minutes / 60.0
+            if self._get("chill_rising", 0.0) >= 1.0:
+                peak = self._get("chill_peak", 0.0)
+                rise = min(max(0.0, peak - level), CHILL_RISE_PER_HOUR * hours)
+                level += rise
+                hours -= rise / CHILL_RISE_PER_HOUR
+                if level >= peak - 1e-9:
+                    level = peak
+                    self._set("chill_rising", 0.0)
+            level -= CHILL_RECOVER_PER_HOUR * hours
+            if level <= 0.0:
+                self._set("chill", 0.0)
+                self._set("chill_peak", 0.0)
+                self._set("chill_rising", 0.0)
+            else:
+                self._set("chill", level)
             return
         if discomfort < CHILL_MIN_UNCOMFORT:
             return
@@ -432,7 +453,10 @@ class SomaService:
         if cold >= 0.5 and debt >= 0.5:
             chance += CHILL_CHANCE_DOUBLE * minutes
         if chance > 0 and self._random() < chance:
-            self._set("chill", _clamp(30.0 + discomfort * 0.2, 30.0, 50.0))
+            # 起头只是「着凉」：轻。峰值（感冒）由当时的不适定——越虚病得越重。
+            self._set("chill", _clamp(24.0 + discomfort * 0.1, 24.0, 32.0))
+            self._set("chill_peak", _clamp(48.0 + discomfort * 0.3, 48.0, 78.0))
+            self._set("chill_rising", 1.0)
 
     def _cycle_discomfort(self, moment: datetime) -> float:
         cfg = self.config

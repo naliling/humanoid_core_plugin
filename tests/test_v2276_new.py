@@ -88,11 +88,30 @@ class ChillTest(unittest.TestCase):
                 break
         self.assertTrue(hit, "受冻 + 缺觉永远不着凉，概率参数是不是被调没了")
         level = soma.snapshot()["chill"]
-        self.assertGreaterEqual(level, 30.0)
-        self.assertLessEqual(level, 50.0)
-        # 一两天就该好：往前进 36 小时必须痊愈
-        soma._maybe_chill(60.0 * 36, soma._clock.now(), 60.0)
+        # 起头是「着凉」：轻，落在词表的 28 档附近（不是一上来就重感冒）
+        self.assertGreaterEqual(level, 24.0)
+        self.assertLessEqual(level, 32.0)
+        # 一两天就该好：往前进 48 小时必须痊愈
+        soma._maybe_chill(60.0 * 48, soma._clock.now(), 60.0)
         self.assertEqual(soma.snapshot()["chill"], 0.0)
+
+    def test_chill_has_a_rising_then_falling_course(self):
+        """B1：着了之后先加重（着凉→感冒），到顶再好转（感冒→恢复）。"""
+        soma = self._soma()
+        soma._set("chill", 26.0)
+        soma._set("chill_peak", 60.0)
+        soma._set("chill_rising", 1.0)
+        levels = []
+        for _ in range(80):
+            soma._maybe_chill(60.0, soma._clock.now(), 60.0)
+            levels.append(soma.snapshot()["chill"])
+        peak = max(levels)
+        self.assertGreater(peak, 55.0, "病程该走到「感冒」的顶上")
+        peak_idx = levels.index(peak)
+        self.assertGreater(peak_idx, 0, "起头不该是最高点：那不是病程，是一根直接下坡")
+        self.assertLess(levels[0], peak, "病程前半在加重")
+        self.assertLess(levels[-1], peak, "病程后半在好转")
+        self.assertEqual(levels[-1], 0.0, "80 小时该痊愈了")
 
     def test_chill_shows_up_in_feelings(self):
         soma = self._soma()

@@ -163,6 +163,50 @@ def _append_framing(req: Any, char_name: str = "", user_name: str = "") -> None:
     req.system_prompt = current + build_framing(char_name, user_name)
 
 
+def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "") -> str:
+    """I1/I2：算「此刻的她」那一段（关系阶段 + 心境 + 她这会儿在过什么）。
+
+    **日程走 system_prompt、不进事实块**（I2）：塞进上下文她会每句都报备一句日程，
+    非常影响对话；放到提示词里，她只是「知道」，要不要提由她自己定。
+    """
+    try:
+        from .humanoid import relstage
+        from .humanoid.prompt_builder import build_state_note
+        affection = float((core.mood.profile(user_id) or {}).get("affection", 0.0) or 0.0)
+        stage = relstage.line_for(affection)
+        tone = core.mood.current_tone(user_id)
+        style = core.mood.style_tendency(user_id)
+        day = ""
+        try:
+            slot = core.schedule.current_slot() or {}
+            event = str(slot.get("event", "") or "").strip()
+            loc = str(slot.get("location", "") or "").strip()
+            if event:
+                day = f"她这会儿正在{event}" + (f"（{loc}）" if loc else "")
+        except Exception:
+            day = ""
+        return build_state_note(char_name, user_name, stage, tone, day, style)
+    except Exception:
+        return ""
+
+
+def _append_state_note(req: Any, note: str) -> None:
+    """I1：把「此刻的她」那段写进 system_prompt，**替换**上一轮留下的那条。
+
+    与 `_append_framing` 不同：那段是稳定的、只放一次；这段每轮都变（关系阶段 + 心境），
+    所以先按标记把旧的切掉再写新的，别越滚越长。
+    """
+    from .humanoid.prompt_builder import STATE_MARK
+
+    current = getattr(req, "system_prompt", None)
+    if not isinstance(current, str):
+        current = ""
+    idx = current.find(STATE_MARK)
+    if idx >= 0:
+        current = current[:idx].rstrip()
+    req.system_prompt = (current + note) if note else current
+
+
 def _drop_stale_blocks(req: Any, current_text: str = "") -> int:
     """从本次递出去的上下文里抹掉以前每一份身体事实块，返回抹掉了多少份。
 
@@ -972,6 +1016,7 @@ class HumanoidCore(Star):
                 # 注入为空时（预算卡太小、构建抛异常）留着它，模型收下一句宣告却一条事实都
                 # 拿不到——它会自己编。所以没有事实就不要宣告。
                 _append_framing(req, char_name, user_name)
+                _append_state_note(req, _state_note(core, user_id, char_name, user_name))
                 stale = _drop_stale_blocks(req, text)
                 if stale:
                     logger.debug(f"{LOG_PREFIX} 从上下文里抹掉 {stale} 份旧的身体事实块")

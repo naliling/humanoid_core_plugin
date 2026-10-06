@@ -86,7 +86,11 @@ def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
         return (
             f"{first_index}. 几点睡、几点起由她是谁决定：从人设里读她的年纪感、工作或学业、"
             "生活习惯，结合当前的身体数值（困意、睡眠债）由你判断；"
-            "人设里写着的作息保持不动。\n"
+            "人设里写着的作息保持不动。"
+            # B2：别把一套固定作息当默认（有人设是半夜活动/下午才起）；午睡不是必须。
+            # 不点名具体作息类型——那等于替模型做决定（test_v2142_routine 盯着）。
+            "人设没写清楚时，按她的年纪感与生活习惯推，不要套用一套固定作息；"
+            "午睡/小憩不是每天必须有的一站。\n"
         )
     start, end = cfg.night_start_hour, cfg.night_end_hour
     if start == end:
@@ -334,6 +338,8 @@ def segment_prompt(
     ongoing: list[str] | None = None,
     is_night: bool = False,
     interrupted: bool = False,
+    weather: str = "",
+    holiday: str = "",
 ) -> str:
     """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
 
@@ -386,6 +392,18 @@ def segment_prompt(
         + "\n".join(f"  - {x}" for x in _ongoing) + "\n"
         if _ongoing else ""
     )
+    # 外界（天气/节日）：她身处的环境。只递事实，不说「所以该做什么」——
+    # 下雨要不要改行程、过节要不要出门，由她按人设自己决定。
+    world_lines = []
+    if weather:
+        world_lines.append(f"- 外头：{weather}")
+    if holiday:
+        world_lines.append(f"- 今天：{holiday}")
+    world_block = (
+        "【今天的外界】（她身处的环境，安排这一段时可参考，不是必须围绕它来）\n"
+        + "\n".join(world_lines) + "\n\n"
+        if world_lines else ""
+    )
 
     return (
         persona_block(persona, cfg.schedule_persona_max_chars)
@@ -394,6 +412,7 @@ def segment_prompt(
         + prev_line
         + "\n"
         + body_reference_block(body, now_text)
+        + world_block
         + history_block
         + extra_block
         + night_line
@@ -718,6 +737,7 @@ class ScheduleService:
         persona_provider=None,
         body_provider=None,
         random_source: Callable[[], float] | None = None,
+        world_provider=None,
     ) -> None:
         self._scope = scope
         self._config = config_provider
@@ -735,6 +755,8 @@ class ScheduleService:
         self._persona = persona_provider
         # 身体参考数值的来源：递一个 () -> dict 进来，每次决策现取活值。
         self._body = body_provider
+        # 外界（天气/节日）的来源：同样是 () -> dict，每次决策现取，别用开机那一刻的。
+        self._world = world_provider
         self.last_persona = ""
         # 概率重估的骰子：每个决策窗只掷一次，掷完的结果本窗内保持不变。
         self._random = random_source or random.random
@@ -962,6 +984,15 @@ class ScheduleService:
         except Exception:
             return {}
         return snapshot if isinstance(snapshot, dict) else {}
+
+    def _world_snapshot(self) -> dict[str, Any]:
+        if self._world is None:
+            return {}
+        try:
+            world = self._world()
+        except Exception:
+            return {}
+        return world if isinstance(world, dict) else {}
 
     def _seed(self) -> list[Any]:
         try:
@@ -1244,6 +1275,7 @@ class ScheduleService:
 
         persona = await self._resolve_persona()
         history, history_note = self._history_for_prompt()
+        world = self._world_snapshot()
         prompt = segment_prompt(
             cfg,
             now_text=now.strftime("%H:%M"),
@@ -1257,6 +1289,8 @@ class ScheduleService:
             ongoing=self.ongoing_tasks(),
             is_night=self._clock.is_night(),
             interrupted=interrupted,
+            weather=str(world.get("weather") or ""),
+            holiday=str(world.get("holiday") or ""),
         )
         if self._log and cfg.debug_mode:
             self._log.debug(

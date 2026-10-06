@@ -53,6 +53,10 @@ _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef
 MARK_PREFIX = "〔她的身体与生活"
 MARK_VERSION = "v12"
 
+# 「此刻的她」那一段（I1）的标记。它与上面那段不同：上面是稳定说明、只放一次；
+# 这一段每轮都变（关系阶段 + 心境），所以 main.py 要先按这个标记把旧的切掉再写新的。
+STATE_MARK = "【此刻的她】"
+
 # 给 system_prompt 的那段话：说明下面这些是什么、按什么方式读它。稳定文本，不含事实。
 # 只划参考边界，不下指令：说什么、怎么说、说多长，都由她自己判断。
 def _safe_name(raw: str) -> str:
@@ -64,7 +68,7 @@ def _safe_name(raw: str) -> str:
 
 
 def build_framing(char_name: str = "", user_name: str = "") -> str:
-    """给 system_prompt 的那段说明：这些是什么、怎么读、指的是谁。
+    """给 system_prompt 的那段稳定说明：这些是什么、怎么读、指的是谁。
 
     **指名道姓这一段是必须的。** 模型没有"自我"这个概念——它不扮演角色，只是按
     system_prompt 生成下一段文本。而 system_prompt 里人设写的是「你叫小雨」，
@@ -87,8 +91,36 @@ def build_framing(char_name: str = "", user_name: str = "") -> str:
         f"下面提到的{role}指你自己，{peer}指正在和{role}说话的那个人。"
         "这些不是让你转述的资料，是你现在身上的事实："
         "累的时候话就短，心思在对方身上时才会主动往下接。不必逐条报备。"
-        "如何回应、说什么、说多长，由你自己判断。"
+        # I6：边界说明——**描述式**，不下禁令（这段的规矩是「只讲是什么、怎么读」，
+        # `test_v2151_freedom` 盯着不许出现「不要/必须/别」这类词）。
+        "这些状态是感觉，不是数值。"
+        # 括号约定：动作/内心 vs 说出口的话（只做澄清，不下「要用括号」的指令）。
+        "括号里的是动作或内心，不是要说出口的话——说出口的话在括号外面。"
+        # I4：长度以人设里的要求为准，插件不替她定。
+        "如何回应、说什么由你自己判断；说多长以人设里的要求为准。"
     )
+
+
+def build_state_note(char_name: str = "", user_name: str = "",
+                     stage_line: str = "", tone_line: str = "",
+                     day_line: str = "", style_line: str = "") -> str:
+    """给 system_prompt 的一句「她此刻跟对方到什么程度、什么心气、在过什么日子」（I1/I2）。
+
+    与事实块里那句「（她的内心：…）」分工不同：那句是**本轮**的隐藏状态（给这一轮参考），
+    这句是让模型**始终**知道现在的关系位置、心气与「她在过自己的日子」，
+    不用每轮重新从事实里推断。只说状态，不下指令。
+
+    **日程走这里、不走事实块**（I2）：塞进上下文她会每句都带一句日程报备；
+    放到提示词里，她只是「知道」，要不要提、怎么提由她自己定。
+    """
+    parts = [
+        str(p).strip()
+        for p in (stage_line, tone_line, day_line, style_line)
+        if str(p or "").strip()
+    ]
+    if not parts:
+        return ""
+    return "\n\n" + STATE_MARK + "\n" + "。".join(parts) + "。"
 
 
 # 模块级保留一份默认文案：诊断、测试这些不需要带名字的地方直接用它。
@@ -407,6 +439,14 @@ class PromptBuilder:
         # 「你们认识 400 天」更能指导她怎么说话），而把天数递给模型，它就会拿去念——
         # 「我们认识这么久了」是聊天里最没劲的一句话。想知道天数用 `/你的状态`，那里给你看。
         # 很久没见这件事也不需要专门说一句：间隔那块会报「TA有 7 天没吭声了」。
+
+        # 冷静期：好感跌破门槛后的一段时间里，她带着情绪冷着，想让他先别来吵（D3）。
+        try:
+            cool_line = core.mood.cooling_note(user_id)
+        except Exception:
+            cool_line = ""
+        if cool_line:
+            lines.append(cool_line)
 
         # 情绪事件：她记得今天发生过什么（被骂了/被逗开心了），不记得才出戏。
         emo_ev = core.mood.last_emotional_event(user_id)

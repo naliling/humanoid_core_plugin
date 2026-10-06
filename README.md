@@ -197,6 +197,13 @@ AstrBot「本地安装 zip」**不覆盖同名目录**。装过旧版要先卸�
 | `mood_use_llm_for_delta` | 开 | 关掉则情绪**完全本地**判断，零额外调用 |
 | `mood_llm_interval_messages` | 5 | 每人每几条消息用模型分析一次情绪（**按人算**） |
 | `mood_data_retention_days` | 7 | 超过这么多天没说话，情绪档案清回初始值（称呼保留） |
+| `mood_negative_streak_required` | 2 | 连着几句难听话才扣好感；1=每句都扣 |
+| `mood_negative_softening` | 开 | 底部减速 + 情绪韧性（好感越低扣得越少、关系越深越抗打击） |
+| `mood_recovery_bonus` | 开 | 道歉快速回温 + 低于基线时暖话加成 + 连着哄加速消气 |
+| `cooling_enabled` | 开 | 冷静期：好感跌破门槛后她冷着一段时间，且这段时间不主动找他 |
+| `cooling_affection` | 10 | 好感低于它就进入冷静期 |
+| `cooling_minutes` | 15 | 冷静期语气持续多久（分钟） |
+| `cooling_no_proactive_days` | 3 | 冷静期里不主动找 TA 的天数 |
 | `auto_identify_user` | 关 | 开则注入里用真名区分「她」和「对方」 |
 | `auto_nickname` | 开 | 从消息自带的名字认一次称呼；含数字/emoji/占位词一律不认 |
 | `weather_api_key` | 空 | OpenWeather 密钥（免费档就够） |
