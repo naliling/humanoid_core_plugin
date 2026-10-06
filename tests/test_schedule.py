@@ -17,7 +17,6 @@ from humanoid.config import HumanoidConfig
 from humanoid.jsonx import extract_json_array, extract_json_object
 from humanoid.llm import CallGate, LLMGateway, ProviderResolver
 from humanoid.llm import LLMResult, OUTCOME_GATED
-from humanoid.services.process import ProcessService
 from humanoid.services.schedule import (
     SOURCE_LLM,
     SOURCE_TEMPLATE,
@@ -890,58 +889,6 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         provider.reply = seg_reply()
         await service.ensure_fresh(force=True, ignore_cooldown=True)
         self.assertEqual(service.retry_after, 0)
-
-
-class ProcessFollowsSegmentTest(unittest.IsolatedAsyncioTestCase):
-    """过程跟着段走：同一件事续段不重开，换了事现开新过程。"""
-
-    def build(self):
-        conf = cfg()
-        self.conf = conf
-        tmp = Path(tempfile.mkdtemp()) / "state.json"
-        store = ScopeStore(tmp)
-        store.load(FIXED_TODAY, conf.cycle_length)
-        clock = FrozenClock(FIXED_MOMENT)
-        schedule = ScheduleService(store.scope, lambda: conf, clock)
-        process = ProcessService(store.scope, lambda: conf, clock, schedule)
-        return schedule, process, store
-
-    async def test_same_event_keeps_process(self):
-        schedule, process, store = self.build()
-        schedule.seed_first_segment()
-        first = process.current()
-        first["slot_event"] = "改海报"
-        first["slot_start"] = "09:00"
-        first["expected_end"] = (FIXED_MOMENT + __import__("datetime").timedelta(minutes=120)).isoformat()
-        store.set("current_process", first)
-
-        schedule._clock.advance(minutes=30)
-        process.note_segment_changed({"event": "改海报", "start": "09:30", "end": "11:00"})
-        after = process.current()
-        self.assertEqual(after["slot_event"], "改海报")
-        self.assertEqual(after["slot_start"], "09:30", "锚点跟到新的一段")
-        self.assertEqual(after["phase"], first["phase"], "阶段不重开")
-
-    async def test_different_event_reopens_process(self):
-        schedule, process, store = self.build()
-        schedule.seed_first_segment()
-        first = process.current()
-        first["name"] = "改海报"
-        first["slot_event"] = "改海报"
-        first["slot_start"] = "09:00"
-        store.set("current_process", first)
-
-        schedule.on_install = lambda previous, current: process.note_segment_changed(current)
-        schedule._clock.advance(minutes=30)
-        schedule._append_segment(
-            {"start": "09:30", "end": "10:30", "event": "下楼取快递", "location": "驿站",
-             "emotion": "随性", "energy_rate": -0.03},
-            FIXED_TODAY,
-        )
-        after = process.current()
-        self.assertEqual(after["slot_event"], "下楼取快递")
-        self.assertEqual(after["name"], "下楼取快递")
-        self.assertIn("改海报", process.recent() or [], "旧过程收进历史")
 
 
 class ThrottleTest(unittest.IsolatedAsyncioTestCase):

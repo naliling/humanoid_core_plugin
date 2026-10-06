@@ -396,8 +396,8 @@ class InjectionLayerTest(unittest.TestCase):
         """情绪句是独立的内心独白，每次都要叫得出名字。"""
         from humanoid.prompt_builder import PromptBuilder
 
-        out = PromptBuilder._personalize("（她的内心：心里有点堵）", "小雨", "阿明")
-        self.assertEqual(out, "（小雨的内心：心里有点堵）")
+        out = PromptBuilder._personalize("她内心：心里有点堵", "小雨", "阿明")
+        self.assertEqual(out, "小雨内心：心里有点堵")
 
     def test_names_with_pronouns_are_rejected(self):
         """名字里混进代词会替换出「小小雨今天…」这种句子，直接弃用。"""
@@ -422,7 +422,7 @@ class InjectionLayerTest(unittest.TestCase):
             {"affection": 80.0, "base_affection": 46.0, "aggression": 50.0, "base_aggression": 28.0}
         )
         text = core.build_injection("42", is_group=False, text="在吗")
-        self.assertIn("（她的内心：", text, f"情绪该是括号里的内心：\n{text}")
+        self.assertIn("内心：", text, f"情绪该标成内心：\n{text}")
         self.assertLessEqual(
             text.count("内心"), 1, f"一轮只该给一条情绪，模型会当成要复述的清单：\n{text}"
         )
@@ -542,9 +542,9 @@ class InjectionLayerTest(unittest.TestCase):
             resolver=FakeContext(), gateway=None,
         )
         core.clock = FrozenClock(winter, city="America/Argentina/Buenos_Aires")
-        text = core.build_injection("42", is_group=False)
-        self.assertIn("入冬了", text, f"南半球 6 月该是冬天：\n{text}")
-        self.assertNotIn("入夏了", text, f"南半球 6 月说成夏天：\n{text}")
+        note = core.prompt_builder.background_note()
+        self.assertIn("入冬了", note, f"南半球 6 月该是冬天：\n{note}")
+        self.assertNotIn("入夏了", note, f"南半球 6 月说成夏天：\n{note}")
 
     # ------------------------------------------------------------------
     # 场景
@@ -558,9 +558,10 @@ class InjectionLayerTest(unittest.TestCase):
         """
         south = self.core()
         south.clock = FrozenClock(MOMENT, city="Australia/Sydney")
-        text = south.build_injection("42", is_group=False)
-        self.assertNotIn("入秋了", text, f"9 月的悉尼角色被告知入秋了：\n{text}")
-        self.assertIn("开春了", text, f"南半球 9 月该是春天：\n{text}")
+        # 季节走 system_prompt 的【此刻的她】当背景（不再进事实块）。
+        note = south.prompt_builder.background_note()
+        self.assertNotIn("入秋了", note, f"9 月的悉尼角色被告知入秋了：\n{note}")
+        self.assertIn("开春了", note, f"南半球 9 月该是春天：\n{note}")
 
     def test_injection_stays_within_budget(self):
         for mode in ("medium", "full", "mood_only"):

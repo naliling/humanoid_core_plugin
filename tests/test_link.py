@@ -34,7 +34,7 @@ def freeze(core, moment=None):
     """把角色的所有服务换成同一个假时钟：滚动日程按「现在」截段，测试必须定住现在。"""
     clock = FrozenClock(moment or FROZEN)
     core.clock = clock
-    for service in (core.schedule, core.soma, core.energy, core.process, core.mood, core.social, core.weather):
+    for service in (core.schedule, core.soma, core.energy, core.mood, core.social, core.weather):
         service._clock = clock
     return core
 

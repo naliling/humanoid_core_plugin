@@ -72,7 +72,7 @@ def freeze(core, moment=MOMENT):
     """
     clock = FrozenClock(moment)
     core.clock = clock
-    for service in (core.schedule, core.soma, core.energy, core.process, core.mood, core.social, core.weather):
+    for service in (core.schedule, core.soma, core.energy, core.mood, core.social, core.weather):
         service._clock = clock
     return core
 
@@ -564,7 +564,7 @@ class EmotionLineTest(unittest.TestCase):
             any(w in text for w in ("心里有点堵", "不想搭理你")),
             f"攻击性到了门槛却没说她在气：{text}",
         )
-        self.assertIn("（她的内心：", text, f"情绪该包在括号里当内心独白：{text}")
+        self.assertIn("内心：", text, f"情绪该标成内心独白：{text}")
         for script in ("积了点火", "攒着点事", "火压在底下", "说话会短", "顶回去"):
             self.assertNotIn(script, text)
 
@@ -588,7 +588,7 @@ class EmotionLineTest(unittest.TestCase):
         text = core.build_injection("42", is_group=False)
         self.assertNotIn("不必逐条回应", text)
         self.assertIn("由你自己判断", FRAMING_TEXT)
-        self.assertIn("身上的事实", FRAMING_TEXT)
+        self.assertIn("身上的状态", FRAMING_TEXT)
 
 
 

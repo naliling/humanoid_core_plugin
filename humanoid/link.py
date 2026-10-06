@@ -108,8 +108,7 @@ def build_contract(core: Any) -> dict[str, Any]:
             "burst_ok": bool(form.get("burst_ok", False)),
         },
         "activity": {
-            "name": str((snap.get("process") or {}).get("name", "")),
-            "phase": str((snap.get("process") or {}).get("phase", "")),
+            "name": str(slot.get("event", "")),
             "schedule_event": str(slot.get("event", "")),
             "location": str(slot.get("location", "")),
         },

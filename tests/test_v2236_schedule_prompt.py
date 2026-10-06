@@ -73,10 +73,12 @@ class SchedulePromptExamples(unittest.TestCase):
         self.assertIn("不是让你照抄", p)
 
     def test_examples_cover_both_short_and_long(self):
-        """22 分钟和 145 分钟并列，本身就是在示范「长短都正常」。"""
-        p = build()
-        self.assertIn("22", p)
-        self.assertIn("145", p)
+        """范例池要同时有短有长（按天抽一批给模型），长短都正常。"""
+        from humanoid.services.schedule import EXAMPLE_POOL
+
+        mins = [int(x["minutes"]) for x in EXAMPLE_POOL]
+        self.assertLessEqual(min(mins), 30, "池子里没有短的")
+        self.assertGreaterEqual(max(mins), 120, "池子里没有长的")
 
     def test_examples_cover_continue(self):
         self.assertIn('{"continue": true}', p := build()) or self.assertIn("continue", p)
@@ -183,6 +185,54 @@ class ScheduleWorldContext(unittest.TestCase):
         """只递事实，不说「所以该做什么」。"""
         p = segment_prompt(cfg(), now_text="16:10", weekday="二", weather="雨")
         self.assertNotIn("所以", p)
+
+
+class ScheduleExamplesRotateDaily(unittest.TestCase):
+    """举例池按（角色+日期）抽：同一天稳定、不同天不同，不再天天看到同一批。"""
+
+    def test_same_day_same_examples(self):
+        from humanoid.services.schedule import examples_for
+
+        a = [x["event"] for x in examples_for(["bot1", "2026-10-06"])]
+        b = [x["event"] for x in examples_for(["bot1", "2026-10-06"])]
+        self.assertEqual(a, b)
+
+    def test_different_day_differs(self):
+        from humanoid.services.schedule import examples_for
+
+        a = [x["event"] for x in examples_for(["bot1", "2026-10-06"])]
+        b = [x["event"] for x in examples_for(["bot1", "2026-10-07"])]
+        self.assertNotEqual(a, b)
+
+    def test_no_micro_actions_in_pool(self):
+        """「翻个身继续睡」这类没有信息量的微动作不许再当范例。"""
+        from humanoid.services.schedule import EXAMPLE_POOL
+
+        for item in EXAMPLE_POOL:
+            self.assertNotIn("翻个身", item["event"])
+
+
+class ScheduleDayFrame(unittest.TestCase):
+    """日框：当天第一次决定时顺带给一句，之后每段都带着它。"""
+
+    def test_frame_block_rendered_when_present(self):
+        p = segment_prompt(
+            cfg(), now_text="09:00", weekday="一", day_frame="今天得赶一份稿子，晚上想早点歇。")
+        self.assertIn("今天大概是这样的", p)
+        self.assertIn("赶一份稿子", p)
+
+    def test_frame_block_absent_when_empty(self):
+        self.assertNotIn("今天大概是这样的", build())
+
+    def test_first_decision_asks_for_today_field(self):
+        p = segment_prompt(cfg(), now_text="09:00", weekday="一", want_day_frame=True)
+        self.assertIn('"today"', p)
+
+    def test_later_decisions_do_not_ask_again(self):
+        p = segment_prompt(
+            cfg(), now_text="09:00", weekday="一",
+            day_frame="今天松一点。", want_day_frame=False)
+        self.assertNotIn('"today"', p)
 
 
 if __name__ == "__main__":

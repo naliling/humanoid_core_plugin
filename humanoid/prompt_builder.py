@@ -89,13 +89,13 @@ def build_framing(char_name: str = "", user_name: str = "") -> str:
     return (
         "\n\n【她的身体与生活】\n"
         f"下面提到的{role}指你自己，{peer}指正在和{role}说话的那个人。"
-        "这些不是让你转述的资料，是你现在身上的事实："
-        "累的时候话就短，心思在对方身上时才会主动往下接。不必逐条报备。"
-        # I6：边界说明——**描述式**，不下禁令（这段的规矩是「只讲是什么、怎么读」，
-        # `test_v2151_freedom` 盯着不许出现「不要/必须/别」这类词）。
+        "这些不是让你转述的资料，是你现在身上的状态："
+        "累的时候话就短，心思在对方身上时才会主动往下接。"
+        # 这些状态是**背景**，不是聊天内容。模型最容易犯的错就是把她几点醒的、
+        # 困不困、外头什么天当成台词说出来——那样每一句都像在报备。
+        # I6：描述式，不下禁令（`test_v2151_freedom` 盯着不许出现「不要/必须/别」）。
+        "它们是背景，不是要拿出来讲的内容；对方没问起时，它们只影响你怎么说话。"
         "这些状态是感觉，不是数值。"
-        # 括号约定：动作/内心 vs 说出口的话（只做澄清，不下「要用括号」的指令）。
-        "括号里的是动作或内心，不是要说出口的话——说出口的话在括号外面。"
         # I4：长度以人设里的要求为准，插件不替她定。
         "如何回应、说什么由你自己判断；说多长以人设里的要求为准。"
     )
@@ -103,19 +103,20 @@ def build_framing(char_name: str = "", user_name: str = "") -> str:
 
 def build_state_note(char_name: str = "", user_name: str = "",
                      stage_line: str = "", tone_line: str = "",
-                     day_line: str = "", style_line: str = "") -> str:
-    """给 system_prompt 的一句「她此刻跟对方到什么程度、什么心气、在过什么日子」（I1/I2）。
+                     day_line: str = "", style_line: str = "",
+                     world_line: str = "") -> str:
+    """给 system_prompt 的一句「她此刻跟对方到什么程度、什么心气、在过什么日子、身处什么样的世界」（I1/I2）。
 
-    与事实块里那句「（她的内心：…）」分工不同：那句是**本轮**的隐藏状态（给这一轮参考），
+    与事实块里那句「她内心：…」分工不同：那句是**本轮**的隐藏状态（给这一轮参考），
     这句是让模型**始终**知道现在的关系位置、心气与「她在过自己的日子」，
     不用每轮重新从事实里推断。只说状态，不下指令。
 
-    **日程走这里、不走事实块**（I2）：塞进上下文她会每句都带一句日程报备；
-    放到提示词里，她只是「知道」，要不要提、怎么提由她自己定。
+    **日程与外界走这里、不走事实块**（I2）：塞进用户消息她会每句都带一句日程报备、
+    拿天气当开场白；放到提示词里，她只是「知道」，要不要提、怎么提由她自己定。
     """
     parts = [
         str(p).strip()
-        for p in (stage_line, tone_line, day_line, style_line)
+        for p in (stage_line, tone_line, day_line, style_line, world_line)
         if str(p or "").strip()
     ]
     if not parts:
@@ -424,16 +425,9 @@ class PromptBuilder:
         if position:
             lines.append(position)
 
-        # 关系到了哪一步。位置词说「多亲密」，这句说「到什么程度可以说什么」——
-        # 好感 60 和 90 不该一样，但现在看起来一样。
-        # 只说状态，不对模型下指令（「所以你应该…」是越界）。
-        try:
-            stage_line = relstage.line_for(data.get("affection", 46.0))
-        except (TypeError, ValueError, AttributeError):
-            stage_line = ""
-        if stage_line:
-            lines.append(stage_line)
-
+        # 关系到了哪一步（「到什么程度可以说什么」）不再在这里说——system_prompt 的
+        # 【此刻的她】已经有一句一样的关系阶段。两处都说，模型每轮都被同一件事推着，
+        # 调子会卡在一个点上、看着重复（插件自己的规矩是「同一件事只说一遍」）。
 
         # **认识多久不进上下文。** 关系深浅已经由上面那句位置词承载（「她对TA关系亲密」比
         # 「你们认识 400 天」更能指导她怎么说话），而把天数递给模型，它就会拿去念——
@@ -558,7 +552,11 @@ class PromptBuilder:
         return f"对TA的称呼是「{nickname}」" if nickname else ""
 
     def _scene_lines(self, is_group: bool) -> List[str]:
-        """场景必需品：几点、在她的哪个城市、这是群聊还是私聊。三样永远在。"""
+        """场景：这是群聊还是私聊。
+
+        几点、几号、周几、季节、城市、天气这类**会被当成台词念出来**的参考不在这里——
+        它们走 system_prompt 的【此刻的她】（`background_note`）当背景，模型不会去「回应」它们。
+        """
         cfg = self.config
         if is_group:
             # 「这是群聊」永远给；这一层「周围还有人看着」由 enable_chat_awareness 定。
@@ -567,9 +565,17 @@ class PromptBuilder:
             # 剩下的让她按自己人设去反应。
             # 用「会话」而不是「旁边」：群成员可能分布在不同城市，说「旁边」等于
             # 给了距离断言，模型会当成贴身盯着，害羞就变成戒备。
-            lines: List[str] = ["群聊，这个会话里还有别人" if cfg.enable_chat_awareness else "群聊"]
-        else:
-            lines = ["私聊，只有她和TA"]
+            return ["群聊，这个会话里还有别人" if cfg.enable_chat_awareness else "群聊"]
+        return ["私聊，只有她和TA"]
+
+    def _background_lines(self) -> List[str]:
+        """她此刻身处的世界：几点、几号、周几、季节、她在哪个城市、外头什么天。
+
+        这些是**背景**——模型看到它们就该「知道」，而不是拿去做开场白。所以它们走
+        system_prompt（模型不会去「回应」system_prompt），不塞进用户消息。
+        """
+        cfg = self.config
+        lines: List[str] = []
         now = self._core.clock.now()
         # 只报钟点，不报「上午/下午/晚上」这类时段词：时段词会被模型当成打招呼的
         # 由头（无论几点都回一句「下午好呀」），钟点是一张随手可看的表，用不用由她。
@@ -594,17 +600,11 @@ class PromptBuilder:
             pass
         # 季节：真人知道现在入秋了、快过年了。
         # 按所在城市的时区判南北半球——只看月份的话，9 月的悉尼角色会被告知「入秋了」。
-        # 没有权威的纬度表，与其造一张不如按时区名判：下面这些前缀本身就只在南半球。
-        # Australia/Darwin 在北纬、南回归线上，刻意不列进去。
         month = now.month
         season = ""
         try:
             from .data.cities import resolve_zone_name
 
-            # 城市口径必须和下面「你在XX」那句同一个源：那里读的是 clock（带角色级
-            # 覆盖），这里原来读 config.timezone_city，于是多 bot 各自设城市时
-            # 季节按全局城市判，9 月在悉尼的 bot 会被告知「入秋了」。
-            # 解析不出时区名就不判季节——拿不准时说季节，比说错一句更糟。
             zone = str(resolve_zone_name(str(self._core.clock.city or "")) or "").upper()
         except Exception:
             zone = ""
@@ -613,12 +613,9 @@ class PromptBuilder:
                 ("AUSTRALIA/SYDNEY", "AUSTRALIA/MELBOURNE", "AUSTRALIA/HOBART",
                  "AUSTRALIA/ADELAIDE", "AUSTRALIA/BRISBANE", "AUSTRALIA/LORD_HOWE",
                  "PACIFIC/AUCKLAND", "ANTARCTICA/",
-                 # 南美洲：阿根廷、智利、乌拉圭、玻利维亚。美洲这一区里南半球城市和大把
-                 # 北半球城市混在一起，所以只列确实在南半球的那几个前缀。
                  "AMERICA/ARGENTINA/", "AMERICA/SANTIAGO/", "AMERICA/MONTEVIDEO/",
                  "AMERICA/LA_PAZ/", "PACIFIC/CHATHAM")
             )
-            # 北半球 3-5 春 / 6-8 夏 / 9-11 秋 / 12-2 冬；南半球反过来
             table = (
                 ((9, 11), (12, 2), (3, 5), (6, 8))
                 if southern else
@@ -647,6 +644,14 @@ class PromptBuilder:
         if temp:
             lines.append(f"外头{temp}")
         return lines
+
+    def background_note(self) -> str:
+        """给 system_prompt 用的一段「她此刻的世界」；拿不到就返回空串。"""
+        try:
+            lines = [str(x).strip() for x in self._background_lines() if str(x or "").strip()]
+        except Exception:
+            return ""
+        return "；".join(lines)
 
     def _sleep_cause_line(self) -> str:
         """熬夜因果：昨晚只睡了几小时，今天整个人状态就不对。
@@ -988,9 +993,9 @@ class PromptBuilder:
             text = text.replace("TA", who)
         name = cls._safe_name(char_name)
         if name:
-            # 情绪句例外：它是独立的内心独白，每次都该叫得出名字（「小雨的内心：心里有点堵」），
-            # 否则括号里又冒出一个「她」，读者得回头去猜这是谁。
-            text = text.replace("（她的内心：", f"（{name}的内心：")
+            # 情绪句例外：它是独立的内心独白，每次都该叫得出名字（「小雨内心：心里有点堵」），
+            # 否则句首又冒出一个「她」，读者得回头去猜这是谁。
+            text = text.replace("她内心：", f"{name}内心：", 1)
             text = text.replace("她", name, 1)
         return text
 

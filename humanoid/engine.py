@@ -86,8 +86,8 @@ class HumanoidEngine:
         if resolver is None or gateway is None:
             return "诊断信息暂不可用。"
 
-        # 获取过程状态
-        process_status = core.process.current() if hasattr(core, "process") else {}
+        # 她此刻在做什么（过程退役后直接用当前日程段）
+        activity_status = core.schedule.current_activity()
         body_status = None
         if hasattr(core, "soma"):
             target, at = core.signals.last_proactive(getattr(core, "role_id", ""))
@@ -113,7 +113,7 @@ class HumanoidEngine:
             resolver=resolver,
             gateway=gateway,
             schedule_status=core.schedule.status(),
-            process_status=process_status,
+            activity_status=activity_status,
             body_status=body_status,
             inject_estimate=self._inject_estimate(core),
             zone_status=self._zone_status(core),

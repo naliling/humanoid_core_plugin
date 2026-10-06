@@ -17,7 +17,6 @@ from .prompt_builder import PromptBuilder
 from .role_scope import RoleScope
 from .services.energy import EnergyService
 from .services.mood import MoodService
-from .services.process import ProcessService
 from .services.schedule import ScheduleService
 from .services.social import SocialEnergyService
 from .services.weather import WeatherService
@@ -197,9 +196,6 @@ class HumanoidCoreInstance:
             body_provider=lambda: self.soma if self.config.soma_enabled else None,
         )
 
-        self.process = ProcessService(
-            self._scope, config_provider, self.clock, self.schedule, self._spawn_background
-        )
         self.mood = MoodService(
             self._scope,
             config_provider,
@@ -422,10 +418,6 @@ class HumanoidCoreInstance:
                 self.soma.note_schedule_changed()
         except Exception:
             pass
-        try:
-            self.process.note_segment_changed(current or {})
-        except Exception:
-            pass
 
     async def _persona_for_schedule(self):
         """日程生成用的当前生效人设。没接上人格源时返回 None，prompt 走中性身份。"""
@@ -626,7 +618,6 @@ class HumanoidCoreInstance:
         if cfg.social_energy_enabled and not is_command:
             self.social.consume_for_message()
 
-        self.process.tick()
         self.mood.decay_user(user_id)
         if cfg.soma_enabled and not is_group and not is_command:
             # 私聊算「有人陪」，把想说话的程度泄掉；群聊里潜水不等于被陪。
@@ -637,8 +628,6 @@ class HumanoidCoreInstance:
 
     def _dispatch_async(self, user_id: str, text: str, is_group: bool = False):
         cfg = self.config
-        if cfg.process_auto_update and self.process.needs_update():
-            self._spawn_background(self.process.update_async(), "process-update")
         mood_allowed = cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group)
         if mood_allowed:
             self._spawn_background(
@@ -766,9 +755,6 @@ class HumanoidCoreInstance:
     def snapshot(self, user_id: Optional[str] = None, refresh: bool = True) -> dict:
         if refresh:
             self.energy.advance()
-            self.process.tick()
-            if self.process.needs_update():
-                self.process.update_sync()
         if self.config.soma_enabled:
             self.soma.advance()
 
@@ -785,7 +771,7 @@ class HumanoidCoreInstance:
                 "text": self.energy.describe(),
             },
             "cycle": self.energy.cycle_description(),
-            "process": self.process.current(),
+            "activity": self.schedule.current_activity(),
             "schedule": {
                 "slots": self.schedule.current_slots(),
                 "source": self.schedule.status()["source_text"],
@@ -894,10 +880,12 @@ class HumanoidCoreInstance:
             out.append(row("社交能量", f"{int(s['social_energy']['value'])}%", s['social_energy']['text']))
         if soma:
             out.append(row("想找人说", f"{soma.get('social_desire', 0):.0f}/100"))
-        proc = s.get("process") or {}
-        if proc:
-            out.append(row("当前过程", str(proc.get("name", "休息")),
-                            f"已持续 {int(proc.get('duration_minutes', 0) or 0)} 分钟"))
+        act = s.get("activity") or {}
+        if act:
+            loc = str(act.get("location", "") or "").strip()
+            out.append(row("此刻在做什么", str(act.get("name", "")),
+                            (f"在{loc}，" if loc else "")
+                            + f"已 {int(act.get('duration_minutes', 0) or 0)} 分钟"))
         if user_id:
             try:
                 axes = self.behavior.interest_state(user_id, self.now_epoch()) or {}
@@ -997,27 +985,6 @@ class HumanoidCoreInstance:
             lines.append("（正在决定下一段…）")
         return "\n".join(lines)
 
-    def process_text(self) -> str:
-        """过程的详细状况：当前时段 + 过程 + 行为阶段。"""
-        p = self.process.current()
-        slot = self.schedule.current_slot() or {}
-        lines = [
-            f"📋 当前时段：{slot.get('start', '')}-{slot.get('end', '')} "
-            f"【{slot.get('event', '')}】@{slot.get('location', '')}",
-            f"当前过程：{p.get('name', '休息')}",
-            f"行为阶段：{p.get('phase') or '自然进行中'}",
-        ]
-        style = p.get("style", "")
-        if style:
-            lines.append(f"过程风格：{style}")
-        lines.extend([
-            f"开始：{p.get('started_at', '未知')}",
-            f"预计结束：{p.get('expected_end', '未知')}",
-            f"持续时长：{p.get('duration_minutes', 0)} 分钟",
-        ])
-        return "\n".join(lines)
-
-
     async def start(self):
         if self._started:
             return
@@ -1025,12 +992,10 @@ class HumanoidCoreInstance:
         self._spawn_background(self._social_loop(), "social-recovery")
         self._spawn_background(self._weather_loop(), "weather-refresh")
         self._spawn_background(self._schedule_loop(), "schedule-refresh")
-        self._spawn_background(self._process_loop(), "process-refresh")
         self._spawn_background(self._body_loop(), "body-tick")
         self._spawn_background(self._maintenance_loop(), "data-maintenance")
         self.schedule.current_slots()
         self.schedule.seed_first_segment()
-        self.process.current()
         self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 已启动")
 
     async def stop(self):
@@ -1109,22 +1074,6 @@ class HumanoidCoreInstance:
             interval = max(60.0, float(cfg.weather_refresh_minutes) * 60)
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
-
-    async def _process_loop(self):
-        """后台推进过程内部阶段，避免一个过程几十分钟毫无变化。"""
-        while not self._stop_event.is_set():
-            cfg = self.config
-            if cfg.process_auto_update:
-                try:
-                    self.process.tick()
-                    if self.process.needs_update():
-                        await self.process.update_async()
-                except Exception as exc:
-                    self._log.warning(f"{LOG_PREFIX} 过程阶段更新失败: {exc}")
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=30)
             except asyncio.TimeoutError:
                 pass
 

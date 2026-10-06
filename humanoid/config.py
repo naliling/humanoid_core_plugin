@@ -320,12 +320,6 @@ class HumanoidConfig:
     last_interaction_threshold_minutes: int = 5
     last_interaction_mode: str = "with_last_msg"
 
-    # v3 新增
-    process_min_duration: int = 15
-    process_max_duration: int = 90
-    process_auto_update: bool = True
-    process_history_limit: int = 5
-
     # v2.14 生理层（soma）
     soma_enabled: bool = True
     body_tick_seconds: int = 60
@@ -479,10 +473,6 @@ class HumanoidConfig:
             state_flush_interval_seconds=i("state_flush_interval_seconds", 1, 60),
             last_interaction_threshold_minutes=i("last_interaction_threshold_minutes", 0, 1440),
             last_interaction_mode=c("last_interaction_mode", LAST_INTERACTION_MODES),
-            process_min_duration=i("process_min_duration", 5, 60),
-            process_max_duration=i("process_max_duration", 30, 240),
-            process_auto_update=b("process_auto_update"),
-            process_history_limit=i("process_history_limit", 0, 20),
             soma_enabled=b("soma_enabled"),
             body_tick_seconds=i("body_tick_seconds", 15, 600),
             sleep_need_hours=f("sleep_need_hours", 3.0, 14.0),

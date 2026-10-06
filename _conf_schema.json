@@ -686,36 +686,6 @@
       "with_last_msg"
     ]
   },
-  "process_min_duration": {
-    "description": "【进阶】过程最短持续(分)",
-    "hint": "「她手上正在做的那件事」最少挂多久，防频繁跳变。",
-    "type": "int",
-    "default": 15,
-    "minimum": 5,
-    "maximum": 60
-  },
-  "process_max_duration": {
-    "description": "【进阶】过程最长持续(分)",
-    "hint": "超过这个时长强制换下一件，防一件事挂一整天。",
-    "type": "int",
-    "default": 90,
-    "minimum": 30,
-    "maximum": 240
-  },
-  "process_auto_update": {
-    "description": "【进阶】自动更新过程",
-    "hint": "当前过程过期就自动换新的；关：留在原地直到日程换段。",
-    "type": "bool",
-    "default": true
-  },
-  "process_history_limit": {
-    "description": "【进阶】过程历史条数",
-    "hint": "留几条「最近做过什么」供延续感；0=不留。",
-    "type": "int",
-    "default": 5,
-    "minimum": 0,
-    "maximum": 20
-  },
   "soma_enabled": {
     "description": "多轴身体",
     "hint": "要不要维护身体状态（精力/饥饿/困意）",

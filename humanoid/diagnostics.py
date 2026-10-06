@@ -223,7 +223,7 @@ def build_report(
     resolver: ProviderResolver,
     gateway: LLMGateway,
     schedule_status: dict[str, Any],
-    process_status: dict[str, Any],   # 新增参数
+    activity_status: dict[str, Any],
     version: str,
     body_status: dict[str, Any] | None = None,
     inject_estimate: dict[str, int] | None = None,
@@ -300,17 +300,20 @@ def build_report(
 
     lines += ["", "【作息】", *_routine_lines(cfg, schedule_status, body_status)]
 
-    lines += ["", "【当前过程】"]
-    if process_status:
-        name = process_status.get("name", "未知")
-        duration = process_status.get("duration_minutes", 0)
-        started = process_status.get("started_at", "")
-        ended = process_status.get("expected_end", "")
+    lines += ["", "【此刻在做什么】"]
+    if activity_status:
+        name = activity_status.get("name", "")
+        duration = activity_status.get("duration_minutes", 0)
+        started = activity_status.get("started_at", "")
+        ended = activity_status.get("expected_end", "")
+        location = str(activity_status.get("location", "") or "").strip()
         lines.append(f"- 正在：{name}（已持续约 {duration} 分钟）")
+        if location:
+            lines.append(f"- 地点：{location}")
         if started and ended:
             lines.append(f"- 开始：{started}，预计结束：{ended}")
     else:
-        lines.append("- 无活跃过程")
+        lines.append("- 此刻还没排出来的时段")
 
     lines += ["", "【情绪模型】"]
     if not cfg.mood_use_llm_for_delta:

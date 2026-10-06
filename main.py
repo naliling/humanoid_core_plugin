@@ -185,7 +185,13 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
                 day = f"她这会儿正在{event}" + (f"（{loc}）" if loc else "")
         except Exception:
             day = ""
-        return build_state_note(char_name, user_name, stage, tone, day, style)
+        # 外界（几点/几号/周几/季节/城市/天气）走这里当背景：塞进用户消息，模型会拿去当开场白。
+        world = ""
+        try:
+            world = core.prompt_builder.background_note()
+        except Exception:
+            world = ""
+        return build_state_note(char_name, user_name, stage, tone, day, style, world)
     except Exception:
         return ""
 
@@ -463,7 +469,6 @@ class HumanoidCore(Star):
         await self.role_manager.start()
         for core in self.role_manager.get_all():
             core.schedule.current_slots()
-            core.process.current()
 
     async def terminate(self) -> None:
         # 合并缓冲里可能还压着没发出的内容（用户发了半句就没下文了）。卸载时丢掉是对的：

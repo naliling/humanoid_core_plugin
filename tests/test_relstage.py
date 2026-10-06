@@ -14,6 +14,7 @@ from pathlib import Path
 from humanoid.config import HumanoidConfig
 from humanoid.core_instance import HumanoidCoreInstance
 from humanoid.relstage import BANDS, line_for, stage_of
+from humanoid.prompt_builder import build_state_note
 from humanoid.state import StateStore
 from tests.fakes import FakeContext, FrozenClock, RecordingLogger
 
@@ -59,16 +60,24 @@ class InInjection(unittest.TestCase):
         return core.build_injection("u1")
 
     def test_each_stage_shows_its_own_line(self):
+        """关系阶段句走 system_prompt 的【此刻的她】，不再进事实块（避免每轮被念）。"""
         markers = {
             50: "互相认识", 60: "讲点自己的事",
             80: "不用绕弯子", 92: "几乎没有边界",
         }
         for aff, mark in markers.items():
-            self.assertIn(mark, self._inject(aff), f"好感 {aff} 的注入里没有「{mark}」")
+            note = build_state_note("小雨", "TA", line_for(aff), "", "", "")
+            self.assertIn(mark, note, f"好感 {aff} 的【此刻的她】里没有「{mark}」")
 
     def test_high_and_low_differ(self):
         """这是这一项的全部意义：60 和 90 不该长得一样。"""
-        self.assertNotEqual(self._inject(60), self._inject(90))
+        low = build_state_note("小雨", "TA", line_for(60), "", "", "")
+        high = build_state_note("小雨", "TA", line_for(90), "", "", "")
+        self.assertNotEqual(low, high)
+
+    def test_fact_block_no_longer_repeats_the_stage(self):
+        """事实块里不再重复关系阶段句——它已经在 system_prompt 里，两处都说会显得重复。"""
+        self.assertNotIn("没到能说私事的地步", self._inject(50))
 
     def test_bad_affection_does_not_crash(self):
         self.assertTrue(self._inject(46))

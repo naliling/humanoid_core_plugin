@@ -191,7 +191,7 @@ class EndToEnd(unittest.TestCase):
 
     def _line(self, core, is_group=False):
         import re
-        m = re.search(r"内心：([^）]*)）", core.build_injection("u1", is_group=is_group))
+        m = re.search(r"内心：([^，。\n]*)", core.build_injection("u1", is_group=is_group))
         return m.group(1) if m else ""
 
     def test_injection_carries_it_when_on(self):

@@ -59,11 +59,11 @@ class WordingSoundsHuman(unittest.TestCase):
         self.assertEqual(bad, [], f"内心独白里混进了能力/状态评价：{bad}")
 
     def test_every_one_gets_the_inner_voice_prefix(self):
-        """一律要包成「（她的内心：…）」，格式不统一模型就分不清这是心情还是事实。"""
+        """一律要标成「她内心：…」，格式不统一模型就分不清这是心情还是事实。"""
         for fn, w in all_phrasings():
             line = bracket(w)
             self.assertTrue(
-                line.startswith("（她的内心："),
+                line.startswith("她内心："),
                 f"{fn} 的「{w}」渲染成了 {line}，没有内心标记",
             )
 

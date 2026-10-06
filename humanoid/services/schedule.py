@@ -324,6 +324,58 @@ def body_reference_block(body: dict[str, Any] | None, now_text: str) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+# 举例池：每次给模型看的范例从这里按天抽。
+#
+# 原来那 5 条是写死在代码里的，每次调用都一模一样。模型对 few-shot 的模仿远强于
+# 对抽象规则的服从，于是她的一天反复长成那几件事（「翻翻最近想去的那几家店」）。
+# 改成按（角色+日期）抽一批，每天看到的范例不同；顺带把「翻个身」这类没有信息量
+# 的微动作从示范里去掉。
+EXAMPLE_POOL: tuple[dict[str, Any], ...] = (
+    {"event": "啃两口昨天剩的面包", "location": "厨房", "emotion": "有点没睡醒", "energy_rate": 0.02, "minutes": 22},
+    {"event": "翻翻最近想去的那几家店，顺路买双袜子", "location": "商场", "emotion": "有点期待", "energy_rate": -0.08, "minutes": 145},
+    {"event": "拐去那家一直想去的书店", "location": "街角书店", "emotion": "有点期待", "energy_rate": -0.05, "minutes": 60, "wants": True},
+    {"event": "把阳台那几盆花浇一遍、修掉黄叶", "location": "阳台", "emotion": "踏实", "energy_rate": -0.03, "minutes": 35},
+    {"event": "回一封拖了两天的邮件", "location": "书桌前", "emotion": "终于动手了", "energy_rate": -0.04, "minutes": 40},
+    {"event": "煮一锅面，就着剩菜吃完", "location": "厨房", "emotion": "饿坏了", "energy_rate": 0.05, "minutes": 30},
+    {"event": "出门取个快递，顺便绕小区走两圈", "location": "楼下", "emotion": "透透气", "energy_rate": 0.02, "minutes": 45},
+    {"event": "窝在沙发上把攒的两集看完", "location": "客厅", "emotion": "放松下来", "energy_rate": 0.03, "minutes": 95},
+    {"event": "跟朋友打一通电话，聊了聊近况", "location": "卧室", "emotion": "有点高兴", "energy_rate": -0.04, "minutes": 55},
+    {"event": "把桌上的东西归拢、擦一遍", "location": "书桌前", "emotion": "看着清爽些了", "energy_rate": -0.05, "minutes": 40},
+    {"event": "认真做一顿饭，切切炒炒", "location": "厨房", "emotion": "挺享受", "energy_rate": -0.06, "minutes": 80},
+    {"event": "去楼下超市补点菜和日用品", "location": "超市", "emotion": "例行公事", "energy_rate": -0.07, "minutes": 50},
+    {"event": "坐在窗边发会儿呆，什么也没干", "location": "窗边", "emotion": "空落落的", "energy_rate": 0.04, "minutes": 30, "wants": True},
+    {"event": "把攒下的照片挑一挑、删掉重复的", "location": "床上", "emotion": "有点走神", "energy_rate": 0.01, "minutes": 65},
+    {"event": "写点东西，开了个头又删了", "location": "书桌前", "emotion": "有点卡", "energy_rate": -0.05, "minutes": 70},
+    {"event": "出门办那件拖了一阵的事", "location": "外面", "emotion": "得办完", "energy_rate": -0.09, "minutes": 130},
+    {"event": "洗个热水澡，把今天收拾掉", "location": "浴室", "emotion": "慢慢松下来", "energy_rate": 0.06, "minutes": 35},
+    {"event": "接着整理那份个案笔记", "location": "书桌前", "emotion": "还差几份", "energy_rate": -0.05, "minutes": 110, "ongoing": "整理那份个案笔记（还差 4 份）"},
+)
+EXAMPLE_COUNT = 4
+
+
+def examples_for(seed: list[Any] | None, count: int = EXAMPLE_COUNT) -> list[dict[str, Any]]:
+    """按（角色+日期）抽一批范例：同一天稳定，不同天不同。"""
+    pool = list(EXAMPLE_POOL)
+    rnd = random.Random("|".join(str(x) for x in (seed or [])) or "default")
+    rnd.shuffle(pool)
+    return pool[: max(1, int(count))]
+
+
+def _render_examples(items: list[dict[str, Any]]) -> str:
+    rows = []
+    for item in items:
+        rows.append("   · " + json_dumps_example(item))
+    # continue 是格式的一部分，不是活动范例——每次都给。
+    rows.append('   · {"continue": true}')
+    return "\n".join(rows)
+
+
+def json_dumps_example(item: dict[str, Any]) -> str:
+    import json
+
+    return json.dumps(item, ensure_ascii=False)
+
+
 def segment_prompt(
     cfg: HumanoidConfig,
     *,
@@ -340,6 +392,9 @@ def segment_prompt(
     interrupted: bool = False,
     weather: str = "",
     holiday: str = "",
+    day_frame: str = "",
+    seed: list[Any] | None = None,
+    want_day_frame: bool = False,
 ) -> str:
     """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
 
@@ -404,6 +459,12 @@ def segment_prompt(
         + "\n".join(world_lines) + "\n\n"
         if world_lines else ""
     )
+    # 今天的大致样子：每天开头定一句，后续每段都带着它，给「最安全的平均」一个锚。
+    frame_block = (
+        "【今天大概是这样的】（一整天的大致样子，安排这一段时参考，别当任务清单）\n"
+        f"{day_frame}\n\n"
+        if day_frame else ""
+    )
 
     return (
         persona_block(persona, cfg.schedule_persona_max_chars)
@@ -412,6 +473,7 @@ def segment_prompt(
         + prev_line
         + "\n"
         + body_reference_block(body, now_text)
+        + frame_block
         + world_block
         + history_block
         + extra_block
@@ -423,7 +485,7 @@ def segment_prompt(
         # 「怎么决定」原来只有上面两条，全是「什么时候该换」。这等于只教了它何时停下，
         # 没教它一段能有多短——于是模型把每段都当成一件大事，minutes 天然偏长。
         "3. minutes 要真的反映这件事要多久：\n"
-        "   喝口水、吃两口、翻个身就是 15~30 分钟，不用非撑满；\n"
+        "   喝口水、吃两口、回个消息就是 15~30 分钟，不用非撑满；\n"
         "   出门办事、见人、认真做一件事可以 1~3 小时；\n"
         "   一次出门可以是一整段（路上→店里→回来），也可以中途换成另一件事。\n"
         "   **别因为「反正要填一段时间」就往长的填。**\n"
@@ -462,17 +524,11 @@ def segment_prompt(
         # 所以给回几个**有画面、长度和内容都不一样**的范例，并明说这是举例不是填空。
         # 长度不一这件事本身就是示范：它告诉模型 22 分钟和 2 小时都是对的。
         "2. 下面是几个**举例**，看格式和详略，不是让你照抄，也不是填空题：\n"
-        '   \u00b7 {"continue": false, "event": "啃两口昨天剩的面包", "location": "厨房", '
-        '"emotion": "有点没睡醒", "energy_rate": 0.02, "minutes": 22}\n'
-        '   \u00b7 {"continue": false, "event": "翻翻最近想去的那几家店，顺路买双袜子", '
-        '"location": "商场", "emotion": "有点期待", "energy_rate": -0.08, "minutes": 145}\n'
-        '   \u00b7 {"continue": false, "event": "拐去那家一直想去的书店", "location": "街角", '
-        '"emotion": "有点期待", "energy_rate": -0.05, "minutes": 60, "wants": true}\n'
-        '   \u00b7 {"continue": false, "event": "接着整理那份个案笔记", "location": "书桌前", '
-        '"emotion": "还差几份", "energy_rate": -0.05, "minutes": 110, '
-        '"ongoing": "整理那份个案笔记（还差 4 份）"}\n'
-        '   \u00b7 {"continue": true}\n'
+        + _render_examples(examples_for(seed))
+        + "\n"
         "   event 写具体在做什么、location 写她在哪，两者都要具体到能说出口的程度；\n"
+        "   不要写「翻个身」「换个姿势」这种没有信息量的微动作——睡眠就直接写「睡眠」，\n"
+        "   其它事要是一件说得出口的事（做了什么、去了哪），不是姿势或状态。\n"
         "3. continue：true = 接着做手上这件事（event/location/emotion 留空，速率沿用）；"
         "false = 换一件事。\n"
         f"4. minutes：这一段做多久。最短 {SEGMENT_MIN_MINUTES} 分钟，一般的事最长 "
@@ -481,7 +537,13 @@ def segment_prompt(
         "多数日常小事落在 20~60 分钟，真正要花时间的事才写长。\n"
         "5. energy_rate 是这一段对精力的作用：睡眠/休息为正（0.05~0.2），"
         "工作/外出/社交为负（-0.05~-0.15）。\n"
-        "\n"
+        + (
+            # 当天第一次决定时顺带把「今天大概是什么日子」定下来（不另开一次调用）。
+            "6. 这是今天第一次决定：再多给一个 \"today\" 字段——一句话说今天大概是什么日子"
+            "（30 字内，不要引号，别排任务清单）。\n"
+            if want_day_frame else ""
+        )
+        + "\n"
         + routine_prompt(cfg, 6)
     )
 
@@ -1001,6 +1063,44 @@ class ScheduleService:
             return [self._scope.role_id]
 
     # ------------------------------------------------------------------
+    # 日框：每天开头定一句「今天大概是什么日子」，之后每段都带着它
+    # ------------------------------------------------------------------
+
+    DAY_FRAME_KEY = "day_frame"
+    DAY_FRAME_DATE_KEY = "day_frame_date"
+
+    def _cached_day_frame(self) -> str:
+        if str(self._scope.get_self(self.DAY_FRAME_DATE_KEY, "") or "") != self._clock.today_str():
+            return ""
+        return str(self._scope.get_self(self.DAY_FRAME_KEY, "") or "").strip()
+
+    def _fallback_day_frame(self) -> str:
+        """模型不可用时的确定句：星期 + 节日 + 天气。"""
+        world = self._world_snapshot()
+        bits = [f"周{self._clock.weekday()}"]
+        holiday = str(world.get("holiday") or "").strip()
+        weather = str(world.get("weather") or "").strip()
+        if holiday:
+            bits.append(f"是{holiday}")
+        if weather:
+            bits.append(f"外头{weather}")
+        return "，".join(bits) + "。"
+
+    async def _ensure_day_frame(self) -> str:
+        """拿今天的日框（不在时给空串，由当天第一段顺带定下来）。"""
+        return self._cached_day_frame()
+
+    def _store_day_frame(self, text: str) -> None:
+        """把今天第一段顺带给出的日框存下来（拿不到就用确定句，不再重复问）。"""
+        if self._cached_day_frame():
+            return
+        frame = str(text or "").strip().strip("\"'“”「」 　")[:60] or self._fallback_day_frame()
+        self._scope.update_self(
+            **{self.DAY_FRAME_KEY: frame, self.DAY_FRAME_DATE_KEY: self._clock.today_str()}
+        )
+        self._scope.mark_dirty()
+
+    # ------------------------------------------------------------------
     # 跨天与结转
     # ------------------------------------------------------------------
 
@@ -1274,6 +1374,7 @@ class ScheduleService:
             return None
 
         persona = await self._resolve_persona()
+        frame = await self._ensure_day_frame()
         history, history_note = self._history_for_prompt()
         world = self._world_snapshot()
         prompt = segment_prompt(
@@ -1291,6 +1392,9 @@ class ScheduleService:
             interrupted=interrupted,
             weather=str(world.get("weather") or ""),
             holiday=str(world.get("holiday") or ""),
+            day_frame=frame,
+            seed=self._seed(),
+            want_day_frame=not frame,
         )
         if self._log and cfg.debug_mode:
             self._log.debug(
@@ -1352,6 +1456,11 @@ class ScheduleService:
         self.last_error = ""
         self._retry_after = 0.0
         self._set_source(SOURCE_LLM)
+        if not frame:
+            # 这一段是当天第一次：把顺带给出的日框存下来（没给就用确定句）。
+            self._store_day_frame(
+                str(raw.get("today") or "") if isinstance(raw, dict) else ""
+            )
         return slot
 
     def _set_source(self, source: str) -> None:
