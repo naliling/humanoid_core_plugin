@@ -418,22 +418,31 @@ class EmotionLayer:
             coerced = (float(moment) - float(user_state.get("ccb_coerced_at", 0.0) or 0.0)) < 3600.0
         except (TypeError, ValueError):
             coerced = False
+        # 门槛从配置取。写死在这个模块里的话，用户看到「够不着」却无处可调——
+        # 而这个开关默认的 affection 门槛对多数人是永远够不着的。
+        libido_min = getattr(_cfg, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN)
+        libido_rise = getattr(_cfg, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE)
+        affection_min = getattr(_cfg, "ccb_affection_min", _ccb.CCB_AFFECTION_MIN)
+        affection_rise = getattr(_cfg, "ccb_affection_rise", _ccb.CCB_AFFECTION_RISE)
+        affection_deep = getattr(_cfg, "ccb_affection_deep", _ccb.CCB_AFFECTION_DEEP)
+        affection = _num(state.get("affection"), 46.0)
+        base_affection = _num(state.get("base_affection"), 46.0)
+        libido = _num(state.get("libido"), 34.0)
+        base_libido = _num(state.get("base_libido"), 34.0)
         res = _ccb.evaluate(
             enabled=True,
-            # 门槛从配置取。写死在这个模块里的话，用户看到「够不着」却无处可调——
-            # 而这个开关默认的 affection 门槛对多数人是永远够不着的。
-            libido_min=getattr(_cfg, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN),
-            libido_rise=getattr(_cfg, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE),
-            affection_min=getattr(_cfg, "ccb_affection_min", _ccb.CCB_AFFECTION_MIN),
-            affection_rise=getattr(_cfg, "ccb_affection_rise", _ccb.CCB_AFFECTION_RISE),
-            affection_deep=getattr(_cfg, "ccb_affection_deep", _ccb.CCB_AFFECTION_DEEP),
+            libido_min=libido_min,
+            libido_rise=libido_rise,
+            affection_min=affection_min,
+            affection_rise=affection_rise,
+            affection_deep=affection_deep,
             coerced=coerced,
             is_group=is_group,
             persona_prompt=persona_prompt,
-            affection=_num(state.get("affection"), 46.0),
-            base_affection=_num(state.get("base_affection"), 46.0),
-            libido=_num(state.get("libido"), 34.0),
-            base_libido=_num(state.get("base_libido"), 34.0),
+            affection=affection,
+            base_affection=base_affection,
+            libido=libido,
+            base_libido=base_libido,
             energy=energy,
             last_at=float(user_state.get("ccb_last_at", 0.0) or 0.0),
             now=float(moment),
@@ -441,9 +450,24 @@ class EmotionLayer:
             index=idx,
         )
         if res is None:
-            # 门槛掉下去了就把状态清掉：色欲降了就是没了，不留尾巴
-            if float(user_state.get("ccb_stage", 0.0) or 0.0) > 0:
-                _ccb.reset_state(user_state)
+            # 只有「该不该进入」的门槛**真的掉下去了**，才算场景结束、清掉场景状态。
+            # 冷却期内 / 当日已达上限 / 群里 / 精力见底 都是**暂时的**——原来一律
+            # reset_state() 会把 ccb_last_at / ccb_turns / ccb_done_count 一起清掉：
+            # 冷却随之失效（下一轮又能触发），一辈子的次数也归零。
+            if float(user_state.get("ccb_stage", 0.0) or 0.0) > 0 and _ccb.scene_lapsed(
+                is_group=is_group,
+                persona_prompt=persona_prompt,
+                affection=affection,
+                base_affection=base_affection,
+                libido=libido,
+                base_libido=base_libido,
+                libido_min=libido_min,
+                libido_rise=libido_rise,
+                affection_min=affection_min,
+                affection_rise=affection_rise,
+                coerced=coerced,
+            ):
+                _ccb.reset_scene(user_state)
             return None
         score, text, stage = res
         user_state["ccb_stage"] = float(stage)

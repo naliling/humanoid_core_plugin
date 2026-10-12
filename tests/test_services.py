@@ -285,14 +285,37 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
     async def test_decay_is_gradual(self):
         service, _, _ = self.build(cfg(mood_decay_hours=6.0))
         record = service.profile("1")
-        record["affection"] = 90.0
         record["base_affection"] = 46.0
+        # 好感的时间衰减由账本做（每笔按半衰期时衰），不由 mood_decay_hours 拉。
+        # 记一笔 +40，走 3 小时：应回落一点，但远没到基线——不是一步拉回 46。
+        service._ledger_append(record, Delta(40.0, 0.0, 0.0), self.time_value)
+        record["affection"] = 86.0
         record["last_decay"] = self.time_value
         self.time_value += 3 * 3600
         service.decay_user("1")
         value = service.profile("1")["affection"]
-        self.assertLess(value, 90.0)
+        self.assertLess(value, 86.0)
         self.assertGreater(value, 46.0)
+
+    async def test_decay_agrees_with_commit(self):
+        """好感只有一本账：decay 后的值必须等于 base + 账本净值（与下一条消息 _commit 同口径）。
+
+        原来 decay 按 mood_decay_hours 把好感拉向 base，_commit 又按账本把它顶回去，
+        两次消息之间值会在 base 与 base+净值 之间跳。
+        """
+        service, _, _ = self.build(cfg(mood_sensitivity=100))
+        service.profile("1")["last_interaction"] = self.time_value
+        await service.update_from_message("1", "你好棒，我最喜欢你了", 80.0, 8)
+        rec = service.profile("1")
+        self.assertGreater(rec["affection"], float(rec["base_affection"]), "聊过一句好感该涨上来")
+        self.time_value += 3 * 3600
+        service.decay_user("1")
+        rec = service.profile("1")
+        net = service._ledger_total(rec, self.time_value)
+        self.assertAlmostEqual(
+            float(rec["affection"]), float(rec["base_affection"]) + net, places=3,
+            msg="decay 后的好感必须等于 base + 账本净值，不能另走一套回落",
+        )
 
     async def test_decay_skips_when_too_recent(self):
         service, _, _ = self.build()

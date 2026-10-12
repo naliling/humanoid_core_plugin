@@ -15,7 +15,7 @@ import json
 import unittest
 
 from humanoid.config import HumanoidConfig
-from humanoid.services.mood import MoodService
+from humanoid.services.mood import Delta, MoodService
 from tests.fakes import FakeContext, FakeProvider, RecordingLogger
 from tests.test_services import FrozenClock, TZ, build_store
 
@@ -149,15 +149,15 @@ class MoodDecayNotOneWay(unittest.TestCase):
         service = MoodService(store.scope, lambda: conf, clock, logger=log)
         rec = service.profile("u1")
         base = float(rec["base_affection"])
+        # 好感的时间衰减由账本做（每笔按半衰期时衰）。记一笔 +20，走一段不长的时间：
+        # 好感应回落一点、但远没到基线——不是一步拉回 base，也不是归零。
+        service._ledger_append(rec, Delta(20.0, 0.0, 0.0), 0.0)
         rec["affection"] = base + 20.0
         rec["last_decay"] = 0.0
-        # 用**配置时长的一半**：走完整个时长本来就会回到基线（那是设计），
-        # 这里要验的是部分衰减——回一点，但不该跌破基线。
-        half = float(conf.mood_decay_hours) * 1800.0
-        service._decay_record(rec, store.scope.user_state("u1"), conf, now=half)
+        service._decay_record(rec, store.scope.user_state("u1"), conf, now=3600.0)
         after = float(rec["affection"])
-        self.assertGreater(after, base, "部分衰减不该把好感度拉回基线以下")
-        self.assertLess(after, base + 20.0, "偏离基线的部分应该被收回去")
+        self.assertGreater(after, base, "短时间不该把好感度拉回基线")
+        self.assertLess(after, base + 20.0, "账本时衰应把偏离基线的部分收回一点")
         self.assertEqual(float(rec["base_affection"]), base, "基线本身不该动")
 
     def test_full_decay_lands_exactly_on_base(self):

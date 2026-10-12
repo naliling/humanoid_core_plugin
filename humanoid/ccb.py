@@ -147,9 +147,15 @@ def read_state(user_state: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def reset_state(user_state: Dict[str, Any]) -> None:
-    for key in STATE_KEYS:
-        user_state[key] = 0.0
+def reset_scene(user_state: Dict[str, Any]) -> None:
+    """场景结束：只清「此刻到哪一步」，**不动记录**。
+
+    `ccb_last_at` / `ccb_turns` / `ccb_done_count` 是历史（冷却时间、当日次数、
+    一辈子的次数）。场景结束不是它们的生命周期终点——一起清掉会让冷却立刻失效
+    （下一轮又能触发），累计次数也归零，社交层再也判断不出「有没有和对方色色过」。
+    """
+    user_state["ccb_stage"] = 0.0
+    user_state["ccb_satisfy"] = 0.0
 
 
 def decay_satisfy(user_state: Dict[str, Any], now: float) -> None:
@@ -200,6 +206,99 @@ def _band_for(libido: float, libido_min: float) -> Optional[Tuple[float, Tuple[s
     return picked
 
 
+def _values_hold(
+    *,
+    affection: float,
+    base_affection: float,
+    libido: float,
+    base_libido: float,
+    libido_min: float = CCB_LIBIDO_MIN,
+    libido_rise: float = CCB_LIBIDO_RISE,
+    affection_min: float = CCB_AFFECTION_MIN,
+    affection_rise: float = CCB_AFFECTION_RISE,
+) -> bool:
+    """只有**数值门槛**这一组——冷却/当日封顶/精力/群聊都不在这里。
+
+    拆出来是给 `_qualifies`（能不能进）与 `scene_lapsed`（结没结束）共用，
+    门槛只此一处定义，改阈值不会两边走歪。
+    """
+    if libido < float(libido_min):
+        return False
+    if (libido - base_libido) < float(libido_rise):
+        return False
+    if affection < float(affection_min):
+        return False
+    if (affection - base_affection) < float(affection_rise):
+        return False
+    return True
+
+
+def _qualifies(
+    *,
+    is_group: bool,
+    persona_prompt: str,
+    affection: float,
+    base_affection: float,
+    libido: float,
+    base_libido: float,
+    libido_min: float = CCB_LIBIDO_MIN,
+    libido_rise: float = CCB_LIBIDO_RISE,
+    affection_min: float = CCB_AFFECTION_MIN,
+    affection_rise: float = CCB_AFFECTION_RISE,
+    coerced: bool = False,
+) -> bool:
+    """「该不该进入场景」的门槛——上下文闸 + 数值门槛，冷却/当日封顶/精力**不在**。"""
+    if coerced or is_group:
+        return False
+    if not looks_female(persona_prompt):
+        return False
+    return _values_hold(
+        affection=affection,
+        base_affection=base_affection,
+        libido=libido,
+        base_libido=base_libido,
+        libido_min=libido_min,
+        libido_rise=libido_rise,
+        affection_min=affection_min,
+        affection_rise=affection_rise,
+    )
+
+
+def scene_lapsed(
+    *,
+    is_group: bool,
+    persona_prompt: str,
+    affection: float,
+    base_affection: float,
+    libido: float,
+    base_libido: float,
+    libido_min: float = CCB_LIBIDO_MIN,
+    libido_rise: float = CCB_LIBIDO_RISE,
+    affection_min: float = CCB_AFFECTION_MIN,
+    affection_rise: float = CCB_AFFECTION_RISE,
+    coerced: bool = False,
+) -> bool:
+    """场景是否**真的结束**（色欲/好感掉下数值门槛）。
+
+    群聊 / 刚被强迫 / 判不出性别——这些是**上下文**，不是「结束」：她这会儿
+    进不去，但场景还在，不该清。冷却、当日已达上限、精力见底同样不算结束。
+    """
+    if coerced or is_group:
+        return False
+    if not looks_female(persona_prompt):
+        return False
+    return not _values_hold(
+        affection=affection,
+        base_affection=base_affection,
+        libido=libido,
+        base_libido=base_libido,
+        libido_min=libido_min,
+        libido_rise=libido_rise,
+        affection_min=affection_min,
+        affection_rise=affection_rise,
+    )
+
+
 def evaluate(
     *,
     enabled: bool,
@@ -228,19 +327,19 @@ def evaluate(
     if not enabled:
         return None
     # E4/E6：刚被强迫过（无视拒绝/胁迫）→ 不进入，谈不上「享受」
-    if coerced:
-        return None
-    if is_group:
-        return None
-    if not looks_female(persona_prompt):
-        return None
-    if libido < float(libido_min):
-        return None
-    if (libido - base_libido) < float(libido_rise):
-        return None
-    if affection < float(affection_min):
-        return None
-    if (affection - base_affection) < float(affection_rise):
+    if not _qualifies(
+        coerced=coerced,
+        is_group=is_group,
+        persona_prompt=persona_prompt,
+        affection=affection,
+        base_affection=base_affection,
+        libido=libido,
+        base_libido=base_libido,
+        libido_min=libido_min,
+        libido_rise=libido_rise,
+        affection_min=affection_min,
+        affection_rise=affection_rise,
+    ):
         return None
     if energy < CCB_ENERGY_MIN:
         return None

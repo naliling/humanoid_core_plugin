@@ -242,22 +242,59 @@ class EndToEnd(unittest.TestCase):
         self._line(core)
         us = core._scope.user_state("u1")
         self.assertEqual(us.get("ccb_stage"), 2.0)
-        # 亲近欲掉回基线 → 状态清掉，不留尾巴
+        # 亲近欲掉回基线 → 门槛真的掉了，场景结束、清掉场景状态，不留尾巴
         self._mood(core, libido=35.0, base_libido=34.0)
         self._line(core)
         self.assertEqual(us.get("ccb_stage"), 0.0)
+
+    def test_cooldown_does_not_wipe_records(self):
+        """冷却期内再请求，只该保持场景，**不该把记录清掉**。
+
+        原来 `evaluate` 因冷却返回 None 时，`_ccb_line` 一律 `reset_state()`，把
+        `ccb_last_at` / `ccb_turns` / `ccb_done_count` 一起清空——冷却随之失效
+        （下一轮又能触发），一辈子的次数也归零（社交层靠它判断有没有色色过）。
+        """
+        core = self._core(True)
+        self._mood(core)
+        us = core._scope.user_state("u1")
+        # 第一次：条件全中 → 触发，写记录
+        self._line(core)
+        self.assertEqual(us.get("ccb_done_count"), 1.0)
+        first_at = us.get("ccb_last_at")
+        self.assertGreater(first_at, 0.0)
+        # 第二次：同一个人、数值不变、时间没走 → 落在冷却里 → 返回 None
+        self._line(core)
+        self.assertEqual(us.get("ccb_done_count"), 1.0, "冷却不该把一辈子的次数清掉")
+        self.assertEqual(us.get("ccb_last_at"), first_at, "冷却不该把上次时间清掉")
+        self.assertGreaterEqual(us.get("ccb_turns"), 1.0, "冷却不该把当日次数清掉")
 
 
 class State(unittest.TestCase):
     def test_state_roundtrip(self):
         u = {"ccb_stage": 2.0, "ccb_last_at": 5.0, "ccb_satisfy": 80.0,
-             "ccb_day": 3.0, "ccb_turns": 4.0}
+             "ccb_day": 3.0, "ccb_turns": 4.0, "ccb_done_count": 7.0}
         st = ccb.read_state(u)
         self.assertEqual(st["ccb_stage"], 2.0)
         self.assertEqual(st["ccb_satisfy"], 80.0)
-        ccb.reset_state(u)
+        # 场景结束只清场景状态，记录（冷却时间/当日次数/一辈子的次数）必须留
+        ccb.reset_scene(u)
         self.assertEqual(ccb.read_state(u)["ccb_stage"], 0.0)
         self.assertEqual(ccb.read_state(u)["ccb_satisfy"], 0.0)
+        self.assertEqual(u["ccb_last_at"], 5.0)
+        self.assertEqual(u["ccb_turns"], 4.0)
+        self.assertEqual(u["ccb_done_count"], 7.0)
+
+    def test_scene_lapsed_ignores_transient_conditions(self):
+        """「场景结束」只看门槛；冷却/当日封顶/群里/精力见底都**不算**结束。"""
+        ok = dict(is_group=False, persona_prompt=FEMALE, affection=92.0,
+                  base_affection=46.0, libido=47.0, base_libido=34.0)
+        self.assertFalse(ccb.scene_lapsed(**ok))
+        # 色欲掉下门槛 → 真的结束
+        self.assertTrue(ccb.scene_lapsed(**{**ok, "libido": 30.0}))
+        # 好感掉下门槛 → 真的结束
+        self.assertTrue(ccb.scene_lapsed(**{**ok, "affection": 40.0, "base_affection": 40.0}))
+        # 群里不是「结束」，只是进不去
+        self.assertFalse(ccb.scene_lapsed(**{**ok, "is_group": True}))
 
     def test_config_lands_last_in_schema(self):
         import json

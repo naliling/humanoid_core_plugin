@@ -933,6 +933,14 @@ class MoodService:
         ratio = 1.0 if elapsed_hours >= duration else (elapsed_hours / duration) ** 2
         changed = False
         for key, base_key, bounds in DIMENSIONS:
+            # 好感不走这条「按比例往 base 回落」的衰减。
+            #
+            # 它的时间衰减**已经由账本自己做了**（每笔按 LEDGER_HALF_LIFE_HOURS 时衰）。
+            # 这里再按 mood_decay_hours 拉一次，就是同一件事算两遍：消息间隔里好感
+            # 慢慢回到 base，下一条消息 _commit 又用账本净值把它顶回去——显示值于是
+            # 在两次消息之间跳变。统一交给账本：下面单独把它重算成 base + 账本净值。
+            if key == "affection":
+                continue
             current = float(record.get(key, bounds[0]))
             base = float(record.get(base_key, bounds[0]))
             deviation = current - base
@@ -942,6 +950,15 @@ class MoodService:
             if abs(updated - current) > 1e-4:
                 record[key] = updated
                 changed = True
+        # 好感 = base + 账本此刻的净值（与 _commit 同一口径）。
+        _key, _base_key, aff_bounds = DIMENSIONS[0]
+        base_aff = float(record.get("base_affection", aff_bounds[0]))
+        net = self._ledger_total(record, now)
+        target = max(aff_bounds[0], min(aff_bounds[1], base_aff + net))
+        current_aff = float(record.get("affection", aff_bounds[0]))
+        if abs(target - current_aff) > 1e-4:
+            record["affection"] = target
+            changed = True
         if changed:
             record["last_decay"] = now
             user_state["mood"] = record
@@ -1826,6 +1843,9 @@ class MoodService:
         for key in values:
             record[key] = values[key]
             record[f"base_{key}"] = values[key]
+        # 账本是好感的真源（affection = base + 账本净值）。重置而不清账本的话，
+        # 下一条消息 _commit 又会用旧账本把好感顶回去——「重置」等于没重置。
+        record.pop(LEDGER_KEY, None)
         record["turn_count"] = 0
         record["last_interaction"] = self._time()
         record["last_decay"] = self._time()
@@ -1839,6 +1859,8 @@ class MoodService:
         record = self.profile(user_id)
         record["affection"] = clamped
         record["base_affection"] = clamped
+        # 同上：账本是真源，不清账本的话这次「设置」会被旧账本顶回去。
+        record.pop(LEDGER_KEY, None)
         self._scope.user_state(user_id)["mood"] = record
         self._scope.mark_dirty()
         return clamped

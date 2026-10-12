@@ -20,6 +20,7 @@ from humanoid.link import (
     CONTRACT_VERSION,
     SIGNALS_FILE_NAME,
     SOCIAL_PLUGIN_DIR_NAME,
+    SocialSignals,
     build_contract,
     signals_path,
     social_data_dir,
