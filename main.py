@@ -191,6 +191,13 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
             world = core.prompt_builder.background_note()
         except Exception:
             world = ""
+        # 穿搭：与天气/季节同一类背景——她只「知道」自己穿着什么，要不要提由她自己定。
+        try:
+            outfit_note = core.outfit_line()
+        except Exception:
+            outfit_note = ""
+        if outfit_note:
+            world = "；".join(p for p in (world, outfit_note) if p)
         return build_state_note(char_name, user_name, stage, tone, day, style, world)
     except Exception:
         return ""
@@ -694,6 +701,9 @@ class HumanoidCore(Star):
         "日预算": "llm_daily_call_budget",
         "上下文": "inject_activity_context",
         "环境": "environment_mode",
+        "穿搭": "__outfit__",
+        "衣服": "__outfit__",
+        "穿着": "__outfit__",
         "管理员": "admin_qq",
         "调试": "debug_mode",
     }
@@ -740,6 +750,22 @@ class HumanoidCore(Star):
                 yield event.plain_result(
                     f"✅ 已取消当前机器人的单独城市，回到跟随全局配置（{effective!r}）。"
                 )
+            return
+        # 穿搭按机器人分离：写当前这个 bot 自己的覆盖（与城市同一套做法）。
+        if key == "__outfit__":
+            if not value:
+                cur = core.outfit_override() or "（自动：按人设判物种）"
+                yield event.plain_result(
+                    f"当前穿搭：{cur}\n"
+                    "用法：/拟人 设置 穿搭 白色连衣裙（只改当前这个机器人）；"
+                    "写「/拟人 设置 穿搭 自动」可取消，回到按人设自动判。"
+                )
+                return
+            effective = core.set_outfit_override(value)
+            if effective:
+                yield event.plain_result(f"✅ 当前机器人的穿搭已单独设为：{effective}")
+            else:
+                yield event.plain_result("✅ 已取消单独穿搭，回到按人设自动判。")
             return
         raw_config = self._config_box.raw
         if not isinstance(raw_config, dict):
@@ -794,6 +820,20 @@ class HumanoidCore(Star):
         lines.append(f"- 日程额外偏好：{cfg.schedule_prompt_extra or '（空）'}")
         lines.append(f"- 上下文详略：{cfg.inject_activity_context}（medium/full/mood_only）")
         lines.append(f"- 参与环境：{cfg.environment_mode}（private/group/both）")
+        if core is not None:
+            oi = core.outfit_info()
+            if oi.get("enabled"):
+                lines.append(
+                    f"- 穿搭：{oi.get('text') or '（不注入）'}（{oi.get('source')}）"
+                    "　→ /拟人 设置 穿搭 白色连衣裙"
+                )
+            else:
+                lines.append("- 穿搭：关　→ 面板里开 outfit_enabled")
+        else:
+            lines.append(
+                f"- 穿搭：{'开' if cfg.outfit_enabled else '关'}"
+                f"（手写预设：{cfg.outfit_preset or '（空，按人设自动判）'}）"
+            )
         admins = "、".join(cfg.admin_qq) if cfg.admin_qq else "（未设，靠 AstrBot 全局 admins_id）"
         lines.append(f"- 管理员：{admins}")
         lines.append(f"- 调试日志：{'开' if cfg.debug_mode else '关'}")

@@ -245,6 +245,14 @@ class HumanoidConfig:
     show_city_time_in_low_intrusion: bool = True
     timezone_city: str = DEFAULT_CITY_PLACEHOLDER
 
+    # 穿搭（humanoid/outfit.py）：给她一件贴身的衣服。
+    # 手写预设（outfit_preset / 按角色覆盖）优先；没有就按识别到的物种取内置默认；
+    # 两者都没有（判不出她是什么）→ **什么都不注入**（宁缺勿错）。
+    outfit_enabled: bool = True
+    outfit_preset: str = ""
+    # 要不要按场景调（睡觉→睡衣、洗澡→不穿、出门冷天→加外套、生理期/不适→宽松）
+    outfit_scene_variation: bool = True
+
     mood_enabled: bool = True
     mood_provider_name: str = ""
     mood_sensitivity: int = 60
@@ -419,6 +427,9 @@ class HumanoidConfig:
             enable_chat_awareness=b("enable_chat_awareness"),
             show_city_time_in_low_intrusion=b("show_city_time_in_low_intrusion"),
             timezone_city=s("timezone_city"),
+            outfit_enabled=b("outfit_enabled"),
+            outfit_preset=s_opt("outfit_preset")[:200],
+            outfit_scene_variation=b("outfit_scene_variation"),
             mood_enabled=b("mood_enabled"),
             mood_provider_name=s_opt("mood_provider_name"),
             mood_sensitivity=i("mood_sensitivity", 0, 100),

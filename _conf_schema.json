@@ -312,6 +312,24 @@
     "type": "bool",
     "default": true
   },
+  "outfit_enabled": {
+    "description": "穿搭",
+    "hint": "给她一件贴身的衣服（她知道自己在穿什么）。按名字/人设/物种挑；判不准就不给",
+    "type": "bool",
+    "default": true
+  },
+  "outfit_preset": {
+    "description": "【进阶】手写穿搭预设",
+    "hint": "留空 = 按人设自动判物种取默认；填了就优先用它（也可用 /拟人 设置 穿搭 单独给某个角色设）",
+    "type": "string",
+    "default": ""
+  },
+  "outfit_scene_variation": {
+    "description": "【进阶】穿搭随场景变",
+    "hint": "开：睡觉换睡衣、洗澡不穿、出门天冷加外套、生理期/不适换宽松；关：一直是那一件",
+    "type": "bool",
+    "default": true
+  },
   "mood_enabled": {
     "description": "情绪模拟",
     "hint": "开：对每个人各自积累好感度/亲近欲/攻击性，说话热冷有差别；关：对谁都是一个样",

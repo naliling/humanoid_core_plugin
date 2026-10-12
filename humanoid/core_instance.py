@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from .state import seed_cycle_day
 from . import __version__
+from . import outfit
 from .clock import Clock, format_state_timestamp
 from .config import HumanoidConfig
 from .link import SocialSignals, build_contract
@@ -273,6 +274,106 @@ class HumanoidCoreInstance:
             self._scope.set_self("tz_city_override", value)
         self._rebase_after_move()
         return self.clock.city
+
+    # ── 穿搭（humanoid/outfit.py）──────────────────────────────
+
+    def outfit_override(self) -> str:
+        """这个机器人单独设的穿搭（空 = 没单独设，跟全局配置）。"""
+        return str(self._scope.get_self("outfit_override", "") or "")
+
+    def set_outfit_override(self, text: str) -> str:
+        """单独设这个机器人的穿搭（`/拟人 设置 穿搭` 走这里）。
+
+        传空串或「默认/自动/清除」意思的词 = 取消单独设置，回到自动（按人设判物种）。
+        """
+        value = str(text or "").strip()
+        if value in ("", "默认", "自动", "清除", "跟随全局", "全局"):
+            self._scope.set_self("outfit_override", "")
+        else:
+            self._scope.set_self("outfit_override", value[:200])
+        return self.outfit_override()
+
+    def outfit_scene(self) -> str:
+        """此刻的场景（睡/洗/出门/冷/不适/居家），给穿搭用。"""
+        event = ""
+        try:
+            slot = self.schedule.current_slot() or {}
+            event = str(slot.get("event", "") or "")
+        except Exception:
+            event = ""
+        asleep = False
+        discomfort = 0.0
+        try:
+            snap = self.soma.snapshot()
+            asleep = float(snap.get("asleep", 0.0) or 0.0) >= 1.0
+            discomfort = float(snap.get("discomfort", 0.0) or 0.0)
+        except Exception:
+            pass
+        temp_c: float | None = None
+        try:
+            env = str((self.weather.snapshot() or {}).get("env", ""))
+            m = re.search(r"(-?\d+(?:\.\d+)?)\s*[℃°]", env)
+            if m:
+                temp_c = float(m.group(1))
+        except Exception:
+            temp_c = None
+        phase = -1
+        try:
+            day = int(self._scope.get_self("current_cycle_day", 1) or 1)
+            phase = int(self.config.cycle_phase_index(day))
+        except Exception:
+            phase = -1
+        return outfit.scene_of(
+            event=event, asleep=asleep, temp_c=temp_c,
+            discomfort=discomfort, cycle_phase=phase,
+        )
+
+    def _persona_text(self) -> str:
+        """同步读缓存里的人格正文（注入热路径上不能走 async）。"""
+        src = getattr(self, "persona_source", None)
+        if src is None:
+            return ""
+        try:
+            snap = src.cached_persona(self.role_id)
+        except Exception:
+            return ""
+        return str(getattr(snap, "prompt", "") or "")
+
+    def outfit_text(self) -> str:
+        """此刻穿着（未格式化）。关掉 / 判不出来 → 空串。"""
+        cfg = self.config
+        if not cfg.outfit_enabled:
+            return ""
+        try:
+            preset = self.outfit_override() or cfg.outfit_preset
+            return outfit.resolve(
+                preset=preset,
+                name=self.char_name(),
+                persona=self._persona_text(),
+                scene=self.outfit_scene(),
+                scene_variation=cfg.outfit_scene_variation,
+            )
+        except Exception:
+            return ""
+
+    def outfit_line(self) -> str:
+        """注入用的一句话「她穿着：…」；空串 = 不注入。"""
+        return outfit.line(self.outfit_text())
+
+    def outfit_info(self) -> dict:
+        """面板/诊断用：识别到的种类、来源、当前穿着。"""
+        cfg = self.config
+        if not cfg.outfit_enabled:
+            return {"enabled": False, "kind": "", "source": "关", "text": ""}
+        preset = self.outfit_override() or cfg.outfit_preset
+        kind = outfit.detect_kind(self.char_name(), self._persona_text())
+        if preset:
+            source = "手写（本角色）" if self.outfit_override() else "手写（全局）"
+        elif kind:
+            source = f"自动（按物种：{kind}）"
+        else:
+            source = "无（判不出她是什么，不注入）"
+        return {"enabled": True, "kind": kind, "source": source, "text": self.outfit_text()}
 
     def char_name(self) -> str:
         """注入里代表角色的那个名字。
@@ -873,6 +974,10 @@ class HumanoidCoreInstance:
             out.append(row("唤醒度", f"{soma.get('arousal', 0):.0f}/100"))
         if s.get("cycle"):
             out.append(row("生理", s["cycle"]))
+        # 穿搭：跟天气一样是背景。看得到她此刻穿什么、以及这件是怎么来的。
+        oi = self.outfit_info()
+        if oi.get("enabled"):
+            out.append(row("穿着", oi.get("text") or "（不注入）", oi.get("source", "")))
 
         out.append("")
         out.append("社交")
