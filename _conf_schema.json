@@ -236,10 +236,18 @@
     "maximum": 1440
   },
   "schedule_min_interval_minutes": {
-    "description": "日程最小调用间隔(分)",
-    "hint": "离上一次决定至少隔多久",
+    "description": "日程间隔下限(分)",
+    "hint": "每次生成后在这个下限与上限之间随机抽一个「下次最早可再排」的时间",
     "type": "int",
     "default": 30,
+    "minimum": 0,
+    "maximum": 1440
+  },
+  "schedule_max_interval_minutes": {
+    "description": "日程间隔上限(分)",
+    "hint": "与下限相等 = 固定间隔；大于下限则每次随机，节奏更零散",
+    "type": "int",
+    "default": 60,
     "minimum": 0,
     "maximum": 1440
   },

@@ -472,13 +472,16 @@ class CallGateTest(unittest.TestCase):
         self.assertTrue(gate.check(PURPOSE_SCHEDULE).allowed)
 
     def test_min_interval_blocks_then_releases(self):
+        """间隔是随机的（下限~上限）：刚过下限仍可能被挡，过了上限必然放行。"""
         gate, _conf, wall, mono = self.build(
-            llm_idle_silence_minutes=0, schedule_min_interval_minutes=30
+            llm_idle_silence_minutes=0,
+            schedule_min_interval_minutes=30,
+            schedule_max_interval_minutes=60,
         )
         gate.consume(PURPOSE_SCHEDULE)
         mono.advance(29 * 60)
         self.assertFalse(gate.check(PURPOSE_SCHEDULE).allowed)
-        mono.advance(2 * 60)
+        mono.advance(32 * 60)  # 共 61 分钟 > 上限，必然放行
         self.assertTrue(gate.check(PURPOSE_SCHEDULE).allowed)
 
     def test_daily_budget_blocks_and_resets_next_day(self):

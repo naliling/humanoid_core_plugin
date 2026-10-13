@@ -167,10 +167,11 @@ class HumanoidConfig:
     # 她临时改主意的频率。0 = 只在到期/身体报警时才排；100 = 每个窗都重排。
     schedule_change_chance: int = 30
     schedule_provider_cooldown_minutes: int = 30
-    # 日程两次调模型之间的最小间隔（分钟）。掷骰只决定「要不要临时改主意」，
-    # 定不住频率上限：掷中一次就可能连着砸两次。这一项才是硬上限，
-    # 0 = 只靠掷骰与越线判断（就是旧行为，全天无人时也能烧掉一百多次）。
+    # 日程两次调模型之间的间隔（分钟）：每次生成后在这个区间里**随机**抽一个
+    # 「下次最早可再排」的时间。随机是为了让节奏像「随机发生的事」，而不是固定
+    # 周期的计时器（这是拟人插件，不该按表打卡）。两项相等 = 固定间隔。
     schedule_min_interval_minutes: int = 30
+    schedule_max_interval_minutes: int = 60
     # 多久没人发消息就停掉后台的模型调用（分钟）。没人看着时，背景日程不值得
     # 每次都去问模型；用户一说话立刻恢复。0 = 不静默。
     llm_idle_silence_minutes: int = 60
@@ -399,6 +400,7 @@ class HumanoidConfig:
             schedule_change_chance=i("schedule_change_chance", 0, 100),
             schedule_provider_cooldown_minutes=i("schedule_provider_cooldown_minutes", 0, 1440),
             schedule_min_interval_minutes=i("schedule_min_interval_minutes", 0, 1440),
+            schedule_max_interval_minutes=i("schedule_max_interval_minutes", 0, 1440),
             llm_idle_silence_minutes=i("llm_idle_silence_minutes", 0, 1440),
             llm_daily_call_budget=i("llm_daily_call_budget", 0, 1_000_000),
             schedule_prompt_extra=s_opt("schedule_prompt_extra")[

@@ -1413,6 +1413,7 @@ class ScheduleService:
                 retry_interval=float(cfg.schedule_retry_interval_seconds),
                 purpose=PURPOSE,
                 ignore_cooldown=ignore_cooldown,
+                role_label=str(self._scope.role_id or ""),
             )
         except Exception as exc:
             self.last_error = f"生成异常：{exc}"
@@ -1435,8 +1436,10 @@ class ScheduleService:
                 return None
             self.last_error = result.summary()
             self._fail_backoff(cfg)
-            if self._log and cfg.debug_mode:
-                self._log.debug(f"[humanoid_core] 下一段生成失败: {self.last_error}")
+            if self._log:
+                self._log.warning(
+                    f"[humanoid_core] 日程生成失败（{self._scope.role_id}）：{self.last_error}"
+                )
             return None
 
         raw = extract_json_object(result.text)
@@ -1456,6 +1459,12 @@ class ScheduleService:
         self.last_error = ""
         self._retry_after = 0.0
         self._set_source(SOURCE_LLM)
+        if self._log:
+            # 带上是哪个 bot：多开时日志里分不清谁生成了谁没生成。
+            self._log.info(
+                f"[humanoid_core] 日程已生成（{self._scope.role_id}）："
+                f"{slot.get('event')} {slot.get('start')}–{slot.get('end')}"
+            )
         if not frame:
             # 这一段是当天第一次：把顺带给出的日框存下来（没给就用确定句）。
             self._store_day_frame(

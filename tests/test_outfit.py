@@ -112,7 +112,8 @@ class EndToEnd(unittest.TestCase):
     """从 Core 实例走一遍：人设 → 识别 → 注入，接线对不对只有跑起来才知道。"""
 
     def _core(self, persona, conf_extra=None):
-        raw = {"timezone_city": "北京"}
+        # 关掉「场景变化」：这几个用例测的是基础穿着，场景（睡衣/家居服等）另有专门用例。
+        raw = {"timezone_city": "北京", "outfit_scene_variation": False}
         raw.update(conf_extra or {})
         conf = HumanoidConfig.from_raw(raw)
         st = StateStore(Path(tempfile.mkdtemp()) / "s.json", 0.01)

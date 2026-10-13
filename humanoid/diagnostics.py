@@ -419,11 +419,13 @@ def build_report(
                 f"- 空闲静默：开启（{int(idle_limit)} 分钟），已 {int(idle_min)} 分钟没人说话，当前 {state}"
             )
         interval = snap["interval_minutes"]
-        lines.append(
-            f"- 最小调用间隔：{int(interval)} 分钟（两次日程调用至少隔这么久）"
-            if interval > 0
-            else "- 最小调用间隔：未限制（改主意概率仍可能连着触发）"
-        )
+        max_interval = snap.get("max_interval_minutes", 0)
+        if interval > 0 and max_interval > interval:
+            lines.append(f"- 调用间隔：{int(interval)}~{int(max_interval)} 分钟随机（每次生成后抽一个）")
+        elif interval > 0:
+            lines.append(f"- 调用间隔：{int(interval)} 分钟")
+        else:
+            lines.append("- 调用间隔：未限制（改主意概率仍可能连着触发）")
         budget = snap["budget"]
         used = snap["used_today"]
         lines.append(

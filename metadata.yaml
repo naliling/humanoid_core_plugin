@@ -16,7 +16,7 @@ desc: |
   要长期记忆请另配记忆插件。
 
   使用轻量 配置不复杂 需要调的东西就一些 额外的都标上【进阶】。
-version: 2.27.19
+version: 2.27.20
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"

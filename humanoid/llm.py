@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -255,6 +256,7 @@ class CallGate:
         "_used_today",
         "_used_by_purpose",
         "_ledger_path",
+        "_next_gap",
         "_warned",
         "_wall",
     )
@@ -276,6 +278,9 @@ class CallGate:
         # None 而不是 0：0 同时是「从没调用过」和「正好在 0 时刻调用过」的真实取值，
         # 拿它当哨兵会让间隔判定在单调钟从 0 起的场景下整个失效。
         self._last_call: float | None = None
+        # 下一次最早可再排的间隔（秒）。每次真的发了一次请求后重新抽一个随机值——
+        # 让日程的节奏像「随机发生的事」，而不是一个固定周期的计时器。
+        self._next_gap: float | None = None
         self._day = ""
         self._used_today = 0
         # 按用途分开记：日程生成和情绪分析原来是共用一个数，预算被谁吃掉了看不出来。
@@ -371,6 +376,24 @@ class CallGate:
     def _min_interval_minutes(self) -> float:
         return max(0.0, float(getattr(self._config(), "schedule_min_interval_minutes", 0) or 0))
 
+    def _max_interval_minutes(self) -> float:
+        return max(0.0, float(getattr(self._config(), "schedule_max_interval_minutes", 0) or 0))
+
+    def _draw_gap(self) -> float:
+        """抽一个随机的「下次最早可再排」间隔（秒）。下限 ≤ 0 = 不节流。"""
+        lo = self._min_interval_minutes()
+        if lo <= 0:
+            return 0.0
+        hi = self._max_interval_minutes()
+        if hi <= lo:
+            return lo * 60.0
+        return random.uniform(lo, hi) * 60.0
+
+    def _gap_seconds(self) -> float:
+        if self._next_gap is None:
+            return 0.0
+        return self._next_gap
+
     def _daily_budget(self) -> int:
         return max(0, int(getattr(self._config(), "llm_daily_call_budget", 0) or 0))
 
@@ -413,16 +436,16 @@ class CallGate:
                 )
                 return GateVerdict(False, _GATE_IDLE, detail)
 
-        interval = self._min_interval_minutes()
+        interval = self._gap_seconds()
         if interval > 0 and self._last_call is not None:
             elapsed = self._mono() - self._last_call
-            remaining = interval * 60.0 - elapsed
+            remaining = interval - elapsed
             if remaining > 0:
                 return GateVerdict(
                     False,
                     _GATE_INTERVAL,
                     f"距上次只过了 {int(elapsed // 60)} 分钟，还差 {remaining / 60:.0f} 分钟"
-                    f"到 {int(interval)} 分钟间隔",
+                    f"到这次抽到的间隔（{interval / 60:.0f} 分钟）",
                 )
 
         budget = self._daily_budget()
@@ -437,19 +460,22 @@ class CallGate:
             return
         self._roll_day()
         self._last_call = self._mono()
+        self._next_gap = self._draw_gap()
         self._used_today += 1
         self._used_by_purpose[purpose] = self._used_by_purpose.get(purpose, 0) + 1
         self._save_ledger()
 
-    def log_block(self, purpose: str, verdict: GateVerdict) -> None:
-        """记录一次拦截。同一理由限速，否则每 30 秒一条能把日志刷爆。"""
+    def log_block(self, purpose: str, verdict: GateVerdict, role_label: str = "") -> None:
+        """记录一次拦截。同一（理由, 角色）限速，否则每 30 秒一条能把日志刷爆。"""
         if self._log is None or verdict.allowed:
             return
         now = self._mono()
-        if now - self._warned.get(verdict.reason, -1e18) < GATE_WARN_INTERVAL_SECONDS:
+        key = f"{verdict.reason}@{role_label}"
+        if now - self._warned.get(key, -1e18) < GATE_WARN_INTERVAL_SECONDS:
             return
-        self._warned[verdict.reason] = now
-        self._log.info(f"[humanoid_core] {purpose} {verdict.describe()}，本次跳过")
+        self._warned[key] = now
+        who = f"（{role_label}）" if role_label else ""
+        self._log.info(f"[humanoid_core] {purpose}{who} {verdict.describe()}，本次跳过")
 
     def snapshot(self) -> dict[str, Any]:
         """给 /拟人 诊断 用：让用户看得见钱花在哪儿、被什么挡住了。"""
@@ -457,6 +483,7 @@ class CallGate:
         wall = self._wall()
         idle_limit = self._idle_minutes()
         interval = self._min_interval_minutes()
+        max_interval = self._max_interval_minutes()
         budget = self._daily_budget()
         idle_for = (
             None if self._last_interaction is None
@@ -471,6 +498,7 @@ class CallGate:
             ),
             "never_interacted": never_interacted,
             "interval_minutes": interval,
+            "max_interval_minutes": max_interval,
             "budget": budget,
             "used_today": self._used_today,
             "used_by_purpose": dict(self._used_by_purpose),
@@ -567,6 +595,7 @@ class LLMGateway:
         umo: str | None = None,
         purpose: str = PURPOSE_SCHEDULE,
         ignore_cooldown: bool = False,
+        role_label: str = "",
         **call_kwargs: Any,
     ) -> LLMResult:
         candidates: list[tuple[str, str]] = [(label, pid) for label, pid in chain if pid]
@@ -615,7 +644,7 @@ class LLMGateway:
                 # 那种调用得给出去：绕开空闲静默与最小间隔，但仍受每日预算约束。
                 verdict = self._gate.check(purpose, budget_only=ignore_cooldown)
                 if not verdict.allowed:
-                    self._gate.log_block(purpose, verdict)
+                    self._gate.log_block(purpose, verdict, role_label)
                     result = LLMResult(
                         ok=False,
                         outcome=OUTCOME_GATED,

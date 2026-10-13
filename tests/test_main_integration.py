@@ -195,7 +195,7 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         # 真实会话里组指令是「拟人 设置」（中间一个空格），这里按真形态驱动。
         out = await collect(self.star.cmd_settings(FakeEvent("拟人 设置")))
         self.assertIn("调用节流", out[0])
-        self.assertIn("最短间隔", out[0])
+        self.assertIn("间隔", out[0])
 
     async def test_settings_missing_value_shows_current(self):
         """不带值时友好回显当前值，而不是报「不是这一项能接受的值」。"""

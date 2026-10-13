@@ -810,8 +810,11 @@ class HumanoidCore(Star):
             lines.append(f"- 城市（全局默认）：{cfg.timezone_city or '（未定）'}　→ /拟人 设置 城市 大阪")
         lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人 设置 人设 开")
         lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（每 {cfg.schedule_refresh_minutes} 分钟决定一次要不要排下一段，变动概率 {cfg.schedule_change_chance}%）")
+        _lo = cfg.schedule_min_interval_minutes
+        _hi = cfg.schedule_max_interval_minutes
+        _gap = f"{_lo}~{_hi} 分钟随机" if _hi > _lo else f"{_lo} 分钟"
         lines.append(
-            f"- 调用节流：最短间隔 {cfg.schedule_min_interval_minutes} 分钟"
+            f"- 调用节流：间隔 {_gap}"
             f"，空闲 {cfg.llm_idle_silence_minutes} 分钟静默"
             f"，今日已用 {self.call_gate.used_today}/"
             f"{cfg.llm_daily_call_budget or '不限'} 次（所有 bot 共享）"
