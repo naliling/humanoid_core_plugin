@@ -324,7 +324,7 @@ class HumanoidConfig:
 
     debug_mode: bool = False
     holidays: tuple[dict[str, Any], ...] = ()
-    state_flush_interval_seconds: int = 5
+    state_flush_interval_seconds: int = 60
     last_interaction_threshold_minutes: int = 5
     last_interaction_mode: str = "with_last_msg"
 

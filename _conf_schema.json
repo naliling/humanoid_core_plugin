@@ -680,9 +680,9 @@
   },
   "state_flush_interval_seconds": {
     "description": "【进阶】写盘间隔(秒)",
-    "hint": "状态文件的最小落盘间隔。越小断电丢得越少、IO 越多。默认 5。",
+    "hint": "状态文件的最小落盘间隔。越小断电丢得越少、IO 越多。默认 60。",
     "type": "int",
-    "default": 5,
+    "default": 60,
     "minimum": 1,
     "maximum": 60
   },

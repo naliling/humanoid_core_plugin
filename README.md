@@ -301,7 +301,7 @@ AstrBot「本地安装 zip」**不覆盖同名目录**。装过旧版要先卸�
 **上下文档位**：`mood_only` / `medium` / `full` 只决定给多少事实。真正卡住体积的是
 `inject_token_budget`（默认 3500 token，正常用量远达不到它）。
 
-**写盘**：状态变更后最多每 `state_flush_interval_seconds`（默认 5 秒）整份重写一次，原子替换。
+**写盘**：状态变更后最多每 `state_flush_interval_seconds`（默认 60 秒）整份重写一次，原子替换。
 体积随用户条目增长，`/拟人 诊断` 会显示文件大小与用户数。
 
 ---
