@@ -67,7 +67,7 @@ LOG_PREFIX = "[humanoid_core] "
 
 # 默认值一次性迁移的标记文件。AstrBot 更新配置只补缺不覆盖，不调这一手的话老用户
 # 会永远停在装插件那一版的行为上。
-DEFAULTS_MIGRATION_MARK = ".defaults-migrated-v2.16.7"
+DEFAULTS_MIGRATION_MARK = ".defaults-migrated-v2.27.20"
 
 
 def _arg_after(text: str, *commands: str) -> str:

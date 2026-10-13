@@ -312,12 +312,18 @@ class SocialSignals:
         return 0
 
     def _slots(self, data: Any, role_id: str = "") -> list:
-        """单 Bot 时信号写顶层，多 Bot 写在 roles 下。两处都要看。"""
+        """社交层（signals.py）多 Bot 时写在 `by_bid[bid]` 下，单 Bot 也写一份顶层。两处都要看。
+
+        注意键名是 `by_bid`，不是 `roles`：以前这里读错键，于是 `ignored_by_uid`
+        恒返回 0（而同一文件的 `_scope_of` 读的是 `by_bid`，是对的）。
+        """
         out = []
-        if isinstance(data, dict) and isinstance(data.get("roles"), dict):
-            role = data["roles"].get(str(role_id or "")) or {}
-            if isinstance(role, dict):
-                out.append(role)
+        if isinstance(data, dict) and role_id:
+            by_bid = data.get("by_bid")
+            if isinstance(by_bid, dict):
+                role = by_bid.get(str(role_id))
+                if isinstance(role, dict):
+                    out.append(role)
         if isinstance(data, dict):
             out.append(data)
         return out

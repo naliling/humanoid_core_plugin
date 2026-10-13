@@ -1,5 +1,20 @@
 # 更新日志
 
+## v2.27.21 — 深度检查修四处：被冷落→好感接线、信号键名、迁移标记、循环兑底
+
+- **修「被冷落 → 好感」整条链路从未接线**（v2.27.0 起）：社交层早写了 per-user 的
+  `ignored_by`，`SocialSignals.ignored_by_uid()` / `MoodService.note_ignored_by_peer()` 也已就位，
+  但 `_apply_social_signals` 一直只把角色级 streak 接到社交能量上，从未调用它们。
+  现在按角色遍历用户、读 `ignored_by_uid`，增量交给 `note_ignored_by_peer`（内部已按
+  `ignored_seen` 去重，每轮重调安全）。被冷落终于会降低对具体那个人的好感。
+- **修信号文件键名读错**：`link.py:_slots` 读的是 `roles`，而社交层写的是 `by_bid`，
+  导致 `ignored_by_uid()` 恒返回 0（同文件的 `_scope_of` 读的是 `by_bid`，是对的）。
+- **修默认值迁移标记冻结在 v2.16.7**：标记存在就直接 return，于是 v2.18.2 / v2.27.2 的迁移
+  对任何跑过 v2.16.7 的安装永不生效（与 CHANGELOG 承诺不符）。标记名 bump 到 v2.27.21，
+  让这批迁移对老用户跑一次。
+- **`_social_loop` / `_weather_loop` 补异常兑底**：原来没有 try/except，单轮抛错会让后台任务
+  静默死亡、不重启（另三个循环都有）；现在与它们一致，出错记一条 warning。
+
 ## v2.27.20 — 日程节奏改随机（不再是固定计时器）；日程日志带上是哪个 bot
 
 - **日程间隔改为随机**：原来两次日程生成之间固定隔 `schedule_min_interval_minutes` 分钟，

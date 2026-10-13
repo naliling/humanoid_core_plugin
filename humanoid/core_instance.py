@@ -841,6 +841,8 @@ class HumanoidCoreInstance:
         except Exception as exc:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 应用冷落计数失败: {exc}")
+        # 按人把「被冷落」记进好感账本（这条链路 v2.27.0 起就该接上）
+        self._apply_ignored_affection()
         if at <= 0:
             return
         try:
@@ -852,6 +854,23 @@ class HumanoidCoreInstance:
         except Exception as exc:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 应用主动消息反馈失败: {exc}")
+
+    def _apply_ignored_affection(self) -> None:
+        """把「她主动找了 TA、TA 没回」按人记进好感账本。
+
+        v2.27.0 起社交层就写了 per-user 的 `ignored_by`，但这里一直只把角色级的
+        streak 接到社交能量上——那条链路从未接线，于是「被冷落」只让她变冷淡，
+        不会让她对具体某个人少一分喜欢。`note_ignored_by_peer` 内部按 `ignored_seen`
+        增量去重，所以每轮重复调用是安全的。
+        """
+        try:
+            for uid in self.scope.all_user_ids():
+                per = self.signals.ignored_by_uid(uid, self.role_id)
+                if per > 0:
+                    self.mood.note_ignored_by_peer(uid, per)
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 应用按人冷落失败: {exc}")
 
     def snapshot(self, user_id: Optional[str] = None, refresh: bool = True) -> dict:
         if refresh:
@@ -1168,13 +1187,22 @@ class HumanoidCoreInstance:
                 pass
             if self._stop_event.is_set():
                 break
-            if cfg.social_energy_enabled:
-                self.social.recover(interval)
-                self.social.maybe_daily_reset()
+            try:
+                if cfg.social_energy_enabled:
+                    self.social.recover(interval)
+                    self.social.maybe_daily_reset()
+            except Exception as exc:
+                # 与其它循环一致：单轮出错只记一条，别让任务静默死掉。
+                if self._log:
+                    self._log.warning(f"{LOG_PREFIX} 社交能量循环出错: {exc}")
 
     async def _weather_loop(self):
         while not self._stop_event.is_set():
-            await self.weather.refresh_async()
+            try:
+                await self.weather.refresh_async()
+            except Exception as exc:
+                if self._log:
+                    self._log.warning(f"{LOG_PREFIX} 天气刷新出错: {exc}")
             cfg = self.config
             interval = max(60.0, float(cfg.weather_refresh_minutes) * 60)
             try:
