@@ -810,7 +810,14 @@ class HumanoidCoreInstance:
                 self._log.warning(f"{LOG_PREFIX} 契约生成返回空字典")
             return None
         previous = self._scope.get_self("contract")
-        keys = ("body", "feelings", "form", "activity")
+        # 比较时排除「随时间自己走」的字段（generated_at/time 每分钟都在动，拿它们参与
+        # 比较会让这个方法本身变成常驻写盘源）；其余字段变了就该重写——尤其 weather/
+        # holiday/day/routine 这些**独立于身体**、社交层还要用的外部事实。以前只比
+        # body/feelings/form/activity，于是天气变了契约却还留着旧值。
+        keys = (
+            "body", "feelings", "form", "activity",
+            "ongoing", "wants", "day", "persona", "routine", "weather", "holiday",
+        )
         try:
             if isinstance(previous, dict) and all(previous.get(key) == contract.get(key) for key in keys):
                 return previous

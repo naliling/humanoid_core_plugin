@@ -144,6 +144,39 @@ class ContractTest(unittest.TestCase):
         self.assertNotEqual(third["body"]["sleep_pressure"], first["body"]["sleep_pressure"])
         self.assertTrue(self.harness.store.dirty)
 
+    def test_contract_weather_drops_notices(self):
+        """说明书（未取到/过期/未配置）不能当天气导出——社交层会照着编。"""
+        from humanoid.link import _contract_weather
+
+        self.assertEqual(
+            _contract_weather(
+                {"weather": "多云 🌡️ 12°C", "env": "天气：多云，气温 12℃", "notice": False}
+            ),
+            "天气：多云，气温 12℃",
+        )
+        # notice 标志为真就导出空串，不管文案有没有被字符串黑名单覆盖
+        for text in ("天气数据过期了", "天气还没取到", "当前城市 [X]（获取中）", "天气未开启"):
+            self.assertEqual(
+                _contract_weather({"weather": "", "env": text, "notice": True}), "", text
+            )
+
+    def test_contract_rewritten_when_weather_changes(self):
+        """天气变了、身体没变，契约也得重写——否则社交层读到的是旧天气。"""
+        from unittest import mock
+
+        import humanoid.core_instance as ci
+
+        freeze(self.core)
+        first = self.core.refresh_contract()
+        self.assertIsNotNone(first)
+        self.harness.store.flush_sync()
+        changed = dict(ci.build_contract(self.core))
+        changed["weather"] = "天气：小雨，气温 9℃"
+        with mock.patch.object(ci, "build_contract", return_value=changed):
+            again = self.core.refresh_contract()
+        self.assertEqual(again["weather"], "天气：小雨，气温 9℃")
+        self.assertTrue(self.harness.store.dirty, "天气变了却没重写契约")
+
     def test_contract_can_be_disabled(self):
         self.box_off = self.harness.box
         self.box_off.raw["contract_enabled"] = False

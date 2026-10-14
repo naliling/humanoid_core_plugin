@@ -144,11 +144,18 @@ def build_contract(core: Any) -> dict[str, Any]:
 
 
 def _contract_weather(weather: Any) -> str:
-    """契约里的天气：拿到真天气才有值，配置说明书导出空串。"""
+    """契约里的天气：拿到真天气才有值，说明书（未取到/过期/未配置）导出空串。
+
+    以 `snapshot()` 打在 `notice` 字段上的标志为准，而不是猜字符串——说明书文案会
+    增改，字符串黑名单（`is_notice`）会漏（曾漏过「天气数据过期了」「天气还没取到」，
+    被当成真天气导出，社交层照着编）。`is_notice` 仍留作兜底。
+    """
 
     from .services.weather import is_notice
 
-    env = str((weather or {}).get("env", "") or "").strip()
+    if not isinstance(weather, dict) or weather.get("notice"):
+        return ""
+    env = str(weather.get("env", "") or "").strip()
     return "" if not env or is_notice(env) else env
 
 
