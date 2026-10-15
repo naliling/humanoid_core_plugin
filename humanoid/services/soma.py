@@ -337,6 +337,12 @@ class SomaService:
         self.data["sleep_hours_today"] = 0.0
         self.data["last_wake_at"] = _rounded(moment.timestamp())
         self.data["sitting_since"] = _rounded(moment.timestamp())
+        # 睡够了一晚：困意落到低位，醒来该是清醒的（起落要看得出来）。
+        # 睡着时积分里本来就在按 sleep_relief_per_hour 清，这里只是把「睡够」后
+        # 的残留按上限夹低——是夹上限，不是再减一次，不会把同一夜算两遍。
+        need = max(1.0, float(self.config.sleep_need_hours))
+        if slept_hours >= need * 0.85:
+            self._set("sleep_pressure", min(self._get("sleep_pressure", 20.0), 12.0))
 
     def biological_night(self) -> tuple[float, float] | None:
         """她的生物钟夜里是哪一段：**(起始小时, 结束小时)**，跨午夜用 start > end 表示。
@@ -353,6 +359,40 @@ class SomaService:
                 return None
             return float(cfg.night_start_hour), float(cfg.night_end_hour)
         return window
+
+    def scheduled_night(self) -> tuple[float, float] | None:
+        """她**日程里**推出来的夜；日程没排睡眠（或还没生成）时返回 None。
+
+        与 `biological_night()` 的区别：这个**不退回配置窗口**。判断「现在是不是她
+        自己的夜里」必须用这个——配置窗口只是没日程时的兑底，拿它硬套会让夜猫子在
+        23:00-06:00 被当成「她的生物钟夜」（生成日程时去排睡眠、注入时说睡眠时段）。
+        """
+        return _sleep_window(self._slots())
+
+    def in_scheduled_night(self, hour_of_day: float) -> bool:
+        """给定钟点是不是在她日程推出来的夜里。没有日程 → False。"""
+        night = self.scheduled_night()
+        if night is None:
+            return False
+        start, end = night
+        if start == end:
+            return False
+        if start < end:
+            return start <= hour_of_day < end
+        return hour_of_day >= start or hour_of_day < end
+
+    def in_scheduled_deep_sleep(self, hour_of_day: float) -> bool:
+        """她日程推出来的夜里前 `night_deep_sleep_ratio` 比例那一段。没日程 → False。"""
+        night = self.scheduled_night()
+        if night is None:
+            return False
+        start, end = night
+        if start == end:
+            return False
+        span = end - start if end > start else (24.0 - start) + end
+        ratio = max(0.1, min(1.0, self.config.night_deep_sleep_ratio))
+        offset = (hour_of_day - start) % 24.0
+        return 0.0 <= offset < span * ratio
 
     def _night_span_hours(self) -> float:
         night = self.biological_night()
@@ -498,7 +538,6 @@ class SomaService:
 
         锚点用的是 `biological_night()`——她自己的日程里那段觉的中点，不是配置里那个
         写死的 23→6。低谷摆错位会让她下午 5 点最想睡、凌晨 3 点最清醒。"""
-        cfg = self.config
         anchor = self._night_mid_hour()
         # 主低谷：生物钟夜里中点后 2 小时左右（核心体温最低点）。
         main = (hour_of_day - (anchor + 3.0)) % 24.0

@@ -76,6 +76,54 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(engine.role_manager._state_store.dirty)
         self.assertTrue(engine.role_manager._state_store.path.exists())
 
+    async def test_stop_does_not_let_a_late_role_start_leak(self):
+        """卸载竞态：`stop()` 之后新建的角色不许再被启动。
+
+        `stop()` 原来不复位 `_started`，于是竞态窗口里 `get_or_create` 仍会
+        create_task 启动新实例；那个实例不在被停的名单里，5 个后台循环会一直活着
+        并继续写 state.json。
+        """
+        engine, _, _ = self.build()
+        await engine.role_manager.start()
+        core = engine.role_manager.get_or_create("default")
+        await core.start()
+        await engine.role_manager.stop()
+        self.assertFalse(engine.role_manager._started, "stop() 必须复位 _started")
+
+        late = engine.role_manager.get_or_create("late")
+        await asyncio.sleep(0)  # 给「万一被创建」的任务一个跑起来的机会
+        self.assertEqual(engine.role_manager._start_tasks, set(), "stop() 之后不该再启动角色")
+        self.assertFalse(late._started, "新角色不该被启动")
+        self.assertEqual(late._tasks, set(), "新角色不该有后台任务")
+
+    async def test_spawn_after_stop_is_refused(self):
+        """停止信号发出后 `_spawn_background` 必须拒绝——否则循环会活过 stop()。"""
+        engine, _, _ = self.build()
+        await engine.role_manager.start()
+        core = engine.role_manager.get_or_create("default")
+        await core.start()
+        await engine.role_manager.stop()
+        self.assertTrue(core._stop_event.is_set())
+        before = set(core._tasks)
+        self.assertIsNone(core._spawn_background(core._body_loop(), "body-tick"))
+        self.assertEqual(core._tasks, before)
+
+    async def test_start_after_stop_is_refused(self):
+        """停止信号已发出时 start() 不该把 `_started` 置真。
+
+        否则 5 个循环全被 `_spawn_background` 拦下、而 `_started` 已经是 True，
+        后续再 start() 会被开头那句挡掉 —— 这个角色**永远起不来**。
+        """
+        engine, _, _ = self.build()
+        await engine.role_manager.start()
+        core = engine.role_manager.get_or_create("default")
+        await core.start()
+        await engine.role_manager.stop()
+        self.assertFalse(core._started)
+        await core.start()
+        self.assertFalse(core._started, "停止中不该被置成已启动")
+        self.assertEqual(core._tasks, set())
+
     async def test_snapshot_has_no_awaits_and_is_complete(self):
         engine, _, _ = self.build()
         await engine.role_manager.start()

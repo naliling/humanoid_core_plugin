@@ -37,19 +37,6 @@ class SocialEnergyService:
             return "一般"
         return "较低"
 
-    def hint(self) -> str:
-        """社交能量对应的意愿状态，仅作状态描述，不指令模型回复长度或语气。"""
-        value = self.value
-        if value > 85:
-            return "社交意愿高"
-        if value > 60:
-            return "社交意愿良好"
-        if value > 40:
-            return "社交意愿平稳"
-        if value > 20:
-            return "社交意愿偏低"
-        return "倾向独处"
-
     def consume_for_message(self) -> float:
         cfg = self.config
         if not cfg.social_energy_enabled:

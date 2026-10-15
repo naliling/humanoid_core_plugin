@@ -102,7 +102,7 @@ class HumanoidEngine:
                     "found": bool(at > 0),
                     "last_proactive_age": max(0.0, now - at) if at > 0 else -1.0,
                     "last_target_uid": target,
-                    "ignored_streak": core.signals.ignored_streak(),
+                    "ignored_streak": core.signals.ignored_streak(getattr(core, "role_id", "")),
                     # 对接到底卡在哪一步（没装 / 没写过 / 过期 / 在用）与它去看的路径。
                     **{k: v for k, v in core.signals.status().items() if k != "payload"},
                 },
@@ -141,6 +141,13 @@ class HumanoidEngine:
             text = core.build_injection("status-probe", is_group=False)
         except Exception:
             return {}
+        finally:
+            # 诊断必须无副作用：build_injection 会经 mood.profile() 给这个探针 uid
+            # 建一份用户档案。用完就删，别在 state.json 里留一个假用户。
+            try:
+                core.scope.delete_user("status-probe")
+            except Exception:
+                pass
         return {
             f"{core.config.inject_activity_context}（实测）": estimate_tokens(text),
             "Token 预算": int(core.config.inject_token_budget),

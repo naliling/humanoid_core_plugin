@@ -56,6 +56,34 @@ class HolidayRepeatTest(unittest.TestCase):
         moment = datetime(2026, 10, 1, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
         self.assertEqual(resolve_holiday(moment, []), "国庆节")
 
+    def test_plain_string_entries_are_accepted(self):
+        """按 hint 直接填字符串也要生效——面板的 list 编辑器产出的就是字符串。
+
+        原来只认带 `date` 键的 Mapping，字符串被**静默丢弃**：用户照着
+        「日期写 MM-DD（如 05-20）」填进去，节日一个都不生效、日志里一个字都没有。
+        """
+        cfg = HumanoidConfig.from_raw(
+            {"holidays": ["05-20 我们的纪念日", "2026-09-25:体检", "6-1 小儿童节"]}
+        )
+        self.assertEqual(len(cfg.holidays), 3)
+        moment = datetime(2027, 5, 20, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(resolve_holiday(moment, cfg.holidays), "我们的纪念日")
+        # 不补零的写法归一化后同样命中
+        child = datetime(2028, 6, 1, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(resolve_holiday(child, cfg.holidays), "小儿童节")
+        # 带年份的只在当年那天
+        hit = datetime(2026, 9, 25, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(resolve_holiday(hit, cfg.holidays), "体检")
+        # 存的是归一化后的写法，面板里再手填 6-1 也认得
+        self.assertEqual([h["date"] for h in cfg.holidays], ["05-20", "2026-09-25", "06-01"])
+
+    def test_unparseable_entries_are_dropped(self):
+        """认不出来的项丢掉，但不能把整份配置带崩。"""
+        cfg = HumanoidConfig.from_raw(
+            {"holidays": ["不是日期", {"name": "没有日期"}, "05-20 有效"]}
+        )
+        self.assertEqual([h["date"] for h in cfg.holidays], ["05-20"])
+
 
 class ChillTest(unittest.TestCase):
     """着凉：小概率、有起头条件、自己会好、进体感。"""

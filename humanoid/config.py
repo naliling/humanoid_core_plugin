@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields
 from typing import Any
 
 from .data.cities import DEFAULT_CITY_PLACEHOLDER
+from .data.holidays import canonical_date
+
+logger = logging.getLogger(__name__)
 
 GRANULARITY_MINUTES: dict[str, int] = {
     "flexible": 0,
@@ -127,13 +131,46 @@ def _phase_multipliers(value: Any, default: tuple[float, ...]) -> tuple[float, .
     return out if len(out) == len(default) else default
 
 
+def _date_entry(item: Any) -> dict[str, str] | None:
+    """把日期列表里的一项解析成 `{"date": …, "name": …}`；认不出来返回 None。
+
+    两种形态都收：Mapping（带 `templates` 的列表编辑器产出的正常形状），
+    以及**纯字符串**——面板的 list 编辑器在没有 `templates` 时产出的就是一串字符串，
+    而 `holidays` 的 hint 一直教用户「日期写 MM-DD」，所以这是真实可达的输入。
+    字符串支持 `05-20`、`2026-05-20`，日期后面可以用空格或冒号跟一个名称。
+    """
+    if isinstance(item, Mapping):
+        raw_date = item.get("date", "")
+        name = str(item.get("name", "") or "").strip()
+    else:
+        text = str(item or "").strip()
+        if not text:
+            return None
+        head, sep, tail = text.partition(":")
+        if not sep:
+            parts = head.split(None, 1)
+            head = parts[0] if parts else ""
+            tail = parts[1] if len(parts) > 1 else ""
+        raw_date, name = head, tail.strip()
+    full, month_day = canonical_date(raw_date)
+    if not (full or month_day):
+        return None
+    # 存归一化后的写法：`6-1` → `06-01`，下游 resolve_holiday 再用一次 canonical 也不会走样。
+    return {"date": full or month_day, "name": name}
+
+
 def _as_mapping_tuple(value: Any) -> tuple[dict[str, Any], ...]:
     if not isinstance(value, Iterable) or isinstance(value, (str, bytes)):
         return ()
     out: list[dict[str, Any]] = []
     for item in value:
-        if isinstance(item, Mapping) and item.get("date"):
-            out.append({"date": str(item["date"]).strip(), "name": str(item.get("name", "")).strip()})
+        entry = _date_entry(item)
+        if entry is None:
+            if item not in ("", None):
+                # 原来是**静默丢弃**：用户按 hint 填了日期却完全不生效，日志里一个字都没有。
+                logger.warning("日期列表项无法解析，已忽略：%r", item)
+            continue
+        out.append(entry)
     return tuple(out)
 
 
@@ -287,7 +324,7 @@ class HumanoidConfig:
     mood_log_threshold_libido: int = 2
     # 原为 1：单次 delta 上限是 2，所以每一条负面消息的攻击性变化都跨过这个门槛，
     # 情绪日志被单条对话刷满，而 last_emotional_event 只看最新一条——于是「今天TA惹她
-    # 不痛快了」会连续挂一整天。提到 2 后只有真的明显波动才记。
+    # 不痛快了」会连续挂一整天。提到 3 后只有真的明显波动才记。
     mood_log_threshold_aggression: int = 3
     mood_update_timeout: float = 120.0
     mood_tag_enabled: bool = True
@@ -421,9 +458,10 @@ class HumanoidConfig:
             message_merge_settle_seconds=f("message_merge_settle_seconds", 0.0, 10.0),
             message_merge_max_count=i("message_merge_max_count", 1, 50),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
-            schedule_persona_max_chars=max(
-                200, min(8000, int(src.get("schedule_persona_max_chars", 3000) or 3000))
-            ),
+            # 这一项曾经是 113 个字段里唯一不走 i()/f() 的（直接 int(src.get(...))），
+            # 面板里填个 'abc' 或 '3000.0' 就会抛 ValueError 一路冒到 initialize()，
+            # 插件加载失败，而坏值还躺在配置文件里 —— 每次重启再崩一次。
+            schedule_persona_max_chars=i("schedule_persona_max_chars", 200, 8000),
             inject_token_budget=i("inject_token_budget", 200, 20000),
             environment_mode=c("environment_mode", ENVIRONMENT_MODES),
             enable_chat_awareness=b("enable_chat_awareness"),
@@ -701,11 +739,30 @@ class ConfigBox:
     `environment_allows()` 这种每条消息都会走的方法在每条消息上重新解析一遍 90 个字段。
     """
 
-    __slots__ = ("_raw", "_value")
+    __slots__ = ("_raw", "_value", "_load_error")
 
     def __init__(self, raw: Mapping[str, Any] | None) -> None:
         self._raw = raw
-        self._value = HumanoidConfig.from_raw(raw)
+        self._load_error = ""
+        self._value = self._parse(raw)
+
+    def _parse(self, raw: Mapping[str, Any] | None) -> HumanoidConfig:
+        """解析配置，**任何异常都不许把插件带崩**。
+
+        113 个字段现在全部走 `i()/f()/b()/s()/c()` 这些带兜底的助手，正常抛不出来。
+        这里再兜一层，是因为代价不对等：异常会顺着 `main.py` 的 `initialize()` 冒到
+        AstrBot，结果是**整个插件加载失败**，而坏值还躺在配置文件里 —— 每次重启都再崩
+        一次，用户只能手改 JSON 才能恢复。宁可退回默认值，并在日志里喊一声。
+        """
+        try:
+            self._load_error = ""
+            return HumanoidConfig.from_raw(raw)
+        except Exception as exc:  # noqa: BLE001 - 兜底就是为了不让插件起不来
+            self._load_error = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "配置解析失败，已整体退回默认值，请检查配置项：%s", self._load_error, exc_info=True
+            )
+            return HumanoidConfig()
 
     def __call__(self) -> HumanoidConfig:
         return self._value
@@ -715,11 +772,16 @@ class ConfigBox:
         return self._value
 
     @property
+    def load_error(self) -> str:
+        """上次解析失败的原因；空串表示正常。`/拟人 诊断` 用它告诉用户配置有问题。"""
+        return self._load_error
+
+    @property
     def raw(self) -> Mapping[str, Any] | None:
         return self._raw
 
     def reload(self, raw: Mapping[str, Any] | None = None) -> HumanoidConfig:
         if raw is not None:
             self._raw = raw
-        self._value = HumanoidConfig.from_raw(self._raw)
+        self._value = self._parse(self._raw)
         return self._value

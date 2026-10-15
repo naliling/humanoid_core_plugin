@@ -34,8 +34,16 @@ class _StubCore:
 
         self.config = config
         self.role_id = "bot1"
-        self.clock = SimpleNamespace(is_night=lambda: night, today_str=lambda: "2026-08-22")
-        self.soma = SimpleNamespace(snapshot=lambda: {"asleep": 1.0 if asleep else 0.0})
+        self.clock = SimpleNamespace(
+            now=lambda: datetime(2026, 8, 22, 23, 0, tzinfo=TZ),
+            today_str=lambda: "2026-08-22",
+        )
+        # 「现在是不是她的夜里」现在按她**日程**推出来的夜判（soma.in_scheduled_night），
+        # 不再看配置里的固定窗口。测试用 night 直接驱动它。
+        self.soma = SimpleNamespace(
+            snapshot=lambda: {"asleep": 1.0 if asleep else 0.0},
+            in_scheduled_night=lambda hour: night,
+        )
 
 
 def night_lines(**conf) -> list[str]:

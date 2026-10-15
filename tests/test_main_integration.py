@@ -128,6 +128,14 @@ class FakeProviderRequest:
     def __init__(self, system_prompt: str = "", prompt: str = "") -> None:
         self.system_prompt = system_prompt
         self.prompt = prompt
+        self.contexts: list = []
+        self.extra_user_content_parts: list = []
+
+
+def injected_text(req) -> str:
+    """把 req 这一轮真正发给模型的内容拼起来：system_prompt + 临时内容块。"""
+    parts = getattr(req, "extra_user_content_parts", []) or []
+    return req.system_prompt + "\n" + "\n".join(getattr(p, "text", "") for p in parts)
 
 
 GOOD_SCHEDULE = json.dumps(
@@ -407,13 +415,13 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         """旧版「还没问过TA叫什么」会被模型当待办逢人就问名字：这行必须在任何注入里消失。"""
         req = FakeProviderRequest("")
         await self.star.inject_context(FakeEvent("你好", sender="7120"), req)
-        self.assertNotIn("还没问过", req.system_prompt)
-        self.assertNotIn("叫什么", req.system_prompt)
+        self.assertNotIn("还没问过", injected_text(req))
+        self.assertNotIn("叫什么", injected_text(req))
         # 认下名字后同一个位置换成「对TA的称呼是X」
         await self.star.on_message(FakeEvent("你好", sender="7120", sender_name="阿名"))
         req2 = FakeProviderRequest("")
         await self.star.inject_context(FakeEvent("在吗", sender="7120"), req2)
-        self.assertIn("对TA的称呼是「阿名」", req2.system_prompt)
+        self.assertIn("对TA的称呼是「阿名」", injected_text(req2))
 
     # ---------- 钩子 ----------
 
@@ -422,13 +430,31 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await self.star.inject_context(FakeEvent("你好", private=False), req)
         self.assertIn("你是一个助手。", req.system_prompt)
         self.assertIn("【她的身体与生活】", req.system_prompt)
-        self.assertIn("群聊", req.system_prompt)
+        self.assertIn("群聊", injected_text(req))
 
     async def test_injection_creates_prompt_when_empty(self):
         req = FakeProviderRequest("")
         await self.star.inject_context(FakeEvent("你好"), req)
         self.assertTrue(req.system_prompt)
-        self.assertIn("私聊", req.system_prompt)
+        self.assertIn("私聊", injected_text(req))
+
+    async def test_injection_uses_temp_parts_and_leaves_history_alone(self):
+        """每轮变化的内容走 mark_as_temp 的临时块：不落历史，也不逐轮改写 system_prompt。"""
+        req = FakeProviderRequest("")
+        req.contexts = [
+            {"role": "user", "content": "〔她的身体与生活 v12 uid=x〕\n旧块：她上午很困。"},
+            {"role": "assistant", "content": "嗯。"},
+        ]
+        before = [dict(item) for item in req.contexts]
+        await self.star.inject_context(FakeEvent("你好"), req)
+        self.assertEqual(req.contexts, before, "注入不该回写历史消息")
+        self.assertTrue(req.extra_user_content_parts, "事实应进临时内容块")
+        self.assertTrue(
+            all(getattr(p, "_no_save", False) for p in req.extra_user_content_parts),
+            "临时块必须标 _no_save，否则会落进会话历史",
+        )
+        self.assertNotIn("私聊", req.system_prompt, "变化的事实不该再进 system_prompt")
+        self.assertNotIn("【此刻的她】", req.system_prompt, "变化的状态段不该再进 system_prompt")
 
     async def test_injection_is_fast_even_with_slow_provider(self):
         self.provider.delay = 5.0

@@ -557,7 +557,7 @@
   },
   "auto_identify_user": {
     "description": "自动识别用户",
-    "hint": "认不出来的时候要不要追问名字",
+    "hint": "开启后注入里用对方的真名（群名片/QQ 昵称）区分「她」和「你」；关闭统一写「TA」",
     "type": "bool",
     "default": false
   },
@@ -637,7 +637,7 @@
   },
   "holidays": {
     "description": "【进阶】自定义节日",
-    "hint": "她的纪念日等自定义日期。日期写 MM-DD（如 05-20）每年生效，或 YYYY-MM-DD（如 2026-05-20）只在当年那天",
+    "hint": "她的纪念日等自定义日期。每条填「日期」或「日期 名称」：日期写 MM-DD（如 05-20 生日）每年生效，或 YYYY-MM-DD（如 2026-05-20 体检）只在当年那天。日期与名称之间用空格或冒号隔开。",
     "type": "list",
     "default": []
   },
@@ -782,8 +782,8 @@
     "hint": "生成日程时最多引用多少字人设",
     "obvious_hint": true,
     "default": 3000,
-    "min": 200,
-    "max": 8000
+    "minimum": 200,
+    "maximum": 8000
   },
   "mood_llm_batch_max": {
     "type": "int",
@@ -791,8 +791,8 @@
     "hint": "一次最多合并几条送去分析",
     "obvious_hint": true,
     "default": 10,
-    "min": 1,
-    "max": 30
+    "minimum": 1,
+    "maximum": 30
   },
   "mood_llm_message_chars": {
     "type": "int",
@@ -800,8 +800,8 @@
     "hint": "每条消息送进去多少字",
     "obvious_hint": true,
     "default": 300,
-    "min": 50,
-    "max": 2000
+    "minimum": 50,
+    "maximum": 2000
   },
   "ccb": {
     "type": "bool",

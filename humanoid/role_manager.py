@@ -76,11 +76,29 @@ class RoleManager:
             await inst.start()
 
     async def stop(self):
+        """停掉所有角色实例。
+
+        顺序有讲究，**先落状态再 await**：`get_or_create` 是同步的，只可能在这些
+        await 之间插进来。只要它看到 `_started` 为假，就不会再 create_task 启动新实例——
+        否则那个实例既不在被停的名单里、又已经跑起了 5 个后台循环，会一直写 state.json
+        （实测过的卸载竞态）。
+        """
+        self._started = False
         self._stop_event.set()
-        tasks = [inst.stop() for inst in self._instances.values()]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        pending = list(self._instances.values())
         self._instances.clear()
+        # 「正在启动」的角色任务不在 `_instances` 的遍历范围里，必须单独取消并 await，
+        # 否则 stop() 返回后它们还在启动。
+        starting = [t for t in self._start_tasks if not t.done()]
+        for task in starting:
+            task.cancel()
+        if starting:
+            await asyncio.gather(*starting, return_exceptions=True)
+        self._start_tasks.clear()
+        if pending:
+            await asyncio.gather(
+                *[inst.stop() for inst in pending], return_exceptions=True
+            )
         # 角色停了就不该还有未落盘的状态。调用方随后还会 stop 一次 StateStore，
         # 多这一次 flush 代价为零，却保证单独用 RoleManager 的代码也不丢数据。
         await self._state_store.flush()

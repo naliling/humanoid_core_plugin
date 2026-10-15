@@ -6,7 +6,7 @@ import asyncio
 import re
 import time
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any
 
 import aiohttp
 
@@ -15,11 +15,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-from astrbot.core.agent.message import TextPart  # 新增导入
+from astrbot.core.agent.message import TextPart
 
 from .humanoid import __version__
 from .humanoid.config import ConfigBox, HumanoidConfig, plan_default_migrations
-from .humanoid.engine import LOG_PREFIX, HumanoidEngine
+from .humanoid.engine import HumanoidEngine
 from .humanoid.llm import CallGate, LLMGateway, ProviderResolver
 from .humanoid.persona import PersonaSource
 from .humanoid.role_manager import RoleManager
@@ -151,31 +151,47 @@ def _append_framing(req: Any, char_name: str = "", user_name: str = "") -> None:
 
     AstrBot 在 `build_main_agent` 里先把人设写进 system_prompt，再跑 OnLLMRequestEvent
     钩子，所以这里追加的内容排在人设后面；而初始 system 消息不会落进会话历史，
-    这段话不会越滚越多。
+    这段话不会越滚越多。它每轮文本都一样，放 system_prompt 里不会破坏前缀缓存。
     """
-    from .humanoid.prompt_builder import MARK_PREFIX, build_framing
+    from .humanoid.prompt_builder import FRAMING_MARK, build_framing
 
     current = getattr(req, "system_prompt", None)
     if not isinstance(current, str):
         current = ""
-    if MARK_PREFIX in current:
+    if FRAMING_MARK in current:
         return
     req.system_prompt = current + build_framing(char_name, user_name)
 
 
-def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "") -> str:
+def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "",
+                is_group: bool = False) -> str:
     """I1/I2：算「此刻的她」那一段（关系阶段 + 心境 + 她这会儿在过什么）。
 
-    **日程走 system_prompt、不进事实块**（I2）：塞进上下文她会每句都报备一句日程，
-    非常影响对话；放到提示词里，她只是「知道」，要不要提由她自己定。
+    它每轮都在变，调用方把它当临时内容块发出去（不落会话历史），不写进 system_prompt——
+    否则整段提示词的前缀缓存会逐轮失效。日程与外界走这里、不进事实块（I2）：
+    单独成段只当她「知道」，要不要提由她自己定。
     """
     try:
         from .humanoid import relstage
         from .humanoid.prompt_builder import build_state_note
-        affection = float((core.mood.profile(user_id) or {}).get("affection", 0.0) or 0.0)
-        stage = relstage.line_for(affection)
-        tone = core.mood.current_tone(user_id)
-        style = core.mood.style_tendency(user_id)
+        # 关系阶段/心境只在 mood 可读时才算：mood_enabled_in_group=False 时，群聊里的
+        # 陌生人直接 mood.profile() 会现建一份档案（并 mark_dirty），绕过「群里不给
+        # 陌生人建档」的闸门。readable() 是插件里唯一的判据入口，三处都调它。
+        cfg = core.prompt_builder.config
+        try:
+            readable = core.mood.readable(
+                user_id, is_group,
+                enabled=cfg.mood_enabled, in_group=cfg.mood_enabled_in_group,
+            )
+        except Exception:
+            readable = False
+        affection = 0.0
+        stage = tone = style = ""
+        if readable:
+            affection = float((core.mood.profile(user_id) or {}).get("affection", 0.0) or 0.0)
+            stage = relstage.line_for(affection)
+            tone = core.mood.current_tone(user_id)
+            style = core.mood.style_tendency(user_id)
         day = ""
         try:
             slot = core.schedule.current_slot() or {}
@@ -185,7 +201,8 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
                 day = f"她这会儿正在{event}" + (f"（{loc}）" if loc else "")
         except Exception:
             day = ""
-        # 外界（几点/几号/周几/季节/城市/天气）走这里当背景：塞进用户消息，模型会拿去当开场白。
+        # 外界（几点/几号/周几/季节/城市/天气）与穿搭都进这一段当背景，不进事实块：
+        # 单独成段、只当她「知道」，要不要提由她自己定。
         world = ""
         try:
             world = core.prompt_builder.background_note()
@@ -201,71 +218,6 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
         return build_state_note(char_name, user_name, stage, tone, day, style, world)
     except Exception:
         return ""
-
-
-def _append_state_note(req: Any, note: str) -> None:
-    """I1：把「此刻的她」那段写进 system_prompt，**替换**上一轮留下的那条。
-
-    与 `_append_framing` 不同：那段是稳定的、只放一次；这段每轮都变（关系阶段 + 心境），
-    所以先按标记把旧的切掉再写新的，别越滚越长。
-    """
-    from .humanoid.prompt_builder import STATE_MARK
-
-    current = getattr(req, "system_prompt", None)
-    if not isinstance(current, str):
-        current = ""
-    idx = current.find(STATE_MARK)
-    if idx >= 0:
-        current = current[:idx].rstrip()
-    req.system_prompt = (current + note) if note else current
-
-
-def _drop_stale_blocks(req: Any, current_text: str = "") -> int:
-    """从本次递出去的上下文里抹掉以前每一份身体事实块，返回抹掉了多少份。
-
-    事实块走的是用户消息后面，而 AstrBot 存的就是拼装后的用户消息，不清的话长对话里
-    会堆几十份过期状态（她上午很困、下午很饿，模型看到的是同时成立的十几条）。
-    只动 user 消息，只认自己那个标记开头的块，不碰用户真正说过的字。
-    """
-    from .humanoid.prompt_builder import MARK_PREFIX
-
-    contexts = getattr(req, "contexts", None)
-    if not isinstance(contexts, list):
-        return 0
-    removed = 0
-    for item in contexts:
-        if not isinstance(item, dict) or str(item.get("role", "")) != "user":
-            continue
-        content = item.get("content")
-        if isinstance(content, str):
-            index = content.find(MARK_PREFIX)
-            if index >= 0:
-                item["content"] = content[:index].rstrip()
-                removed += 1
-            continue
-        if not isinstance(content, list):
-            continue
-        kept: List[Any] = []
-        for part in content:
-            text = _part_text(part)
-            if text is None:
-                kept.append(part)
-                continue
-            index = text.find(MARK_PREFIX)
-            if index < 0:
-                kept.append(part)
-                continue
-            removed += 1
-            head = text[:index].rstrip()
-            if head:
-                _set_part_text(part, head)
-                kept.append(part)
-        if len(kept) != len(content):
-            # 只剩一个文本块时收回成纯字符串：content 要么是 str 要么是 parts 列表，
-            # 不能留一个单独的 part 对象在列表里（那不是合法的 OpenAI 消息体）。
-            only = _part_text(kept[0]) if len(kept) == 1 else None
-            item["content"] = only if only is not None else kept
-    return removed
 
 
 def _apply_merged_prompt(event: Any, req: Any) -> None:
@@ -358,27 +310,6 @@ def _coerce_setting(key: str, value: str, current: Any) -> Any:
     if not text:
         return None
     return text
-
-
-def _part_text(part: Any) -> Optional[str]:
-    if isinstance(part, dict):
-        if str(part.get("type", "text")) not in ("text", ""):
-            return None
-        value = part.get("text")
-        return value if isinstance(value, str) else None
-    value = getattr(part, "text", None)
-    return value if isinstance(value, str) else None
-
-
-def _set_part_text(part: Any, value: str) -> bool:
-    if isinstance(part, dict):
-        part["text"] = value
-        return True
-    try:
-        part.text = value
-        return True
-    except Exception:
-        return False
 
 
 class HumanoidCore(Star):
@@ -629,10 +560,25 @@ class HumanoidCore(Star):
             yield event.plain_result("用法：/叫我 昵称")
             return
         if len(nickname) > 32:
-            yield event.plain_result("昵称太长了")
+            yield event.plain_result("昵称太长了（最多 32 字）")
             return
-        core.mood.set_nickname(user_id, nickname, src="user")
-        yield event.plain_result(f"✅ 记住了，以后叫你：{nickname}")
+        # 这个名字会被拼进上下文（`对TA的称呼是「…」`），所以在入口就按同一套白名单清洗。
+        # 原来只查长度：填个带换行或「」的昵称能闭合注入里的引号，而且此后**每一轮**都生效。
+        # 清洗结果与原输入不同时明说一句，别让用户以为存进去的是他写的那个。
+        from .humanoid.prompt_builder import sanitize_name
+
+        cleaned = sanitize_name(nickname)
+        if not cleaned:
+            yield event.plain_result(
+                "这个称呼用不了：请只用字母、数字、汉字（可带 - . 空格与表情），"
+                "不要带引号、换行，也不要含「你 / 她 / TA」这类代词。"
+            )
+            return
+        core.mood.set_nickname(user_id, cleaned, src="user")
+        if cleaned != nickname.strip():
+            yield event.plain_result(f"✅ 记住了，以后叫你：{cleaned}（已去掉称呼里不能用的字符）")
+        else:
+            yield event.plain_result(f"✅ 记住了，以后叫你：{cleaned}")
 
     @humanoid_group.command("参照名称")
     async def cmd_set_char_name(self, event: AstrMessageEvent):
@@ -1007,18 +953,17 @@ class HumanoidCore(Star):
 
     @filter.on_llm_request()
     async def inject_context(self, event: AstrMessageEvent, req: ProviderRequest):
-        """身体与生活进上下文：事实进用户消息，「怎么读它」进 system_prompt。
+        """身体与生活进上下文：稳定的说明进 system_prompt，每轮变化的内容进临时内容块。
 
-        为什么分两处：事实每条消息都在变，而 AstrBot 保存历史时存的是拼装后的用户
-        消息（`agent_sub_stages/internal.py` 里 `_save_to_history` 存的是 run_context.messages），
-        所以往 `extra_user_content_parts` 里塞东西会永久留在会话历史里——以前没人管过，
-        聊得越久历史里堆的过期身体状态越多。现在：
+        为什么这么分：
 
-        1. 拼新块之前先把上下文里旧的块抹掉（改的是本次递出去的历史，跟着一起落盘），
-           所以全程只有一份、永远是新鲜的；
-        2. 「这些事实是什么、按什么方式读」这段不随消息变的说明只进 system_prompt——
-           它是参考，不该被当成用户刚说的一句话。初始 system 消息不入历史（同一处代码
-           里 `skipped_initial_system` 就是干这个的）。
+        1. 「这些事实是什么、按什么方式读」这段不随消息变，只进 system_prompt 一次——
+           它是参考，不该被当成用户刚说的一句话。初始 system 消息不入历史
+           （`agent_sub_stages/internal.py` 里 `skipped_initial_system` 就是干这个的）。
+        2. 「此刻的她」与身体事实每轮都在变，走 `extra_user_content_parts` 并
+           `mark_as_temp()`：临时块只发给模型、不落会话历史（`_save_to_history` 落盘时
+           会丢掉带 `_no_save` 的块），所以既不用回写清理旧块，也把变化的文本压在整个
+           提示词最末尾——前缀缓存不会被逐轮击穿。
         """
         try:
             is_group = not _is_private_chat(event)
@@ -1064,18 +1009,15 @@ class HumanoidCore(Star):
                 # 注入为空时（预算卡太小、构建抛异常）留着它，模型收下一句宣告却一条事实都
                 # 拿不到——它会自己编。所以没有事实就不要宣告。
                 _append_framing(req, char_name, user_name)
-                _append_state_note(req, _state_note(core, user_id, char_name, user_name))
-                stale = _drop_stale_blocks(req, text)
-                if stale:
-                    logger.debug(f"{LOG_PREFIX} 从上下文里抹掉 {stale} 份旧的身体事实块")
-                if hasattr(req, "extra_user_content_parts"):
-                    parts = getattr(req, "extra_user_content_parts", None)
-                    if not isinstance(parts, list):
-                        parts = []
-                        req.extra_user_content_parts = parts
-                    parts.append(TextPart(text=injection))
-                else:  # 老版本 AstrBot 没这个字段：退回 system_prompt，至少事实是新鲜的。
-                    req.system_prompt = f"{getattr(req, 'system_prompt', '') or ''}\n{injection}"
+                # 「此刻的她」与身体事实走临时内容块：只发给模型、不落历史。
+                state_note = _state_note(core, user_id, char_name, user_name, is_group=is_group)
+                parts = getattr(req, "extra_user_content_parts", None)
+                if not isinstance(parts, list):
+                    parts = []
+                    req.extra_user_content_parts = parts
+                if state_note:
+                    parts.append(TextPart(text=state_note).mark_as_temp())
+                parts.append(TextPart(text=injection).mark_as_temp())
 
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 注入失败: {e}")

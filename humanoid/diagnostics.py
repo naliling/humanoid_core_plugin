@@ -471,7 +471,7 @@ def build_report(
 def state_size_lines(core) -> list[str]:
     """状态文件有多大、有多少用户条目——写盘成本全看这两项。
 
-    每 5 秒（有变更时）整份重写一次 `state.json`，所以它的体积就是写盘开销的倍数。
+    默认每 60 秒（有变更时）整份重写一次 `state.json`，所以它的体积就是写盘开销的倍数。
     而体积的真正来源是**每用户条目**：被自动认定过称呼的群成员会永久留一条（只有
     nickname、没有任何会被清理的字段），群越大涨得越快。这些数字平时看不见，
     涨到影响体验时已经晚了，所以放进诊断里。
@@ -484,7 +484,7 @@ def state_size_lines(core) -> list[str]:
             size_kb = path.stat().st_size / 1024.0
             hint = ""
             if size_kb > 512:
-                hint = "（已经偏大：写盘是每 5 秒整份重写，可调大「写盘间隔」或调小「情绪数据保留」）"
+                hint = "（已经偏大：写盘是默认每 60 秒整份重写，可调小「情绪数据保留」）"
             out.append(f"状态文件：{size_kb:.0f} KB{hint}")
     except Exception:
         pass

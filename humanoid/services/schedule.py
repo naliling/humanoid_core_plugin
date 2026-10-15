@@ -671,6 +671,19 @@ def _in_window(minutes: int, start: int, end: int) -> bool:
     return minutes >= start or minutes < end
 
 
+def in_scheduled_night(slots: list[Slot], moment: Any) -> bool:
+    """给定时刻是不是在她**日程**推出来的夜里（日程没排睡眠 → False）。
+
+    「现在正处在她的生物钟夜里」这句提示词用它判，不用配置里的固定窗口——
+    否则夜猫子在 23:00-06:00 会被按固定窗口告知「这是你的生物钟夜」，去排睡眠。
+    """
+    window = sleep_window_minutes(slots)
+    if window is None:
+        return False
+    start, end = window
+    return _in_window(moment.hour * 60 + moment.minute, start, end)
+
+
 def dynamic_segment(
     cfg: HumanoidConfig,
     body: dict[str, Any] | None,
@@ -1388,7 +1401,7 @@ class ScheduleService:
             history=history,
             history_note=history_note,
             ongoing=self.ongoing_tasks(),
-            is_night=self._clock.is_night(),
+            is_night=in_scheduled_night(self.current_slots(), now),
             interrupted=interrupted,
             weather=str(world.get("weather") or ""),
             holiday=str(world.get("holiday") or ""),

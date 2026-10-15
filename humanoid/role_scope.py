@@ -8,21 +8,20 @@ from typing import Any, Callable, Optional
 class RoleScope:
     """封装对 state.json 中特定角色数据的读写。"""
 
-    def __init__(self, state_data: dict, role_id: str):
+    def __init__(self, state_data: dict, role_id: str, mark_dirty: Optional[Callable[[], None]] = None):
         self._state_data = state_data
         self._role_id = str(role_id)
-        self._mark_dirty: Optional[Callable[[], None]] = None
+        self._mark_dirty: Optional[Callable[[], None]] = mark_dirty
 
         roles = self._state_data.setdefault("roles", {})
         existed = self._role_id in roles
         self._root = roles.setdefault(self._role_id, {"self": {}, "users": {}})
         if not existed:
             # 新角色必须标脏，否则这个 `roles[新id]` 只存在于内存里，插件重载或崩溃
-            # 就整个没了。以前靠 `__init__` 后面那次 `update_self` 顺带标了，是巧合式依赖：
-            # 一旦那个角色已经有 `current_cycle_day`，新建实例的头几秒就写不出去。
-            mark = self._mark_dirty
-            if callable(mark):
-                mark()
+            # 就整个没了。`mark_dirty` 必须由构造函数传入——`set_mark_dirty` 是构造之后
+            # 才调的，在这里读到的一直是 None，标脏从未真正发生过。
+            if callable(self._mark_dirty):
+                self._mark_dirty()
 
     def set_mark_dirty(self, callback: Callable[[], None]):
         self._mark_dirty = callback

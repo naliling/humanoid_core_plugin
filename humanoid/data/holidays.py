@@ -42,6 +42,15 @@ def _canonical(value: str) -> tuple[str, str]:
     return "", ""
 
 
+def canonical_date(value: object) -> tuple[str, str]:
+    """归一化用户填的日期，返回 `(YYYY-MM-DD, MM-DD)`；认不出来就都是空串。
+
+    `config._as_mapping_tuple` 用它校验自定义节日 —— 面板产出的可能是一串字符串
+    （见那里的注释），两种形态都得能过这一关。
+    """
+    return _canonical(str(value or ""))
+
+
 def resolve_holiday(date_obj: datetime, custom: Iterable[object] | None = None) -> str:
     full = date_obj.strftime("%Y-%m-%d")
     month_day = date_obj.strftime("%m-%d")

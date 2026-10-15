@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 from . import relstage
+import logging
 import math
 import re
 import time
@@ -45,26 +46,72 @@ from .wording import (
     scale_word,
 )
 
+logger = logging.getLogger(__name__)
+
 _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 
-# 事实块的开头标记。注入走的是用户消息，而 AstrBot 会把拼装后的用户消息存进会话历史，
-# 所以每次注入前要把历史里旧的块抹掉（`main.py` 负责），标记就是给这一步认路用的。
-# 换文案时把 v 后面的数字加一，老会话里的旧块会被当成不认识的内容直接清掉。
+# 事实块的标题标记。换文案时把 v 后面的数字加一，老会话里残留的旧块一眼能看出是哪一版。
 MARK_PREFIX = "〔她的身体与生活"
 MARK_VERSION = "v12"
 
-# 「此刻的她」那一段（I1）的标记。它与上面那段不同：上面是稳定说明、只放一次；
-# 这一段每轮都变（关系阶段 + 心境），所以 main.py 要先按这个标记把旧的切掉再写新的。
+# system_prompt 里那段稳定说明的标记，main.py 用它判断「已经放过了、别重复放」。
+FRAMING_MARK = "【她的身体与生活】"
+
+# 「此刻的她」那一段（I1）的标题：每轮变化，作为临时内容块发出（不落历史）。
 STATE_MARK = "【此刻的她】"
 
 # 给 system_prompt 的那段话：说明下面这些是什么、按什么方式读它。稳定文本，不含事实。
 # 只划参考边界，不下指令：说什么、怎么说、说多长，都由她自己判断。
-def _safe_name(raw: str) -> str:
-    """名字里混进代词会替换出「小小雨今天…」这种句子，直接弃用、退回代词。"""
-    name = str(raw or "").strip()
+# 名字会被包进「」拼进 system_prompt，而群名片是**对方能随手改**的，所以这里走白名单：
+# 只留字母/数字/汉字/下划线（\w）、少量连接符与 emoji，其余一律丢弃。
+# 剔除的重点是换行、引号、括号、控制字符、行/段分隔符与零宽字符——有它们才能闭合
+# 外面那对「」把指令塞进 system_prompt，而 system_prompt 每轮重建，一旦成功就是
+# **对该用户此后每一轮都持续生效**。
+_NAME_KEEP = re.compile(
+    r"[^\w\-.· \u2600-\u27bf\u2b00-\u2bff\ufe0f\u200d\U0001f000-\U0001faff]",
+    re.UNICODE,
+)
+# 名字用不到这么长；封顶同时压缩"用一长串汉字拼出一句指令"的空间。
+_NAME_MAX_CHARS = 16
+
+
+def sanitize_name(raw: str) -> str:
+    """任何要拼进上下文的「名字」都从这里过一遍。
+
+    名字里混进代词会替换出「小小雨今天…」这种句子，那种直接弃用、退回代词。
+    群名片/角色名都会经过这里，而前者由对方控制，所以做白名单清洗而不是原样透传：
+    换行、引号、括号、控制字符与零宽字符全部剔除，长度封顶。清洗或弃用时打一条
+    debug 日志——原来是完全静默的，出问题只能靠猜。
+    """
+    original = str(raw or "")
+    name = _NAME_KEEP.sub("", original).strip()
     if not name or "她" in name or "你" in name or "TA" in name:
+        if original.strip():
+            logger.debug("名字含代词或清洗后为空，已弃用、退回代词：%r", original)
         return ""
+    if len(name) > _NAME_MAX_CHARS:
+        logger.debug("名字过长（%d 字），已截断：%r", len(name), name)
+        name = name[:_NAME_MAX_CHARS]
+    if name != original.strip():
+        logger.debug("名字含不安全字符，已清洗：%r -> %r", original, name)
     return name
+
+
+# 会「换行 / 改方向 / 不可见」的字符：嵌进一行引号里之前必须清掉。
+_QUOTE_STRIP = re.compile(r"[\r\n\u2028\u2029\u202a-\u202e\u200b-\u200f\ufeff]+")
+
+
+def quote_line(raw: object, limit: int) -> str:
+    """把一段**用户原文**压成能安全嵌进一行引号里的一小段。
+
+    用户消息里可以有换行，也可以有「」这类引号。原样塞进 `「…」` 就能闭合引号，
+    让后面的文字看起来像插件自己写的话（`TA离开前说的最后一句：「X」` 这种句式尤其明显）。
+    这里把换行与双向控制字符压成空格、把引号剥掉、折叠空白，再截断。
+    """
+    text = _QUOTE_STRIP.sub(" ", str(raw or ""))
+    for ch in ("「", "」", "『", "』", "【", "】"):
+        text = text.replace(ch, "")
+    return " ".join(text.split())[:limit]
 
 
 def build_framing(char_name: str = "", user_name: str = "") -> str:
@@ -82,12 +129,12 @@ def build_framing(char_name: str = "", user_name: str = "") -> str:
 
     末句「说什么、说多长由她自己判断」是插件的核心原则，不动。
     """
-    who = _safe_name(char_name)
-    them = _safe_name(user_name)
+    who = sanitize_name(char_name)
+    them = sanitize_name(user_name)
     role = f"「{who}」" if who else "「她」"
     peer = f"「{them}」" if them else "「TA」"
     return (
-        "\n\n【她的身体与生活】\n"
+        f"\n\n{FRAMING_MARK}\n"
         f"下面提到的{role}指你自己，{peer}指正在和{role}说话的那个人。"
         "这些不是让你转述的资料，是你现在身上的状态："
         "累的时候话就短，心思在对方身上时才会主动往下接。"
@@ -105,14 +152,14 @@ def build_state_note(char_name: str = "", user_name: str = "",
                      stage_line: str = "", tone_line: str = "",
                      day_line: str = "", style_line: str = "",
                      world_line: str = "") -> str:
-    """给 system_prompt 的一句「她此刻跟对方到什么程度、什么心气、在过什么日子、身处什么样的世界」（I1/I2）。
+    """一句「她此刻跟对方到什么程度、什么心气、在过什么日子、身处什么样的世界」（I1/I2）。
 
     与事实块里那句「她内心：…」分工不同：那句是**本轮**的隐藏状态（给这一轮参考），
     这句是让模型**始终**知道现在的关系位置、心气与「她在过自己的日子」，
     不用每轮重新从事实里推断。只说状态，不下指令。
 
-    **日程与外界走这里、不走事实块**（I2）：塞进用户消息她会每句都带一句日程报备、
-    拿天气当开场白；放到提示词里，她只是「知道」，要不要提、怎么提由她自己定。
+    **日程与外界走这里、不走事实块**（I2）：单独成段地递出去，她只是「知道」，
+    要不要提、怎么提由她自己定；混进事实块会被当成要回应的内容。
     """
     parts = [
         str(p).strip()
@@ -157,12 +204,6 @@ FEELING_THRESHOLD_LOW = 0.75
 # 而真人只记得一两件事，剩下的过半天就忘了。
 TOPICS_LOW = 1
 TOPICS_FULL = 1
-
-# 心气词（压着火 / 惦记TA / 拧巴）的触发门槛。刻意高于配置里的初始值
-# （aggression 28、libido 34）——门槛压着初始值时，这几句几乎每条消息都在，
-# 于是「一股气没处发，有点惦记TA，她有点拧巴，矛盾」成了常驻背景。
-EMOTION_AGGRESSION_ONSET = 40.0
-EMOTION_LIBIDO_ONSET = 42.0
 
 EVENT_TEXT = {
     "conversation_started": "这是你们头一次说话",
@@ -229,7 +270,7 @@ class PromptBuilder:
 
         if mode == "mood_only":
             # 最轻的一档也带着四样必需品：时间、场景、称呼、今天。省掉的只能是生活细节。
-            relation = self._relation_lines(user_id, is_group, detailed=False, interest=interest)
+            relation = self._relation_lines(user_id, is_group, interest=interest)
             nickname = self._nickname_line(user_id, is_group)
             if nickname:
                 relation = relation + [nickname]
@@ -305,7 +346,16 @@ class PromptBuilder:
         只留两件事：按她自己的日程这会儿算不算睡，以及她的身体有多困。"""
         cfg = self.config
         core = self._core
-        if not cfg.night_mode_enabled or not cfg.show_sleep_window or not core.clock.is_night():
+        if not cfg.night_mode_enabled or not cfg.show_sleep_window:
+            return []
+        # 「现在是不是她的夜里」按她**日程**推出来的夜判，不用配置里的固定窗口：
+        # 夜猫子下午才起、早上才睡，23:00-06:00 不该被当成她的睡眠时段。
+        try:
+            now = core.clock.now()
+            in_night = core.soma.in_scheduled_night(now.hour + now.minute / 60.0)
+        except Exception:
+            in_night = False
+        if not in_night:
             return []
         lines: List[str] = []
         if cfg.soma_enabled:
@@ -399,9 +449,7 @@ class PromptBuilder:
         self,
         user_id: str,
         is_group: bool,
-        detailed: bool,
         interest: Dict[str, float],
-        agency: Optional[Dict[str, float]] = None,
     ) -> List[str]:
         """她对TA是什么位置、认识多久、最近一次情绪事件。
 
@@ -421,12 +469,12 @@ class PromptBuilder:
             data = {}
 
         lines: List[str] = []
-        position = self._position_line(data, interest, seed)
+        position = self._position_line(user_id, data, interest, seed)
         if position:
             lines.append(position)
 
-        # 关系到了哪一步（「到什么程度可以说什么」）不再在这里说——system_prompt 的
-        # 【此刻的她】已经有一句一样的关系阶段。两处都说，模型每轮都被同一件事推着，
+        # 关系到了哪一步（「到什么程度可以说什么」）不再在这里说——【此刻的她】
+        # 那一段已经有一句一样的关系阶段。两处都说，模型每轮都被同一件事推着，
         # 调子会卡在一个点上、看着重复（插件自己的规矩是「同一件事只说一遍」）。
 
         # **认识多久不进上下文。** 关系深浅已经由上面那句位置词承载（「她对TA关系亲密」比
@@ -449,7 +497,7 @@ class PromptBuilder:
         return [line for line in lines if line]
 
     def _position_line(
-        self, data: Dict[str, Any], interest: Dict[str, float], seed: List[Any]
+        self, user_id: str, data: Dict[str, Any], interest: Dict[str, float], seed: List[Any]
     ) -> str:
         """她对TA的位置：升降 / 在意度 / 关系标签，三者只出一句。
 
@@ -473,7 +521,7 @@ class PromptBuilder:
         except (TypeError, ValueError):
             care = 0.5
         try:
-            label = core.mood.stable_label(user_id)
+            label = self._core.mood.stable_label(user_id)
         except Exception:
             label = get_mood_label(
                 float(data.get("affection", 50.0)),
@@ -546,7 +594,7 @@ class PromptBuilder:
         没记下称呼就整行不提：旧版写「还没问过TA叫什么」，模型把它当成待办，
         逢人就追问名字。现在没名字就只叫「TA」，要名字交给自动认定去拿。"""
         try:
-            nickname = self._core.mood.nickname(user_id)
+            nickname = sanitize_name(self._core.mood.nickname(user_id))
         except Exception:
             return ""
         return f"对TA的称呼是「{nickname}」" if nickname else ""
@@ -555,7 +603,7 @@ class PromptBuilder:
         """场景：这是群聊还是私聊。
 
         几点、几号、周几、季节、城市、天气这类**会被当成台词念出来**的参考不在这里——
-        它们走 system_prompt 的【此刻的她】（`background_note`）当背景，模型不会去「回应」它们。
+        它们进【此刻的她】那一段（`background_note`）当背景，单独成段，不混进事实块。
         """
         cfg = self.config
         if is_group:
@@ -571,8 +619,8 @@ class PromptBuilder:
     def _background_lines(self) -> List[str]:
         """她此刻身处的世界：几点、几号、周几、季节、她在哪个城市、外头什么天。
 
-        这些是**背景**——模型看到它们就该「知道」，而不是拿去做开场白。所以它们走
-        system_prompt（模型不会去「回应」system_prompt），不塞进用户消息。
+        这些是**背景**——模型看到它们就该「知道」，而不是拿去做开场白。所以它们单独成
+        【此刻的她】一段递出去，不混进事实块里当要回应的内容。
         """
         cfg = self.config
         lines: List[str] = []
@@ -646,7 +694,7 @@ class PromptBuilder:
         return lines
 
     def background_note(self) -> str:
-        """给 system_prompt 用的一段「她此刻的世界」；拿不到就返回空串。"""
+        """一段「她此刻的世界」，拼进【此刻的她】那一段；拿不到就返回空串。"""
         try:
             lines = [str(x).strip() for x in self._background_lines() if str(x or "").strip()]
         except Exception:
@@ -725,9 +773,11 @@ class PromptBuilder:
         # 离开前那句原话是实用性的一半：没有它，「隔了三小时」只是一个秒表读数；
         # 有了它，模型自己就能接上「会开完了吗」。只给事实，不写「要主动问起」。
         if with_previous:
-            previous = str(data.get("previous_message") or "").strip()
+            # 这是**用户原文**，必须压成一行再嵌进引号：原文里的换行与「」能闭合
+            # 外面这对引号，让后面的字看起来像插件自己写的话。
+            previous = quote_line(data.get("previous_message"), 60)
             if previous:
-                lines.append(f"TA离开前说的最后一句：「{previous[:60]}」")
+                lines.append(f"TA离开前说的最后一句：「{previous}」")
         # 聊天频率：TA今天话不少/很少，中间档不给。
         # 只在私聊给：这个计数挂在角色上（`daily_msg_count` 是 self 级），群聊里 A 会看到
         # 「TA今天话不少」，而那句话可能是 B、C 在私聊里刷出来的——同一条注入发给不同的人，
@@ -779,7 +829,7 @@ class PromptBuilder:
         本身——半夜被消息吵醒的真人照样知道这是谁、隔了多久没见、TA之前提过什么。
         睡着 ≠ 失忆：把她变成一个不认识TA的梦游者，比多说两句生活细节更出戏。
         """
-        relation = self._relation_lines(user_id, is_group, detailed=detailed, interest=interest)
+        relation = self._relation_lines(user_id, is_group, interest=interest)
         nickname = self._nickname_line(user_id, is_group)
         if nickname:
             relation = relation + [nickname]
@@ -837,7 +887,7 @@ class PromptBuilder:
         if echo:
             sents.append((echo, 6.0))
 
-        relation = self._relation_lines(user_id, is_group, detailed=False, interest=interest)
+        relation = self._relation_lines(user_id, is_group, interest=interest)
         nickname = self._nickname_line(user_id, is_group)
         if nickname:
             relation = relation + [nickname]
@@ -900,7 +950,7 @@ class PromptBuilder:
         echo = self._sentence(self._echo_lines())
         if echo:
             sents.append((echo, 6.0))
-        relation = self._relation_lines(user_id, is_group, detailed=True, interest=interest)
+        relation = self._relation_lines(user_id, is_group, interest=interest)
         nickname = self._nickname_line(user_id, is_group)
         if nickname:
             relation = relation + [nickname]
@@ -961,13 +1011,12 @@ class PromptBuilder:
         body = "。".join(sents[i][0] for i in kept_idx)
         if not body:
             return ""
-        # **只对正文做替换，标题不动。** 标题里的「〔她的身体与生活」是
-        # `MARK_PREFIX`——`_drop_stale_blocks` 靠它认出历史里的旧块并抹掉。
-        # 一旦标题被换成「〔小雨的身体与生活…」，前缀对不上，聊天越久历史里堆的
-        # 过期状态块就越多（那正是这段代码当初要解决的问题）。
+        # **只对正文做替换，标题不动。** 标题「〔她的身体与生活 v12 uid=…〕」是
+        # `MARK_PREFIX`，也是这块事实的抬头——一旦被 `_personalize` 换成
+        # 「〔小雨的身体与生活…」，抬头就丢了。
         return header + "\n" + self._personalize(body + "。", char_name, user_name)
 
-    _safe_name = staticmethod(_safe_name)
+    sanitize_name = staticmethod(sanitize_name)
 
     @classmethod
     def _personalize(cls, text: str, char_name: str = "", user_name: str = "") -> str:
@@ -988,10 +1037,10 @@ class PromptBuilder:
         """
         if not text:
             return text
-        who = cls._safe_name(user_name)
+        who = cls.sanitize_name(user_name)
         if who:
             text = text.replace("TA", who)
-        name = cls._safe_name(char_name)
+        name = cls.sanitize_name(char_name)
         if name:
             # 情绪句例外：它是独立的内心独白，每次都该叫得出名字（「小雨内心：心里有点堵」），
             # 否则句首又冒出一个「她」，读者得回头去猜这是谁。

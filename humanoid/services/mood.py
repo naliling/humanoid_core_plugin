@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import re
 import time
@@ -10,7 +11,7 @@ import weakref
 from collections.abc import Callable
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional, Tuple
 
 from ..config import HumanoidConfig
 from ..data.mood_map import generate_mood_tag, get_mood_label
@@ -19,6 +20,8 @@ from ..llm import PURPOSE_MOOD, LLMGateway
 from ..recall import MAX_SNIPPETS, note_said, recall_lines
 from ..wording import pick
 from ..role_scope import RoleScope
+
+logger = logging.getLogger(__name__)
 
 NEGATIVE_PATTERN = re.compile(
     r"(傻|蠢|笨|白痴|废物|垃圾|去死|死吧|滚蛋|操|妈|逼|贱|恶心|讨厌|恨|烦|骂|吵|滚|弱智|脑残|sb|煞笔)",
@@ -150,6 +153,18 @@ LEDGER_KEY = "ledger"
 
 # 「很敷衍」这个词只留给**真的被骂/被明确推拒**——被不回不是被骂。
 # 区分靠来源标记：消息里的辱骂带 `from_msg`，主动联系没被回带 `from_silence`。
+# 配置项取数：`getattr(...) or 默认值` 会把合法的 0 当成「没设」——冷却门槛/天数/
+# ccb 好感门槛的 minimum 都是 0，用户把 0 当「关掉这一道」用，不能被吞掉。
+def _num_or(raw: Any, default: float) -> float:
+    try:
+        out = float(raw)
+    except (TypeError, ValueError):
+        return default
+    # NaN 必须挡在这里：Python 里 `min(100.0, nan)` 返回 100.0、`max(0.0, nan)` 返回 0.0，
+    # 于是 NaN 会被下面的夹取**静默变成满分**（好感 NaN → 100 分）。宁可退回默认值。
+    return default if out != out else out
+
+
 def _event_kind(weight: float, kind: str = "") -> str:
     """一笔账的**性质**——她要能说出「你最近在敷衍我」，就得知道这是敷衍。
 
@@ -197,17 +212,19 @@ LLM_SKIPPABLE_AFFECTION = -1.5
 # 刷成「满分依恋」。感情该是慢变量：一周以上才到「关系明显变好」。
 #
 # 三道闸叠加：单句上限 → 同类话递减 → 每日封顶。
-# 单句正收益上限。
+# 单句正收益上限。**这是内置天花板，不是最终生效值**：真正生效的是
+# `min(面板的 mood_affection_delta_cap, 本常量)` —— 面板默认 2 更保守，会把它压住；
+# 面板调到 3 以上时，这里的 2.4 才成为天花板（原来面板默认 2 让它成了死常量）。
 # 注意这是「上限」：普通暖话落在 1~1.8，只有亲近类顶到 2.4。
 # 一天正常聊（含 6~10 次暖话、扣除冷淡误伤）净增 ~4~5，12~14 天到「关系明显变好」。
 POSITIVE_MESSAGE_CAP = 2.4
 # 亲近欲的同款上限（甜话不但在刷好感，也在刷亲近欲，ccb 门槛全靠它）。
 LIBIDO_MESSAGE_CAP = 1.2
-# 甜话压脾气也要慢：单句最多压 0.25 分，否则几十句甜话就把攻击性打到 0。
+# 甜话压脾气也要慢：单句最多压 0.3 分，否则几十句甜话就把攻击性打到 0。
 AGGRESSION_DOWN_CAP = 0.3
 # 每日净增封顶（按她城市的自然日计）。封顶值与时衰半衰期是**配套**的：
-# 168h 半衰期 + 日净增 5 的实测曲线约在 12~14 天到 70（正常强度聊天），
-# 封顶 6.5 时给「高光日」留了余量，又不会让刷屏一天爆涨。
+# 168h 半衰期 + 日净增封顶 6.5 的实测曲线约在 12~14 天到 70（正常强度聊天），
+# 给「高光日」留了余量，又不会让刷屏一天爆涨。
 DAILY_NET_GAIN_CAP = 6.5
 DAILY_LIBIDO_GAIN_CAP = 4.5
 # 同类话递减系数：同一天里第 1/2/3/4+ 次只有对应比例生效。
@@ -221,6 +238,9 @@ REPEAT_DECAY = (1.0, 0.6, 0.35, 0.2)
 #
 # 一条消息对好感的负向上限（A1）。
 NEGATIVE_MESSAGE_CAP = 2.0
+
+# 「连续才扣好感」的连击时间窗：两条负向之间超过这么久就算两件独立的事。
+NEG_STREAK_WINDOW_SECONDS = 6 * 3600.0
 # 账本里负向的放大系数（A4）。原来 1.6（「下的快上的也快」），实测掉太快，收到 1.2。
 LEDGER_NEGATIVE_AMPLIFY = 1.2
 # 被冷落单次惩罚上限（A5）。原来 4.0（×1.6 后可达 -6.4），收到 2.0。
@@ -577,10 +597,7 @@ class MoodService:
         changed = False
         for key, base_key, bounds in DIMENSIONS:
             for target in (key, base_key):
-                try:
-                    value = float(record.get(target, bounds[0]))
-                except (TypeError, ValueError):
-                    value = bounds[0]
+                value = _num_or(record.get(target, bounds[0]), bounds[0])
                 clamped = max(bounds[0], min(bounds[1], value))
                 if record.get(target) != clamped:
                     record[target] = clamped
@@ -824,9 +841,9 @@ class MoodService:
         """称呼的来路：user=用户自己设的，auto=自动认定的，""=还没有称呼。
 
         自动认定上线之前的称呼只可能来自 /叫我，没记来源的老数据按 user 算。"""
-        if not self._scope.get_user(user_id, "nickname", ""):
+        if not self._scope.peek_user(user_id, "nickname", ""):
             return ""
-        src = str(self._scope.get_user(user_id, "nickname_src", "") or "")
+        src = str(self._scope.peek_user(user_id, "nickname_src", "") or "")
         return src if src in ("user", "auto") else "user"
 
     def auto_nickname(self, user_id: str, candidate: str) -> str:
@@ -834,7 +851,7 @@ class MoodService:
 
         已有称呼（用户 /叫我 设的、或早先自动认定的）一律不碰；候选名过不了
         validate_auto_nickname 的高门槛也不认。返回真正认定的名字，没认定返回空。"""
-        if self._scope.get_user(user_id, "nickname", ""):
+        if self._scope.peek_user(user_id, "nickname", ""):
             return ""
         name = validate_auto_nickname(candidate)
         if not name:
@@ -850,13 +867,37 @@ class MoodService:
                 result[uid] = (name, self.nickname_source(uid))
         return result
 
+    def _decayable(self, user_state: dict) -> Optional[dict]:
+        """取出可以衰减的 mood 记录；坏数据在这里就地修好或清掉。
+
+        **必须在这里兜住**：`decay_user` 是 `on_message` 里最早碰 mood 记录的一步
+        （`core_instance` 先调它，之后才走 `update_from_message_async` → `profile()`），
+        而唯一的修复路径 `_repair` 只在 `profile()` 里跑 —— 也就是**在崩溃点之后**。
+        非 dict 的 mood（`state._absorb_legacy` 会把老版本的值原样搬进来）在这里抛
+        AttributeError，字符串字段让 `_decay_record` 抛 ValueError；异常冒到
+        `on_message` 之外被 `main.py` 的宽 except 吞成一行 warning，于是这个用户
+        **此后每一条消息**的记账（note_chat、情绪更新、天气刷新）全部静默失效。
+        """
+        record = user_state.get("mood")
+        if not record:
+            return None
+        if not isinstance(record, dict):
+            # 修不了就删：profile() 会按初始值重建，正是文档承诺的「好感度清回初始值」。
+            logger.warning(
+                "mood 记录不是字典（%s），已清除并按初始值重建", type(record).__name__
+            )
+            user_state.pop("mood", None)
+            self._scope.mark_dirty()
+            return None
+        return self._repair(record, user_state)
+
     def decay_user(self, user_id: str) -> bool:
         cfg = self.config
         if not cfg.mood_enabled:
             return False
         user_state = self._scope.user_state(user_id)
-        record = user_state.get("mood")
-        if not record:
+        record = self._decayable(user_state)
+        if record is None:
             return False
         return self._decay_record(record, user_state, cfg, self._time())
 
@@ -868,8 +909,8 @@ class MoodService:
         changed = 0
         for uid in self._scope.all_user_ids():
             user_state = self._scope.user_state(uid)
-            record = user_state.get("mood")
-            if record and self._decay_record(record, user_state, cfg, now):
+            record = self._decayable(user_state)
+            if record is not None and self._decay_record(record, user_state, cfg, now):
                 changed += 1
         return changed
 
@@ -941,8 +982,8 @@ class MoodService:
             # 在两次消息之间跳变。统一交给账本：下面单独把它重算成 base + 账本净值。
             if key == "affection":
                 continue
-            current = float(record.get(key, bounds[0]))
-            base = float(record.get(base_key, bounds[0]))
+            current = _num_or(record.get(key, bounds[0]), bounds[0])
+            base = _num_or(record.get(base_key, bounds[0]), bounds[0])
             deviation = current - base
             if abs(deviation) < 1e-3:
                 continue
@@ -1045,9 +1086,15 @@ class MoodService:
                 return None
 
             delta = self._resolve_delta(base_delta, llm_delta)
-            delta = self._apply_modifiers(delta, user_id, warm_key, _neg_key_for(text))
-            delta = self._apply_intimacy_request(delta, record, text)
+            # 顺序（v2.28）：**补充判断先折进 delta，三道闸最后过**。
+            # 恢复侧与亲密请求原先跑在 `_apply_modifiers` 之后，等于绕开单句封顶、
+            # 同类递减与每日净增封顶，也不进 `warm_day` 的当日账：道歉一次能加到 4.7
+            # （声明上限 2.4）、求亲密一次白加 2.0 亲近欲且没有任何日上限。
+            # 折进来之后封顶/递减/日封顶对它们一律生效，记账也自动落进当日额度。
+            # `severe` 是「强迫」标记：它要当场扣好感，不能被「连续才扣」的门槛归零。
             delta = self._apply_recovery(delta, record, text)
+            delta, severe = self._apply_intimacy_request(delta, record, text)
+            delta = self._apply_modifiers(delta, user_id, warm_key, _neg_key_for(text), severe)
             self._commit(user_id, record, user_state, delta)
             return delta
 
@@ -1092,7 +1139,18 @@ class MoodService:
             record["messages_since_llm"] = 0    # 重新攒，别在同一个阈值上反复触发
             self._scope.mark_dirty()
             return
-        record["llm_batch"] = []
+        # 只删这一批分析过的，别把等待模型期间新攒进来的也清掉：
+        # `_llm_delta` 是一次网络调用，中途对方又发一条就会 append 进缓冲，
+        # 整表清空等于把那条静默丢掉（本地 delta 仍生效，所以看不出来）。
+        consumed = [str(x) for x in (batch or []) if str(x).strip()]
+        try:
+            current = [str(x) for x in (record.get("llm_batch") or []) if str(x).strip()]
+        except (TypeError, ValueError):
+            current = []
+        for item in consumed:
+            if item in current:
+                current.remove(item)
+        record["llm_batch"] = current[-max(1, int(self.config.mood_llm_batch_max)):]
         self._scope.mark_dirty()
 
     def _append_llm_batch(self, user_id: str, text: str) -> None:
@@ -1136,13 +1194,16 @@ class MoodService:
 
     def _resolve_delta(self, base: Delta, llm: Delta | None) -> Delta:
         if llm is None:
+            # 本地已经判得很死（骂人/重话）时模型不会被调用（见 LLM_SKIPPABLE_AFFECTION），
+            # 这时候本地那一票该顶上来：再放大一点。原来的位置在 `llm is None` 之后，
+            # 而那种情况下 base 必然 > LLM_SKIPPABLE_AFFECTION，这个分支永远走不到。
+            if base.affection <= LLM_SKIPPABLE_AFFECTION:
+                return base.scaled(1.2)
             return base
-        if base.affection <= LLM_SKIPPABLE_AFFECTION:
-            return base.scaled(1.2)
         return base.blend(llm, 0.3)
 
     def _apply_modifiers(self, delta: Delta, user_id: str, warm_key: str = "",
-                         neg_key: str = "") -> Delta:
+                         neg_key: str = "", severe: bool = False) -> Delta:
         cfg = self.config
         record = self.profile(user_id)
         factor = cfg.mood_sensitivity / 100.0
@@ -1175,12 +1236,32 @@ class MoodService:
                 delta.aggression * (1.4 if delta.aggression > 0 else 1.0),
             )
 
-        delta = delta.capped(float(cfg.mood_affection_delta_cap))
+        # 单次变化上限（面板项）。**按轴各自夹**：这一项的名字是「单次好感变化上限」，
+        # 而 `Delta.capped()` 会把 libido / aggression 也一起夹到 ±cap —— 面板设成 1 时，
+        # 亲近欲那条 1.2 的上限和脾气那条 -0.3 的独立口径就一起失真了。
+        # 好感在下面还会被三道闸按 POSITIVE/NEGATIVE_MESSAGE_CAP 再夹一次，
+        # 于是真正生效的是 `min(面板 cap, 内置上限)`：面板调到 3 以上时，
+        # 内置的 2.4 才是天花板（原来面板默认 2 把它压成了死常量）。
+        panel_cap = max(
+            0.0,
+            _num_or(getattr(cfg, "mood_affection_delta_cap", POSITIVE_MESSAGE_CAP),
+                    POSITIVE_MESSAGE_CAP),
+        )
+        delta = Delta(
+            max(-panel_cap, min(panel_cap, delta.affection)),
+            max(-LIBIDO_MESSAGE_CAP, min(LIBIDO_MESSAGE_CAP, delta.libido)),
+            max(-panel_cap, min(panel_cap, delta.aggression)),
+        )
         # 负向走另一套（v2.27.8）：单条封顶 → 同类递减 → 连续才扣好感 → 底部减速+韧性。
         if delta.affection < 0:
-            return self._throttle_negative(delta, record, neg_key)
-        # 非负向消息到达 → 连击清零
-        if record.get("neg_streak"):
+            return self._throttle_negative(delta, record, neg_key, severe)
+        # **真的在说好话**才清零连击。
+        #
+        # 中性闲聊返回的是 `Delta(0, 0, 0)`，原来它走这一支（`affection >= 0`）也清零
+        # →「骂一句 → 说句'在吗' → 再骂一句」永远凑不满连击，而
+        # `mood_negative_streak_required` 默认 2 → **好感在骂人路径上恒不减**，
+        # 「连续才扣好感」这条规则等于从来没生效过。
+        if delta.affection > 0 and record.get("neg_streak"):
             record["neg_streak"] = 0
         # 三道闸（v2.27.2）依次过：单句封顶 → 同类递减 → 每日净增封顶。
         return self._throttle_positive(delta, record, user_id, warm_key)
@@ -1208,11 +1289,11 @@ class MoodService:
                            warm_key: str = "") -> Delta:
         """把「她还能被暖到多少」的三道闸依次施加到一条正向上。
 
-        1. **单句封顶**：好感最多 +0.8、亲近欲最多 +0.5、脾气最多压 -0.25。
-           原来是 2.0（面板 cap）——单句太厚，十句话就能感到关系变了。
+        1. **单句封顶**：好感最多 +2.4、亲近欲最多 +1.2、脾气最多压 -0.3。
+           原来是 2.0（面板 cap）且无递减、无封顶——单句太厚，十句话就能感到关系变了。
         2. **同类递减**：同一天里同类话第 2 次 ×0.6、第 3 次 ×0.35、第 4 次起 ×0.2。
            刷一百句「喜欢你」和说一句「喜欢你」没有区别。
-        3. **每日净增封顶**：按她城市的自然日，正向上的净增封顶 3.5 / 3.0。
+        3. **每日净增封顶**：按她城市的自然日，正向上的净增封顶 6.5 / 4.5。
            刷屏一天也不会比认真聊一天额外收获多少。
         只削正向；负向（骂人/冷淡）不动——那个该疼就疼。
         """
@@ -1264,7 +1345,8 @@ class MoodService:
         record["warm_day"] = day
         return Delta(affection, libido, aggression)
 
-    def _throttle_negative(self, delta: Delta, record: dict, neg_key: str) -> Delta:
+    def _throttle_negative(self, delta: Delta, record: dict, neg_key: str,
+                           severe: bool = False) -> Delta:
         """负向软化（v2.27.8）：单条封顶 / 同类递减 / 连续才扣好感 / 底部减速+韧性。
 
         只削「负向」，**不削冷淡**（`cold`）：冷淡本来就轻、靠长期累积显形，
@@ -1273,6 +1355,10 @@ class MoodService:
         同类递减只对**骂人**按具体词生效（`neg:…` 键）。模型判出来的负向没有词键
         （`neg_key` 为空）——**照样要过封顶 / 连击 / 底部减速**，只是不递减；
         否则「本地没命中、模型判负」的那条会绕开所有负向规则，比骂人还凶。
+
+        `severe=True` 是 E4 的「强迫」：它**跳过「连续才扣好感」的门槛**。那一关是给
+        「一句孤立的难听话」留的缓冲，而强迫要的正是当场扣好感 —— 被归零就等于
+        这条规则从来没生效过。单条封顶与底部减速照旧生效。
         """
         cfg = self.config
         aff = float(delta.affection)
@@ -1308,10 +1394,19 @@ class MoodService:
             streak = int(record.get("neg_streak", 0) or 0)
         except (TypeError, ValueError):
             streak = 0
+        # 连击要有时间窗：隔了半天还叫「连续」就太苛刻了——那其实是两件独立的事，
+        # 不该叠在一起算。超过窗口就当作新的第一句。
+        now = self._time()
+        last_neg = _num_or(record.get("neg_streak_at", 0.0), 0.0)
+        if last_neg <= 0 or (now - last_neg) > NEG_STREAK_WINDOW_SECONDS:
+            streak = 0
         streak += 1
         record["neg_streak"] = streak
+        record["neg_streak_at"] = now
         required = max(1, int(getattr(cfg, "mood_negative_streak_required", 2) or 2))
-        if streak < required:
+        # 「强迫」不算「一句孤立的难听话」：E4 要的是当场扣好感，
+        # 被连击门槛归零就等于这条规则从来没生效过。
+        if streak < required and not severe:
             aff = 0.0
         aff *= factor
         if aff < 0 and bool(getattr(cfg, "mood_negative_softening", True)):
@@ -1329,6 +1424,11 @@ class MoodService:
 
         只在 `mood_recovery_bonus` 开着时生效，且全部作用于**低于基线**的情形——
         她本来就好好的，多说两句好话不该额外加分（那是正向三道闸管的事）。
+
+        **在 `_apply_modifiers` 之前调用**（v2.28 起）：这些加成也是「这条消息的
+        情绪影响」的一部分，必须先折进 delta 再统一过三道闸。原来跑在闸后，
+        等于绕开单句封顶、同类递减与每日封顶 —— 道歉一次实测能加到 4.7，
+        远超这里声明的 2.4，而且一分钱都不进当日额度。
         """
         cfg = self.config
         if not bool(getattr(cfg, "mood_recovery_bonus", True)):
@@ -1359,32 +1459,49 @@ class MoodService:
             aggr *= 1.5
         return Delta(aff, delta.libido, aggr)
 
-    def _apply_intimacy_request(self, delta: Delta, record: dict, text: str) -> Delta:
+    def _apply_intimacy_request(
+        self, delta: Delta, record: dict, text: str
+    ) -> Tuple[Delta, bool]:
         """E3/E4：用户主动求亲密 / 强迫。
 
         · 双方同意 → 把亲近欲往上推（够不够得着由 ccb 那套门槛决定，E1/E2）。
         · 强迫（无视拒绝/胁迫）→ 拒绝 + 扣好感（E4），并标一笔「刚被强迫」，
           ccb 读到就不进场景（E6：那不是「享受」）。
+
+        返回 `(delta, severe)`：`severe` 告诉下游「这一条是强迫」，让它**当场扣好感**，
+        而不是被 `_throttle_negative` 的「连续才扣好感」门槛归零。
+
+        **成人档关着时整段不生效**：这两条都是 ccb 分级解锁的功能，而原实现只读
+        `ccb_affection_min`、从不读 `ccb` 开关 —— 默认配置（`ccb=false`）下
+        一句「我们上床吧」照样白拿 2.0 亲近欲，而且完全不计入当日额度。
         """
+        cfg = self.config
+        if not bool(getattr(cfg, "ccb", False)):
+            return delta, False
         body = str(text or "")
         if not _SEXUAL_REQUEST_PATTERN.search(body):
-            return delta
-        cfg = self.config
+            return delta, False
         if _COERCION_PATTERN.search(body):
             record["ccb_coerced_at"] = float(self._time())
-            return Delta(
-                float(delta.affection) - 1.2,
-                float(delta.libido),
-                max(float(delta.aggression), 1.0),
+            return (
+                Delta(
+                    float(delta.affection) - 1.2,
+                    float(delta.libido),
+                    max(float(delta.aggression), 1.0),
+                ),
+                True,
             )
-        threshold = float(getattr(cfg, "ccb_affection_min", 50.0) or 50.0)
+        threshold = _num_or(getattr(cfg, "ccb_affection_min", 50.0), 50.0)
         try:
             aff = float(record.get("affection", 50.0) or 50.0)
         except (TypeError, ValueError):
             aff = 50.0
         if aff >= threshold:
-            return Delta(float(delta.affection), float(delta.libido) + 2.0, float(delta.aggression))
-        return delta
+            return (
+                Delta(float(delta.affection), float(delta.libido) + 2.0, float(delta.aggression)),
+                False,
+            )
+        return delta, False
 
     def _maybe_enter_cooling(self, user_id: str, record: dict, now: float, delta: Delta) -> None:
         """D 冷静期：好感跌破门槛（或被一记重创）后，她带情绪冷一段时间。
@@ -1400,21 +1517,24 @@ class MoodService:
             aff = float(record.get("affection", 50.0) or 50.0)
         except (TypeError, ValueError):
             aff = 50.0
-        threshold = float(getattr(cfg, "cooling_affection", 10) or 10)
-        big_hit = float(delta.affection) <= -2.5
+        threshold = _num_or(getattr(cfg, "cooling_affection", 10), 10.0)
+        # 单条负向的幅度在 `_throttle_negative` 里已封顶到 -NEGATIVE_MESSAGE_CAP，
+        # 所以「重创」的阈值必须贴着这个上限，否则这条分支恒假（原来是 -2.5）。
+        big_hit = float(delta.affection) <= -NEGATIVE_MESSAGE_CAP
         if aff >= threshold and not big_hit:
             return
         reason = "你刚才说的话"
         try:
-            events = self.recent_events(user_id, 1)
-            if events:
-                kind = str(events[0][0])
-                if kind in ("有点冷", "一直没被理"):
+            led = record.get(LEDGER_KEY)
+            if isinstance(led, list) and led and isinstance(led[-1], dict):
+                # 只有「她主动发出去没人理」那一类才配说「你一直没好好理我」。
+                # 旧数据没有 src，落回默认的「你刚才说的话」。
+                if str(led[-1].get("src") or "") == "silence":
                     reason = "你一直没好好理我"
         except Exception:
             pass
-        minutes = float(getattr(cfg, "cooling_minutes", 15) or 15)
-        days = float(getattr(cfg, "cooling_no_proactive_days", 3) or 3)
+        minutes = _num_or(getattr(cfg, "cooling_minutes", 15), 15.0)
+        days = _num_or(getattr(cfg, "cooling_no_proactive_days", 3), 3.0)
         record["cool_until"] = float(now) + minutes * 60.0
         record["cool_no_proactive_until"] = float(now) + days * 86400.0
         record["cool_reason"] = reason
@@ -1531,6 +1651,10 @@ class MoodService:
             "t": round(float(now), 1),
             "w": round(weight, 3),
             "k": _event_kind(weight, kind),
+            # 账的来源：silence=她主动发出去没人理，msg=对方说的话。
+            # 冷静期理由靠它区分「你一直没好好理我」和「你刚才说的话」——
+            # 只看 `k` 的话，轻度骂人（k=「有点冷」）会被误说成「一直没好好理我」。
+            "src": "silence" if kind == "没被理" else "msg",
         })
         if len(led) > self.LEDGER_MAX:
             del led[:-self.LEDGER_MAX]

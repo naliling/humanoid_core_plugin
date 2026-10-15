@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Awaitable
+from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -15,6 +16,12 @@ API_URL = "https://api.openweathermap.org/data/2.5/weather"
 MIN_KEY_LENGTH = 10
 REQUEST_TIMEOUT = 10.0
 FetchJson = Callable[[str, float], Awaitable[dict[str, Any]]]
+
+# 取天气失败后的退避：5 分钟起步、每次翻倍、封顶 60 分钟。
+# 原来失败路径**不写 `_last_weather_fetch`**，于是 `is_stale()` 永远为真 ——
+# 而消息路径是每条消息调一次 `is_stale()`，用户看到的是「这个插件在疯狂请求接口」。
+RETRY_BACKOFF_BASE_SECONDS = 300.0
+RETRY_BACKOFF_MAX_SECONDS = 3600.0
 
 # 还没拿到真天气时 snapshot() 给的是「为什么没有天气」的说明书。这类句子是给主人
 # 看的，不能当状态递出去：模型与社交层会把它当成一句天气话接着说。
@@ -53,6 +60,11 @@ class WeatherService:
         self._clock = clock
         self._fetch = fetch_json
         self._log = logger
+        # 请求风暴的两道闸（见 should_refresh）：一个请求在飞时不再发第二个；
+        # 上一次失败后按指数退避，别每条消息都去撞接口。
+        self._inflight = False
+        self._fail_streak = 0
+        self._next_attempt_at: datetime | None = None
 
     @property
     def config(self) -> HumanoidConfig:
@@ -132,6 +144,34 @@ class WeatherService:
             return True
         return (now - fetched).total_seconds() >= max(1, cfg.weather_refresh_minutes) * 60
 
+    def should_refresh(self) -> bool:
+        """现在该不该真的去取一次天气——**消息路径用这个，不要用 `is_stale()`**。
+
+        两者分工：`is_stale()` 说的是「缓存过期了」（纯事实，诊断与面板也看它），
+        这里再问「现在去取有意义吗」：
+        · 已经有一个请求在飞 → 不必再发一个（消息连发时每条都会问到这里）；
+        · 上一次刚失败过 → 按退避等一会儿，否则失败会变成每条消息一次重试。
+        """
+        if self._inflight or not self.is_stale():
+            return False
+        if self._next_attempt_at is not None and self._clock.now() < self._next_attempt_at:
+            return False
+        return True
+
+    def _note_failure(self) -> None:
+        """失败也要记账：安排下一次尝试的时间（指数退避）。
+
+        原实现失败路径只打一行日志、不动 `_last_weather_fetch`，`is_stale()` 于是
+        永远为真 —— 而消息路径每条消息都会问一次，等于「取不到天气」直接变成
+        「每条消息一个 HTTP 请求」。这里把失败也记进尝试时间。
+        """
+        self._fail_streak = min(self._fail_streak + 1, 20)
+        delay = min(
+            RETRY_BACKOFF_BASE_SECONDS * (2 ** (self._fail_streak - 1)),
+            RETRY_BACKOFF_MAX_SECONDS,
+        )
+        self._next_attempt_at = self._clock.now() + timedelta(seconds=delay)
+
     async def refresh_async(self, force: bool = False) -> bool:
         cfg = self.config
         location = self.effective_location()
@@ -139,12 +179,16 @@ class WeatherService:
             return False
         if len(cfg.weather_api_key) < MIN_KEY_LENGTH:
             return False
-        if not force and not self.is_stale():
+        # 同一时刻只允许一个请求在飞。检查与置位之间没有 await，所以「查完就占」是原子的。
+        if self._inflight:
             return False
-        url = build_url(location, cfg.weather_api_key)
-        if cfg.debug_mode and self._log:
-            self._log.debug(f"[humanoid_core] 天气请求: {_redacted(url)}")
+        if not force and not self.should_refresh():
+            return False
+        self._inflight = True
         try:
+            url = build_url(location, cfg.weather_api_key)
+            if cfg.debug_mode and self._log:
+                self._log.debug(f"[humanoid_core] 天气请求: {_redacted(url)}")
             payload = await self._fetch(url, REQUEST_TIMEOUT)
             parsed = parse_payload(payload)
             if parsed is None:
@@ -156,13 +200,18 @@ class WeatherService:
                 _cached_location=location,
                 _last_weather_fetch=format_state_timestamp(self._clock.now())
             )
+            self._fail_streak = 0
+            self._next_attempt_at = None
             if cfg.debug_mode and self._log:
                 self._log.debug(f"[humanoid_core] 天气刷新成功: {parsed}")
             return True
         except Exception as e:
+            self._note_failure()
             if self._log:
                 self._log.warning(f"[humanoid_core] 天气刷新失败: {e}")
             return False
+        finally:
+            self._inflight = False
 
 
 def _redacted(url: str) -> str:

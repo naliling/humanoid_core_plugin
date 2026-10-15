@@ -604,18 +604,6 @@ class SocialEnergyTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, timeout=1.0)  # 关停不该等满 60 秒
         self.assertGreater(service.value, 0.0, "第一轮就应该恢复过一次")
 
-    async def test_hint_bands(self):
-        """意愿描述随能量单调变淡，而且不能出现数值。"""
-        service, store, _ = self.build()
-        store.data["social_energy"] = 95.0
-        talkative = service.hint()
-        store.data["social_energy"] = 10.0
-        terse = service.hint()
-        self.assertIn("意愿高", talkative)
-        self.assertIn("独处", terse)
-        self.assertNotIn("95", talkative)
-        self.assertEqual(service.text, "较低")
-
 
 class WeatherTest(unittest.IsolatedAsyncioTestCase):
     PAYLOAD = {

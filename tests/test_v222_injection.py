@@ -365,9 +365,8 @@ class InjectionLayerTest(unittest.TestCase):
     def test_marker_header_survives_personalization(self):
         """标题 `〔她的身体与生活…〕` 里的「她」不能被换成名字。
 
-        `_drop_stale_blocks` 靠 MARK_PREFIX 认出历史里的旧块并抹掉。标题一旦变成
-        「〔小雨的身体与生活…」，前缀对不上，聊天越久历史里堆的过期状态块就越多——
-        正是那段代码当初要解决的问题。这条是回归锁。
+        标题是 `MARK_PREFIX`，也是这块事实的抬头；一旦变成「〔小雨的身体与生活…」，
+        抬头就丢了。这条是回归锁。
         """
         from humanoid.prompt_builder import MARK_PREFIX, PromptBuilder
 

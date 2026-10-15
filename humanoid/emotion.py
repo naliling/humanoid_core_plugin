@@ -36,6 +36,11 @@ CARE_CLOSE = 0.62
 # v2.27.8（B4）：只按「同一天里 ≥2 次」判定——单次负向不再立刻亮「窝火」。
 GRUDGE_SAME_DAY = 2
 
+# ccb 推进状态的去重窗口（秒）：同一条用户消息可能触发多次 LLM 请求（工具循环/重试），
+# 而 ccb 是在**读路径**（build_injection）里推进的，不去重的话一条消息会被算成几次
+# （当日次数、一辈子的次数都重复计，ccb_satisfy 还会一步跨几格）。
+CCB_ADVANCE_DEDUP_SECONDS = 60.0
+
 
 def _num(value: Any, default: float = 0.0) -> float:
     try:
@@ -159,7 +164,7 @@ class EmotionLayer:
             return 0.66, _pick(("愿意多说两句", "愿意说点私人的"), index)
         if care >= CARE_CLOSE and upset:
             return 0.68, _pick(("不太想多说", "今天不太想说真心话"), index)
-        if care < 0.35:
+        if care < 0.25:
             return 0.55, _pick(("跟你还有点距离", "不太愿意提私事"), index)
         return 0.45, _pick(("今天跟平时一样", "今天跟你说话挺正常的"), index)
 
@@ -225,7 +230,7 @@ class EmotionLayer:
         # E1（v2.27.11）再加四维：疲倦 / 兴奋 / 心虚 / 期待。
         # 显著度压得低一些，只在上面几个更重的信号都不亮时才露头。
         if energy_val < 30.0:
-            out.append((0.55, _pick(("有点乏，提不起劲", "整个人薓薓的"), index)))
+            out.append((0.55, _pick(("有点乏，提不起劲", "整个人蔫蔫的"), index)))
         elif energy_val >= 85.0:
             out.append((0.54, _pick(("今天精神头很足", "这会儿浑身是劲"), index)))
         if d_aggr >= AGGRESSION_UP and d_aff >= 0:
@@ -470,6 +475,16 @@ class EmotionLayer:
                 _ccb.reset_scene(user_state)
             return None
         score, text, stage = res
+        # 同一条用户消息可能触发多次 LLM 请求，而这里是**读路径**：每次都推进的话，
+        # ccb 的当日次数/一辈子次数会被重复计数（一条消息算成几次）。用短窗去重：
+        # 窗口内的重复渲染只出文本、不再推进状态。
+        try:
+            last_advance = float(user_state.get("ccb_advance_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last_advance = 0.0
+        if float(moment) - last_advance < CCB_ADVANCE_DEDUP_SECONDS:
+            return score, text
+        user_state["ccb_advance_at"] = float(moment)
         user_state["ccb_stage"] = float(stage)
         user_state["ccb_last_at"] = float(moment)
         user_state["ccb_turns"] = float(user_state.get("ccb_turns", 0.0) or 0.0) + 1.0

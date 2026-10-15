@@ -29,8 +29,20 @@ from .services.schedule import (
 
 CONTRACT_VERSION = 1
 
-# 社交层写回的信号文件：超过这个秒数就不采信（它自己也是每分钟才写一次）。
-SIGNALS_TTL_SECONDS = 900.0
+# 社交层写回的信号文件：超过这个秒数就不采信。
+#
+# 它的心跳间隔是**可配的**（`heartbeat_max_minutes`：默认 15 分钟、最大 120 分钟），
+# 所以 TTL 必须盖得住「最大间隔 + 余量」。原来写死 900 秒，正好等于默认的 15 分钟 ——
+# 任何调度抖动都会越界；用户把心跳配成 120 分钟时，约 87% 的时间都判「已过期」，
+# Core 会把社交层写回的信号整段丢掉（表现为「她刚主动找过谁」永远不生效）。
+#
+# 写方可以在信号文件里用 `ttl_seconds` 声明自己实际的保鲜期，这里优先采用它；
+# 这个常量是写方没声明时的兜底。
+SIGNALS_TTL_SECONDS = 3 * 3600.0
+# 写方声明的 TTL 也要夹一下：声明成一周就失去「社交层已经停了」的检测意义了。
+SIGNALS_TTL_MAX_SECONDS = 6 * 3600.0
+# 下限：声明得比一分钟还短，只会让信号频繁被判过期，没有意义。
+SIGNALS_TTL_MIN_SECONDS = 60.0
 SOCIAL_PLUGIN_DIR_NAME = "astrbot_plugin_autonomous_social"
 SIGNALS_FILE_NAME = "humanoid_signals.json"
 
@@ -76,8 +88,14 @@ def build_contract(core: Any) -> dict[str, Any]:
             "hour": now.hour,
             "weekday": snap.get("weekday", ""),
             "city": snap.get("city", ""),
-            "is_night": bool(cfg.night_mode_enabled and core.clock.is_night(now)),
-            "is_deep_sleep": bool(cfg.night_mode_enabled and core.clock.is_deep_sleep(now)),
+            "is_night": bool(
+                cfg.night_mode_enabled
+                and core.soma.in_scheduled_night(now.hour + now.minute / 60.0)
+            ),
+            "is_deep_sleep": bool(
+                cfg.night_mode_enabled
+                and core.soma.in_scheduled_deep_sleep(now.hour + now.minute / 60.0)
+            ),
             # 社交层跟 Core 跑在同一台机器上，但它自己的时段判断用的是本机时钟。
             # 给出偏移量比给出一个时刻更可靠：拿它把 epoch 换算成她的本地小时即可。
             # 算不出来时必须是 None 而不是 0：当成 0 等于把她的城市当 UTC，错得静悄悄。
@@ -223,12 +241,26 @@ class SocialSignals:
         self._fingerprint: tuple[int, int] | None = None
         self._payload: dict[str, Any] = {}
         self._loaded_at = 0.0
+        # 写方在信号文件里声明的保鲜期（秒）；0 表示没声明，用默认值。
+        self._declared_ttl = 0.0
+
+    def _ttl(self) -> float:
+        """当前采信的保鲜期。
+
+        写方声明的优先（它知道自己的心跳间隔），夹在 [下限, 上限] 之间；
+        没声明就用默认值。原来这里是个写死的 900 秒，与可配的心跳间隔对不上。
+        """
+        if self._declared_ttl <= 0:
+            return SIGNALS_TTL_SECONDS
+        return min(
+            max(SIGNALS_TTL_MIN_SECONDS, self._declared_ttl), SIGNALS_TTL_MAX_SECONDS
+        )
 
     def read(self) -> dict[str, Any]:
         now = self._time()
         try:
             path = signals_path(self._root())
-        except Exception as exc:
+        except Exception:
             # 获取 data_root 失败时返回空，避免抛出异常中断调用方
             return {}
         if path is None:
@@ -240,7 +272,7 @@ class SocialSignals:
         except OSError:
             # 文件不存在或无法访问时返回空
             return {}
-        if now - stat.st_mtime > SIGNALS_TTL_SECONDS:
+        if now - stat.st_mtime > self._ttl():
             # 社交层停了：它写的那份「刚主动找过谁」不该继续影响身体。
             self._payload = {}
             return {}
@@ -249,7 +281,7 @@ class SocialSignals:
             return self._payload
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError):
             # JSON 解析失败或读取错误时保持上一次的有效数据
             return self._payload or {}
         except Exception:
@@ -260,6 +292,12 @@ class SocialSignals:
         self._fingerprint = fingerprint
         self._payload = payload
         self._loaded_at = now
+        # 写方声明的保鲜期。第一次读之前用的是默认值（足够宽），读到之后按声明的来。
+        try:
+            declared = float(payload.get("ttl_seconds") or 0.0)
+        except (TypeError, ValueError):
+            declared = 0.0
+        self._declared_ttl = declared if declared > 0 else 0.0
         return payload
 
     def _scope_of(self, payload: dict[str, Any], role_id: str = "") -> dict[str, Any]:
@@ -290,11 +328,19 @@ class SocialSignals:
         target = str(row.get("last_target_uid", "") or "")
         return target, at
 
-    def ignored_streak(self) -> int:
+    def ignored_streak(self, role_id: str = "") -> int:
+        """被冷落的角色级计数。传了 role_id 就按角色取——多 Bot 时顶层那个是冻结的。"""
         try:
-            return max(0, int(self.read().get("ignored_streak", 0) or 0))
-        except (TypeError, ValueError):
+            data = self.read()
+        except Exception:
             return 0
+        row = self._scope_of(data, role_id) if role_id else data
+        if isinstance(row, dict):
+            try:
+                return max(0, int(row.get("ignored_streak", 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+        return 0
 
     def ignored_by_uid(self, uid: str, role_id: str = "") -> int:
         """社交层记的「这个人累计没理我几次」。
@@ -306,11 +352,10 @@ class SocialSignals:
             data = self.read()
         except Exception:
             return 0
-        for key in self._slots(data, role_id):
-            per = data.get(key) if isinstance(data, dict) else None
-            if not isinstance(per, dict):
+        for slot in self._slots(data, role_id):
+            if not isinstance(slot, dict):
                 continue
-            by = per.get("ignored_by")
+            by = slot.get("ignored_by")
             if isinstance(by, dict):
                 try:
                     return max(0, int(by.get(str(uid or "")) or 0))
@@ -361,6 +406,6 @@ class SocialSignals:
             age = max(0.0, now - path.stat().st_mtime)
         except OSError:
             age = None
-        if not payload and age is not None and age > SIGNALS_TTL_SECONDS:
+        if not payload and age is not None and age > self._ttl():
             return {"state": "stale", "path": str(path), "age": age, "payload": {}}
         return {"state": "fresh", "path": str(path), "age": age, "payload": payload}

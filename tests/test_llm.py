@@ -28,8 +28,10 @@ from .fakes import (
     FakeClock,
     FakeContext,
     FakeLegacyContext,
+    FakeMeta,
     FakeNonChatProvider,
     FakeProvider,
+    FakeResponse,
     RecordingLogger,
 )
 
@@ -435,6 +437,145 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
             timeout=5,
         )
         self.assertTrue(res.ok)
+
+
+
+
+class SystemPromptProbeTest(unittest.IsolatedAsyncioTestCase):
+    """能力探测看**签名**，不看 `except TypeError`。
+
+    TypeError 会在 `text_chat` 内部任意位置抛出——包括 HTTP 往返**之后**。原写法
+    把「请求已经发出去了、只是后面解析炸了」也当成「参数不支持」，于是**再发一次
+    完整请求**（重复计费），并在降级时静默丢掉 system_prompt。
+    """
+
+    def build(self, ctx, config=None, clock=None):
+        conf = config or cfg()
+        log = RecordingLogger()
+        resolver = ProviderResolver(ctx, log)
+        return LLMGateway(resolver, lambda: conf, log, clock or FakeClock()), log
+
+    async def test_internal_typeerror_does_not_resend(self):
+        class InternalTypeError(FakeProvider):
+            """签名里明确收 system_prompt，但内部（网络之后）抛 TypeError。"""
+
+            async def text_chat(self, prompt=None, system_prompt=None, **kwargs):
+                self.calls += 1
+                self.last_kwargs = {"prompt": prompt, "system_prompt": system_prompt, **kwargs}
+                raise TypeError("解析响应时炸了")
+
+        broken = InternalTypeError("broken")
+        gw, _ = self.build(FakeContext(chat_providers=[broken]))
+        res = await gw.generate(
+            prompt="hi",
+            chain=(("首选模型", "broken"),),
+            allow_global=False,
+            timeout=5,
+            attempts_per_provider=1,
+            system_prompt="你是小雨",
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(broken.calls, 1, "不该因为内部 TypeError 再发一次完整请求")
+        self.assertIsNotNone(broken.last_kwargs.get("system_prompt"), "system_prompt 不该被丢掉")
+
+    async def test_provider_without_system_prompt_is_called_plain(self):
+        """签名里既没有 system_prompt 也没有 **kwargs → 去掉它再调，且不抛 TypeError。"""
+
+        class OldProvider:
+            def __init__(self, provider_id):
+                self._id = provider_id
+                self.calls = 0
+                self.last_kwargs = {}
+
+            def meta(self):
+                return FakeMeta(self._id)
+
+            async def text_chat(self, prompt=None):
+                self.calls += 1
+                self.last_kwargs = {"prompt": prompt}
+                return FakeResponse("OK-OLD")
+
+        old = OldProvider("old")
+        gw, _ = self.build(FakeContext(chat_providers=[old]))
+        res = await gw.generate(
+            prompt="hi",
+            chain=(("首选模型", "old"),),
+            allow_global=False,
+            timeout=5,
+            system_prompt="你是小雨",
+        )
+        self.assertTrue(res.ok, "不支持 system_prompt 的旧 provider 应自动降级")
+        self.assertEqual(res.text, "OK-OLD")
+        self.assertEqual(old.calls, 1)
+
+
+class RetryPolicyTest(unittest.IsolatedAsyncioTestCase):
+    """重试只对「再试一次可能就好了」的错误有意义。"""
+
+    def build(self, ctx, config=None, clock=None):
+        conf = config or cfg()
+        log = RecordingLogger()
+        resolver = ProviderResolver(ctx, log)
+        return LLMGateway(resolver, lambda: conf, log, clock or FakeClock()), log
+
+    async def test_permanent_error_is_not_retried(self):
+        broken = FakeProvider("broken", error=RuntimeError("401 unauthorized"))
+        gw, _ = self.build(FakeContext(chat_providers=[broken]))
+        res = await gw.generate(
+            prompt="hi",
+            chain=(("首选模型", "broken"),),
+            allow_global=False,
+            timeout=5,
+            attempts_per_provider=3,
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(broken.calls, 1, "鉴权失败不该重试三次")
+        self.assertEqual(len(res.attempts), 1)
+
+    async def test_content_moderation_is_not_retried(self):
+        broken = FakeProvider("broken", error=RuntimeError("content policy violation"))
+        gw, _ = self.build(FakeContext(chat_providers=[broken]))
+        res = await gw.generate(
+            prompt="hi",
+            chain=(("首选模型", "broken"),),
+            allow_global=False,
+            timeout=5,
+            attempts_per_provider=3,
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(broken.calls, 1)
+
+    async def test_total_deadline_stops_retrying(self):
+        """总时间闸：跨候选/重试的总预算用完就不再试。
+
+        原来没有总闸，候选数 × 重试数 × 超时会相乘（3×2×60s 最坏 6 分钟），
+        而日程生成期间 `_generating` 全程为真。
+        """
+        state = {"t": 0.0}
+
+        def monotonic() -> float:
+            return state["t"]
+
+        class TimeEater(FakeProvider):
+            async def text_chat(self, prompt=None, **kwargs):
+                self.calls += 1
+                state["t"] += 200.0  # 一次调用就吃掉远超总预算的时间
+                raise RuntimeError("rate limit")
+
+        broken = TimeEater("broken")
+        conf = cfg()
+        log = RecordingLogger()
+        resolver = ProviderResolver(FakeContext(chat_providers=[broken]), log)
+        gw = LLMGateway(resolver, lambda: conf, log, monotonic)
+        res = await gw.generate(
+            prompt="hi",
+            chain=(("首选模型", "broken"),),
+            allow_global=False,
+            timeout=5,
+            attempts_per_provider=5,
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(broken.calls, 1, "总闸到期后不该再重试")
 
 
 

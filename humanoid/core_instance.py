@@ -138,7 +138,7 @@ class HumanoidCoreInstance:
         self.resolver = resolver
         self.gateway = gateway
 
-        self._scope = RoleScope(state_store.data, role_id)
+        self._scope = RoleScope(state_store.data, role_id, state_store.mark_dirty)
         self._scope.set_mark_dirty(state_store.mark_dirty)
 
         # 时区按角色分离：这个 bot 单独设过城市就用它自己的，没设过才用全局配置。
@@ -633,7 +633,18 @@ class HumanoidCoreInstance:
             return stored
         return self.schedule.last_persona or ""
 
-    def _spawn_background(self, coro, name: str) -> asyncio.Task:
+    def _spawn_background(self, coro, name: str):
+        """起一个后台任务；**已经收到停止信号就别再起**。
+
+        卸载竞态：`stop()` 之后仍可能有人调到这里（消息路径在竞态窗口里跑完、
+        后台循环在取消落地前又走了一轮）。此时 create_task 出来的协程不在 `stop()`
+        的取消名单里，会一直活着并继续写 state.json。
+        """
+        if self._stop_event.is_set():
+            # 不 close 掉会报 "coroutine ... was never awaited"
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return None
         task = asyncio.create_task(coro, name=f"humanoid-{self.role_id}-{name}")
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -735,7 +746,9 @@ class HumanoidCoreInstance:
                 self.mood.update_from_message_async(user_id, text),
                 "mood-update"
             )
-        if self.weather.is_stale():
+        # 用 should_refresh() 而不是 is_stale()：这一行是**每条消息**都会走的，
+        # 只看 is_stale() 的话，「取不到天气」会变成「每条消息一次 HTTP 请求」。
+        if self.weather.should_refresh():
             self._spawn_background(self.weather.refresh_async(), "weather-refresh")
 
     def build_injection(
@@ -838,7 +851,7 @@ class HumanoidCoreInstance:
             return
         try:
             _, at = self.signals.last_proactive(self.role_id)
-            streak = self.signals.ignored_streak()
+            streak = self.signals.ignored_streak(self.role_id)
         except Exception as exc:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 读取社交信号失败: {exc}")
@@ -1051,7 +1064,7 @@ class HumanoidCoreInstance:
                 recent = []
             if recent:
                 out.append(row("情绪事件", f"最近 {len(recent)} 条",
-                                str(recent[-1].get("event", "")).replace("，", "，")))
+                                str(recent[-1].get("event", ""))))
 
         out.append("")
         out.append("环境")
@@ -1118,6 +1131,11 @@ class HumanoidCoreInstance:
 
     async def start(self):
         if self._started:
+            return
+        # 已经收到停止信号就别启动了：`_spawn_background` 会把 5 个循环全部拦下，
+        # 而 `_started` 已经被置 True，后续再 start() 会被上面那句挡掉、**永远起不来**。
+        if self._stop_event.is_set():
+            self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 已在停止中，跳过启动")
             return
         self._started = True
         self._spawn_background(self._social_loop(), "social-recovery")

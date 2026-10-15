@@ -155,9 +155,9 @@ class InjectionFreedomTest(unittest.TestCase):
         """在意度要变成状态词，而且不同用户词不一样；数值不上下文。"""
         core = self.core()
         builder = PromptBuilder(core)
-        mine = builder._relation_lines("42", False, detailed=False,
+        mine = builder._relation_lines("42", False,
                                        interest={"care": 0.9, "focus": 0.9, "spare": 0.9})
-        cold = builder._relation_lines("43", False, detailed=False,
+        cold = builder._relation_lines("43", False,
                                        interest={"care": 0.05, "focus": 0.05, "spare": 0.05})
         self.assertTrue(any("亲密" in line or "在意" in line or "她对TA" in line for line in mine), mine)
         # 措辞按天抽签：0.00 档有几套说法，都得认。

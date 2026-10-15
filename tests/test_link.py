@@ -19,6 +19,7 @@ from humanoid.engine import HumanoidEngine
 from humanoid.link import (
     CONTRACT_VERSION,
     SIGNALS_FILE_NAME,
+    SIGNALS_TTL_SECONDS,
     SOCIAL_PLUGIN_DIR_NAME,
     SocialSignals,
     build_contract,
@@ -132,6 +133,10 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(routine["wake_at"], "11:30")
 
     def test_contract_is_written_into_state_and_only_on_change(self):
+        # 必须定住时钟：契约的 body 里有随「现在」走的身体量，真实时钟下两次刷新之间
+        # 只要跨过一个积分步就会真的变化，于是「没变化时不该写盘」这条断言随机失败。
+        # 同类里其它测试都调了 freeze，只有这一条漏了（实测两棵树各跑 25 次都有一半失败）。
+        freeze(self.core)
         first = self.core.refresh_contract()
         self.assertIsNotNone(first)
         self.store_dirty_after = self.harness.store.dirty
@@ -234,11 +239,12 @@ class SignalsStatusTest(unittest.TestCase):
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / SIGNALS_FILE_NAME
         path.write_text(json.dumps({"last_proactive_at": time.time() - 4000}), encoding="utf-8")
-        old = path.stat().st_mtime - 2000
+        age = SIGNALS_TTL_SECONDS + 3600
+        old = path.stat().st_mtime - age
         os.utime(path, (old, old))
         status = core.signals.status()
         self.assertEqual(status["state"], "stale", status)
-        self.assertGreater(status["age"], 1900)
+        self.assertGreater(status["age"], age - 60)
         self.assertIn("分钟没刷新", harness.engine.diagnostics_text(core))
 
     def test_fresh_carries_age_and_path(self):
@@ -288,10 +294,42 @@ class SignalsTest(unittest.TestCase):
         """社交层停了三小时后，它写的「刚主动找过谁」不该继续压着身体。"""
         from humanoid.link import SocialSignals
 
-        root = self.write_signals({"last_proactive_at": 1_800_000_000.0, "ignored_streak": 4}, mtime_age=10_800)
+        root = self.write_signals(
+            {"last_proactive_at": 1_800_000_000.0, "ignored_streak": 4},
+            mtime_age=SIGNALS_TTL_SECONDS + 60,
+        )
         signals = SocialSignals(lambda: root)
         self.assertEqual(signals.read(), {}, "超过 TTL 的信号必须作废")
         self.assertEqual(signals.ignored_streak(), 0)
+
+    def test_fresh_within_ttl_is_kept(self):
+        """TTL 之内必须采信——原来 TTL 写死 900 秒，而心跳间隔可配到 120 分钟，
+        于是「还没过期」的信号会被整段丢掉（联动单边断）。"""
+        from humanoid.link import SocialSignals
+
+        root = self.write_signals(
+            {"last_proactive_at": 1_800_000_000.0, "ignored_streak": 4},
+            mtime_age=3600,
+        )
+        signals = SocialSignals(lambda: root)
+        self.assertEqual(signals.ignored_streak(), 4, "一小时的信号不该被当成过期")
+
+    def test_writer_can_declare_its_own_ttl(self):
+        """写方在信号文件里声明 `ttl_seconds` 时按它算，而不是用默认值。
+
+        社交层的心跳间隔是可配的，只有它自己知道该保鲜多久。
+        """
+        from humanoid.link import SocialSignals
+
+        root = self.write_signals(
+            {"ignored_streak": 4, "ttl_seconds": 120}, mtime_age=600
+        )
+        signals = SocialSignals(lambda: root)
+        # 第一次读之前用的是默认 TTL（足够宽），所以能读到并学到声明的值
+        self.assertEqual(signals.ignored_streak(), 4)
+        self.assertEqual(signals._ttl(), 120.0)
+        # 学到之后，10 分钟前的文件就该判过期
+        self.assertEqual(signals.read(), {}, "声明了 120 秒就该按 120 秒算")
 
     def test_garbage_file_does_not_crash(self):
         from humanoid.link import SocialSignals
@@ -323,6 +361,40 @@ class SignalsTest(unittest.TestCase):
         core.soma._set("social_desire", 90.0)
         core._apply_social_signals()
         self.assertEqual(core.soma.snapshot()["social_desire"], 90.0, "旧信号被重复消费了")
+
+    def test_ignored_by_uid_reads_per_role_slot(self):
+        """`ignored_by_uid` 以前把 slot（dict）当成 dict 的键，必然抛 TypeError——
+        「被冷落→好感」整条链路因此静默失效（异常在 `_apply_ignored_affection` 里被吞）。"""
+        from humanoid.link import SocialSignals
+
+        root = self.write_signals({
+            "schema": 1,
+            "ignored_streak": 2,
+            "by_bid": {"bot1": {"ignored_streak": 5, "ignored_by": {"42": 5, "43": 1}}},
+        })
+        signals = SocialSignals(lambda: root)
+        self.assertEqual(signals.ignored_by_uid("42", "bot1"), 5)
+        self.assertEqual(signals.ignored_by_uid("43", "bot1"), 1)
+        self.assertEqual(signals.ignored_by_uid("99", "bot1"), 0)
+        # 角色级 streak 要按角色取，别读多 Bot 下被冻结的顶层值。
+        self.assertEqual(signals.ignored_streak("bot1"), 5)
+        self.assertEqual(signals.ignored_streak(), 2)
+
+    def test_apply_ignored_affection_reaches_mood(self):
+        """整条「被冷落→好感」链路：信号里的 per-user 计数要真的落到好感账本。"""
+        harness = Harness()
+        core = harness.roles.get_or_create("bot1")
+        root = harness.root / "plugin_data" / SOCIAL_PLUGIN_DIR_NAME
+        root.mkdir(parents=True, exist_ok=True)
+        (root / SIGNALS_FILE_NAME).write_text(json.dumps({
+            "schema": 1, "ignored_streak": 3,
+            "by_bid": {"bot1": {"ignored_streak": 3, "ignored_by": {"42": 3}}},
+        }), encoding="utf-8")
+        core.mood.profile("42")
+        before = float(core.mood.profile("42")["affection"])
+        core._apply_ignored_affection()
+        after = float(core.mood.profile("42")["affection"])
+        self.assertLess(after, before, "被冷落 3 次该让好感往下走")
 
     def test_ignored_streak_is_recorded_but_never_scripted(self):
         """被冷落要记进身体（给契约/诊断用），但不许变成台词或「所以别先开口」。"""
