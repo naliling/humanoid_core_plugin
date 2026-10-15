@@ -914,6 +914,22 @@ class ScheduleService:
     ONGOING_KEY = "ongoing_tasks"
     ONGOING_MAX = 3
     ONGOING_TTL_DAYS = 4
+    # 昨天那份日程存哪儿：跨天时 `daily_schedule` 被今天的第一段覆盖，昨天做了什么
+    # 就没了着落。留一份尾部给 `_history_for_prompt` 当「昨天的收尾」。
+    PREV_DAY_KEY = "prev_day_schedule"
+    PREV_DAY_KEEP = 8
+
+    def _wall_clock(self) -> float:
+        """墙钟秒（epoch）。走**注入的时钟**：冻结时钟的测试才验证得到 TTL 过期，
+        系统时间跳变时过期判断也跟着同一台钟走。没接时钟时退回 `time.time()`。"""
+        clock = getattr(self, "_clock", None)
+        try:
+            stamp = getattr(clock, "timestamp", None)
+            if callable(stamp):
+                return float(stamp())
+            return float(clock.now().timestamp())
+        except Exception:
+            return time.time()
 
     def ongoing_tasks(self) -> list[str]:
         """她手上还没做完的那几件事（跨天跟着她）。"""
@@ -921,7 +937,7 @@ class ScheduleService:
         if not isinstance(raw, list):
             return []
         out: list[str] = []
-        cutoff = time.time() - self.ONGOING_TTL_DAYS * 86400.0
+        cutoff = self._wall_clock() - self.ONGOING_TTL_DAYS * 86400.0
         for item in raw:
             if not isinstance(item, dict):
                 continue
@@ -935,7 +951,12 @@ class ScheduleService:
         return out[: self.ONGOING_MAX]
 
     def _note_ongoing(self, slot: Slot) -> None:
-        """把这一段报的「还没做完」记下来。做完的事由模型不再报就自然过期。"""
+        """把这一段报的「还没做完」记下来。做完的事由模型不再报就自然过期。
+
+        时间戳只盖在**本次真正重报**的那一条上，其余条目保留原来的 `at`。旧写法对所有
+        条目一律写 `time.time()`（包括那些没被重报的），于是 `ONGOING_TTL_DAYS` 只对
+        「她主动停止报告」的条目生效：同一件事一直报就一直续命，别的条目也跟着续命。
+        """
         text = str((slot or {}).get("ongoing", "") or "").strip()[:40]
         if not text:
             return
@@ -945,17 +966,18 @@ class ScheduleService:
         # 堆成好几条同一件事。这里按**前六个字**归一：那是「整理那份/那份个案/写完那
         # 封」这种稳定前缀，进度部分在后面。
         stem = text[:6]
-        kept, seen_stem = [], set()
+        kept: list[dict[str, Any]] = []
         for item in items:
             what = str(item.get("what", "") or "").strip()
             if not what or what[:6] == stem:
                 continue
-            seen_stem.add(what[:6])
-            kept.append(what)
-        kept.append(text)
-        self._scope.set_self(self.ONGOING_KEY, [
-            {"what": w, "at": time.time()} for w in kept[-self.ONGOING_MAX:]
-        ])
+            try:
+                at = float(item.get("at", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                at = 0.0
+            kept.append({"what": what, "at": at})
+        kept.append({"what": text, "at": self._wall_clock()})
+        self._scope.set_self(self.ONGOING_KEY, kept[-self.ONGOING_MAX :])
         self._scope.mark_dirty()
 
     def current_slots(self) -> list[Slot]:
@@ -1122,9 +1144,14 @@ class ScheduleService:
 
         没有结转时不在这里生成——今天的第一段由后台循环按到期规则现决定，
         昨天那份留在原地当 prompt 的上下文（「昨天的收尾」）。
+
+        有结转时昨天那份**不丢**：先挪到 `prev_day_schedule` 再覆盖。旧写法直接
+        `daily_schedule=[slot]`，昨天做了什么当场消失，`_history_for_prompt` 的
+        「昨天的收尾」分支（它按 `today_date` 判断）也就永远不可达。
         """
         if str(self._scope.get_self("today_date", "") or "") == today:
             return
+        previous = self._stored_slots()
         carry = self._scope.get_self(CARRY_KEY)
         if not isinstance(carry, dict) or not carry:
             return
@@ -1140,11 +1167,21 @@ class ScheduleService:
             "emotion": str(carry.get("emotion") or "沉睡"),
             "energy_rate": clamp_rate(carry.get("energy_rate", 0.15)),
         }
-        self._scope.update_self(
-            today_date=today,
-            daily_schedule=[slot],
-            **{CARRY_KEY: None},
-        )
+        updates: dict[str, Any] = {
+            "today_date": today,
+            "daily_schedule": [slot],
+            CARRY_KEY: None,
+        }
+        if previous:
+            updates[self.PREV_DAY_KEY] = previous[-self.PREV_DAY_KEEP :]
+        self._scope.update_self(**updates)
+
+    def _prev_day_slots(self) -> list[Slot]:
+        """昨天那份日程的尾部（跨天时由 `_migrate_new_day` 留下）。"""
+        stored = self._scope.get_self(self.PREV_DAY_KEY)
+        if not isinstance(stored, list):
+            return []
+        return [slot for slot in stored if isinstance(slot, dict)]
 
     def _history_for_prompt(self) -> tuple[list[Slot], str]:
         """生成 prompt 用的「最近过完的段」：今天的不够看就接昨天的收尾。"""
@@ -1153,12 +1190,20 @@ class ScheduleService:
         today = self._clock.today_str()
         if str(self._scope.get_self("today_date", "") or "") == today:
             segs = self.segments()
-            note = "今天到这会她已经过完的时段"
             done = [
                 slot for slot in segs
                 if (parse_time(slot.get("end")) or 0) <= minutes
             ]
-            return done, note
+            if done:
+                return done, "今天到这会她已经过完的时段"
+            # 今天还没过完任何一段（刚跨过零点、结转的那截觉还罩着现在）：接上昨天的
+            # 收尾。旧写法这里返回空表——而它本来的「昨天」分支因为有结转时
+            # `_migrate_new_day` 已经把 `today_date` 改成今天而不可达，于是跨年夜
+            # 之后的第一段 prompt 里 `history_block` 只有一条睡眠段。
+            previous = self._prev_day_slots()
+            if previous:
+                return previous, "昨天的收尾（刚跨过零点）"
+            return done, "今天到这会她已经过完的时段"
         stored = self._stored_slots()
         return stored, "昨天的收尾（刚跨过零点）"
 
@@ -1203,16 +1248,19 @@ class ScheduleService:
         self._last_interrupt_at = t
         self._interrupt_at = t
 
-    def _fresh_interruption(self) -> bool:
+    def _fresh_interruption(self, *, clear: bool = True) -> bool:
         """有没有还新鲜（未过期）的待处理「来访」；过期的顺手清掉。
 
         不设保鲜期时，标记可以一睡几个小时（睡着时不被消费）或卡在闸门后面，
         等到下一次重排才被取用——那时提示词里那句「刚刚有人来找她」就是假话。
+
+        `clear=False` 供只读路径（`_due_peek`）用：连「把过期标记置 0」这个写操作都不做。
         """
         if self._interrupt_at <= 0:
             return False
         if self._monotonic() - self._interrupt_at > INTERRUPT_TTL_SECONDS:
-            self._interrupt_at = 0.0
+            if clear:
+                self._interrupt_at = 0.0
             return False
         return True
 
@@ -1229,7 +1277,23 @@ class ScheduleService:
         return ts
 
     def refresh_due(self) -> bool:
-        """该不该决定下一段：没段/这一段过完了/身体打架/刚被打断/还没排上大模型/掷中骰子。"""
+        """该不该决定下一段：没段/这一段过完了/身体打架/刚被打断/还没排上大模型/掷中骰子。
+
+        **会写状态**（掷骰子、清过期的「来访」）。只读查询请用 `_due_peek()`。
+        """
+        return self._due(roll=True)
+
+    def _due_peek(self) -> bool:
+        """`refresh_due()` 的**只读**版本，给 `status()` 这类查询用。
+
+        `refresh_due()` 经 `_roll_change()` 会写 `_roll_window`/`_roll_hit`，而
+        `status()` 在每条消息组 prompt 的路径上都会被调到 —— 用户在 15 分钟决策窗里
+        说一句话就把本窗的「临时改主意」骰子吃掉，且结果缓存到窗口结束。这里只**读**
+        本窗已经掷出的结果（还没掷过就是 False），也不清过期的「来访」标记。
+        """
+        return self._due(roll=False)
+
+    def _due(self, *, roll: bool) -> bool:
         cfg = self.config
         segs = self.segments()
         if not segs:
@@ -1259,14 +1323,24 @@ class ScheduleService:
         # 所以一天下来每段都像排好的任务，从来没有中途变过。
         # 只有走大模型日程时才有意义：纯模板兜底没有「让模型改主意」这一层，
         # 放它进来只会白白重排一次模板。
-        if cfg.use_llm_schedule and self._fresh_interruption() and self._gate_allows():
+        if cfg.use_llm_schedule and self._fresh_interruption(clear=roll) and self._gate_allows():
             return True
         if cfg.use_llm_schedule and self.source != SOURCE_LLM:
             # 本地兜底段还占着位：尽快让大模型接手（退避会挡住砸模型的频率）。
             due = True
-        else:
+        elif roll:
             due = self._roll_change()
+        else:
+            due = self._roll_peek()
         return due and self._gate_allows()
+
+    def _roll_peek(self) -> bool:
+        """本窗已经掷出的骰子；本窗还没掷过就是 False（只读路径不替它掷）。"""
+        interval = max(60, int(self.config.schedule_refresh_minutes) * 60)
+        window = int(self._clock.now().timestamp() // interval)
+        if window != self._roll_window:
+            return False
+        return self._roll_hit
 
     def _roll_change(self) -> bool:
         """概率重估：每个决策窗掷一次骰子，本窗内结果保持不变。"""
@@ -1326,6 +1400,10 @@ class ScheduleService:
 
         模型不可用、未配置或还在退避期时：手上没有能接着做的段就按身体现算一段
         （不留白）；有段就先做着手上的事，等退避过去再让模型接手。
+
+        **模型调用在锁外**：它带超时与重试（多 provider 链最坏 ≈ 超时 × 尝试次数 ×
+        provider 数），持锁期间任何并发 `ensure_fresh` 都得排队，一条 `/日程` 强制刷新
+        可能排在一次卡住的生成后面等几分钟。锁只覆盖「读状态 → 决策」与「写回」两段。
         """
         cfg = self.config
         now = self._clock.now()
@@ -1333,6 +1411,11 @@ class ScheduleService:
         today = self._clock.today_str()
 
         async with self._lock:
+            # 单飞闸：模型调用挪到锁外之后，没有这道闸，10 个并发 `ensure_fresh`
+            # 会各调一次模型（旧实现靠持锁串行化 + 第二次 refresh_due() 返回 False
+            # 才只有一个真的去调）。
+            if self._generating:
+                return False
             # 拿锁期间可能已被别的路径决定过：再确认一次。
             if not force and not self.refresh_due():
                 return False
@@ -1345,27 +1428,41 @@ class ScheduleService:
                 if lo is not None:
                     elapsed = max(0, minutes - lo)
 
-            slot: Slot | None = None
-            if cfg.use_llm_schedule and self.gateway is not None:
-                if force or ignore_cooldown or self.retry_after <= 0:
-                    # 「这次是不是被人打断触发的」只在**真的要去生成**时才取走；
-                    # 退避中不取，留到下一轮。取走时拿到原始时间戳，被闸门挡回时
-                    # 原样还回（不重新计时，保鲜期才拦得住无限续命）。
-                    interrupted_ts = self._consume_interruption()
-                    slot = await self._generate_segment(
-                        cfg, now, minutes, prev, elapsed, ignore_cooldown,
-                        interrupted_ts=interrupted_ts,
-                    )
-            if slot is None and (active is None or force or not cfg.use_llm_schedule):
-                slot = dynamic_segment(
-                    cfg, self._body_snapshot(), now_minute=minutes,
-                    step=cfg.granularity_minutes, prev=prev, seed=self._seed(),
+            attempt_llm = bool(
+                cfg.use_llm_schedule
+                and self.gateway is not None
+                and (force or ignore_cooldown or self.retry_after <= 0)
+            )
+            interrupted_ts = 0.0
+            if attempt_llm:
+                # 「这次是不是被人打断触发的」只在**真的要去生成**时才取走；
+                # 退避中不取，留到下一轮。取走时拿到原始时间戳，被闸门挡回时
+                # 原样还回（不重新计时，保鲜期才拦得住无限续命）。
+                interrupted_ts = self._consume_interruption()
+
+        slot: Slot | None = None
+        if attempt_llm:
+            self._generating = True
+        try:
+            if attempt_llm:
+                slot = await self._generate_segment(
+                    cfg, now, minutes, prev, elapsed, ignore_cooldown,
+                    interrupted_ts=interrupted_ts,
                 )
-                self._set_source(SOURCE_TEMPLATE)
-            if slot is None:
-                return False
-            self._append_segment(slot, today)
-            return True
+            async with self._lock:
+                if slot is None and (active is None or force or not cfg.use_llm_schedule):
+                    slot = dynamic_segment(
+                        cfg, self._body_snapshot(), now_minute=minutes,
+                        step=cfg.granularity_minutes, prev=prev, seed=self._seed(),
+                    )
+                    self._set_source(SOURCE_TEMPLATE)
+                if slot is None:
+                    return False
+                self._append_segment(slot, today)
+                return True
+        finally:
+            if attempt_llm:
+                self._generating = False
 
     def _fail_backoff(self, cfg: HumanoidConfig) -> None:
         backoff = max(MIN_RETRY_BACKOFF_SECONDS, float(cfg.schedule_provider_cooldown_minutes) * 60)
@@ -1499,13 +1596,23 @@ class ScheduleService:
         - 睡觉跨午夜：今天截到 24:00，剩下的结转到明天（`segment_carry`）。
         """
         segs = self.segments()
-        minutes = self._clock.now().hour * 60 + self._clock.now().minute
+        now = self._clock.now()
+        minutes = now.hour * 60 + now.minute
+        # 日程可能乱序（carry 拼接、旧版整表迁移、`_migrate_new_day` 的部分写入）：
+        # `_covering` 取**第一个**命中，而下面的截断原本盲取 `segs[-1]`，两者不是同一段
+        # 时会截错段、留下重叠（`active_segment`/`day_phrases` 于是看错她在做什么）。
+        # 先按起点排序，再显式定位「覆盖现在的那一段」。
+        segs.sort(key=lambda item: parse_time(item.get("start")) or 0)
         previous = self._covering(segs, minutes) or (segs[-1] if segs else None)
+        target = next(
+            (index for index, item in enumerate(segs) if item is previous),
+            len(segs) - 1,
+        )
 
         carry_end = str(slot.pop("carry_end", "") or "")
         new_start = parse_time(slot.get("start"))
         if segs and new_start is not None:
-            last = dict(segs[-1])
+            last = dict(segs[target])
             hi = parse_time(last.get("end"))
             lo = parse_time(last.get("start"))
             if hi is not None and lo is not None:
@@ -1513,13 +1620,13 @@ class ScheduleService:
                     # 她提前结束去做别的：收到新段起点，不留重叠。
                     if new_start > lo:
                         last["end"] = format_time(new_start)
-                        segs[-1] = last
+                        segs[target] = last
                     else:
                         # 上一段刚开始就被换掉：它没有存在过，丢掉比留一条零长度记录干净。
-                        segs.pop()
+                        segs.pop(target)
                 elif hi < new_start and new_start - hi <= SEGMENT_GAP_MERGE_MINUTES:
                     last["end"] = format_time(new_start)
-                    segs[-1] = last
+                    segs[target] = last
 
         # 接着做同一件事：并回上一段，不拆成两条「上午在改海报」
         installed = slot
@@ -1531,6 +1638,13 @@ class ScheduleService:
             ):
                 last["end"] = slot.get("end")
                 last["energy_rate"] = slot.get("energy_rate", last.get("energy_rate"))
+                # 同一件事接着做时，新一段的 location/emotion/ongoing 是**更新过的**
+                # （「专注」→「有点累」、「还差 4 份」→「还差 2 份」）。旧写法只同步
+                # `end`/`energy_rate`，于是进度文字永远停在第一版，`_note_ongoing(installed)`
+                # 拿到的也是旧段。
+                for key in ("location", "emotion", "ongoing", "wants"):
+                    if key in slot:
+                        last[key] = slot[key]
                 segs[-1] = last
                 installed = last
 
@@ -1615,7 +1729,7 @@ class ScheduleService:
             "last_error": self.last_error,
             "generating": self.generating,
             "retry_after": self.retry_after,
-            "due": self.refresh_due(),
+            "due": self._due_peek(),
             "pending_today": str(self._scope.get_self("today_date", "") or "") != today,
         }
 

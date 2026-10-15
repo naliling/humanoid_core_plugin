@@ -85,6 +85,78 @@ class SchemaTest(unittest.TestCase):
             self.assertIn(key, self.schema)
 
 
+class SliderKeyTest(unittest.TestCase):
+    """钉住「区间声明」与「面板真正认的键」不许漂移。
+
+    AstrBot 的配置渲染器（`webui/assets/ProviderSelectMenu-*.js`）在写回配置时
+    收到的是 `const q = itemMeta?.slider; if (q) return Math.max(q.min ?? 0,
+    Math.min(q.max ?? 100, v)); return v` —— **没有 slider 就原样放行**。
+    `minimum`/`maximum` 前端一个都不读，后端也不校验。
+
+    所以区间必须同时落在这两处：`minimum`/`maximum`（本仓库把这里当唯一真源）
+    与 `slider`。任何一边单独改动，都会让「面板显示的范围」与「实际生效的范围」
+    对不上，而面板还会悄悄放行越界值。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    def _ranged(self):
+        for key, meta in self.schema.items():
+            if meta.get("type") not in {"int", "float"}:
+                continue
+            if not isinstance(meta.get("minimum"), (int, float)):
+                continue
+            if not isinstance(meta.get("maximum"), (int, float)):
+                continue
+            yield key, meta
+
+    def test_every_declared_range_also_reaches_the_panel(self):
+        missing = [key for key, meta in self._ranged() if "slider" not in meta]
+        self.assertEqual(missing, [], "声明了区间却没有 slider，面板根本不钳制")
+
+    def test_slider_matches_the_declared_range(self):
+        for key, meta in self._ranged():
+            with self.subTest(key=key):
+                slider = meta.get("slider")
+                self.assertIsInstance(slider, dict)
+                self.assertEqual(set(slider), {"min", "max", "step"})
+                self.assertEqual(slider["min"], meta["minimum"])
+                self.assertEqual(slider["max"], meta["maximum"])
+
+    def test_range_is_wide_enough_to_slide(self):
+        for key, meta in self._ranged():
+            with self.subTest(key=key):
+                self.assertLess(
+                    meta["minimum"], meta["maximum"], "区间退化成一个点，滑块没有意义"
+                )
+
+    def test_slider_step_is_usable(self):
+        for key, meta in self._ranged():
+            with self.subTest(key=key):
+                slider = meta["slider"]
+                span = meta["maximum"] - meta["minimum"]
+                self.assertGreater(slider["step"], 0)
+                self.assertLessEqual(slider["step"], span)
+                if meta["type"] == "int":
+                    self.assertEqual(
+                        slider["step"],
+                        int(slider["step"]),
+                        "int 项的滑块步长必须还是整数，否则滑块会产出一串小数",
+                    )
+
+    def test_default_sits_inside_the_slider(self):
+        for key, meta in self._ranged():
+            value = meta.get("default")
+            if not isinstance(value, (int, float)):
+                continue
+            with self.subTest(key=key):
+                slider = meta["slider"]
+                self.assertGreaterEqual(value, slider["min"])
+                self.assertLessEqual(value, slider["max"])
+
+
 class DefaultMigrationTest(unittest.TestCase):
     """AstrBot 只补缺不覆盖，所以旧默认值必须靠插件自己提升一次。"""
 
@@ -167,3 +239,55 @@ class ReadmeCommandsMatchCode(unittest.TestCase):
         readme = (SCHEMA_PATH.parent / "README.md").read_text(encoding="utf-8")
         bad = re.findall(r"`/拟人 (状态|日程|时间|好感度|情绪详情|情绪日志|叫我|帮助)`", readme)
         self.assertEqual(bad, [], f"README 仍写着已拆掉的旧指令：{bad}")
+
+
+class SchemaHintsAndBoundsTest(unittest.TestCase):
+    """hint / minimum / maximum 必须与代码实际行为一致。
+
+    面板显示的值与代码生效的值是两份时，用户没有任何线索能发现——所以这几条
+    不是文案洁癖，是「用户看到的范围必须是他真能拿到的范围」。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.raw = SCHEMA_PATH.read_text(encoding="utf-8")
+        cls.schema = json.loads(cls.raw)
+
+    def test_no_replacement_characters_anywhere(self):
+        """`admin_qq` 的 hint 里曾有 3 个 U+FFFD（一个汉字的 UTF-8 三字节被打坏）。"""
+        self.assertNotIn("\ufffd", self.raw, "schema 里还有乱码替换字符")
+
+    def test_admin_qq_hint_is_readable_chinese(self):
+        self.assertEqual(self.schema["admin_qq"]["hint"], "能发管理指令的 QQ 名单")
+
+    def test_floors_match_the_code_clamps(self):
+        """0 冻住全部情绪、1 关掉「连续才扣好感」：两者都曾是面板上的合法值。"""
+        for key, floor in (("mood_sensitivity", 1), ("mood_negative_streak_required", 2)):
+            with self.subTest(key=key):
+                self.assertEqual(self.schema[key]["minimum"], floor)
+                self.assertEqual(getattr(HumanoidConfig.from_raw({key: floor}), key), floor)
+
+    def test_rate_field_maxima_match_the_hint_magnitude(self):
+        """hint 写 0.05~1.0 而 maximum 是 100：面板放行、代码原样采用，hint 就是假的。"""
+        for key, top in (
+            ("social_energy_consumption_per_msg", 1.0),
+            ("social_energy_recovery_per_minute", 3.0),
+            ("energy_natural_recovery_per_minute", 0.9),
+            ("energy_consumption_per_msg", 0.9),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(self.schema[key]["maximum"], top)
+                self.assertEqual(getattr(HumanoidConfig.from_raw({key: top}), key), top)
+
+    def test_night_window_hints_explain_equal_hours(self):
+        """起止相同 = 没有夜里（不是「全天算夜里」），面板必须说出来。"""
+        for key in ("night_start_hour", "night_end_hour"):
+            with self.subTest(key=key):
+                self.assertIn("相同", self.schema[key]["hint"])
+                self.assertIn("关闭夜间窗口", self.schema[key]["hint"])
+
+    def test_affection_override_hint_teaches_one_entry_per_line(self):
+        """list 编辑器一个条目就是一条：教「一个条目里用逗号分隔」会让两条一起失效。"""
+        hint = self.schema["mood_affection_override"]["hint"]
+        self.assertIn("每个条目", hint)
+        self.assertNotIn("逗号分隔", hint)

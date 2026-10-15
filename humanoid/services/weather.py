@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable, Awaitable
-from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -25,7 +25,11 @@ RETRY_BACKOFF_MAX_SECONDS = 3600.0
 
 # 还没拿到真天气时 snapshot() 给的是「为什么没有天气」的说明书。这类句子是给主人
 # 看的，不能当状态递出去：模型与社交层会把它当成一句天气话接着说。
-NOTICE_WORDS = ("未填", "未开启", "获取中", "没配天气")
+#
+# 判据的主路径是 `snapshot()` 的 `notice` 字段（见它的 docstring）；这个黑名单是
+# `link.py` 那类**只拿到 env 字符串**的调用方的兜底，所以必须覆盖 `_notice()` 的
+# 每一句文案——「天气数据过期了」「天气还没取到」曾经漏在里面，被当成真天气导出。
+NOTICE_WORDS = ("未填", "未开启", "获取中", "没配天气", "过期", "还没取到")
 
 
 def is_notice(text: str) -> bool:
@@ -64,7 +68,10 @@ class WeatherService:
         # 上一次失败后按指数退避，别每条消息都去撞接口。
         self._inflight = False
         self._fail_streak = 0
-        self._next_attempt_at: datetime | None = None
+        # 退避到期的时刻，**单调钟**秒（不是墙钟 datetime）：系统时间被回拨一小时时
+        # 墙钟会把退避拉长到一小时以上，天气在两小时内都不再尝试，而 `snapshot()`
+        # 同时把缓存判过期 → 注入里一直说「天气数据过期了」。
+        self._next_attempt_at: float | None = None
 
     @property
     def config(self) -> HumanoidConfig:
@@ -154,7 +161,7 @@ class WeatherService:
         """
         if self._inflight or not self.is_stale():
             return False
-        if self._next_attempt_at is not None and self._clock.now() < self._next_attempt_at:
+        if self._next_attempt_at is not None and time.monotonic() < self._next_attempt_at:
             return False
         return True
 
@@ -170,7 +177,7 @@ class WeatherService:
             RETRY_BACKOFF_BASE_SECONDS * (2 ** (self._fail_streak - 1)),
             RETRY_BACKOFF_MAX_SECONDS,
         )
-        self._next_attempt_at = self._clock.now() + timedelta(seconds=delay)
+        self._next_attempt_at = time.monotonic() + delay
 
     async def refresh_async(self, force: bool = False) -> bool:
         cfg = self.config

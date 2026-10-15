@@ -24,11 +24,12 @@
 from __future__ import annotations
 
 from . import relstage
-import logging
 import math
 import re
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from astrbot.api import logger
 
 if TYPE_CHECKING:
     from .core_instance import HumanoidCoreInstance
@@ -45,8 +46,6 @@ from .wording import (
     pick,
     scale_word,
 )
-
-logger = logging.getLogger(__name__)
 
 _CJK_RANGES = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]")
 
@@ -74,6 +73,16 @@ _NAME_KEEP = re.compile(
 # 名字用不到这么长；封顶同时压缩"用一长串汉字拼出一句指令"的空间。
 _NAME_MAX_CHARS = 16
 
+# 名字里出现这些词就弃用、退回代词。名字会被**替换进句子**（「她今天有点累」→
+# 「小雨今天有点累」），名字自己含代词就会替换出「小小雨今天…」这种句子。
+# 原来只挡「她 / 你 / TA」，漏了「他 / 我 / 它 / 您」——同一条替换路径，同样会被替换坏。
+_NAME_PRONOUNS = ("她", "他", "你", "我", "它", "您", "TA")
+
+# 只认**独立成词**的「她」：`其他` / `他人` 里的那个字是构词成分，不是代词。
+# 原来 `_personalize` 是 `text.replace("她", name, 1)`，任何含「她」的词都会被改坏
+# （「其他人都说她温柔」→「其小雨人都说小雨温柔」）。
+_SHE_STANDALONE_RE = re.compile(r"(?<!其)她")
+
 
 def sanitize_name(raw: str) -> str:
     """任何要拼进上下文的「名字」都从这里过一遍。
@@ -85,7 +94,7 @@ def sanitize_name(raw: str) -> str:
     """
     original = str(raw or "")
     name = _NAME_KEEP.sub("", original).strip()
-    if not name or "她" in name or "你" in name or "TA" in name:
+    if not name or any(pronoun in name for pronoun in _NAME_PRONOUNS):
         if original.strip():
             logger.debug("名字含代词或清洗后为空，已弃用、退回代词：%r", original)
         return ""
@@ -94,6 +103,20 @@ def sanitize_name(raw: str) -> str:
         name = name[:_NAME_MAX_CHARS]
     if name != original.strip():
         logger.debug("名字含不安全字符，已清洗：%r -> %r", original, name)
+    return name
+
+
+def clean_label(raw: str) -> str:
+    """把**只当标签用**的外部字符串（群名片、昵称）清成一行安全文本。
+
+    与 `sanitize_name` 同一套字符白名单与长度上限，但**不做代词弃用**：代词黑名单是为
+    「名字会被替换进句子」准备的，而标签只当 `f"{who}：{body}"` 的前缀、不参与替换，
+    弃用只会让归属行整个消失（`TA：…` 退化成裸文本，模型又分不清在回谁）。
+    """
+    original = str(raw or "")
+    name = _NAME_KEEP.sub("", original).strip()
+    if len(name) > _NAME_MAX_CHARS:
+        name = name[:_NAME_MAX_CHARS]
     return name
 
 
@@ -328,10 +351,23 @@ class PromptBuilder:
             feelings = core.soma.feelings(float(core.energy.energy))
         except Exception:
             return []
-        picked = [item for item in feelings if item[0] >= threshold]
+        try:
+            items = list(feelings)
+        except TypeError:
+            return []
+        picked: List[tuple[float, str]] = []
+        for item in items:
+            # soma 返回的是 (显著度, 文本) 二元组。形状不对就跳过**这一条**，
+            # 而不是让一个坏元素把整轮体感（乃至整条注入）带走。
+            try:
+                score, text = float(item[0]), str(item[1])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            if score >= threshold:
+                picked.append((score, text))
         if not self.config.show_sleep_window:
             # 「她这会儿在睡」也是睡眠信息：关掉不提睡眠时段，就不能换句话又说她在睡。
-            picked = [item for item in picked if "在睡" not in item[1]]
+            picked = [(score, text) for score, text in picked if "在睡" not in text]
         picked.sort(key=lambda item: item[0], reverse=True)
         # 体感句一律披上主语，但 soma 自己带主语的整句不能再披一遍。
         return [
@@ -363,7 +399,13 @@ class PromptBuilder:
                 snap = core.soma.snapshot()
             except Exception:
                 snap = {}
-            if float(snap.get("asleep", 0.0)) >= 1.0:
+            try:
+                asleep_now = float(snap.get("asleep", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                # 快照里这一项坏了不该让整段背景消失（原来这个 float 在 try 之外，
+                # 一抛异常就顺着调用栈把整轮注入带走）。
+                asleep_now = 0.0
+            if asleep_now >= 1.0:
                 return []
             # 到点了但还醒着：说「她在睡」是假话，熬夜的人这个点正精神。
             lines.append("这会儿是她的睡眠时段")
@@ -569,9 +611,19 @@ class PromptBuilder:
             snap = core.soma.snapshot()
         except Exception:
             snap = {}
-        if snap.get("asleep", 0.0) < 1.0:
-            wake = float(core.soma.data.get("last_wake_at", 0.0) or 0.0)
-            slept = float(snap.get("last_sleep_hours", 0.0) or 0.0)
+        try:
+            asleep_now = float(snap.get("asleep", 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            asleep_now = 0.0
+        if asleep_now < 1.0:
+            try:
+                wake = float(core.soma.data.get("last_wake_at", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                wake = 0.0
+            try:
+                slept = float(snap.get("last_sleep_hours", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                slept = 0.0
             if wake > 0 and slept >= 0.5:
                 mins = (_core_epoch(self._core) - wake) / 60.0
                 if 0 < mins <= 90:
@@ -710,9 +762,16 @@ class PromptBuilder:
             snap = self._core.soma.snapshot()
         except Exception:
             return ""
-        if snap.get("asleep", 0.0) >= 1.0:
+        try:
+            asleep_now = float(snap.get("asleep", 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            asleep_now = 0.0
+        if asleep_now >= 1.0:
             return ""
-        slept = float(snap.get("last_sleep_hours", 0.0) or 0.0)
+        try:
+            slept = float(snap.get("last_sleep_hours", 0.0) or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            slept = 0.0
         if 0 < slept < 6.0:
             return f"昨晚只睡了{slept:.0f}小时"
         return ""
@@ -765,8 +824,16 @@ class PromptBuilder:
         seconds = data.get("gap_seconds")
         seed = self._seed(user_id)
         lines: List[str] = []
+        gap = ""
         if seconds is not None:
-            gap = humanize_gap(float(seconds))
+            # 与下面「几天没说话」那段同一个口径：这个值来自事件数据，坏掉时按
+            # 「没有准确隔时」退回 EVENT_TEXT 那句，而不是让异常顺着调用栈
+            # 把整轮注入带走（这一句就在注入热路径上，且不在任何 try 里）。
+            try:
+                gap = humanize_gap(float(seconds))
+            except (TypeError, ValueError):
+                gap = ""
+        if gap:
             lines.append(pick("since", seed, SINCE_WORDS).format(gap=gap))
         else:
             lines.append(EVENT_TEXT.get(event_type) or "最近出现了交流变化")
@@ -1045,7 +1112,10 @@ class PromptBuilder:
             # 情绪句例外：它是独立的内心独白，每次都该叫得出名字（「小雨内心：心里有点堵」），
             # 否则句首又冒出一个「她」，读者得回头去猜这是谁。
             text = text.replace("她内心：", f"{name}内心：", 1)
-            text = text.replace("她", name, 1)
+            # 只替换**独立成词**的第一个「她」——盲替换单个汉字会把「其他」改成「其小雨」。
+            match = _SHE_STANDALONE_RE.search(text)
+            if match:
+                text = text[: match.start()] + name + text[match.end() :]
         return text
 
 
@@ -1075,6 +1145,10 @@ def _short_weather(weather: Dict[str, Any]) -> str:
     天气没有温度等于没说。句子长度改由天气服务自己控制（见 parse_payload）。
     """
 
+    if not isinstance(weather, dict):
+        # 快照里这一项坏了（None / 字符串）时返回空串，而不是让整段背景消失：
+        # 这里原来是裸的 `weather.get(...)`，非 dict 直接 AttributeError。
+        return ""
     if weather.get("notice"):
         return ""
     env = str(weather.get("env", "")).strip()

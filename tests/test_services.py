@@ -554,7 +554,12 @@ class SocialEnergyTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(service.value, 100.0)
 
     async def test_never_exceeds_bounds(self):
-        service, store, _ = self.build(cfg(social_energy_consumption_per_msg=200.0))
+        # v2.27.28：social_energy_consumption_per_msg 的钳制上限从 100 收到 hint 量级 1.0
+        # （D6 决策：把明显过宽的钳制上限收到 hint 声明的量级），所以不能再靠 200 一条打到底。
+        # 改成「先把今天标上、再把能量压到低于一次消耗量」，验证的仍是同一个不变量：下限钳到 0、上限钳到 100。
+        service, store, _ = self.build(cfg(social_energy_consumption_per_msg=1.0))
+        service.maybe_daily_reset()          # consume_for_message 内部会先 maybe_daily_reset，先调一次免得 0.5 被日重置覆盖
+        store.data["social_energy"] = 0.5    # 低于一次消耗量，验证下限钳制
         service.consume_for_message()
         self.assertEqual(service.value, 0.0)
         service.recover(10_000)
@@ -911,13 +916,47 @@ class ProactiveSilenceCostsAffection(unittest.TestCase):
                         "streak 涨到 5 时该再扣一次")
 
     def test_it_can_really_go_down_but_stays_above_zero(self):
-        """掉到 0 是可能的，但不该轻轻一下就归零——那不像记仇，像迁怒。"""
-        svc = self._svc(50)
+        """掉到 0 是可能的，但不该轻轻一下就归零——那不像记仇，像迁怒。
+
+        v2.28.9：负向补了每日净损封顶（`DAILY_NET_LOSS_CAP`），**日上限是这次修复
+        引入的**，所以本用例改成两段跨天验证。原写法把 39 次 `note_ignored_by_peer`
+        全压在同一时刻再断言 50 → <25，那恰好是在断言「负向没有日闸」这个旧行为
+        （生产里 39 次冷落本来就跨很多天）。
+
+        1. 同一自然日里连打 39 次：最多掉 `DAILY_NET_LOSS_CAP × LEDGER_NEGATIVE_AMPLIFY`
+           = 6.5 × 1.2 = 7.8，**日上限成立**；
+        2. 冷落持续到跨天（每 4 小时一次、每天 6 次，单日 6 × 0.85 = 5.1 < 6.5，日闸
+           不咬，掉的是账本积累）：39 次之后 50 → 20.4，**长期确实会掉下去**。
+           节奏必须跑赢账本时衰（半衰期 168h）：一天一次的话均衡只到 39 上下，
+           一天 12 次又会被日闸截住（27.7）——「连着不理」才压得下来，这是设计意图。
+        """
+        from humanoid.services import mood as M
+
+        t = MoodTest("test_profile_uses_configured_initials")
+        t.setUp()
+
+        # 1) 同一自然日：日上限成立。
+        svc, _store, _log = t.build(cfg(mood_initial_affection=50))
+        svc.profile("1")
         for k in range(1, 40):
             svc.note_ignored_by_peer("1", k)
-        got = svc.profile("1")["affection"]
-        self.assertGreaterEqual(got, 0.0)
-        self.assertLess(got, 25.0, f"连着 39 次没回只掉到 {got:.1f}，太温和了")
+        same_day = svc.profile("1")["affection"]
+        ceiling = M.DAILY_NET_LOSS_CAP * M.LEDGER_NEGATIVE_AMPLIFY
+        self.assertGreaterEqual(
+            same_day, 50.0 - ceiling - 1e-6,
+            f"单日 39 次冷落掉了 {50.0 - same_day:.1f}，超过日上限 {ceiling}",
+        )
+
+        # 2) 跨天持续：长期确实会掉下去（换一份干净的档案，时间重新起算）。
+        svc, _store, _log = t.build(cfg(mood_initial_affection=50))
+        svc.profile("1")
+        for k in range(1, 40):
+            svc.note_ignored_by_peer("1", k)
+            t.time_value += 4 * 3600.0
+        long_run = svc.profile("1")["affection"]
+        self.assertGreaterEqual(long_run, 0.0)
+        self.assertLess(long_run, 25.0,
+                        f"跨天持续冷落 39 次只掉到 {long_run:.1f}，太温和了")
 
     def test_ignored_is_not_the_same_as_insulted(self):
         """被冷落记的是「有点冷」，不是「很敷衍」——它们轻重不同。"""

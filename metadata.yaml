@@ -1,4 +1,4 @@
-﻿name: astrbot_plugin_humanoid_core
+name: astrbot_plugin_humanoid_core
 display_name: 人形化伴侣插件
 short_desc: 人设是一句话，日子是一整天。
 desc: |
@@ -16,7 +16,7 @@ desc: |
   要长期记忆请另配记忆插件。
 
   使用轻量 配置不复杂 需要调的东西就一些 额外的都标上【进阶】。
-version: 2.27.27
+version: 2.27.30
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"

@@ -844,3 +844,51 @@ class DailyBudgetSurvivesRestart(unittest.TestCase):
         g = self._gate(ledger)
         self.assertEqual(g.used_today, 0)
         self.assertTrue(g.check("schedule").allowed)
+
+
+class RetryableJudgementTest(unittest.TestCase):
+    """`_is_retryable` 看的是 HTTP 状态语义，不是错误文本里的裸数字。
+
+    原来用 `\\b(400|401|403|404|422)\\b` 裸扫子串，于是「重试第 400 次」「4000 字超限」
+    这类文本被判成永久失败——该重试的不重试，而且完全看不出为什么。
+    """
+
+    class _Http(Exception):
+        def __init__(self, code, message=""):
+            super().__init__(message or f"HTTP {code}")
+            self.status_code = code
+
+    def test_permanent_status_codes(self):
+        from humanoid.llm import _is_retryable
+
+        for code in (400, 401, 403, 404, 422):
+            with self.subTest(code=code):
+                self.assertFalse(_is_retryable(self._Http(code)))
+
+    def test_rate_limit_and_server_errors_are_retryable(self):
+        from humanoid.llm import _is_retryable
+
+        for code in (408, 429, 500, 502, 503):
+            with self.subTest(code=code):
+                self.assertTrue(_is_retryable(self._Http(code)))
+
+    def test_bare_numbers_in_text_are_not_status_codes(self):
+        from humanoid.llm import _is_retryable
+
+        self.assertTrue(_is_retryable(RuntimeError("重试第 400 次还是失败")), "裸数字不是状态码")
+        self.assertTrue(_is_retryable(RuntimeError("prompt 4000 字超限")))
+        self.assertTrue(_is_retryable(RuntimeError("connection reset by peer")))
+
+    def test_status_written_in_text_still_counts(self):
+        from humanoid.llm import _is_retryable
+
+        self.assertFalse(_is_retryable(RuntimeError("HTTP 400 Bad Request")))
+        self.assertFalse(_is_retryable(RuntimeError("HTTP/1.1 401 Unauthorized")))
+        self.assertTrue(_is_retryable(RuntimeError("HTTP 503 Service Unavailable")))
+
+    def test_permanent_words_without_a_status_code(self):
+        from humanoid.llm import _is_retryable
+
+        self.assertFalse(_is_retryable(RuntimeError("invalid api key")))
+        self.assertFalse(_is_retryable(RuntimeError("quota exceeded")))
+        self.assertTrue(_is_retryable(RuntimeError("timeout while reading response")))

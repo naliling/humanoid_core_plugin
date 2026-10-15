@@ -22,6 +22,13 @@ from typing import Any, Dict, Tuple
 # 任务表里的每一条：任务、停止信号、上一次上报时间。
 _Entry = Tuple[asyncio.Task, asyncio.Event]
 
+# 单次上报的超时（秒）。NapCat 连接半开时 `call_action` 会**永久挂起**，而这一路
+# 挂在 `on_llm_response` → `stop()` 上，卡住的是**回复本身**——每一步都必须有上限。
+REPORT_TIMEOUT_SECONDS = 5.0
+# `stop()` 等任务收尾的上限（秒）。`self.timeout` 是上报任务的寿命（默认 120s），
+# 拿它当收尾等待时间等于没有上限。
+STOP_WAIT_SECONDS = 2.0
+
 
 class InputStateNotifier:
     """按会话维护「正在输入」的上报任务。"""
@@ -118,7 +125,15 @@ class InputStateNotifier:
         stop_event.set()
         if not task.done():
             try:
-                await task
+                # 必须有上限：`stop()` 是在 `@filter.on_llm_response()` 里被 await 的，
+                # 这里一旦挂住，「她生成了但一直没发出去」——正好违反模块头
+                # 「任何一步出错都只记一条 debug 日志，不影响正常回复」的承诺。
+                await asyncio.wait_for(task, timeout=STOP_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                task.cancel()
+                self._log.debug(
+                    f"[humanoid_core] 输入状态任务 {STOP_WAIT_SECONDS:.0f}s 内没停下，已取消"
+                )
             except asyncio.CancelledError:
                 pass
             except Exception as exc:  # pragma: no cover - 兜底
@@ -162,7 +177,12 @@ class InputStateNotifier:
 
     async def _report(self, client: Any, user_id: str) -> None:
         try:
-            await client.call_action("set_input_status", user_id=str(user_id), event_type=1)
+            # 这一句也必须带上限：`call_action` 挂住时不是「出错」，是**卡死**，
+            # 而它会把 `on_llm_response` 钩子一起挂住（见模块头第 12-13 行的承诺）。
+            await asyncio.wait_for(
+                client.call_action("set_input_status", user_id=str(user_id), event_type=1),
+                timeout=REPORT_TIMEOUT_SECONDS,
+            )
         except Exception as exc:
             self._log.debug(f"[humanoid_core] set_input_status 失败（可能不是 NapCat）: {exc}")
             raise

@@ -26,8 +26,11 @@ v2.24.1 改了两件事，都是因为原来那套「达标就一直这样」不
 
 from __future__ import annotations
 
+import datetime
 import re
 from typing import Any, Dict, Optional, Tuple
+
+from .persona import PERSONA_PROMPT_MAX
 
 # 绝对高阈值：45/50。下面的「涨了多少」是防止初始值被设高之后天天满足。
 CCB_LIBIDO_MIN = 38.0
@@ -91,10 +94,22 @@ CCB_ENERGY_COST = 12.0
 # 原来档位从 45 起、触发也在 45，两者是配套的。触发降到 38 而档位没动的话，
 # 38~44 这一段能过门槛、却没有任何一档匹配得到——结果就是「到了该触发的时候他不触发」，
 # 比原来还糟。所以这里按 38 / 43 / 48 重排。
-_BAND_WORDS = (
-    (0.80, ("有点想离你近一点", "今天特别想挨着你")),
-    (0.92, ("想让你抱着我", "不太想一个人待着")),
-    (1.00, ("今天不想一个人", "很想让你再靠近一点")),
+_BAND_MIN_SCORE = 0.80
+# 三档的措辞。强度（score）由档数**线性推导**，不再和 floor 并排写死：
+# floor 是「什么时候能触发」（由 `bands()` 从 libido_min 推），
+# score 是「这一档有多强」（喂给 emotion 去和别的情绪池比大小）——两者不同源，
+# 写在同一行里会让人以为是同一个刻度。
+_BAND_WORD_TEXTS = (
+    ("有点想离你近一点", "今天特别想挨着你"),
+    ("想让你抱着我", "不太想一个人待着"),
+    ("今天不想一个人", "很想让你再靠近一点"),
+)
+_BAND_WORDS = tuple(
+    (
+        _BAND_MIN_SCORE + (1.0 - _BAND_MIN_SCORE) * index / max(1, len(_BAND_WORD_TEXTS) - 1),
+        words,
+    )
+    for index, words in enumerate(_BAND_WORD_TEXTS)
 )
 # 档位之间的间隔。原来写死 38/43/48，间隔 5；这里跟着走，免得以后改间距要改两处。
 _BAND_STEP = 5.0
@@ -116,25 +131,51 @@ def bands(libido_min: float) -> Tuple[Tuple[float, float, Tuple[str, ...]], ...]
     )
 
 # 从人设正文判性别。她/他在中文里足够明显；判不出来按女（Core 通篇是「她」）。
+# `他` 必须排除构词成分：`其他` / `他人` 里的那个字不是性别信号——
+# 实测裸 `他` 命中「其他」会把女角色判成男，而 ccb 只对女角色开，判错就是静默永不触发。
 _FEMALE = re.compile(r"她|少女|女孩|女子|女王|公主|姐姐|妹妹|夫人|小姐")
-_MALE = re.compile(r"他|少年|男孩|男子|国王|王子|哥哥|弟弟|先生")
+_MALE = re.compile(r"(?<!其)他(?!人)|少年|男孩|男子|国王|王子|哥哥|弟弟|先生")
 
 
 def looks_female(persona_prompt: str) -> bool:
-    """从人设正文判是不是女角色。判不出来一律当女。"""
-    head = str(persona_prompt or "")[:400]
-    if not head:
+    """从人设正文判是不是女角色。判不出来一律当女。
+
+    扫描上限跟人设注入上限（`persona.PERSONA_PROMPT_MAX`）一致，而不是只看前 400 字：
+    女性身份写在第 500 字时，原来会判成男 → ccb 静默永不触发。
+    """
+    body = str(persona_prompt or "")[:PERSONA_PROMPT_MAX]
+    if not body.strip():
         return True
-    female = len(_FEMALE.findall(head))
-    male = len(_MALE.findall(head))
+    female = len(_FEMALE.findall(body))
+    male = len(_MALE.findall(body))
     if male > female:
         return False
     return True
 
 
+def _local_utc_offset(now: float) -> float:
+    """宿主本地时区相对 UTC 的偏移（秒）。"""
+    local = datetime.datetime.fromtimestamp(now)
+    utc = datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc).replace(tzinfo=None)
+    return (local - utc).total_seconds()
+
+
 def _day_index(now: float) -> int:
-    """自然日序号。用 UTC 天数就行，只要求「跨天」这件事可靠，不要求对应本地日历。"""
-    return int(now // 86400.0)
+    """自然日序号。按**宿主本地日**算，与 llm 账本的宿主日同源。
+
+    原来直接 `int(now // 86400)`（UTC 天）：角色的一天按她的本地时区算、llm 账本按
+    宿主本地日算（`llm._roll_day` 用 `time.localtime`），这里却按 UTC 算——三方在跨日
+    时刻各差几个小时，「当天最多 8 次」会在错误的时刻重置。
+
+    做法是把时间戳先按本地 UTC 偏移平移、再取整天数：仍然是「第几天」的整数，
+    调用方直接相减的用法（`decay_satisfy` 的 `int(today - last)`）不受影响。
+    """
+    try:
+        offset = _local_utc_offset(now)
+    except (OverflowError, OSError, ValueError):
+        # 时间戳超出可表示范围（坏数据）：退回旧口径，至少保证「跨天」这件事可靠。
+        offset = 0.0
+    return int((now + offset) // 86400.0)
 
 
 def read_state(user_state: Dict[str, Any]) -> Dict[str, Any]:

@@ -11,7 +11,7 @@ MAX_ENERGY_RATE = 0.3
 
 Slot = dict[str, Any]
 
-_TIME_PATTERN = re.compile(r"^(\d{1,2})\s*[:：.：]\s*(\d{1,2})$")
+_TIME_PATTERN = re.compile(r"^(\d{1,2})\s*[:：.]\s*(\d{1,2})$")
 
 FILLER_SLOT = {
     "event": "自由活动/休息",
@@ -60,7 +60,7 @@ def parse_time(raw: Any) -> int | None:
     if minute > 59:
         return None
     total = hour * 60 + minute
-    if total < 0 or total > DAY_MINUTES:
+    if total > DAY_MINUTES:
         return None
     return total
 
@@ -87,7 +87,9 @@ def _snap(minutes: int, step: int) -> int:
         return minutes
     if minutes in (0, DAY_MINUTES):
         return minutes
-    snapped = round(minutes / step) * step
+    # 向下对齐，与 `schedule.segment_start`（655-662）同一立场：四舍五入会把起点
+    # 推到未来（20:40 对齐成 20:45），那一段就罩不住「现在」。
+    snapped = (minutes // step) * step
     return max(0, min(DAY_MINUTES, snapped))
 
 
@@ -238,13 +240,31 @@ def coverage_is_complete(slots: Iterable[Slot]) -> bool:
     return seen and cursor == DAY_MINUTES
 
 
+# 「无论怎么排都该是夜」的那一段（00:00–06:00）。生物钟夜从落在这一段里的睡眠段中
+# 挑，而不是挑最长的那一段。
+NIGHT_CORE_END_MINUTES = 6 * 60
+
+
+def _night_overlap(seg: list[int]) -> int:
+    """这一段与 00:00–06:00 的相交分钟数。
+
+    跨午夜的一觉在合并后起点可能是负数（23:00→07:00 变成 -60→420），照常相交。
+    """
+    return max(0, min(seg[1], NIGHT_CORE_END_MINUTES) - max(seg[0], 0))
+
+
 def sleep_window_minutes(slots: Iterable[Slot]) -> tuple[int, int] | None:
-    """日程里最长的那一段觉，返回 (起始分钟, 结束分钟)；跨午夜时 end < start。
+    """日程里的那一段觉，返回 (起始分钟, 结束分钟)；跨午夜时 end < start。
 
     soma 的昼夜低谷与睡眠债记账、schedule 的「她几点起」、契约导出的生物钟夜都从这里取，
     否则同一个「她的睡眠区间」会有三套算法，早上她睡着没睡就说不清了。
     模型常把一夜拆成 23:30→24:00 与 00:00→07:00 两段，所以先把首尾相接的段并起来，
     再把 24:00 与 00:00 那个缝接上。
+
+    挑选口径是**夜觉优先**：取与 00:00–06:00 相交最多的那一段，全都不相交时才退到
+    最长的那一段（值夜班、白天补觉的人也得有个窗口）。只按时长挑会让午睡顶替夜觉——
+    实测「夜 02:00–05:00 + 午睡 13:00–17:30」会把生物钟夜判成 13:00–17:30：下午五点
+    最困、凌晨三点最清醒，午睡在减债、夜觉在欠债，方向整个反过来。
     """
     segs: list[list[int]] = []
     for slot in slots or []:
@@ -252,7 +272,15 @@ def sleep_window_minutes(slots: Iterable[Slot]) -> tuple[int, int] | None:
         if is_meal_event(event) or not is_sleep_event(event):
             continue
         lo, hi = parse_time(slot.get("start")), parse_time(slot.get("end"))
-        if lo is None or hi is None or hi <= lo:
+        if lo is None or hi is None or hi == lo:
+            continue
+        if hi < lo:
+            # 跨午夜写法（`{'start': '23:00', 'end': '06:00'}`）：拆成当天的两段，
+            # 下面的接缝合并会把它们接回一条。旧写法在这里静默丢弃，于是得到
+            # 「她今天没睡」：起床点为空、生物钟夜退回配置、asleep 永远 False。
+            segs.append([lo, DAY_MINUTES])
+            if hi > 0:
+                segs.append([0, hi])
             continue
         segs.append([lo, hi])
     if not segs:
@@ -267,7 +295,7 @@ def sleep_window_minutes(slots: Iterable[Slot]) -> tuple[int, int] | None:
     if len(merged) > 1 and merged[-1][1] >= DAY_MINUTES and merged[0][0] == 0:
         merged[0][0] = merged[-1][0] - DAY_MINUTES
         merged.pop()
-    best = max(merged, key=lambda seg: seg[1] - seg[0])
+    best = max(merged, key=lambda seg: (_night_overlap(seg), seg[1] - seg[0]))
     if best[1] - best[0] < 30:
         return None
     return best[0] % DAY_MINUTES, best[1] % DAY_MINUTES

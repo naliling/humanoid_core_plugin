@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from pathlib import Path
@@ -18,7 +19,13 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.agent.message import TextPart
 
 from .humanoid import __version__
-from .humanoid.config import ConfigBox, HumanoidConfig, plan_default_migrations
+from .humanoid.config import (
+    INT_SETTING_RANGES,
+    ConfigBox,
+    HumanoidConfig,
+    plan_default_migrations,
+)
+from .humanoid.diagnostics import config_error_banner
 from .humanoid.engine import HumanoidEngine
 from .humanoid.llm import CallGate, LLMGateway, ProviderResolver
 from .humanoid.persona import PersonaSource
@@ -67,7 +74,31 @@ LOG_PREFIX = "[humanoid_core] "
 
 # 默认值一次性迁移的标记文件。AstrBot 更新配置只补缺不覆盖，不调这一手的话老用户
 # 会永远停在装插件那一版的行为上。
-DEFAULTS_MIGRATION_MARK = ".defaults-migrated-v2.27.20"
+#
+# **文件名不绑版本号**：以前叫 `.defaults-migrated-v2.27.20`，而判据就是「文件在不在」，
+# 于是后续版本新增的迁移对已升级用户整体跳过（老用户永远停在旧默认值上）。现在标记里
+# 记的是**已应用的迁移项集合**，新增迁移只跳过做过的那几项，其余照常对老用户生效。
+DEFAULTS_MIGRATION_MARK = ".defaults-migrated"
+
+
+def _read_applied_migrations(marker: Path) -> set[str]:
+    """标记文件里记的「已应用过哪些迁移项」。读不出来（旧格式/坏文件）当空集。"""
+    try:
+        raw = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    if isinstance(raw, list):
+        return {str(item) for item in raw}
+    return set()
+
+
+def _write_applied_migrations(marker: Path, applied: set[str]) -> None:
+    """落盘已应用的迁移项集合。写不进去只是下次重跑一遍（迁移本身幂等）。"""
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(sorted(applied), ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _arg_after(text: str, *commands: str) -> str:
@@ -279,11 +310,24 @@ _ENUM_WORDS = {
     "environment_mode": {"private", "group", "both"},
 }
 # 命令行只能传字符串，这些项必须显式转成 int，否则写回配置文件的是 "60" 而不是 60。
-_INT_KEYS = frozenset({
-    "schedule_min_interval_minutes",
-    "llm_idle_silence_minutes",
-    "llm_daily_call_budget",
-})
+# 合法区间与 `HumanoidConfig.from_raw` 共用 config.py 里的那一份：以前这里只做
+# `int(text)`、没有范围检查，`/拟人 设置 预算 -1` 会把 -1 原样写进配置，解析时被
+# 钳到 0（= 不限额度），而回执说「已设为 -1」——意图完全反转且事后无从察觉。
+_INT_KEYS = frozenset(INT_SETTING_RANGES)
+
+
+def _interval_conflict(new_min: int, current_max: Any) -> int | None:
+    """`/拟人 设置 间隔` 的交叉校验：下限越过上限时返回那个上限，否则 None。
+
+    `间隔` 只写 `schedule_min_interval_minutes`，没有这一道就能造出 `120~60` 的
+    倒置区间：抽随机时 `hi <= lo` 会静默退化成固定值，而 `_settings_summary` 与
+    诊断还各按自己的口径打印（一个说「120~60 随机」、一个说「120 分钟」）。
+    """
+    try:
+        limit = int(current_max)
+    except (TypeError, ValueError):
+        return None
+    return limit if new_min > limit else None
 
 
 def _coerce_setting(key: str, value: str, current: Any) -> Any:
@@ -298,9 +342,12 @@ def _coerce_setting(key: str, value: str, current: Any) -> Any:
     if key in _INT_KEYS:
         # 不走下面的默认分支：那一路会把 "60" 当字符串写进配置文件。
         try:
-            return int(text)
+            number = int(text)
         except ValueError:
             return None
+        low, high = INT_SETTING_RANGES[key]
+        # 越界不钳制、直接拒绝：写进去的是用户的原话，钳制只会让回执与生效值对不上。
+        return number if low <= number <= high else None
     if key in _ENUM_WORDS:
         lowered = text.lower()
         return lowered if lowered in _ENUM_WORDS[key] else None
@@ -375,32 +422,45 @@ class HumanoidCore(Star):
 
     @staticmethod
     def _migrate_defaults(raw_config: Any, data_dir: Path) -> None:
-        """把仍等于旧默认值的配置项一次性提升本版默认值，并写回配置文件。"""
+        """把仍等于旧默认值的配置项一次性提升本版默认值，并写回配置文件。
+
+        标记只在**真正落盘成功之后**才写。以前不是：`save_config` 不可调用时
+        （普通 dict，或框架换了配置对象）改动只留在内存里，日志却宣告「已提升」、
+        标记也照样写下——下次启动 AstrBot 从磁盘读回旧值，而标记让迁移**永远**
+        不再跑。用户看到的是一句「已提升」，实际一条都没生效。
+        """
         if not isinstance(raw_config, dict):
             return
         marker = data_dir / DEFAULTS_MIGRATION_MARK
-        if marker.exists():
+        applied = _read_applied_migrations(marker)
+        changes = {
+            key: value
+            for key, value in plan_default_migrations(raw_config).items()
+            if key not in applied
+        }
+        if not changes:
             return
-        changes = plan_default_migrations(raw_config)
-        if changes:
-            for key, value in changes.items():
-                raw_config[key] = value
-            save = getattr(raw_config, "save_config", None)
-            if callable(save):
-                try:
-                    save()
-                except Exception as exc:
-                    logger.warning(f"{LOG_PREFIX} 默认值迁移写回失败，下次启动重试: {exc}")
-                    return
-            logger.info(
-                f"{LOG_PREFIX} 已提升旧默认值："
-                + "、".join(f"{key}={value!r}" for key, value in changes.items())
+        for key, value in changes.items():
+            raw_config[key] = value
+        save = getattr(raw_config, "save_config", None)
+        if not callable(save):
+            # 改动只在内存里，重启就没了。**绝不能写标记**：写了之后下次启动读到的是
+            # 旧值，而标记让这几条迁移永远不再重试。
+            logger.warning(
+                f"{LOG_PREFIX} 配置对象不可写（没有 save_config），默认值迁移未落盘、本次跳过："
+                + "、".join(changes)
             )
+            return
         try:
-            data_dir.mkdir(parents=True, exist_ok=True)
-            marker.write_text(__version__, encoding="utf-8")
-        except OSError:
-            pass
+            save()
+        except Exception as exc:
+            logger.warning(f"{LOG_PREFIX} 默认值迁移写回失败，下次启动重试: {exc}")
+            return
+        logger.info(
+            f"{LOG_PREFIX} 已提升旧默认值："
+            + "、".join(f"{key}={value!r}" for key, value in changes.items())
+        )
+        _write_applied_migrations(marker, applied | set(changes))
 
     async def initialize(self) -> None:
         await self._state_store.start()
@@ -607,11 +667,27 @@ class HumanoidCore(Star):
         if len(value) > 24:
             yield event.plain_result("名字太长了，24 个字以内。")
             return
-        if any(ch in value for ch in ("她", "你")) or "TA" in value:
-            yield event.plain_result("名字里不能有「她」「你」「TA」——注入靠它们区分角色和对方。")
+        # 这个名字会被拼进**每一轮**的 system_prompt（`prompt_builder.build_framing`
+        # 里 `role = f"「{who}」"`），所以必须和 /叫我 同一套白名单清洗：原来只查
+        # 长度与「她/你/TA」，带换行、「」、引号、控制字符的名字能闭合引号并另起一行，
+        # 此后每一轮请求都生效。
+        from .humanoid.prompt_builder import sanitize_name
+
+        cleaned = sanitize_name(value)
+        if not cleaned:
+            yield event.plain_result(
+                "这个名字用不了：请只用字母、数字、汉字（可带 - . 空格与表情），"
+                "不要带引号、换行，也不要含「她 / 你 / TA」这类代词。"
+            )
             return
-        core.set_char_name(value)
-        yield event.plain_result(f"✅ 参照名称已设为「{value}」，注入里会用这个名字称呼她。")
+        core.set_char_name(cleaned)
+        if cleaned != value.strip():
+            yield event.plain_result(
+                f"✅ 参照名称已设为「{cleaned}」（已去掉名字里不能用的字符），"
+                "注入里会用这个名字称呼她。"
+            )
+        else:
+            yield event.plain_result(f"✅ 参照名称已设为「{cleaned}」，注入里会用这个名字称呼她。")
 
     @filter.command("拟人帮助")
     async def cmd_help(self, event: AstrMessageEvent):
@@ -627,8 +703,20 @@ class HumanoidCore(Star):
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
-        core = self._core(event)
-        yield event.plain_result(self.engine.diagnostics_text(core))
+        # 诊断是唯一的排查入口，它自己报错等于把用户挡在门外（signals 的 age 为 None
+        # 曾让 `f"{None:.0f}"` 抛 TypeError 一路冒到这里）。整条包一层兜底。
+        try:
+            core = self._core(event)
+            text = self.engine.diagnostics_text(core)
+        except Exception as exc:  # noqa: BLE001 - 兜底就是为了诊断页还能打开
+            logger.warning(f"{LOG_PREFIX} 诊断生成失败: {exc}")
+            text = f"⚠ 诊断生成失败：{type(exc).__name__}: {exc}"
+        # 配置整体退回默认值时，报告最上面必须写明——否则用户看到的城市/模型链/开关
+        # 全是出厂值，却以为是自己在面板上配的那份（ConfigBox.load_error 以前没人读）。
+        banner = config_error_banner(self._config_box.load_error)
+        if banner:
+            text = "\n".join(banner) + "\n" + text
+        yield event.plain_result(text)
 
     # 面板上 89 项、AstrBot 又不支持分组，改一个城市要翻半天。这一条命令只管常用那几项，
     # 进阶项仍然去面板改——两边改的是同一份配置文件。
@@ -725,8 +813,21 @@ class HumanoidCore(Star):
             return
         new_value = _coerce_setting(key, value, current)
         if new_value is None:
-            yield event.plain_result(f"「{value}」不是这一项能接受的值。当前值：{current!r}")
+            limits = INT_SETTING_RANGES.get(key)
+            extra = f"（合法范围 {limits[0]}~{limits[1]}）" if limits is not None else ""
+            yield event.plain_result(
+                f"「{value}」不是这一项能接受的值{extra}。当前值：{current!r}"
+            )
             return
+        # 间隔是 min≤max 的一对，而这一条只写 min：越过上限会造出 120~60 的倒置区间。
+        if key == "schedule_min_interval_minutes":
+            limit = _interval_conflict(new_value, raw_config.get("schedule_max_interval_minutes"))
+            if limit is not None:
+                yield event.plain_result(
+                    f"间隔下限不能大于上限（当前上限 {limit} 分钟）。"
+                    f"先写「/拟人 设置 间隔 {limit}」，或去面板把「间隔上限」改大。"
+                )
+                return
         raw_config[key] = new_value
         saved = True
         save = getattr(raw_config, "save_config", None)
@@ -738,8 +839,11 @@ class HumanoidCore(Star):
                 logger.warning(f"{LOG_PREFIX} 设置写回失败: {exc}")
         # 所有服务都拿 `lambda: box()` 读配置，换掉内部实例就全链路生效，不用逐个通知角色。
         self._config_box.reload()
+        # 回执报**生效值**而不是用户输入：解析层会钳制/退回默认值，报原话会让
+        # 「回执说 -1、实际 0」这类不一致再出现（设置项与生效值必须是同一个数）。
+        effective = getattr(self._config, key, new_value)
         yield event.plain_result(
-            f"✅ {key_word} 已设为 {new_value!r}"
+            f"✅ {key_word} 已设为 {effective!r}"
             + ("（未能写入配置文件，重启后会回到旧值）" if not saved else "")
         )
 
@@ -862,7 +966,7 @@ class HumanoidCore(Star):
             return
         match = re.search(r"(\d+(?:\.\d+)?)", _arg_after(event.message_str, "设置好感度"))
         if not match:
-            yield event.plain_result("用法：/设置好感度 数值 (0-100)")
+            yield event.plain_result("用法：/拟人 设置好感度 数值 (0-100)")
             return
         v = float(match.group(1))
         if not 0 <= v <= 100:
@@ -881,7 +985,7 @@ class HumanoidCore(Star):
             return
         pairs, malformed = self.engine.parse_affection_batch(_arg_after(event.message_str, "批量好感度"))
         if not pairs:
-            yield event.plain_result("格式错误，请使用：/批量好感度 QQ:数值")
+            yield event.plain_result("格式错误，请使用：/拟人 批量好感度 QQ:数值")
             return
         core = self._core(event)
         applied = core.mood.set_affection_batch(pairs)

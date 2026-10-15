@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import random
 import re
 import time
@@ -13,6 +12,8 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
+from astrbot.api import logger
+
 from ..config import HumanoidConfig
 from ..data.mood_map import generate_mood_tag, get_mood_label
 from ..jsonx import extract_json_object
@@ -20,8 +21,6 @@ from ..llm import PURPOSE_MOOD, LLMGateway
 from ..recall import MAX_SNIPPETS, note_said, recall_lines
 from ..wording import pick
 from ..role_scope import RoleScope
-
-logger = logging.getLogger(__name__)
 
 NEGATIVE_PATTERN = re.compile(
     r"(傻|蠢|笨|白痴|废物|垃圾|去死|死吧|滚蛋|操|妈|逼|贱|恶心|讨厌|恨|烦|骂|吵|滚|弱智|脑残|sb|煞笔)",
@@ -87,8 +86,9 @@ _INTIMATE_PATTERN = re.compile(
 # 均值是 0，攒一百次也攒不出变化。**能让她掉分的是骂她的人，不是冷她的人。**
 #
 # 权重刻意轻（脏话是 -2~-4，这里只有 -0.4~-1.2）：日常冷淡是**一滴滴**的，不是
-# 一记重拳。真正让它显形的是账本的累积——单句几乎不动，连着两周的敷衍才会把
-# 好感拉下来。这比在文本里猜「TA 是不是故意的」可靠得多。
+# 一记重拳。真正让它显形的是账本的累积——单句几乎不动，连着好些天的敷衍才会把
+# 好感拉下来（v2.28.9 起单日负向另有 `DAILY_NET_LOSS_CAP` 封顶，一天最多掉 6.5）。
+# 这比在文本里猜「TA 是不是故意的」可靠得多。
 _COLD_PATTERN = re.compile(
     r"(嗯+|哦+|唔+|随便|随你|都行|无所谓|不用了|没必要|不想说|没什么好说的|"
     r"再说吧|下次吧|算了吧|随便你|你爱怎样|关我什么事|懒得理|不想理|别烦我|"
@@ -216,16 +216,22 @@ LLM_SKIPPABLE_AFFECTION = -1.5
 # `min(面板的 mood_affection_delta_cap, 本常量)` —— 面板默认 2 更保守，会把它压住；
 # 面板调到 3 以上时，这里的 2.4 才成为天花板（原来面板默认 2 让它成了死常量）。
 # 注意这是「上限」：普通暖话落在 1~1.8，只有亲近类顶到 2.4。
-# 一天正常聊（含 6~10 次暖话、扣除冷淡误伤）净增 ~4~5，12~14 天到「关系明显变好」。
+# 一天正常聊（含 6~10 次暖话、扣除冷淡误伤）最多吃满当日的 DAILY_NET_GAIN_CAP，
+# 12~14 天到「关系明显变好」。
 POSITIVE_MESSAGE_CAP = 2.4
 # 亲近欲的同款上限（甜话不但在刷好感，也在刷亲近欲，ccb 门槛全靠它）。
 LIBIDO_MESSAGE_CAP = 1.2
 # 甜话压脾气也要慢：单句最多压 0.3 分，否则几十句甜话就把攻击性打到 0。
 AGGRESSION_DOWN_CAP = 0.3
 # 每日净增封顶（按她城市的自然日计）。封顶值与时衰半衰期是**配套**的：
-# 168h 半衰期 + 日净增封顶 6.5 的实测曲线约在 12~14 天到 70（正常强度聊天），
-# 给「高光日」留了余量，又不会让刷屏一天爆涨。
-DAILY_NET_GAIN_CAP = 6.5
+# 无截断均衡 = 日净增 / (1 - 0.5^(24/168)) = 3.1 / 0.0943 ≈ 32.9 → affection
+# ≈ 基线 35 + 32.9 ≈ 68，曲线在 12~14 天走到 60 上下。
+#
+# v2.28.9（D2）：6.5 → 3.1。6.5 的实测是 **8 天**就到 70、400 天均衡停在 77.6
+# （120 条账本截断后的实测值），和这里宣称的「12~14 天」对不上；3.1 正是注释里
+# 「ledger≈33」反推出来的日净增。注意 3.1 的均衡是 68 —— **70 在 3.1 下不可达**，
+# 别再照抄旧注释里的「到 70」。
+DAILY_NET_GAIN_CAP = 3.1
 DAILY_LIBIDO_GAIN_CAP = 4.5
 # 同类话递减系数：同一天里第 1/2/3/4+ 次只有对应比例生效。
 # 「新话题不受限」——它只打在反复刷的同类话上（本地词典命中类别）。
@@ -234,7 +240,7 @@ REPEAT_DECAY = (1.0, 0.6, 0.35, 0.2)
 # ── 负向软化（v2.27.8）──
 #
 # 反馈：「情绪下降特别快」。原来正向有三道闸、负向一道都没有，账本里负账还 ×1.6。
-# 现在负向也上闸：单条封顶 / 同类递减 / 连续才扣好感 / 底部减速 + 韧性。
+# 现在负向也上闸：单条封顶 / 同类递减 / 连续才扣好感 / 底部减速 + 韧性 / 每日净损封顶。
 #
 # 一条消息对好感的负向上限（A1）。
 NEGATIVE_MESSAGE_CAP = 2.0
@@ -245,6 +251,30 @@ NEG_STREAK_WINDOW_SECONDS = 6 * 3600.0
 LEDGER_NEGATIVE_AMPLIFY = 1.2
 # 被冷落单次惩罚上限（A5）。原来 4.0（×1.6 后可达 -6.4），收到 2.0。
 IGNORE_PENALTY_CAP = 2.0
+
+# 每日净损封顶（v2.28.9，与 DAILY_NET_GAIN_CAP 对称）。
+#
+# 正向有三道闸 + 每日封顶，负向原先**一道日闸都没有**：实测单日连发 200 句「嗯」
+# （cold 路径）或单日 60 次 `note_ignored_by_peer` 都能把好感从 60 直接打到 0，
+# 而正向一天最多 +6.5。现在负向也按自然日累计，当天扣满这个数之后一律归零。
+# 取与正向同量级（6.5）：负向仍然比正向快（同类递减不作用于 cold，且账本对负向另有
+# ×1.2 放大），但一天最多掉 6.5，从 60 拉到底至少要十来天。
+# 口径与 `_throttle_positive` 的 `warm_day` 完全对称，见 `_charge_negative_day`。
+# 注意账本对负向另有 `LEDGER_NEGATIVE_AMPLIFY`（×1.2）的放大，所以**实际好感**的
+# 单日跌幅上限是 6.5 × 1.2 = 7.8；正向没有放大，日涨幅就是 3.1。
+DAILY_NET_LOSS_CAP = 6.5
+
+# 情绪日志的触发阈值（v2.28.9，按实测单句幅度重标）。
+#
+# 原来直接拿面板阈值（好感 3 / 亲近欲 2 / 攻击性 3）跟**单条消息**的变化比，而真实
+# 链路（`update_from_message_async`，9 类消息各 30 句共 270 句）里单句最大变化只有
+# 1.56 / 1.2 / 1.86 —— 三条轴全部够不到阈值，`mood_logs` 恒为空，
+# `emotion._today_events` 拿到 ups=0 downs=0，「今日心境」整组文案永远不出现。
+# 现在两个口径一起改：触发看**同一自然日的累计幅度**（`log_day`），生效阈值则夹到
+# 与实测幅度同量级的上限（下面三个常量）；面板调得更小（更敏感）仍然生效。
+LOG_THRESHOLD_AFFECTION = 0.6
+LOG_THRESHOLD_LIBIDO = 0.5
+LOG_THRESHOLD_AGGRESSION = 0.8
 
 # C3 长期情绪记忆：记仇 + 记好，只留 7 天（用户要的「7 天的刚好」），上限 20 条。
 EMOTION_MEMORY_DAYS = 7.0
@@ -259,7 +289,19 @@ EMOTION_MEMORY_KEY = "emotion_memory"
 # mood.profile，所以它是「有真实互动」的标记；而 `/拟人 诊断` 为了量 token 会拿一个
 # status-probe 的假用户去跑 build_injection，留下一个清不掉的空壳。
 # mood 删掉即可：profile() 会用配置里的初始值重建，正是文档承诺的「好感度清回初始值」。
-RETENTION_DROPPED_FIELDS = ("mood", "mood_logs", "mood_tag", "last_message", "said", "attention")
+#
+# `ignored_seen` 也在清理范围内：它是「被冷落」的已罚计数（见 `note_ignored_by_peer`），
+# 不清的话清档用户回来时 `now_streak <= seen` 恒成立，冷落惩罚**永久免罚**。
+RETENTION_DROPPED_FIELDS = (
+    "mood", "mood_logs", "mood_tag", "last_message", "said", "attention", "ignored_seen",
+)
+
+# 长期不活跃（D4）：只剩这些字段的用户条目**没有任何可清理的内容**——字段清理对它
+# 无效，原来的 `prune_expired` 直接 `continue`，于是它们永久留在 state.json 里。
+# 名单之外还有别的键（亲密计数、情绪记忆…）就保留：「有好感/有记忆的用户」不删。
+_STALE_SHELL_FIELDS = ("nickname", "nickname_src", "first_met", "last_interaction")
+# 整条删除的静默期（天）。配置项由主会话另行添加，这里先用常量。
+STALE_USER_RETENTION_DAYS = 90
 
 # 自动认定称呼的硬性门槛：来源是消息带的名字（群聊是群名片、私聊是 QQ 昵称），
 # 都是用户随手可改的东西——宁缺勿滥：叫错人比不称呼难看得多，认不上就一个都不认。
@@ -528,7 +570,8 @@ class MoodService:
         被关成默认 False。代价是熟人也没了关系感，群里她只剩「这是个群」，
         于是模型按最保险的方式推开——这是「群里强硬拒绝」的由来。
         """
-        record = self._scope.user_state(user_id).get("mood")
+        # 纯查询：走 peek，别因为「问一句有没有」就给对方建条目（群聊里每人都问一次）。
+        record = self._scope.peek_user(user_id, "mood")
         return isinstance(record, dict)
 
     def readable(self, user_id: str, is_group: bool, *, enabled: bool, in_group: bool) -> bool:
@@ -616,7 +659,18 @@ class MoodService:
         return record
 
     def label(self, user_id: str) -> str:
-        return get_mood_label(*self._axes(self.profile(user_id)))
+        # 只读：没档案就用配置里的初始值算，不因为查一个标签就建条目。
+        record = self._scope.peek_user(user_id, "mood")
+        if isinstance(record, dict):
+            return get_mood_label(*self._axes(record))
+        cfg = self.config
+        affection = float(cfg.mood_initial_affection)
+        override = cfg.affection_override_for(user_id)
+        if override is not None:
+            affection = override
+        return get_mood_label(
+            affection, float(cfg.mood_initial_libido), float(cfg.mood_initial_aggression)
+        )
 
     @staticmethod
     def _axes(record: dict) -> tuple[float, float, float]:
@@ -640,7 +694,10 @@ class MoodService:
         `LABEL_ANCHOR_DRIFT` 就沿用旧标签，漂够了才重新查表并把 anchor 换掉。
         **平时不写盘**——只有真的换档时才写，所以这个滞回不增加写盘频率。
         """
-        record = self.profile(user_id)
+        record = self._scope.peek_user(user_id, "mood")
+        if not isinstance(record, dict):
+            # 没档案 → 用初始值那一档，别为了读一个标签建条目（滞回锚点也不写）。
+            return self.label(user_id)
         affection, libido, aggression = self._axes(record)
         anchor = record.get("label_anchor")
         if isinstance(anchor, dict):
@@ -660,7 +717,8 @@ class MoodService:
         return label
 
     def tag(self, user_id: str) -> str:
-        return self._scope.get_user(user_id, "mood_tag", "")
+        # 纯查询，不建条目（同上：群聊里每人查一次就会留下空壳）。
+        return self._scope.peek_user(user_id, "mood_tag", "")
 
     def said(self, user_id: str) -> list:
         """隔一段时间采样下来的对方原话。"""
@@ -919,6 +977,11 @@ class MoodService:
 
         返回被清理的用户数。0 或负数的 retention 表示永不清理。
         没有可判定时间戳的记录一律跳过，宁可不清也不误删。
+
+        v2.28.9（D4）：**没有可清理字段**的条目（只剩 `nickname` / `nickname_src` /
+        `first_met` 这类被刻意保留的东西）原来被直接跳过，于是永久留存。现在它们
+        不活跃超过 `STALE_USER_RETENTION_DAYS` 就**整条删除**；名单之外还有别的键
+        （亲密计数、情绪记忆…）的一律保留。
         """
         cfg = self.config
         try:
@@ -930,10 +993,25 @@ class MoodService:
 
         now = self._time() if now is None else float(now)
         cutoff = now - days * 86400.0
+        stale_cutoff = now - STALE_USER_RETENTION_DAYS * 86400.0
         pruned = 0
         for uid in self._scope.all_user_ids():
             user_state = self._scope.user_state(uid)
             if not any(key in user_state for key in RETENTION_DROPPED_FIELDS):
+                # 无可清理字段：字段清理对它无效，所以只能整条删。
+                if not all(key in _STALE_SHELL_FIELDS for key in user_state):
+                    continue
+                stale_stamp = user_state.get("last_interaction")
+                if stale_stamp is None:
+                    stale_stamp = user_state.get("first_met")
+                try:
+                    stale_stamp = float(stale_stamp)
+                except (TypeError, ValueError):
+                    continue
+                if stale_stamp > stale_cutoff:
+                    continue
+                self._scope.delete_user(uid)
+                pruned += 1
                 continue
             stamp = user_state.get("last_interaction")
             if stamp is None:
@@ -954,6 +1032,10 @@ class MoodService:
                     first_met = 0.0
                 if first_met > 0:
                     user_state["first_met"] = first_met
+            # 把最后活动时间也留在 user 级：mood 被清掉之后，它就是下一次判定的依据
+            # （顶部注释一直这么写，但代码从没写过这个字段，于是清过一次的条目再也
+            # 判不出过期——D4 的「90 天不活跃」正是靠它）。
+            user_state["last_interaction"] = stamp
             for key in RETENTION_DROPPED_FIELDS:
                 user_state.pop(key, None)
             pruned += 1
@@ -1293,7 +1375,8 @@ class MoodService:
            原来是 2.0（面板 cap）且无递减、无封顶——单句太厚，十句话就能感到关系变了。
         2. **同类递减**：同一天里同类话第 2 次 ×0.6、第 3 次 ×0.35、第 4 次起 ×0.2。
            刷一百句「喜欢你」和说一句「喜欢你」没有区别。
-        3. **每日净增封顶**：按她城市的自然日，正向上的净增封顶 6.5 / 4.5。
+        3. **每日净增封顶**：按她城市的自然日，正向上的净增封顶 3.1 / 4.5
+           （好感是 `DAILY_NET_GAIN_CAP`，v2.28.9 的 D2 从 6.5 收到 3.1）。
            刷屏一天也不会比认真聊一天额外收获多少。
         只削正向；负向（骂人/冷淡）不动——那个该疼就疼。
         """
@@ -1345,16 +1428,66 @@ class MoodService:
         record["warm_day"] = day
         return Delta(affection, libido, aggression)
 
+    def _negative_day_key(self) -> str:
+        """当日净损额度的「日」键。
+
+        用 `_time()`（**账本的时间基**）换算到角色所在时区，而不是直接取
+        `clock.today_str()`：账本时衰走 `_time()`，日闸必须跟同一台钟走——两台钟被
+        分别替换时（测试冻结时钟、角色换城市），按另一条时间线算出来的「今天」会让
+        日闸要么永远不重置、要么一天重置好几次。
+        """
+        try:
+            tz = self._clock.now().tzinfo
+            return datetime.fromtimestamp(float(self._time()), tz=tz).strftime("%Y-%m-%d")
+        except Exception:
+            try:
+                return str(self._clock.today_str() or "") if self._clock else ""
+            except Exception:
+                return ""
+
+    def _charge_negative_day(self, record: dict, want: float) -> float:
+        """从当日的「净损额度」里扣掉 `want`，返回**实际允许**扣掉的好感量（正数）。
+
+        与 `_throttle_positive` 的 `warm_day` 对称：按自然日累计，当天扣满
+        `DAILY_NET_LOSS_CAP` 之后负向一律归零。原来负向一道日闸都没有——
+        单日 200 句「嗯」（cold 路径）或 60 次冷落就能把好感从 60 打到 0。
+
+        判不出「今天」时**不封顶**（原样返回）：宁可少一道闸，也不能因为时钟拿不到
+        就把额度永久记在一个空日期上（那会变成「这辈子只能掉 6.5」）。
+        """
+        if want <= 0:
+            return 0.0
+        today = self._negative_day_key()
+        if not today:
+            return float(want)
+        day = record.get("loss_day")
+        if not isinstance(day, dict) or str(day.get("date") or "") != today:
+            day = {"date": today, "loss": 0.0}
+        try:
+            lost = float(day.get("loss", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            lost = 0.0
+        allowed = max(0.0, DAILY_NET_LOSS_CAP - lost)
+        take = min(float(want), allowed)
+        day["loss"] = lost + take
+        record["loss_day"] = day
+        return take
+
     def _throttle_negative(self, delta: Delta, record: dict, neg_key: str,
                            severe: bool = False) -> Delta:
-        """负向软化（v2.27.8）：单条封顶 / 同类递减 / 连续才扣好感 / 底部减速+韧性。
-
-        只削「负向」，**不削冷淡**（`cold`）：冷淡本来就轻、靠长期累积显形，
-        被削就永远显不出来了。
+        """负向软化（v2.27.8）：单条封顶 / 同类递减 / 连续才扣好感 / 底部减速+韧性
+        / 每日净损封顶（v2.28.9）。
 
         同类递减只对**骂人**按具体词生效（`neg:…` 键）。模型判出来的负向没有词键
         （`neg_key` 为空）——**照样要过封顶 / 连击 / 底部减速**，只是不递减；
         否则「本地没命中、模型判负」的那条会绕开所有负向规则，比骂人还凶。
+
+        冷淡（`cold`）只保留**两条**例外：不走同类递减（它本来就轻、靠长期累积显形，
+        被递减削就永远显不出来了），也不走「连续才扣好感」的门槛（它正是靠单句轻扣
+        累积显形的，第一句就被归零等于这条路又断了）。其余闸门——单条封顶、底部
+        减速+韧性、每日净损封顶——一律照过。原来它把这些**全部**绕开：实测单日
+        200 句「嗯」把好感从 60 直接打到 0，而正向一天最多 +6.5。
+        豁免递减与连击是设计，没有日上限是漏洞。
 
         `severe=True` 是 E4 的「强迫」：它**跳过「连续才扣好感」的门槛**。那一关是给
         「一句孤立的难听话」留的缓冲，而强迫要的正是当场扣好感 —— 被归零就等于
@@ -1362,7 +1495,7 @@ class MoodService:
         """
         cfg = self.config
         aff = float(delta.affection)
-        if aff >= 0 or neg_key == "cold":
+        if aff >= 0:
             return delta
         # 同类递减：同一天里同一个词第 2 次 ×0.6、第 3 次 ×0.35、之后 ×0.2。
         factor = 1.0
@@ -1389,25 +1522,27 @@ class MoodService:
 
         # 单条封顶
         aff = max(aff, -NEGATIVE_MESSAGE_CAP)
-        # 连续才扣好感：一句孤立的难听话只动脾气/心情，不动好感
-        try:
-            streak = int(record.get("neg_streak", 0) or 0)
-        except (TypeError, ValueError):
-            streak = 0
-        # 连击要有时间窗：隔了半天还叫「连续」就太苛刻了——那其实是两件独立的事，
-        # 不该叠在一起算。超过窗口就当作新的第一句。
-        now = self._time()
-        last_neg = _num_or(record.get("neg_streak_at", 0.0), 0.0)
-        if last_neg <= 0 or (now - last_neg) > NEG_STREAK_WINDOW_SECONDS:
-            streak = 0
-        streak += 1
-        record["neg_streak"] = streak
-        record["neg_streak_at"] = now
-        required = max(1, int(getattr(cfg, "mood_negative_streak_required", 2) or 2))
-        # 「强迫」不算「一句孤立的难听话」：E4 要的是当场扣好感，
-        # 被连击门槛归零就等于这条规则从来没生效过。
-        if streak < required and not severe:
-            aff = 0.0
+        cold = neg_key == "cold"
+        if not cold:
+            # 连续才扣好感：一句孤立的难听话只动脾气/心情，不动好感
+            try:
+                streak = int(record.get("neg_streak", 0) or 0)
+            except (TypeError, ValueError):
+                streak = 0
+            # 连击要有时间窗：隔了半天还叫「连续」就太苛刻了——那其实是两件独立的事，
+            # 不该叠在一起算。超过窗口就当作新的第一句。
+            now = self._time()
+            last_neg = _num_or(record.get("neg_streak_at", 0.0), 0.0)
+            if last_neg <= 0 or (now - last_neg) > NEG_STREAK_WINDOW_SECONDS:
+                streak = 0
+            streak += 1
+            record["neg_streak"] = streak
+            record["neg_streak_at"] = now
+            required = max(1, int(getattr(cfg, "mood_negative_streak_required", 2) or 2))
+            # 「强迫」不算「一句孤立的难听话」：E4 要的是当场扣好感，
+            # 被连击门槛归零就等于这条规则从来没生效过。
+            if streak < required and not severe:
+                aff = 0.0
         aff *= factor
         if aff < 0 and bool(getattr(cfg, "mood_negative_softening", True)):
             current = float(record.get("affection", 50.0) or 50.0)
@@ -1417,6 +1552,10 @@ class MoodService:
             # 情绪韧性：关系越深越抗打击
             depth = max(0.0, min(1.0, current / 100.0))
             aff *= max(0.5, 1.0 - 0.4 * depth)
+        # 每日净损封顶（v2.28.9）：与 `_throttle_positive` 的 `warm_day` 对称。
+        # 放在最后一步——封的是**实际会落到账本上的净损**，不是闸前的原始幅度。
+        if aff < 0:
+            aff = -self._charge_negative_day(record, -aff)
         return Delta(aff, delta.libido, delta.aggression)
 
     def _apply_recovery(self, delta: Delta, record: dict, text: str) -> Delta:
@@ -1542,7 +1681,8 @@ class MoodService:
     def cooling_note(self, user_id: str) -> str:
         """冷静期里给注入的一句「她正在气头上」（D3）。不在冷静期返回空串。"""
         try:
-            record = self._scope.user_state(user_id).get("mood")
+            # 只读注入路径（每轮都会调）：走 peek，别给陌生人建永久空壳。
+            record = self._scope.peek_user(user_id, "mood")
         except Exception:
             return ""
         if not isinstance(record, dict):
@@ -1569,7 +1709,8 @@ class MoodService:
         只说状态，不下指令。
         """
         try:
-            record = self._scope.user_state(user_id).get("mood")
+            # 只读注入路径（每轮都会调）：走 peek，别给陌生人建永久空壳。
+            record = self._scope.peek_user(user_id, "mood")
         except Exception:
             return ""
         if not isinstance(record, dict):
@@ -1595,7 +1736,8 @@ class MoodService:
         字数仍以人设为准（框架句里写着）；这句只是「这会儿话多还是话少」的底色。
         """
         try:
-            record = self._scope.user_state(user_id).get("mood")
+            # 只读注入路径（每轮都会调）：走 peek，别给陌生人建永久空壳。
+            record = self._scope.peek_user(user_id, "mood")
         except Exception:
             return ""
         if not isinstance(record, dict):
@@ -1618,13 +1760,16 @@ class MoodService:
     #
     # v2.27.2：60 → 120。60 条在「每天 40 句、每 4 句左右入账一笔」的节奏下只存得下
     # 6 天，持续聊天时**最早的正分被截断丢掉**，而负账留着——账本会越用越偏负。
-    # 120 条约等于 12 天，和「12~14 天到 70」的校准窗口对齐。
+    # 「120 条 ≈ 多少天」取决于**入账笔数/天**，不是一个固定天数：每天入账 N 笔就是
+    # 120 / N 天（旧注释写死「≈12 天」，只在 10 笔/天时成立）。
     LEDGER_MAX = 120
     # 时衰半衰期（小时）。
     #
-    # 120h（5 天）时，日净增 4.5 与时衰恰好在 ledger≈25（aff≈60）处平衡——
-    # 持续认真聊天也到不了 70。168h（7 天）把平衡点推高到 ledger≈33（aff≈68）；
-    # 再配上偶发的高光互动（亲密类单句收益更高）即可到 70 上下。
+    # 120h（5 天）时，日净增与时衰在 ledger≈25（aff≈60）处平衡——持续认真聊天也到不了
+    # 70。168h（7 天）把平衡点推高到 ledger≈33（aff≈68，正是「12~14 天到关系明显变好」
+    # 的那条曲线）；再配上偶发的高光互动（亲密类单句收益更高）就能到 70 上下。
+    # 注意 ledger≈33 对应的是**日净增 3.1**，与 `DAILY_NET_GAIN_CAP` 是配套的两个数，
+    # 改一个必须重标另一个。
     LEDGER_HALF_LIFE_HOURS = 168.0
 
     def _ledger_append(self, record: dict, delta: Delta, now: float,
@@ -1690,7 +1835,8 @@ class MoodService:
         这就是「好感度不好用」的根源——它不记事。
         """
         try:
-            record = self._scope.user_state(user_id).get("mood")
+            # 只读查询：走 peek，别因为「看一眼记过什么」就给对方建条目。
+            record = self._scope.peek_user(user_id, "mood")
         except Exception:
             return []
         if not isinstance(record, dict):
@@ -1744,10 +1890,14 @@ class MoodService:
         # 免得连着几天不回直接把好感打到 0——那不像记仇，像迁怒。
         # v2.27.8（A5）：上限 4.0 → 2.0、增长更平缓（×账本 1.2 后单次最多 -2.4）。
         weight = -min(IGNORE_PENALTY_CAP, 0.5 * gain + 0.35 * min(gain, 3) + 0.1 * max(0, gain - 3))
-        self._ledger_append(record, Delta(weight, 0.0, 0.0), self._time(), "没被理")
-        _note_emotion_memory(
-            record, self._time(), "grudge", "heavy" if weight <= -3.0 else "light"
-        )
+        # 每日净损封顶（v2.28.9）：streak 每涨一次就记一笔，60 笔就是 -60——原来一天
+        # 就能把好感打到 0。`IGNORE_PENALTY_CAP` 仍然只管单笔，不动。
+        weight = -self._charge_negative_day(record, -weight)
+        if weight < 0:
+            self._ledger_append(record, Delta(weight, 0.0, 0.0), self._time(), "没被理")
+            _note_emotion_memory(
+                record, self._time(), "grudge", "heavy" if weight <= -3.0 else "light"
+            )
         net = self._ledger_total(record, self._time())
         _k, _bk, bounds = DIMENSIONS[0]
         base = float(record.get("base_affection", 50.0))
@@ -1813,7 +1963,7 @@ class MoodService:
         user_state["mood"] = record
         self._scope.mark_dirty()
         self._refresh_tag(user_id, record)
-        self._log_event(user_id, before, record)
+        self._log_event(user_id, record, delta)
 
     def _refresh_tag(self, user_id: str, record: dict) -> None:
         """刷新心情标签（如「有点疲惫，开心」）。
@@ -1823,13 +1973,23 @@ class MoodService:
         cfg = self.config
         if not cfg.mood_tag_enabled:
             return
+        # 抽签种子 = (角色, 日期)：同一个 (角色, 档位) 在同一天里稳定抽到同一句。
+        # 不传种子时 mood_map 用的是无种子 `random.choice`——同一状态相邻两次调用
+        # 97.78% 不同，下面「变了才写盘」的守卫形同虚设（实测 200 次调用写盘 197 次），
+        # 标签还会每次重启都换一遍。日期进种子是刻意的：第二天她换另一套说法。
+        today = ""
+        try:
+            today = str(self._clock.today_str() or "") if self._clock else ""
+        except Exception:
+            today = ""
         tag = generate_mood_tag(
             float(record["affection"]),
             float(record["libido"]),
             float(record["aggression"]),
             float(self._scope.get_self("energy", 80.0)),
+            seed=(self._scope.role_id, today),
         )
-        if self._scope.get_user(user_id, "mood_tag") != tag:
+        if self._scope.peek_user(user_id, "mood_tag") != tag:
             self._scope.set_user(user_id, "mood_tag", tag)
 
     async def _llm_delta(self, user_id: str, batch) -> Delta | None:
@@ -1926,19 +2086,66 @@ class MoodService:
                 self._warn_throttled("情绪分析失败：JSON 数值无效", "json")
             return None
 
-    def _log_event(self, user_id: str, before: dict, record: dict):
+    def _log_event(self, user_id: str, record: dict, delta: Delta):
+        """写一条情绪波动日志（`emotion._today_events` 的唯一数据源）。
+
+        两个口径都是 v2.28.9 改的：
+
+        1. **触发看同一自然日的累计幅度**，不是单条。真实链路 270 句实测的单句最大
+           变化只有 1.56 / 1.2 / 1.86，而面板阈值是 3 / 2 / 3——按单条比永远打不开，
+           `mood_logs` 恒为空，`emotion` 的「今日心境」整组文案因此从不出现。
+        2. **方向只取本次消息自己的 `delta`**（累计器里存的也只有消息 delta，不含
+           账本时衰）。原来用 `record[key] - before[key]`，那是「本句增量 − 时衰」的
+           合成量：隔得久一点，一条**好话**会被写成「好感度下降至 X」。
+
+        事件串保持「轴名 + 方向 + 至 数值」的老格式（旧数据要能一起读），但
+        `emotion._today_events` 已按轴名区分正负——「攻击性上升」是负向事件。
+        """
         cfg = self.config
         if not cfg.mood_log_enabled:
             return
+        today = ""
+        try:
+            today = str(self._clock.today_str() or "") if self._clock else ""
+        except Exception:
+            today = ""
+        day = record.get("log_day")
+        if not isinstance(day, dict) or str(day.get("date") or "") != today:
+            day = {"date": today, "acc": {}}
+        acc = day.get("acc")
+        if not isinstance(acc, dict):
+            acc = {}
         events = []
-        for key, (threshold, name) in {
-            "affection": (cfg.mood_log_threshold_affection, "好感度"),
-            "libido": (cfg.mood_log_threshold_libido, "亲近欲"),
-            "aggression": (cfg.mood_log_threshold_aggression, "攻击性"),
-        }.items():
-            change = float(record[key]) - before.get(key, 0)
-            if abs(change) >= max(0.0, float(threshold)):
-                events.append(f"{name}{'上升' if change > 0 else '下降'}至 {record[key]:.1f}")
+        for key, floor, name in (
+            ("affection", LOG_THRESHOLD_AFFECTION, "好感度"),
+            ("libido", LOG_THRESHOLD_LIBIDO, "亲近欲"),
+            ("aggression", LOG_THRESHOLD_AGGRESSION, "攻击性"),
+        ):
+            try:
+                configured = float(getattr(cfg, f"mood_log_threshold_{key}", floor))
+            except (TypeError, ValueError):
+                configured = floor
+            # 生效阈值 = min(面板值, 内置上限)：面板调得更小（更敏感）仍然生效，
+            # 调得更大则被内置上限夹住，否则「一天累计」也够不到那个数。
+            threshold = min(max(0.0, configured), float(floor))
+            if threshold <= 0.0:
+                threshold = float(floor)
+            try:
+                step = float(getattr(delta, key) or 0.0)
+            except (TypeError, ValueError):
+                step = 0.0
+            try:
+                moved = float(acc.get(key, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                moved = 0.0
+            moved += step
+            if abs(moved) < threshold:
+                acc[key] = moved
+                continue
+            events.append(f"{name}{'上升' if moved > 0 else '下降'}至 {float(record[key]):.1f}")
+            acc[key] = 0.0
+        day["acc"] = acc
+        record["log_day"] = day
         if not events:
             return
 
@@ -1974,7 +2181,11 @@ class MoodService:
         record["last_interaction"] = self._time()
         record["last_decay"] = self._time()
         record["messages_since_llm"] = 0
-        self._scope.user_state(user_id)["mood"] = record
+        user_state = self._scope.user_state(user_id)
+        user_state["mood"] = record
+        # 「被冷落」的已罚计数也要清：不清的话 `note_ignored_by_peer` 里
+        # `now_streak <= seen` 恒成立，冷落惩罚对这个人**永久免罚**。
+        user_state.pop("ignored_seen", None)
         self._scope.mark_dirty()
         return record
 
@@ -1998,14 +2209,17 @@ class MoodService:
         return applied
 
     def logs(self, user_id: str, limit: int = 0) -> list[dict[str, Any]]:
-        """情绪波动记录（原始条目）。limit > 0 时只取最近若干条。"""
-        entries = self._scope.user_state(user_id).get("mood_logs", [])
+        """情绪波动记录（原始条目）。limit > 0 时只取最近若干条。
+
+        只读查询（`emotion._today_events` 每轮都调）：走 peek，不因为读日志建档。
+        """
+        entries = self._scope.peek_user(user_id, "mood_logs", [])
         if not isinstance(entries, list):
             return []
         return entries[-limit:] if limit > 0 else list(entries)
 
     def logs_text(self, user_id: str, limit: int = 10) -> str:
-        logs = self._scope.user_state(user_id).get("mood_logs", [])
+        logs = self._scope.peek_user(user_id, "mood_logs", [])
         if not logs:
             return "📭 暂无情绪波动记录。"
         entries = logs[-limit:] if limit > 0 else logs
@@ -2015,7 +2229,23 @@ class MoodService:
         return "\n".join(lines)
 
     def profile_text(self, user_id: str, detailed: bool = False) -> str:
-        data = self.profile(user_id)
+        # 只读展示：没档案就用配置里的初始值渲染一份，不因为 `/好感度` 建档。
+        data = self._scope.peek_user(user_id, "mood")
+        if not isinstance(data, dict):
+            cfg = self.config
+            affection = float(cfg.mood_initial_affection)
+            override = cfg.affection_override_for(user_id)
+            if override is not None:
+                affection = override
+            data = {
+                "affection": affection,
+                "base_affection": affection,
+                "libido": float(cfg.mood_initial_libido),
+                "base_libido": float(cfg.mood_initial_libido),
+                "aggression": float(cfg.mood_initial_aggression),
+                "base_aggression": float(cfg.mood_initial_aggression),
+                "turn_count": 0,
+            }
         title = "〖情绪详细档案〗" if detailed else "〖情绪档案〗"
         lines = [title]
         if detailed:
@@ -2048,16 +2278,11 @@ class MoodService:
         **无副作用**。性欲（亲近欲）本来就写在档案里；这句补的是「欲望有没有变成事」
         ——以前只看得到一条亲近欲数字，看不出她到底想不想要、有没有过。
         """
+        # 只读：三个键各自 peek，不因为看一眼亲密档案就建条目。
         try:
-            us = self._scope.user_state(user_id)
-        except Exception:
-            return ""
-        if not isinstance(us, dict):
-            return ""
-        try:
-            done = float(us.get("ccb_done_count", 0.0) or 0.0)
-            satisfy = float(us.get("ccb_satisfy", 0.0) or 0.0)
-            last = float(us.get("ccb_last_at", 0.0) or 0.0)
+            done = float(self._scope.peek_user(user_id, "ccb_done_count", 0.0) or 0.0)
+            satisfy = float(self._scope.peek_user(user_id, "ccb_satisfy", 0.0) or 0.0)
+            last = float(self._scope.peek_user(user_id, "ccb_last_at", 0.0) or 0.0)
         except (TypeError, ValueError):
             return ""
         if done <= 0 and last <= 0:

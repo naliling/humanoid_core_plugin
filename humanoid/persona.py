@@ -126,11 +126,19 @@ async def resolve_persona(context: Any, umo: str = "") -> Persona:
         except Exception:
             resolved = None
         # 返回 (persona_id, persona, force_applied_id, use_webchat_default)
-        if isinstance(resolved, tuple) and len(resolved) >= 2:
-            if resolved[0] == NO_PERSONA_MARKER:
-                return Persona(name="", prompt="", source=NO_PERSONA)
-            if resolved[1]:
-                return _to_persona(resolved[1], "会话生效人格")
+        # 哨兵检查**先看第一个元素**，不看长度与形状：返回值形状一变（列表、1 元组、
+        # 或直接给一个 persona_id 字符串），原来那句 `len(resolved) >= 2` 就会把哨兵
+        # 整个绕过去，于是「这个会话显式不用人格」被静默换成默认人格——含义正好相反。
+        if isinstance(resolved, (tuple, list)):
+            first = resolved[0] if resolved else None
+        elif isinstance(resolved, str):
+            first = resolved
+        else:
+            first = None
+        if first == NO_PERSONA_MARKER:
+            return Persona(name="", prompt="", source=NO_PERSONA)
+        if isinstance(resolved, (tuple, list)) and len(resolved) >= 2 and resolved[1]:
+            return _to_persona(resolved[1], "会话生效人格")
 
     default_getter = getattr(mgr, "get_default_persona_v3", None)
     if default_getter is not None:
@@ -206,7 +214,14 @@ class PersonaSource:
         except Exception as exc:  # 解析失败不影响生成日程，按「没有人设」排
             if self._log is not None:
                 self._log.warning(f"[humanoid_core] 人格设定读取失败，日程按无设 persona 排: {exc}")
-            persona = EMPTY
+            # **失败不写缓存**：一次瞬时故障不该变成接下来 10 分钟的「没有人设」。
+            return EMPTY
+        if persona is EMPTY:
+            # 解析**没拿到任何人设**（管理器还没就绪、读盘抖动、返回形状变了）——
+            # `resolve_persona` 自己把异常吞了、返回这个单例，所以这里必须按同一个
+            # 口径识别它，否则一次瞬时故障会被缓存 10 分钟：那 10 分钟里排出来的
+            # 全是通用模板日程。显式「不用人格」有自己的 source，是成功结果，照常缓存。
+            return EMPTY
         self._cache[key] = _Entry(persona=persona, at=self._time(), umo=umo)
         return persona
 

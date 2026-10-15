@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
@@ -19,6 +20,14 @@ from .data.cities import (
 from .data.holidays import resolve_holiday
 
 WEEKDAY_NAMES = ("一", "二", "三", "四", "五", "六", "日")
+
+# `system_timezone_city()` 认不出宿主时区对应哪个城市时给的显示名。它**不是城市名**：
+# 旧写法把它当城市名传下去，`resolve_zone` 于是走「认不出城市」分支，给诊断面板塞一条
+# 误导性说明（她其实正常按宿主机时钟过日子，并没有填错什么）。`resolve_zone` 认得这个
+# 哨兵，直接返回「没有时区、也没有问题」。
+SYSTEM_TIMEZONE_LABEL = "系统时区"
+# `_tzdata_usable()` 的**失败**结果只保留这么久（秒）；成功则一直算数。
+_TZDATA_RETRY_SECONDS = 300.0
 
 
 def weekday_cn(moment: datetime) -> str:
@@ -45,7 +54,7 @@ def resolve_zone(city: str) -> tuple[tzinfo | None, str]:
     name = resolve_zone_name(city)
     if not name:
         raw = (city or "").strip()
-        if raw and raw != DEFAULT_CITY_PLACEHOLDER:
+        if raw and raw != DEFAULT_CITY_PLACEHOLDER and raw != SYSTEM_TIMEZONE_LABEL:
             return None, f"认不出城市「{raw}」，她现在按这台机器的时间过日子（可填表内城市，或直接填 Asia/Shanghai 这类时区名）"
         return None, ""
     try:
@@ -56,14 +65,30 @@ def resolve_zone(city: str) -> tuple[tzinfo | None, str]:
         return None, f"这台机器缺时区数据库（tzdata），{name} 用不了，她现在按这台机器的时间过日子"
 
 
-@lru_cache(maxsize=1)
+_tzdata_state: tuple[bool, float] | None = None
+
+
 def _tzdata_usable() -> bool:
-    """区分「机器没时区库」与「她填错了名字」：两者的改法完全不同。"""
+    """区分「机器没时区库」与「她填错了名字」：两者的改法完全不同。
+
+    结果**不能永久缓存**：插件启动可能早于 tzdata 可用（容器里后装、AstrBot 的依赖
+    还没加载完），一次 False 被 `lru_cache(maxsize=1)` 记一辈子，之后即使 tzdata
+    可用了也永远说「这台机器缺时区数据库」。成功永久算数，失败只保留
+    `_TZDATA_RETRY_SECONDS` 秒，到点重新探测（`ZoneInfo("UTC")` 本身很便宜）。
+    """
+    global _tzdata_state
+    now = time.monotonic()
+    if _tzdata_state is not None:
+        usable, checked = _tzdata_state
+        if usable or now - checked < _TZDATA_RETRY_SECONDS:
+            return usable
+    usable = True
     try:
         ZoneInfo("UTC")
-        return True
     except Exception:
-        return False
+        usable = False
+    _tzdata_state = (usable, now)
+    return usable
 
 
 # 城市名在每条消息上都会被查（ZoneInfo 本身有缓存，但正则与字典型查找仍不必重做）。
@@ -82,6 +107,11 @@ def now_in_city(city: str) -> datetime:
 
 
 def system_timezone_city() -> str:
+    """宿主机时区对应的城市名（`resolve_zone_name` 认得出的那种）。
+
+    认不出来时返回 `SYSTEM_TIMEZONE_LABEL` 这个哨兵，而**不是**一个会被当成城市名
+    继续解析的字符串：`resolve_zone` 认得它，直接返回「没有时区、也没有问题」。
+    """
     try:
         local_tz = datetime.now().astimezone().tzinfo
         tz_name = getattr(local_tz, "key", None)
@@ -91,13 +121,19 @@ def system_timezone_city() -> str:
                     return city
     except Exception:
         pass
-    return "系统时区"
+    return SYSTEM_TIMEZONE_LABEL
 
 
-def format_offset(moment: datetime) -> str:
+def format_offset(moment: datetime) -> str | None:
+    """`UTC+08:00` 这样的偏移文本；**算不出来时返回 None，不猜 UTC**。
+
+    naive datetime 的 `%z` 是空串，旧写法返回「UTC」——那是把「不知道时区」说成了
+    UTC，正是 `link.py` 的 `utc_offset_minutes` 极力避免的错（「算不出来时必须是
+    None 而不是 0：当成 0 等于把她的城市当 UTC，错得静悄悄」）。
+    """
     raw = moment.strftime("%z")
     if len(raw) < 5:
-        return "UTC"
+        return None
     return f"UTC{raw[:3]}:{raw[3:5]}"
 
 

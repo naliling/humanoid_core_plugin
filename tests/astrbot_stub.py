@@ -7,26 +7,59 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from typing import Any, Callable
 
 
 class _Collector:
+    """`astrbot.api.logger` 的替身：只收集，不输出。
+
+    真实 AstrBot 的 `astrbot.api.logger` 最终落到标准库 `logging.Logger`
+    （`astrbot/core/log.py` 的 `LogManager.GetLogger(...) -> logging.Logger`），
+    所以 `%s` / `%r` 惰性格式化、`exc_info=True`、`extra=` 这些关键字参数都得照单全收——
+    业务模块把 `logger` 换成 astrbot 的那一个之后，调用写法原样不变才不会炸在这里。
+    """
+
     def __init__(self) -> None:
         self.lines: list[tuple[str, str]] = []
 
-    def _add(self, level: str, *args: Any) -> None:
+    def _add(self, level: str, *args: Any, **_kwargs: Any) -> None:
         self.lines.append((level, " ".join(str(a) for a in args)))
 
-    def debug(self, *a): self._add("debug", *a)
-    def info(self, *a): self._add("info", *a)
-    def warning(self, *a): self._add("warning", *a)
-    def error(self, *a): self._add("error", *a)
-    def critical(self, *a): self._add("error", *a)
+    def debug(self, *a, **k): self._add("debug", *a, **k)
+    def info(self, *a, **k): self._add("info", *a, **k)
+    def warning(self, *a, **k): self._add("warning", *a, **k)
+    def error(self, *a, **k): self._add("error", *a, **k)
+    def critical(self, *a, **k): self._add("error", *a, **k)
+    def exception(self, *a, **k): self._add("error", *a, **k)
 
     def text(self, level: str = "") -> str:
         return "\n".join(t for lv, t in self.lines if not level or lv == level)
+
+
+class _PluginLoggerProxy:
+    """`astrbot.api.logger` 的替身。
+
+    真实实现（`astrbot/api/__init__.py`）是个**按调用方模块名解析**的代理：
+    `_PluginContextLogger.__getattr__` 用 `sys._getframe(1)` 取调用者的 `__name__`，
+    再经 `LogManager.GetLogger` / `LogManager.get_plugin_logger` 落到一个标准库
+    `logging.Logger`（`astrbot/core/log.py` 里两者的返回类型注解就是 `logging.Logger`）。
+
+    这里照抄同一套机制，只把解析结果换成 `logging.getLogger(调用方模块名)`：
+    业务模块 `logger.warning(...)` 的写法、`%s`/`%r` 惰性格式化、`exc_info=True`
+    全都与线上一致，测试里的 `assertLogs("humanoid.config")` 也依然抓得到——
+    这正是这些模块改用 `from astrbot.api import logger` 之前的行为。
+    """
+
+    def __getattr__(self, item: str):
+        module_name = sys._getframe(1).f_globals.get("__name__", "") or "astrbot"
+        return getattr(logging.getLogger(module_name), item)
+
+
+PLUGIN_LOGGER = _PluginLoggerProxy()
+"""`astrbot.api.logger` 的替身实例。与真实实现一样无状态，全进程共用一个即可。"""
 
 
 class PermissionType:
@@ -206,7 +239,7 @@ class _Session:
 
 def install(data_dir: str = "/tmp/humanoid_test_data") -> dict[str, Any]:
     """把 astrbot / aiohttp 注册进 sys.modules，返回可断言的句柄。"""
-    handles: dict[str, Any] = {"logger": _Collector(), "filter": _Filter()}
+    handles: dict[str, Any] = {"logger": PLUGIN_LOGGER, "filter": _Filter()}
 
     def mod(name: str) -> types.ModuleType:
         m = sys.modules.get(name)

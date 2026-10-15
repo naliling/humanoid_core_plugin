@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import logging
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields
 from typing import Any
 
+from astrbot.api import logger
+
 from .data.cities import DEFAULT_CITY_PLACEHOLDER
 from .data.holidays import canonical_date
-
-logger = logging.getLogger(__name__)
 
 GRANULARITY_MINUTES: dict[str, int] = {
     "flexible": 0,
@@ -20,6 +20,17 @@ GRANULARITY_MINUTES: dict[str, int] = {
     "20min": 20,
     "30min": 30,
     "hourly": 60,
+}
+
+# `/拟人 设置` 命令行能直接改的整数项及其合法区间。**只此一份**：`main.py` 的
+# `_coerce_setting` 引用它做越界拒绝，`HumanoidConfig.from_raw` 也用它钳制。
+# 以前只有 from_raw 有区间，命令行把 `-1` 原样写进配置——回执说「已设为 -1」，
+# 实际生效 0（= 不限额度），把闸门整个关掉而用户毫不知情。
+INT_SETTING_RANGES: dict[str, tuple[int, int]] = {
+    "schedule_min_interval_minutes": (0, 1440),
+    "schedule_max_interval_minutes": (0, 1440),
+    "llm_idle_silence_minutes": (0, 1440),
+    "llm_daily_call_budget": (0, 1_000_000),
 }
 
 INJECT_MODES = ("medium", "full", "mood_only")
@@ -94,8 +105,22 @@ def _as_str(value: Any, default: str = "") -> str:
 
 
 def _as_choice(value: Any, options: tuple[str, ...], default: str) -> str:
+    """枚举项：认不出来就退回默认值，但**必须留一条日志**。
+
+    以前是纯静默的：面板里写 `"low"`（旧版档位名）、`"GROUP"`（大小写不符）或
+    `"1min"`（不在粒度表里），插件照默认值跑，面板显示的还是用户填的那个字。
+    用户看到的配置与代码实际用的配置是两份，且没有任何线索。
+    """
     text = _as_str(value, default)
-    return text if text in options else default
+    if text in options:
+        return text
+    logger.warning(
+        "配置项取值 %r 不在可选范围内（%s）：已退回默认值 %r",
+        value,
+        "/".join(options),
+        default,
+    )
+    return default
 
 
 def _as_str_tuple(value: Any) -> tuple[str, ...]:
@@ -128,7 +153,17 @@ def _phase_multipliers(value: Any, default: tuple[float, ...]) -> tuple[float, .
     中间几段的恢复倍率对不上。长度对不上就整体用新默认（6 个数本来就写不出 8 段）。
     """
     out = _as_float_tuple(value, default)
-    return out if len(out) == len(default) else default
+    if len(out) != len(default):
+        # 整表退回默认是**必须**的（6 个数写不出 8 段，留着会静默错位），但静默
+        # 退回让用户以为自己的 6 个倍率还在生效。面板不拦、代码丢，只能在这里喊。
+        logger.warning(
+            "energy_recovery_phase_multipliers 需要恰好 %d 个数，收到 %d 个："
+            "已整表退回默认值（旧版是 6 段，本版索引语义是 8 段）",
+            len(default),
+            len(out),
+        )
+        return default
+    return out
 
 
 def _date_entry(item: Any) -> dict[str, str] | None:
@@ -320,12 +355,15 @@ class HumanoidConfig:
     cooling_no_proactive_days: int = 3
     mood_log_enabled: bool = True
     mood_log_max_entries: int = 28
-    mood_log_threshold_affection: int = 3
-    mood_log_threshold_libido: int = 2
-    # 原为 1：单次 delta 上限是 2，所以每一条负面消息的攻击性变化都跨过这个门槛，
-    # 情绪日志被单条对话刷满，而 last_emotional_event 只看最新一条——于是「今天TA惹她
-    # 不痛快了」会连续挂一整天。提到 3 后只有真的明显波动才记。
-    mood_log_threshold_aggression: int = 3
+    # 这三个是 **float**（原为 int）：触发口径是「同一自然日累计幅度」，
+    # 内置上限分别是 0.6 / 0.5 / 0.8（见 mood.py 的 LOG_THRESHOLD_*），
+    # 生效阈值 = min(面板值, 内置上限)。面板只能调得**更敏感**（更频繁记录）：
+    # 调大没用，因为日累计本来也够不到大阈值——那正是 v2.27.26 之前
+    # 「跑了 4 天 mood_logs 一条都没有」那个 P0 的成因。
+    # **不要**改回 int：0.6 会被 int() 截成 0，面板显示的与实际生效的对不上。
+    mood_log_threshold_affection: float = 0.6
+    mood_log_threshold_libido: float = 0.5
+    mood_log_threshold_aggression: float = 0.8
     mood_update_timeout: float = 120.0
     mood_tag_enabled: bool = True
     mood_use_llm_for_delta: bool = True
@@ -350,6 +388,14 @@ class HumanoidConfig:
     social_energy_recovery_per_minute: float = 1.5
     social_energy_reset_hour: int = 0
     social_energy_recovery_interval_seconds: int = 60
+
+    # 过程（services/process.py）：她手上这件事本身会走完、会换阶段。
+    # 这三个键以前**不存在**，而 process.py 直接读 `cfg.process_min_duration` 等——
+    # 它一被实例化起来就是 `AttributeError`。之所以一直没炸，是因为那个服务在全项目里
+    # 零实例化（v2.27.27 才接线）。
+    process_min_duration: int = 20
+    process_max_duration: int = 180
+    process_history_limit: int = 20
 
     night_mode_enabled: bool = True
     night_start_hour: int = 23
@@ -412,16 +458,16 @@ class HumanoidConfig:
             v = pick(key)
             return getattr(d, key) if v is _MISSING else ("" if v is None else str(v).strip())
 
-        return cls(
+        cfg = cls(
             max_energy=f("max_energy", 1.0, 10_000.0),
             enable_cycle=b("enable_cycle"),
             cycle_length=i("cycle_length", 1, 365),
             energy_decay_rate=f("energy_decay_rate", 0.0, 100.0),
             cycle_description_style=c("cycle_description_style", CYCLE_STYLES),
             enable_energy_natural_recovery=b("enable_energy_natural_recovery"),
-            energy_natural_recovery_per_minute=f("energy_natural_recovery_per_minute", 0.0, 100.0),
+            energy_natural_recovery_per_minute=f("energy_natural_recovery_per_minute", 0.0, 0.9),
             energy_natural_recovery_interval_minutes=i("energy_natural_recovery_interval_minutes", 1, 1440),
-            energy_consumption_per_msg=f("energy_consumption_per_msg", 0.0, 100.0),
+            energy_consumption_per_msg=f("energy_consumption_per_msg", 0.0, 0.9),
             energy_recovery_phase_multipliers=_phase_multipliers(
                 pick("energy_recovery_phase_multipliers"), d.energy_recovery_phase_multipliers
             ),
@@ -436,10 +482,20 @@ class HumanoidConfig:
             schedule_refresh_minutes=i("schedule_refresh_minutes", 1, 1440),
             schedule_change_chance=i("schedule_change_chance", 0, 100),
             schedule_provider_cooldown_minutes=i("schedule_provider_cooldown_minutes", 0, 1440),
-            schedule_min_interval_minutes=i("schedule_min_interval_minutes", 0, 1440),
-            schedule_max_interval_minutes=i("schedule_max_interval_minutes", 0, 1440),
-            llm_idle_silence_minutes=i("llm_idle_silence_minutes", 0, 1440),
-            llm_daily_call_budget=i("llm_daily_call_budget", 0, 1_000_000),
+            # 这四项的区间只在 INT_SETTING_RANGES 里写一次：命令行写回（main.py）
+            # 与这里的钳制必须用同一份，否则「回执说 -1、实际 0」那类事会再来。
+            schedule_min_interval_minutes=i(
+                "schedule_min_interval_minutes", *INT_SETTING_RANGES["schedule_min_interval_minutes"]
+            ),
+            schedule_max_interval_minutes=i(
+                "schedule_max_interval_minutes", *INT_SETTING_RANGES["schedule_max_interval_minutes"]
+            ),
+            llm_idle_silence_minutes=i(
+                "llm_idle_silence_minutes", *INT_SETTING_RANGES["llm_idle_silence_minutes"]
+            ),
+            llm_daily_call_budget=i(
+                "llm_daily_call_budget", *INT_SETTING_RANGES["llm_daily_call_budget"]
+            ),
             schedule_prompt_extra=s_opt("schedule_prompt_extra")[
                 : cls.SCHEDULE_PROMPT_EXTRA_MAX
             ],
@@ -472,7 +528,10 @@ class HumanoidConfig:
             outfit_scene_variation=b("outfit_scene_variation"),
             mood_enabled=b("mood_enabled"),
             mood_provider_name=s_opt("mood_provider_name"),
-            mood_sensitivity=i("mood_sensitivity", 0, 100),
+            # 下限必须是 1：0 不是「不敏感」而是**静默冻结全部情绪变化**
+            # （mood.py 里 factor = mood_sensitivity / 100.0，0 → 任何消息都激不起波动），
+            # 面板上却像个合法的「最不敏感」档位。
+            mood_sensitivity=i("mood_sensitivity", 1, 100),
             mood_decay_hours=f("mood_decay_hours", 0.1, 720.0),
             mood_initial_affection=i("mood_initial_affection", 0, 100),
             ccb_libido_min=f("ccb_libido_min", 0.0, 50.0),
@@ -484,7 +543,9 @@ class HumanoidConfig:
             mood_initial_aggression=i("mood_initial_aggression", 0, 50),
             mood_affection_override=_as_str_tuple(pick("mood_affection_override")),
             mood_affection_delta_cap=i("mood_affection_delta_cap", 1, 10),
-            mood_negative_streak_required=i("mood_negative_streak_required", 1, 10),
+            # 下限是 2：1 会让「一句孤立的难听话就扣好感」——那正是本项要关掉的行为，
+            # 面板上的 1 看起来只是个「更严格」的档位，实际把这条规则整条关掉。
+            mood_negative_streak_required=i("mood_negative_streak_required", 2, 10),
             mood_negative_softening=b("mood_negative_softening"),
             mood_recovery_bonus=b("mood_recovery_bonus"),
             cooling_enabled=b("cooling_enabled"),
@@ -493,14 +554,16 @@ class HumanoidConfig:
             cooling_no_proactive_days=i("cooling_no_proactive_days", 0, 30),
             mood_log_enabled=b("mood_log_enabled"),
             mood_log_max_entries=i("mood_log_max_entries", 1, 1000),
-            mood_log_threshold_affection=i("mood_log_threshold_affection", 0, 100),
-            mood_log_threshold_libido=i("mood_log_threshold_libido", 0, 50),
-            mood_log_threshold_aggression=i("mood_log_threshold_aggression", 0, 50),
+            mood_log_threshold_affection=f("mood_log_threshold_affection", 0.0, 1.0),
+            mood_log_threshold_libido=f("mood_log_threshold_libido", 0.0, 1.0),
+            mood_log_threshold_aggression=f("mood_log_threshold_aggression", 0.0, 1.0),
             mood_update_timeout=f("mood_update_timeout", 5.0, 600.0),
             mood_tag_enabled=b("mood_tag_enabled"),
             mood_use_llm_for_delta=b("mood_use_llm_for_delta"),
             mood_provider_cooldown_minutes=i("mood_provider_cooldown_minutes", 0, 1440),
-            ccb=bool(src.get("ccb", False)),
+            # 必须走 b()：`bool(src.get(...))` 让任何非空字符串都为真，
+            # 手改 JSON 写成 "false"/"0" 会把 ccb 开关**意外打开**。
+            ccb=b("ccb"),
             mood_llm_interval_messages=i("mood_llm_interval_messages", 1, 100),
             mood_llm_batch_max=i("mood_llm_batch_max", 1, 30),
             mood_llm_message_chars=i("mood_llm_message_chars", 50, 2000),
@@ -510,10 +573,13 @@ class HumanoidConfig:
             auto_nickname=b("auto_nickname"),
             auto_identify_user=b("auto_identify_user"),
             social_energy_enabled=b("social_energy_enabled"),
-            social_energy_consumption_per_msg=f("social_energy_consumption_per_msg", 0.0, 100.0),
-            social_energy_recovery_per_minute=f("social_energy_recovery_per_minute", 0.0, 100.0),
+            social_energy_consumption_per_msg=f("social_energy_consumption_per_msg", 0.0, 1.0),
+            social_energy_recovery_per_minute=f("social_energy_recovery_per_minute", 0.0, 3.0),
             social_energy_reset_hour=i("social_energy_reset_hour", -1, 23),
             social_energy_recovery_interval_seconds=i("social_energy_recovery_interval_seconds", 60, 300),
+            process_min_duration=i("process_min_duration", 1, 240),
+            process_max_duration=i("process_max_duration", 5, 1440),
+            process_history_limit=i("process_history_limit", 1, 200),
             night_mode_enabled=b("night_mode_enabled"),
             night_start_hour=i("night_start_hour", 0, 23),
             night_end_hour=i("night_end_hour", 0, 23),
@@ -534,6 +600,15 @@ class HumanoidConfig:
             contract_enabled=b("contract_enabled"),
             schedule_follow_night_window=b("schedule_follow_night_window"),
         )
+        if cfg.night_mode_enabled and cfg.night_start_hour == cfg.night_end_hour:
+            # 起止相同 = 窗口长度 0 = **没有夜里**（不是「全天算夜里」）：睡眠债不再累积、
+            # 昼夜低谷不再锚定。面板与 hint 都看不出这一点，至少要留一条日志。
+            logger.warning(
+                "night_start_hour 与 night_end_hour 都是 %d：夜间窗口长度为 0，"
+                "等于关闭夜间窗口（不攒睡眠债、昼夜低谷不锚定）。要关夜间请用 night_mode_enabled",
+                cfg.night_start_hour,
+            )
+        return cfg
 
     # ------------------------------------------------------------------
     # 作息窗口：夜间窗口 = 她的生物钟夜，不是「回复语气开关」那么简单
@@ -635,16 +710,21 @@ class HumanoidConfig:
         return str(sender_id) in self.admin_qq
 
     def affection_override_for(self, qq: str) -> float | None:
-        for item in self.mood_affection_override:
-            if ":" not in item:
-                continue
-            key, _, raw = item.partition(":")
-            if key.strip() != str(qq):
-                continue
-            try:
-                return max(0.0, min(100.0, float(raw.strip())))
-            except ValueError:
-                return None
+        target = str(qq)
+        for entry in self.mood_affection_override:
+            # 面板的 hint 曾经教「一个条目里用英文逗号分隔多条」，而 list 编辑器里
+            # 一个条目就是一条——照那句 hint 填的人拿到的是 "123:100,456:50" 整串，
+            # 不拆的话 `float()` 抛错、**两条设置一起静默失效**。两种写法都认。
+            for item in re.split(r"[,，]", str(entry)):
+                if ":" not in item:
+                    continue
+                key, _, raw = item.partition(":")
+                if key.strip() != target:
+                    continue
+                try:
+                    return max(0.0, min(100.0, float(raw.strip())))
+                except ValueError:
+                    return None
         return None
 
     def cycle_phase_index(self, cycle_day: int) -> int:
@@ -656,7 +736,11 @@ class HumanoidConfig:
         cycle_length 不是 28 时按比例缩放到这条标准轴上，所以自定义周期照样能用。
         """
         length = max(1, self.cycle_length)
-        day = ((int(cycle_day) - 1) % length) * 28.0 / length + 1
+        # 第几天可能来自状态文件/外部输入，非数值不该让整条取值链抛出去：
+        # 同文件其它取值都做了兜底，这里以前是唯一的例外（`phase_recovery_multiplier`
+        # 直接调它，调用方没有 try）。
+        day_number = _as_int(cycle_day, 1)
+        day = ((day_number - 1) % length) * 28.0 / length + 1
         for upper, idx in ((5, 0), (8, 1), (11, 2), (13, 3), (14, 4), (19, 5), (22, 6)):
             if day <= upper:
                 return idx

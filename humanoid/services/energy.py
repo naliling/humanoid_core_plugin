@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from ..clock import format_state_timestamp, parse_state_timestamp
@@ -55,6 +55,35 @@ PHASE_NOTES = (
     # 23-28：激素跳水，PMS
     "激素开始跳水，身子浮肿、冒痘，乳房碰一下都不舒服，情绪像蒙了层灰",
 )
+
+
+def _day_start(moment: datetime) -> datetime:
+    """当天 00:00（同一时区）。跨天结算要把窗口切成「昨天剩下的」与「今天到现在的」。"""
+    return datetime.combine(moment.date(), time(0, 0), tzinfo=moment.tzinfo)
+
+
+def _day_epoch(anchor: datetime, minutes: float) -> float:
+    """把「某天的第几分钟」换算成 epoch 秒。
+
+    日程时段是墙钟分钟，而经过时长必须按 epoch 差算：夏令时前进日 01:30→03:30 的
+    墙钟差是 120 分钟，真实只过了 60 分钟；回退日反过来。
+    """
+    base = datetime.combine(anchor.date(), time(0, 0), tzinfo=anchor.tzinfo)
+    return (base + timedelta(minutes=minutes)).timestamp()
+
+
+def _covered_minutes(spans: list[tuple[float, float]], start_ts: float, end_ts: float) -> float:
+    """这些区间在 [start_ts, end_ts] 里一共盖了多少分钟（重叠只算一次）。"""
+    total = 0.0
+    cursor = start_ts
+    for lo, hi in sorted(spans):
+        lo = max(lo, cursor)
+        hi = min(hi, end_ts)
+        if hi <= lo:
+            continue
+        total += hi - lo
+        cursor = hi
+    return total / 60.0
 
 
 def describe_energy(energy: float, seed=None) -> str:
@@ -125,16 +154,21 @@ class EnergyService:
             self._scope.mark_dirty()
             return self.energy
 
+        energy = self.energy
         if last.date() < now.date():
-            return self._reset_for_new_day(cfg, now)
-
-        start_min = last.hour * 60 + last.minute + last.second / 60.0
-        end_min = now.hour * 60 + now.minute + now.second / 60.0
-        if end_min <= start_min:
-            return self.energy
-
-        delta = self._compute_delta(start_min, end_min, cfg)
-        energy = self._clamp(self.energy + delta, cfg)
+            # 跨天：先落到新一天的起点，再从 00:00 结算到现在。
+            #
+            # 旧写法在这里直接 `return self._reset_for_new_day(...)`，00:00→now 那一段
+            # 一分未计——实测 `last_update=05-31 23:59`、`now=06-01 08:00`、日程
+            # `00:00–24:00 rate=-0.15` 时返回 79.61，八小时的消耗凭空消失。
+            #
+            # 新起点本身已经代表「睡醒后的状态」（`_reset_for_new_day`），所以这一截
+            # 只结算**消耗**，不再叠加恢复：否则同一夜的休息会被算两遍（起点一次、
+            # 午夜后一次），凌晨三点就能把精力顶到上限。
+            energy = self._new_day_baseline(cfg)
+            energy = self._settle(energy, _day_start(now), now, cfg, recovery=False)
+        else:
+            energy = self._settle(energy, last, now, cfg)
         energy = self._apply_body_ceiling(energy, cfg)
         data["energy"] = round(energy, 1)
         data["last_update"] = format_state_timestamp(now)
@@ -152,19 +186,13 @@ class EnergyService:
             return energy
         return min(energy, max(0.0, ceiling))
 
-    def _reset_for_new_day(self, cfg: HumanoidConfig, now: datetime) -> float:
+    def _new_day_baseline(self, cfg: HumanoidConfig) -> float:
         """新一天的起点不是固定 80：欠着睡眠债的时候，起床也不会「满血」。"""
         body = self._body_axis()
         penalty = body.sleep_debt_penalty() if body is not None else 1.0
-        energy = self._clamp(
+        return self._clamp(
             DAY_START_ENERGY * random.uniform(0.95, 1.05) * penalty, cfg, floor=5.0
         )
-        energy = self._apply_body_ceiling(energy, cfg)
-        data = self._scope.self_state
-        data["energy"] = round(energy, 1)
-        data["last_update"] = format_state_timestamp(now)
-        self._scope.mark_dirty()
-        return energy
 
     def _body_axis(self) -> Any:
         if self._body is None:
@@ -174,18 +202,43 @@ class EnergyService:
         except Exception:
             return None
 
-    def _compute_delta(self, start_min: float, end_min: float, cfg: HumanoidConfig) -> float:
+    def _settle(
+        self,
+        energy: float,
+        start: datetime,
+        end: datetime,
+        cfg: HumanoidConfig,
+        *,
+        recovery: bool = True,
+    ) -> float:
+        """把 start→end 这一段按日程结算掉。
+
+        时长一律走 epoch 差。旧写法拿「墙钟分钟差」当经过时长：夏令时前进日
+        01:30→03:30 的墙钟差是 120 分钟（真实 60 分钟，虚增 2 倍），回退日
+        01:45→01:30 直接 `end_min <= start_min` 早退，45 分钟凭空蒸发。
+        """
+        start_ts = start.timestamp()
+        end_ts = end.timestamp()
+        if end_ts <= start_ts:
+            return energy
+        delta = self._compute_delta(start_ts, end_ts, start, cfg, recovery=recovery)
+        return self._clamp(energy + delta, cfg)
+
+    def _compute_delta(
+        self,
+        start_ts: float,
+        end_ts: float,
+        anchor: datetime,
+        cfg: HumanoidConfig,
+        *,
+        recovery: bool = True,
+    ) -> float:
         if self._schedule is None:
             return 0.0
         slots = self._schedule()
         decay = max(0.0, float(cfg.energy_decay_rate))
         if decay == 0.0:
             return 0.0
-        if not slots:
-            # 没日程可用时（刚跨过零点、新的一段还没排出来的那一两分钟）按**自然恢复**算，
-            # 不按 0。返回 0 等于把精力冻住：这段时间里她既不消耗也不回血，而这几分钟
-            # 恰好是模型最慢的时候（要现排一段），冻得最明显。
-            return self._idle_recovery(start_min, end_min, cfg)
 
         body = self._body_axis()
         discomfort_factor = body.discomfort_factor() if body is not None else 1.0
@@ -201,22 +254,29 @@ class EnergyService:
         recovery_factor = cfg.phase_recovery_multiplier(self.cycle_day)
 
         total = 0.0
+        covered: list[tuple[float, float]] = []
         for slot in slots:
             slot_start = parse_time(slot.get("start"))
             slot_end = parse_time(slot.get("end"))
             if slot_start is None or slot_end is None or slot_end <= slot_start:
                 continue
-            overlap_start = max(float(slot_start), start_min)
-            overlap_end = min(float(slot_end), end_min)
-            minutes = overlap_end - overlap_start
-            if minutes <= 0:
+            lo = _day_epoch(anchor, slot_start)
+            hi = _day_epoch(anchor, slot_end)
+            overlap_start = max(lo, start_ts)
+            overlap_end = min(hi, end_ts)
+            if overlap_end <= overlap_start:
                 continue
+            covered.append((overlap_start, overlap_end))
+            minutes = (overlap_end - overlap_start) / 60.0
 
             rate = clamp_rate(slot.get("energy_rate", 0.0))
             if rate < 0:
+                # 消耗永远计：跨天之后那一截也要算，旧写法整段丢掉。
                 total += (
                     rate * CONSUMPTION_DISCOUNT * consumption_factor * decay * minutes * discomfort_factor
                 )
+                continue
+            if not recovery:
                 continue
 
             total += rate * decay * minutes
@@ -224,10 +284,18 @@ class EnergyService:
                 credited = (int(minutes) // recovery_step) * recovery_step
                 if credited > 0:
                     total += recovery_per_min * recovery_factor * decay * credited
+
+        # 空隙：日程非空但没盖到的那几分钟，旧写法既不消耗也不恢复 —— 精力被冻住。
+        # 这与 185-187 行「没日程可依时按自然恢复算，不按 0」是同一条口径，只是
+        # 旧实现只处理了「完全没有日程」，没处理「有日程但有洞」。
+        if recovery:
+            gap = (end_ts - start_ts) / 60.0 - _covered_minutes(covered, start_ts, end_ts)
+            if gap > 0:
+                total += self._idle_recovery(gap, cfg)
         return total
 
-    def _idle_recovery(self, start_min: float, end_min: float, cfg: HumanoidConfig) -> float:
-        """没有日程可依时的那段空窗：只给自然恢复，不给消耗。
+    def _idle_recovery(self, minutes: float, cfg: HumanoidConfig) -> float:
+        """没有日程可依的那段空窗：只给自然恢复，不给消耗。
 
         给恢复是因为「什么也没做」实际是躺着的概率远高于「什么也没做且一直在消耗」；
         幅度按分钟数走，不看是什么时段——反正这段时间本来就不该有结论。
@@ -238,10 +306,15 @@ class EnergyService:
         if per_min <= 0:
             return 0.0
         step = max(1, int(cfg.energy_natural_recovery_interval_minutes))
-        credited = (int(max(0.0, end_min - start_min)) // step) * step
+        credited = (int(max(0.0, minutes)) // step) * step
         if credited <= 0:
             return 0.0
-        return per_min * cfg.phase_recovery_multiplier(self.cycle_day) * max(0.0, float(cfg.energy_decay_rate)) * credited
+        return (
+            per_min
+            * cfg.phase_recovery_multiplier(self.cycle_day)
+            * max(0.0, float(cfg.energy_decay_rate))
+            * credited
+        )
 
     def consume_for_message(self) -> float:
         cfg = self.config
@@ -266,7 +339,10 @@ class EnergyService:
         return energy
 
     def _clamp(self, value: float, cfg: HumanoidConfig, floor: float = 0.0) -> float:
-        return max(floor, min(max(1.0, float(cfg.max_energy)), value))
+        # floor 也要夹到上限以内：`max_energy=1.0`（配置允许）时旧的
+        # `max(5.0, min(1.0, value))` 会返回 5.0 —— 超过 max_energy 四倍。
+        ceiling = max(1.0, float(cfg.max_energy))
+        return max(min(floor, ceiling), min(ceiling, value))
 
     def advance_cycle(self, today: str | None = None) -> int:
         cfg = self.config

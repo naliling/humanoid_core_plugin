@@ -72,11 +72,21 @@ class EmotionLayer:
         for entry in entries or []:
             if not str(entry.get("time", "")).startswith(today):
                 continue
-            event = str(entry.get("event", ""))
-            if "下降" in event:
-                downs += 1
-            elif "上升" in event:
-                ups += 1
+            # **逐轴判正负**：攻击性这一轴的词面与情感是反的——「攻击性上升」是她更生气
+            # （负向），「攻击性下降」是气消了（正向）。原来按「上升/下降」字符串猜：
+            # 一条发怒被读成心情好；而甜话把攻击性压下来的那 0.3 分又被读成负向，
+            # 于是 `_attitude` 会在**好好聊了一天**之后说「上回那句话到现在都还窝火」。
+            # 日志喂饱之后（v2.28.9 修掉饿死后）这一点尤其致命。
+            for segment in str(entry.get("event", "")).split("，"):
+                rising = "上升" in segment
+                falling = "下降" in segment
+                if not rising and not falling:
+                    continue
+                good = falling if "攻击性" in segment else rising
+                if good:
+                    ups += 1
+                else:
+                    downs += 1
         return ups, downs
 
     # ------------------------------------------------------------------
@@ -89,6 +99,8 @@ class EmotionLayer:
         「一会儿好一会儿不好」要求正负各 ≥2 次（v2.27.2）：原来各 1 次就亮，
         而日志阈值只有 2 分、单条消息都能触发——一句玩笑话加一句抱怨，
         当天底色就变成「说不上来」。正负各两次以上，才真是反复的一天。
+        （v2.28.9 起日志按同一自然日的累计幅度触发，不再被单条阈值饿死；
+        正负的判定见 `_today_events`——「攻击性上升」算负向。）
         """
         ups, downs = self._today_events(user_id)
         if downs >= 2 and ups == 0:

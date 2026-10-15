@@ -119,6 +119,22 @@ class ProcessService:
     def config(self) -> HumanoidConfig:
         return self._config()
 
+    def _int_cfg(self, key: str, default: int) -> int:
+        """容错取一个整数配置。
+
+        配置对象上没有这个键时（旧配置、测试替身、别的调用方递进来的轻量对象）用默认值：
+        这里原来是 `self.config.process_min_duration` 这种**硬取**，配置一缺就是
+        `AttributeError`——而这个服务以前全项目零实例化，所以一直没暴露。
+        """
+        try:
+            value = getattr(self.config, key, default)
+        except Exception:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     def current(self) -> dict:
         proc = self._scope.get_self("current_process")
         if not isinstance(proc, dict) or not proc:
@@ -128,6 +144,19 @@ class ProcessService:
             # 兼容旧版过程数据，同时让已经存在的长过程获得阶段更新时间。
             self._ensure_process_fields(proc)
         return proc
+
+    def peek(self) -> dict:
+        """只读当前过程：没有就返回空 dict（**不**生成、不写盘）。
+
+        诊断/快照这类只读入口用它，否则「看一眼状态」本身就会凭空造出一个过程。
+        """
+        proc = self._scope.get_self("current_process")
+        return dict(proc) if isinstance(proc, dict) else {}
+
+    @property
+    def pending_update(self) -> bool:
+        """`tick()` 是否标记了「该更新了」（由 `update_async` 消费）。"""
+        return self._pending_update
 
     def needs_update(self) -> bool:
         proc = self.current()
@@ -158,7 +187,9 @@ class ProcessService:
         # 阶段更新无需频繁调用模型，因此只保留很短的防抖。
         # 防抖计时用单调钟（schedule/llm 同款）：墙钟在系统对时或手动改时间时会
         # 前跳/回拨，2 秒窗口跟着失真——要么连着生成几次，要么卡住不更新。
-        if time.monotonic() - self._last_update_attempt < 2:
+        # `_pending_update`（`tick()` 置的）要在这里**被消费**：它表示「这一轮检查
+        # 判定该更新了」，那种情况下不该再被 2 秒防抖挡回去。
+        if not self._pending_update and time.monotonic() - self._last_update_attempt < 2:
             return self.current()
         proc = self._advance_or_generate()
         self._scope.set_self("current_process", proc)
@@ -204,7 +235,7 @@ class ProcessService:
 
     def _push_history(self, proc: dict) -> None:
         """一个过程结束时记一笔，让「刚做完什么」能被后续上下文引用。"""
-        limit = int(self.config.process_history_limit)
+        limit = self._int_cfg("process_history_limit", 20)
         name = str(proc.get("name", "")).strip()
         if limit <= 0 or not name:
             return
@@ -221,7 +252,7 @@ class ProcessService:
         history = self._scope.get_self("process_history")
         if not isinstance(history, list) or not history:
             return []
-        cap = int(self.config.process_history_limit) if limit is None else limit
+        cap = self._int_cfg("process_history_limit", 20) if limit is None else limit
         if cap <= 0:
             return []
         return [str(item) for item in history[-cap:]][::-1]
@@ -240,13 +271,12 @@ class ProcessService:
         except (TypeError, ValueError):
             index = 0
 
-        # 一次可能跨过多个阶段，例如应用长时间暂停后重新启动。
+        # 一次可能跨过多个阶段，例如应用长时间暂停后重新启动。必须从**旧的**
+        # `next_phase_at` 往后逐个推进：以前每轮都用 `now` 重算，算出来永远在未来，
+        # 循环第一轮就退出——「跨过多个阶段」这件事实际上不可能发生（注释与实现不符）。
+        cursor = self._parse_dt(proc.get("next_phase_at"))
         elapsed = 0
-        while True:
-            next_phase = self._parse_dt(proc.get("next_phase_at"))
-            if next_phase is None or now < next_phase:
-                break
-
+        while cursor is not None and now >= cursor:
             index += 1
             if index >= len(phases):
                 # 阶段列表走完后不改变“当前过程”主题，只生成一个自然的微变化。
@@ -255,8 +285,8 @@ class ProcessService:
                 break
 
             proc["phase"] = phases[index]
-            proc["next_phase_at"] = self._next_phase_time(now, proc).isoformat()
             elapsed += 1
+            cursor = self._next_phase_time(cursor, proc)
             if elapsed >= len(phases):
                 break
 
@@ -272,15 +302,25 @@ class ProcessService:
                 self._parse_dt(proc.get("expected_end")) or (now + timedelta(minutes=5)),
                 now + timedelta(minutes=random.randint(5, 10)),
             ).isoformat()
+        elif cursor is not None:
+            proc["next_phase_at"] = cursor.isoformat()
         return proc
 
     def _ensure_process_fields(self, proc: dict) -> None:
+        """补齐旧版/残缺过程数据缺的字段。
+
+        它由只读入口 `current()` 调用，但**会**改这份 dict：补出来的字段不标脏就只活在
+        内存里，重启后又是缺的（下次读取再补一遍，永远不落盘）。只在真的补了东西时标脏，
+        免得把 `current()` 变成常驻写盘源。
+        """
+        before = dict(proc)
         now = self._clock.now()
         if not proc.get("started_at"):
             proc["started_at"] = now.replace(second=0, microsecond=0).isoformat()
         if not proc.get("expected_end"):
             duration = int(proc.get("duration_minutes") or random.randint(
-                self.config.process_min_duration, self.config.process_max_duration
+                self._int_cfg("process_min_duration", MIN_PROCESS_DURATION),
+                self._int_cfg("process_max_duration", MAX_PROCESS_DURATION),
             ))
             proc["expected_end"] = (
                 self._parse_dt(proc["started_at"]) + timedelta(minutes=max(5, duration))
@@ -304,6 +344,8 @@ class ProcessService:
             proc["slot_event"] = ""
         if "slot_start" not in proc:
             proc["slot_start"] = ""
+        if proc != before:
+            self._scope.mark_dirty()
 
     def note_segment_changed(self, slot: Slot) -> None:
         """日程换了一段之后，过程跟着换锚点。
@@ -352,8 +394,8 @@ class ProcessService:
         templates = PROCESS_TEMPLATES.get(category) or [DEFAULT_TEMPLATE]
         template = random.choice(templates)
 
-        min_duration = max(5, int(self.config.process_min_duration or MIN_PROCESS_DURATION))
-        max_duration = max(min_duration, int(self.config.process_max_duration or MAX_PROCESS_DURATION))
+        min_duration = max(5, self._int_cfg("process_min_duration", MIN_PROCESS_DURATION))
+        max_duration = max(min_duration, self._int_cfg("process_max_duration", MAX_PROCESS_DURATION))
         remaining = self._slot_remaining_minutes(slot, minutes)
 
         if remaining >= min_duration:
@@ -469,18 +511,36 @@ class ProcessService:
         return "自由时间"
 
     def describe(self) -> str:
-        proc = self.current()
-        name = proc.get("name", "休息")
+        """一句话描述当前过程。没有过程时返回空串（**不**凭空生成一个）。"""
+        proc = self.peek()
+        if not proc:
+            return ""
+        name = str(proc.get("name", "") or "")
         phase = proc.get("phase")
         if phase and phase != name:
             return f"{name}：{phase}"
-        return str(name)
+        return name
 
-    @staticmethod
-    def _parse_dt(value: Any) -> datetime | None:
+    def _parse_dt(self, value: Any) -> datetime | None:
+        """解析状态里的时间戳，并补上**这台钟的时区**。
+
+        `datetime.fromisoformat("2026-01-01T09:00:00")` 给的是 naive datetime，而
+        `clock.now()` 是 aware 的——两者一比较就抛
+        `TypeError: can't compare offset-naive and offset-aware datetimes`，于是所有比较点
+        （`needs_update` / `_advance_or_generate` / `_phase_due` / `_advance_phase`）全炸。
+        口径与 `clock.parse_state_datetime` 统一：没有时区的按**当前**时区解释。
+        """
         if not value:
             return None
         try:
-            return datetime.fromisoformat(str(value))
+            parsed = datetime.fromisoformat(str(value))
         except (TypeError, ValueError):
             return None
+        if parsed.tzinfo is None:
+            try:
+                tz = self._clock.now().tzinfo
+            except Exception:
+                tz = None
+            if tz is not None:
+                parsed = parsed.replace(tzinfo=tz)
+        return parsed

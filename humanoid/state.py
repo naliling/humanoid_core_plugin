@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +41,14 @@ _LEGACY_USER_FIELDS = {
 
 _DROPPED_FIELDS = ("_energy_noise_date",)
 
+# 顶层**只允许**有 `_state_version` 与 `roles`。这份集合把所有历史顶层键集中起来，
+# 迁移时无条件 pop：以前只有 `_DROPPED_FIELDS` 是无条件删的，其余旧键仅在
+# `_absorb_legacy` 真的搬成功时才被删——roles 里已有一份同名数据时，顶层那份
+# 拷贝就永远留在文件里，既读不到又一直占体积。
+_LEGACY_TOP_LEVEL = (
+    frozenset(_LEGACY_SELF_FIELDS) | frozenset(_LEGACY_USER_FIELDS) | frozenset(_DROPPED_FIELDS)
+)
+
 
 def default_state(today: str = "", cycle_day: int = 1) -> dict[str, Any]:
     """v3 只存两样东西：版本号与角色表。
@@ -58,11 +68,14 @@ class StateStore:
     __slots__ = (
         "_dirty",
         "_dirty_event",
+        "_disk_version",
         "_flush_task",
         "_interval",
+        "_load_failed",
         "_log",
         "_path",
         "_state",
+        "_version_blocked",
         "_write_lock",
         "lock",
         "writes",
@@ -79,6 +92,10 @@ class StateStore:
         self._log = logger
         self._state: dict[str, Any] = default_state()
         self._dirty = False
+        # 加载失败 / 盘上版本更新 → 一律拒绝写盘（见 `_write_block_reason`）。
+        self._load_failed = False
+        self._version_blocked = False
+        self._disk_version = STATE_VERSION
         self._dirty_event = asyncio.Event()
         self._flush_task: asyncio.Task[None] | None = None
         self.lock = asyncio.Lock()
@@ -116,26 +133,88 @@ class StateStore:
             self.mark_dirty()
             return
 
+        # 先读字节、再按多种编码试解码：**编码不对不是「文件损坏」**。以前直接
+        # `read_text(encoding="utf-8")`，一份 GBK 手改的文件或带 BOM 的文件都会被判成
+        # 损坏备份走，然后重建成空状态——数据其实完好。
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
+            data = self._path.read_bytes()
+        except OSError as exc:
+            # 读都读不到（Windows 上杀软/编辑器占用 → PermissionError）时绝不能把
+            # `_state` 换成 fresh：文件内容可能完好，只是此刻打不开，下一次 flush 就会
+            # 用空状态把它覆盖掉。保留原文件，改为拒绝写盘。
+            self._load_failed = True
+            self._error(f"状态文件读取失败，已停止写盘以免覆盖原文件: {exc}")
+            return
+
+        try:
+            raw = json.loads(_decode_bytes(data))
             if not isinstance(raw, dict):
                 raise ValueError("state.json 顶层不是对象")
         except Exception as exc:
-            self._backup_corrupt(exc)
-            self._state = fresh
-            self.mark_dirty()
+            if self._backup_corrupt(exc):
+                self._state = fresh
+                self.mark_dirty()
             return
 
         self._state = self._migrate(raw, fresh, cycle_length)
+        disk_version = _state_version_of(raw)
+        if disk_version > STATE_VERSION:
+            # 旧版插件读到新版写的文件：照旧读，但**不许**再写回去（写回等于把它降级，
+            # 新版加的字段会被整段抹掉）。
+            self._version_blocked = True
+            self._disk_version = disk_version
+            self._error(
+                f"状态文件版本 {disk_version} 高于本插件支持的 {STATE_VERSION}："
+                "已停止写盘（请升级插件），读取仍按当前版本尽力解析"
+            )
         self._info("状态加载成功")
-    def _backup_corrupt(self, exc: Exception) -> None:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup = self._path.with_name(f"{self._path.stem}.corrupt-{stamp}.json")
+
+    def _backup_corrupt(self, exc: Exception) -> bool:
+        """把损坏的状态文件挪去备份名；返回是否备份成功。
+
+        备份**失败**时不能当作「已处理」：原文件此刻打不开（被占用/无权限）不代表它
+        坏了，紧接着拿一份空状态去覆盖它才是真的丢数据。所以失败时置 `_load_failed`
+        并让 `flush()`/`flush_sync()` 拒绝写盘。
+        """
+        # 时间戳精确到微秒也**不够**：Windows 上 `datetime.now()` 的粒度约 15.6 毫秒，
+        # 同一刻的两次损坏备份会拿到同一个名字，`os.replace` 直接覆盖前一份（等于把
+        # 上一份待查的坏数据销毁）。所以在时间戳之外再探一个没被占用的序号。
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        base = f"{self._path.stem}.corrupt-{stamp}-{os.getpid()}"
+        backup = self._path.with_name(f"{base}.json")
+        seq = 0
+        while backup.exists():
+            seq += 1
+            backup = self._path.with_name(f"{base}-{seq}.json")
         try:
             os.replace(self._path, backup)
-            self._warn(f"状态文件损坏，已备份为 {backup.name} 并重建默认状态: {exc}")
-        except OSError:
-            self._warn(f"状态文件损坏且备份失败，使用默认状态: {exc}")
+        except OSError as backup_exc:
+            self._load_failed = True
+            self._error(
+                f"状态文件损坏（{exc}）且备份失败（{backup_exc}）：已保留原文件并停止写盘，"
+                "确认无误后手动删除该文件再重启即可恢复"
+            )
+            return False
+        self._warn(f"状态文件损坏，已备份为 {backup.name} 并重建默认状态: {exc}")
+        return True
+
+    def _write_block_reason(self) -> str:
+        """非空 = 此刻禁止写盘（盘上那份内容比内存里的更值得保留）。"""
+        if self._load_failed:
+            return "上次加载未能安全读取/备份原文件，写盘会覆盖它"
+        if self._version_blocked:
+            return (
+                f"盘上状态版本 {self._disk_version} 高于本插件支持的 {STATE_VERSION}，"
+                "写回会把它降级丢字段"
+            )
+        return ""
+
+    def _refuse_write(self, reason: str) -> None:
+        self._error(f"拒绝写盘：{reason}")
+        # 脏标记与事件一起清掉，否则 `_flush_loop` 会每个间隔重试一次并把日志刷满；
+        # 下一次真的改动会重新置位。
+        self._dirty = False
+        self._dirty_event.clear()
 
     def _migrate(self, raw: dict[str, Any], fresh: dict[str, Any], cycle_length: int) -> dict[str, Any]:
         """把任意旧版结构收敛成 v3：顶层只留版本号与角色表。
@@ -159,12 +238,23 @@ class StateStore:
             self._info(f"旧版顶层字段已并入 default 角色（{moved} 项）")
             self.mark_dirty()
 
+        # 无论上面搬没搬成功，旧顶层键都不许留在文件里：docstring 的「顶层只留版本号
+        # 与角色表」必须是**无条件**的，否则 roles 里已有一份同名数据时顶层那份拷贝
+        # 会永远留着（读不到、白占体积）。
+        for key in _LEGACY_TOP_LEVEL:
+            state.pop(key, None)
+
         for key, expected in _CONTAINER_FIELDS.items():
             if not isinstance(state.get(key), expected):
                 state[key] = expected()
 
         for role_id, role_data in list(roles.items()):
             if not isinstance(role_data, dict):
+                # 静默重置会把「谁的档案被吞了」这件事藏起来：带上原类型记一条。
+                self._warn(
+                    f"角色条目 {role_id!r} 不是对象（{type(role_data).__name__}），"
+                    "已重置为空角色（self/users 都清空）"
+                )
                 roles[role_id] = {"self": {}, "users": {}}
                 continue
             if not isinstance(role_data.get("self"), dict):
@@ -252,8 +342,15 @@ class StateStore:
     async def _flush_loop(self) -> None:
         while True:
             await self._dirty_event.wait()
+            # 求值放在 try 里：`_interval()` 由外部配置提供，抛一次就顺着任务冒出去，
+            # 整个落盘循环会**静默死掉**（此后再也不写盘，且没人知道）。
             try:
-                await asyncio.sleep(max(0.0, float(self._interval())))
+                interval = max(0.0, float(self._interval()))
+            except Exception as exc:
+                self._warn(f"读取落盘间隔失败，本轮退回默认 60 秒: {exc}")
+                interval = 60.0
+            try:
+                await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
             try:
@@ -267,6 +364,10 @@ class StateStore:
     async def flush(self) -> bool:
         async with self._write_lock:
             if not self._dirty:
+                return False
+            blocked = self._write_block_reason()
+            if blocked:
+                self._refuse_write(blocked)
                 return False
             payload = _serialize(self._state)
             self._dirty = False
@@ -283,8 +384,14 @@ class StateStore:
     def flush_sync(self) -> bool:
         if not self._dirty:
             return False
+        blocked = self._write_block_reason()
+        if blocked:
+            self._refuse_write(blocked)
+            return False
         _atomic_write(self._path, _serialize(self._state))
         self._dirty = False
+        # 不清事件的话，异步 `_flush_loop` 醒来后会立刻再跑一轮空 flush。
+        self._dirty_event.clear()
         self.writes += 1
         return True
 
@@ -296,26 +403,96 @@ class StateStore:
         if self._log is not None:
             self._log.warning(f"[humanoid_core] {message}")
 
+    def _error(self, message: str) -> None:
+        if self._log is not None:
+            self._log.error(f"[humanoid_core] {message}")
+
 
 def _serialize(state: dict[str, Any]) -> str:
     """序列化整个状态。
 
-    紧凑格式（无缩进）：indent=2 会让文件体积翻倍、dumps 耗时约 4 倍，而这份文件
-    每落盘一次就要在事件循环上完整序列化一遍，用户数上千时足以卡住 AstrBot。
-    必须留在事件循环上执行：放到线程里会与并发的 dict 写入赛跑（dictionary changed
-    size during iteration），而当前写法保证每次落盘都是一个一致的时间点快照。
+    用紧凑分隔符只为控制体积（`indent=2` 会把文件撑大）。必须留在事件循环上同步
+    执行：放到线程里就会与并发的 dict 写入赛跑（`dictionary changed size during
+    iteration`），而当前写法保证每次落盘都是一个一致的时间点快照。
+
+    `allow_nan=False`：Python 默认会把 `NaN`/`Infinity` 写成非标准的 JSON 字面量，
+    别的解析器（含下次启动的自己以外的工具）读不了；状态里只要混进一个 NaN
+    （坏输入算出来的浮点），整份文件就变成别人读不懂的东西。发现非有限数就把它
+    降级成 null 再写——丢一个坏数值，好过写出一份坏文件。
     """
-    return json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    try:
+        return json.dumps(
+            state, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        )
+    except ValueError:
+        sanitized = _finite_safe(state)
+        try:
+            return json.dumps(
+                sanitized, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            )
+        except (TypeError, ValueError):
+            # 连清洗后都写不出来：宁可退回一份最小的合法状态，也不写出坏文件。
+            return json.dumps(
+                default_state(), ensure_ascii=False, separators=(",", ":")
+            )
+
+
+def _finite_safe(value: Any) -> Any:
+    """把 NaN/±Infinity 换成 None（递归处理容器），其余原样。"""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _finite_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite_safe(item) for item in value]
+    return value
 
 
 def _atomic_write(path: Path, payload: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    # `.tmp` 固定名会让两个进程/线程互相踩（A 写完 B 又写，A 的 replace 搬走 B 的内容）。
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # 失败分支别留下半截临时文件（下次启动的目录扫描会被它误导）。
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+    # 目录项本身也要落盘，否则断电后可能只有旧文件留下。Windows 不支持对目录
+    # fsync（会抛 OSError），失败就算了——那里本来也不保证这一点。
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _decode_bytes(data: bytes) -> str:
+    """按 utf-8 → utf-8-sig → gbk 试解码；三种都认不出来才算损坏（抛 ValueError）。"""
+    last: Exception | None = None
+    for encoding in ("utf-8", "utf-8-sig", "gbk"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError as exc:
+            last = exc
+    raise ValueError(f"状态文件编码无法识别（已试 utf-8/utf-8-sig/gbk）: {last}")
+
+
+def _state_version_of(raw: dict[str, Any]) -> int:
+    try:
+        return int(raw.get("_state_version", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _clamp_float(value: Any, default: float, low: float, high: float) -> float:

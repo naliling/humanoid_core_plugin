@@ -195,9 +195,19 @@ def _routine_block(core, cfg, slots) -> dict:
     """
     night = None
     try:
-        night = core.soma.biological_night()
+        candidate = core.soma.biological_night()
     except Exception:
-        night = None
+        candidate = None
+    if candidate:
+        # `(0.0, 0.0)` 这种退化返回值以前会被当成有效的夜：start = end = 0，
+        # 跨度算出 24 小时，于是社交层收到「她一天 24 小时都在夜里」。
+        # 跨度不足半小时就退回配置窗口（`night_source` 也会如实写 config）。
+        try:
+            start_h, end_h = float(candidate[0]), float(candidate[1])
+        except (TypeError, ValueError, IndexError):
+            start_h, end_h = 0.0, 0.0
+        if (end_h - start_h) % 24.0 > 0.5:
+            night = (start_h, end_h)
     source = "schedule" if night else "config"
     start, end = night if night else (float(cfg.night_start_hour), float(cfg.night_end_hour))
     span = end - start if end > start else (24.0 - start) + end
@@ -240,7 +250,6 @@ class SocialSignals:
         self._time = time_source
         self._fingerprint: tuple[int, int] | None = None
         self._payload: dict[str, Any] = {}
-        self._loaded_at = 0.0
         # 写方在信号文件里声明的保鲜期（秒）；0 表示没声明，用默认值。
         self._declared_ttl = 0.0
 
@@ -256,6 +265,16 @@ class SocialSignals:
             max(SIGNALS_TTL_MIN_SECONDS, self._declared_ttl), SIGNALS_TTL_MAX_SECONDS
         )
 
+    def _invalidate(self) -> None:
+        """丢掉缓存的那一份（文件没了 / 过期了）：**三样一起清**。
+
+        只清 `_payload` 不清 `_fingerprint`，文件再出现时指纹没变就直接返回空 payload；
+        不清 `_declared_ttl` 则会拿**上一份**文件声明的保鲜期去判下一份。
+        """
+        self._fingerprint = None
+        self._payload = {}
+        self._declared_ttl = 0.0
+
     def read(self) -> dict[str, Any]:
         now = self._time()
         try:
@@ -264,8 +283,7 @@ class SocialSignals:
             # 获取 data_root 失败时返回空，避免抛出异常中断调用方
             return {}
         if path is None:
-            self._fingerprint = None
-            self._payload = {}
+            self._invalidate()
             return {}
         try:
             stat = path.stat()
@@ -274,7 +292,7 @@ class SocialSignals:
             return {}
         if now - stat.st_mtime > self._ttl():
             # 社交层停了：它写的那份「刚主动找过谁」不该继续影响身体。
-            self._payload = {}
+            self._invalidate()
             return {}
         fingerprint = (stat.st_mtime_ns, stat.st_size)
         if fingerprint == self._fingerprint:
@@ -291,7 +309,6 @@ class SocialSignals:
             return self._payload or {}
         self._fingerprint = fingerprint
         self._payload = payload
-        self._loaded_at = now
         # 写方声明的保鲜期。第一次读之前用的是默认值（足够宽），读到之后按声明的来。
         try:
             declared = float(payload.get("ttl_seconds") or 0.0)
@@ -364,21 +381,25 @@ class SocialSignals:
         return 0
 
     def _slots(self, data: Any, role_id: str = "") -> list:
-        """社交层（signals.py）多 Bot 时写在 `by_bid[bid]` 下，单 Bot 也写一份顶层。两处都要看。
+        """社交层（signals.py）多 Bot 时写在 `by_bid[bid]` 下，单 Bot 才写顶层。
+
+        **角色分片存在时只用分片，不再回落顶层**：顶层是跨角色共用的那部分
+        （`ignored_streak`、心跳时间），回落过去等于把别人的数据读成本角色的——
+        多 Bot 同进程时几个 Bot 会读到同一个数，再各自拿它去改自己的好感。
+        口径与 `_scope_of` 保持一致。
 
         注意键名是 `by_bid`，不是 `roles`：以前这里读错键，于是 `ignored_by_uid`
         恒返回 0（而同一文件的 `_scope_of` 读的是 `by_bid`，是对的）。
         """
-        out = []
-        if isinstance(data, dict) and role_id:
-            by_bid = data.get("by_bid")
-            if isinstance(by_bid, dict):
-                role = by_bid.get(str(role_id))
-                if isinstance(role, dict):
-                    out.append(role)
         if isinstance(data, dict):
-            out.append(data)
-        return out
+            if role_id:
+                by_bid = data.get("by_bid")
+                if isinstance(by_bid, dict):
+                    role = by_bid.get(str(role_id))
+                    if isinstance(role, dict):
+                        return [role]
+            return [data]
+        return []
 
     def status(self) -> dict[str, Any]:
         """对接到底卡在哪一步。只说「没读到」会把三种完全不同的情况当成一种。

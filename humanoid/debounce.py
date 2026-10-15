@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from .merge import judge, join, normalize
+from .prompt_builder import clean_label, sanitize_name
 
 # 会话上限：防止 umo 异常时无限增长。
 SESSION_CAP = 512
@@ -46,14 +47,34 @@ def join_texts(buffer: list, limit: int) -> str:
     return join([b if isinstance(b, str) else b[1] for b in buffer], limit=limit)
 
 
+def sender_label(raw: str) -> str:
+    """归属行里的说话人标签：与 prompt_builder 的名字路径同一套口径。
+
+    `who` 来自 `main.py:1303 sender=_sender_name(event) or "TA"`，也就是**群名片/昵称原文**
+    ——那是对方能随手改的字段，直接 `f"{who}：{body}"` 拼进提示词就是一个注入面
+    （改个带换行的名片就能往 `req.prompt` 里插指令）。所以先过白名单清洗。
+
+    先走 `sanitize_name`（同一套字符白名单 + 代词弃用），被弃用时退回 `clean_label`
+    的**纯字符清洗**：`main.py` 传的兜底名就是 "TA"，而 "TA" 正在代词黑名单里，
+    弃用它会让归属行整个消失（`TA：…` 退化成裸文本，模型又分不清在回谁）。
+    """
+    text = str(raw or "")
+    if not text:
+        return ""
+    return sanitize_name(text) or clean_label(text)
+
+
 @dataclass
 class _Session:
     """一个会话的合并状态。`seq` 是单调递增的入场序号，用来判「我是不是最后一条」。"""
 
     seq: int = 0
-    # (说话人, 文本)。**必须带说话人**：群里同一个 umo 下所有人是共用一格的，
-    # 原来只存文本，于是 A 和 B 的话被并成一段、模型看到两句话却没有归属，
-    # 分不清自己在回谁——「他不知道是不是在回他还是在回别人」。
+    # (说话人, 文本)。**必须带说话人**：模型看到两句话却没有归属，就分不清自己在回谁。
+    # 说话人只用于**标注归属**，不参与拼接。
+    #
+    # 注意这里的 buffer 已经是**一个人的**：`main.py:1300` 的 key 是
+    # `f"{umo}|{sender_id}"`，按发送者分桶；同一个 umo 下不同的人不会共用一格
+    # （旧注释说「群里同一个 umo 下所有人是共用一格的」，那已经被 key 设计取代）。
     buffer: List[tuple] = field(default_factory=list)
     last_active: float = field(default_factory=time.monotonic)
 
@@ -117,7 +138,12 @@ class Debouncer:
         if not body:
             return True
 
-        sess = self._sessions.setdefault(key, _Session())
+        sess = self._sessions.get(key)
+        if sess is None:
+            # 不用 setdefault：那会在**每次**调用（热路径，每条消息）都白构造一个
+            # _Session（含一次 time.monotonic()）。
+            sess = _Session()
+            self._sessions[key] = sess
         sess.seq += 1
         my_seq = sess.seq
         sess.buffer.append((sender, body))
@@ -132,7 +158,11 @@ class Debouncer:
         # 后面两条只能各自回一次——那正是「用户发三条、他就回三条」的根。
         # 没说完的等 timeout（更长）；说完的等 settle，但一样不超过 timeout——
         # 否则把 settle 配得比 timeout 大时，「说完的」反而比「没说完的」等得更久。
-        wait = timeout if not verdict.complete else min(settle, timeout)
+        # 「确定说完」（sure=True）才走短的确认窗口 settle；只是「攒够条数」
+        # （complete=True 但 sure=False）不算数，按没说完的口径等满 timeout——
+        # 用户可能正在一个字一个字连发。原来只读 verdict.complete，
+        # `Verdict.sure` 是死字段，两种「说完了」等到的是同一个时长。
+        wait = min(settle, timeout) if (verdict.complete and verdict.sure) else timeout
         if wait <= 0:
             self._release(event, sess, max_count)
             self._debug(f"不等待直接放行（{verdict.why}）：{body[:20]}")
@@ -165,21 +195,20 @@ class Debouncer:
         else:
             # 明确告诉模型这是**一条合并出来的消息**。不标的话它会当成几个人在
             # 各说各的，于是写一条长消息把人一个个回一遍——那比不合并还糟。
-            # 正常已按发送者分桶，这一批应该是同一个人；万一还是混进了不同人
-            # （发送者取不到、或配置改了），就不能说「同一个人连着发」——
-            # 那会直接把「这是谁说的」传给错误的模型。
-            senders = {who for who, _body in batch if who}
-            if len(senders) > 1:
-                earlier = [
-                    f"（下面这 {len(batch)} 句是群里先后说的，已合并成一条；"
-                    f"回一条就行，不用逐句回应）"
-                ]
-            else:
-                earlier = [
-                    f"（下面这 {len(batch)} 句是同一个人连着发的，已合并成一条；"
-                    f"回一条就行，不用逐句回应）"
-                ]
-            earlier += [f"{who}：{body}" if who else body for who, body in batch[:-1]]
+            #
+            # 归属一律写「同一个人连着发」：会话 key 已经按 sender_id 分桶
+            # （main.py:1300 `f"{umo}|{sender_id}"`），同一个 buffer 里必然是同一个人的话。
+            # 原来按**显示名**判「多人」，于是同一个人改了群名片就会被写成
+            # 「群里先后说的」——归属被写反；而真正的多人混发永远进不了同一个 buffer，
+            # 那条分支是死代码。
+            earlier = [
+                f"（下面这 {len(batch)} 句是同一个人连着发的，已合并成一条；"
+                f"回一条就行，不用逐句回应）"
+            ]
+            for who, body in batch[:-1]:
+                # 群名片/昵称是对方能随手改的字段（可以塞换行与指令），必须清洗后再拼。
+                label = sender_label(who)
+                earlier.append(f"{label}：{body}" if label else body)
         setter = getattr(event, "set_extra", None)
         if not callable(setter):
             return

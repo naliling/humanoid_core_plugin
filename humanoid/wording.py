@@ -30,6 +30,11 @@ def pick(key: str, seed_parts: Sequence[object], options: Sequence[str]) -> str:
     """
     if not options:
         return ""
+    if isinstance(options, str):
+        # `str` 也是 `Sequence[str]`：不挡的话 `options[i]` 会从字符串里抽出一个**汉字**，
+        # 而且是静默「成功」（测试多半只断言非空，这种误用会一路带到线上）。
+        # 裸字符串按「只有一条说法」处理。
+        return options
     if len(options) == 1:
         return options[0]
     raw = "|".join([_SEED_NAMESPACE, key, *[str(part) for part in seed_parts]])
@@ -38,7 +43,14 @@ def pick(key: str, seed_parts: Sequence[object], options: Sequence[str]) -> str:
 
 
 def band_index(value: float, ladder: Sequence[tuple]) -> int:
-    """值落在哪两个门槛之间，取哪一档的编号。
+    """值够到了多少档，返回**升序名次**。
+
+    **返回值是「升序名次」，不是「ladder 里的下标」**：这里先把 ladder 按门槛升序排，
+    再数有多少档被 value 够到（0 = 最低档，`len(ladder) - 1` = 最高档）。
+    内建 ladder 全部**降序**书写，所以这个数与书写顺序是相反的——调用方只能把它当
+    **稳定的档位标识**（例如 `pick` 的种子分量），**不要**拿它去索引自己的 ladder
+    （`ladder[band_index(v, ladder)]` 会取到相反的档位）。
+    `services/soma.py` 的打分正是按「升序名次」用的：顶档 → `len(ladder) - 1` → 拿满分。
 
     **抽签种子只能含档位，不能含实时数值。** 之前 soma 里塞的是 `round(value/5)`：睡眠
     压力 72 → 75 落在同一档「有些困意」，措辞却因为跨过 75 而重新抽签——同一天里同一件

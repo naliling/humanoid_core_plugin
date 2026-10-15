@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from astrbot.api import logger
+
 from .config import HumanoidConfig
 from .clock import DEFAULT_CITY_PLACEHOLDER, weekday_cn, format_offset
 from .slots import parse_time
@@ -20,14 +22,46 @@ BAD_MARK = "✗"
 WARN_MARK = "⚠"
 
 
+def config_error_banner(load_error: str) -> list[str]:
+    """配置整体退回默认值时，报告最顶上那几行。空串=正常，返回空列表。
+
+    `ConfigBox.load_error` 的文档一直说「`/拟人 诊断` 用它告诉用户配置有问题」，
+    但全仓无人读它：解析真抛时插件用**全默认值**跑起来（城市、模型链、管理员名单、
+    情绪开关全部复位），诊断只字不提，用户只能靠翻日志。
+    """
+    if not load_error:
+        return []
+    return [
+        f"{WARN_MARK} 配置解析失败，已整体退回默认值：{load_error}",
+        "  → 下面看到的城市、模型链、开关全是出厂默认，不是你配的那份；"
+        "改好配置项后 /拟人 重载。",
+        "",
+    ]
+
+
+def _age_seconds(value: Any) -> float:
+    """signals 里的秒数：拿不到或不是数时当 0，绝不让格式化抛出去。
+
+    `link.py` 在 `stat()` 失败时把 `age` 写成 None 而 state 仍是 `"fresh"`，
+    旧代码 `f"{age:.0f}"` 抛 TypeError，一路冒到 `/拟人 诊断`——唯一的排查入口
+    直接报错。`stale` 分支本来就有兜底，两处现在同口径。
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _signals_line(signals: dict) -> str:
     """社交层信号那一行：把「没读到」拆成三种完全不同的情况说。"""
     state = str(signals.get("state") or "")
     path = str(signals.get("path") or "")
     tail = f"（看的是 {path}）" if path else ""
     if state == "fresh":
-        age = signals.get("age")
-        proactive = signals.get("last_proactive_age", -1)
+        # age 可能是 None（link.py 的 stat() 失败）：以前这里直接 `{age:.0f}`，
+        # 抛 TypeError 让整条 /拟人 诊断 报错。
+        age = _age_seconds(signals.get("age"))
+        proactive = _age_seconds(signals.get("last_proactive_age", -1))
         extra = (
             f"上次刷新 {age:.0f}s 前；上次主动开口 {proactive:.0f}s 前、"
             f"冷落计数 {signals.get('ignored_streak', 0)}"
@@ -36,7 +70,7 @@ def _signals_line(signals: dict) -> str:
         )
         return f"- 社交层信号：读到并在用。{extra}{tail}"
     if state == "stale":
-        age = float(signals.get("age") or 0.0)
+        age = _age_seconds(signals.get("age"))
         return (
             f"- 社交层信号：文件在，但已经 {age / 60:.1f} 分钟没刷新（超过 15 分钟不采信）："
             f"社交层被停用、后台循环卡住，或刚重启还没跑一轮{tail}"
@@ -229,9 +263,55 @@ def build_report(
     inject_estimate: dict[str, int] | None = None,
     zone_status: dict[str, Any] | None = None,
     state_size_lines: list[str] | None = None,
+    config_load_error: str = "",
+) -> str:
+    """诊断报告。**任何一处取值/格式化炸了都不能让这条命令整体报错**。
+
+    它是唯一的排查入口，自己报错等于把用户挡在门外（signals 的 `age` 为 None 时
+    `f"{None:.0f}"` 抛 TypeError，一路冒到 `/拟人 诊断`）。出错时退回一段可读的
+    最小报告；正常路径逐字不变。
+    """
+    try:
+        return _build_report_body(
+            cfg=cfg,
+            resolver=resolver,
+            gateway=gateway,
+            schedule_status=schedule_status,
+            activity_status=activity_status,
+            version=version,
+            body_status=body_status,
+            inject_estimate=inject_estimate,
+            zone_status=zone_status,
+            state_size_lines=state_size_lines,
+            config_load_error=config_load_error,
+        )
+    except Exception as exc:  # noqa: BLE001 - 兜底就是为了诊断页还能打开
+        logger.exception("诊断报告生成失败")
+        return (
+            f"〖拟人诊断〗v{version}\n"
+            f"{WARN_MARK} 诊断报告生成失败：{type(exc).__name__}: {exc}\n"
+            "（其余检查项已跳过；这本身是插件缺陷，请连同上面的日志一起反馈）"
+        )
+
+
+def _build_report_body(
+    *,
+    cfg: HumanoidConfig,
+    resolver: ProviderResolver,
+    gateway: LLMGateway,
+    schedule_status: dict[str, Any],
+    activity_status: dict[str, Any],
+    version: str,
+    body_status: dict[str, Any] | None = None,
+    inject_estimate: dict[str, int] | None = None,
+    zone_status: dict[str, Any] | None = None,
+    state_size_lines: list[str] | None = None,
+    config_load_error: str = "",
 ) -> str:
     available = resolver.available_ids()
-    lines = [f"〖拟人诊断〗v{version}", "", "【AstrBot 可用对话模型 id】"]
+    lines = [f"〖拟人诊断〗v{version}", ""]
+    lines += config_error_banner(config_load_error)
+    lines.append("【AstrBot 可用对话模型 id】")
     lines.append(f"  {available}" if available else "  （空 —— AstrBot 还没有配置任何对话模型）")
 
     lines += ["", "【日程模型链】"]
@@ -332,7 +412,7 @@ def build_report(
             lines.append(f"- 上次尝试: {mood_last.summary()}")
         lines.append(
             f"- 每个用户各自每 {cfg.mood_llm_interval_messages} 条消息分析一次（不是全局每 N 条："
-            f"10 个人各自满 5 条就是 10 次）"
+            f"10 个人各自满 {cfg.mood_llm_interval_messages} 条就是 10 次）"
             f"，失败冷却 {cfg.mood_provider_cooldown_minutes} 分钟"
             f"，群聊{'启用' if cfg.mood_enabled_in_group else '不启用'}"
         )

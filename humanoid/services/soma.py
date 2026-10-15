@@ -54,9 +54,20 @@ CHILL_RECOVER_PER_HOUR = 1.6    # 病程后半：从顶上慢慢好转（40 分�
 CHILL_COMFORT_COOL = 12.0       # 低于这个温度算「冻着」
 # 身体量落盘的最小间隔（秒）。饥饿这类轴每分钟都在动，不节流就等于每分钟写一次全量文件。
 MIN_PERSIST_INTERVAL_SECONDS = 300.0
+# 短于这个时长的一觉算**碎片**，不覆盖 `last_sleep_hours`。
+# 日程是模型每天重排的，相邻两步之间 `is_sleep_event` 可能翻转（「夜间睡眠」→
+# 「起床洗漱」→「回笼觉」→「早餐」），每一步都记一次醒来就会把「昨晚睡了多久」
+# 写成最后那一小段（实测 0.17 小时），prompt 里于是出现「昨晚睡了 0.17 小时」。
+# 阈值取 0.5 与 `prompt_builder` 的「睡了 >= 0.5 小时才算睡了一觉」同一口径。
+SLEEP_FRAGMENT_MIN_HOURS = 0.5
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    # NaN 必须单独拦：`min(100.0, nan)` 在 Python 下返回 **100.0**（nan 与任何数比较
+    # 都是 False），于是任何一个 NaN 经 `_set` 就被静默钉成上限，此后永不回落。
+    # `state._clamp_float` 与 `mood._num_or` 都判 NaN，这里漏了。
+    if value != value:
+        return low
     return max(low, min(high, value))
 
 
@@ -100,6 +111,7 @@ class SomaService:
         self._last_persist = 0.0
         # 新角色当场定下计时基准。不能等第一次 advance 才写：那时「现在」已经往前走了，
         # 启动后第一次补算会被当成零时长，把开机期间真正该补的那段体感全弄丢。
+        self._ensure_data()
         self.data.setdefault("last_tick", _rounded(self._time()))
         self._persist_if_changed()
 
@@ -116,23 +128,50 @@ class SomaService:
         """当前时刻（走注入的时间源，仿真里可信）。"""
         return float(self._time())
 
-    @property
-    def data(self) -> dict[str, Any]:
+    def _ensure_data(self) -> dict[str, Any]:
+        """拿到 `soma` 子字典，必要时建一个。**写路径**才用它。"""
         raw = self._scope.get_self("soma")
         if not isinstance(raw, dict):
             raw = {}
             self._scope.self_state["soma"] = raw
-        raw.setdefault("last_tick", self._time())
         return raw
+
+    @property
+    def data(self) -> dict[str, Any]:
+        """身体状态字典。**只读**：读它不该创建键、也不该写 `last_tick`。
+
+        旧写法在 property 里 `setdefault("last_tick", ...)` 并可能创建整个 `soma` 键，
+        于是 `snapshot()`、`_get()` 这类只读路径（诊断面板、每条消息的注入）都会改状态
+        并把状态标脏。计时基准现在由 `__init__` 与 `_tick_base()` 显式初始化。
+        """
+        raw = self._scope.get_self("soma")
+        return raw if isinstance(raw, dict) else {}
 
     def _get(self, key: str, default: float = 0.0) -> float:
         try:
-            return float(self.data.get(key, default))
+            value = float(self.data.get(key, default))
         except (TypeError, ValueError):
             return default
+        # 非有限值不能进积分：NaN 会让 `int(math.ceil(...))` 抛 ValueError（advance 整条
+        # 炸掉），也会经 `snapshot()` 进 `json.dumps` 写出非法 JSON，还会让
+        # `_persist_if_changed` 的 `round(value)` 比较每 tick 都不相等 → 每 tick 都落盘。
+        if not math.isfinite(value):
+            return default
+        return value
+
+    def _tick_base(self, now: float) -> float:
+        """上次推进点。缺失/NaN/inf 时不能拿它做差：就地修好基准并返回 `now`。"""
+        try:
+            value = float(self.data.get("last_tick"))
+        except (TypeError, ValueError):
+            value = float("nan")
+        if not math.isfinite(value):
+            self._ensure_data()["last_tick"] = _rounded(now)
+            return now
+        return value
 
     def _set(self, key: str, value: float) -> None:
-        self.data[key] = _rounded(_clamp(value))
+        self._ensure_data()[key] = _rounded(_clamp(value))
 
     # ------------------------------------------------------------------
     # 推进
@@ -199,8 +238,12 @@ class SomaService:
     def advance(self, now: float | None = None) -> dict[str, float]:
         """把身体从上次推进点积分到现在。返回推进后的轴快照。"""
         now = self._time() if now is None else float(now)
-        data = self.data
-        last = self._get("last_tick", now)
+        if not math.isfinite(now):
+            # 时间源本身坏了（NaN/inf）：不推进也不写，别让 `int(math.ceil(nan))` 把
+            # 整条 advance 炸掉。
+            return self.snapshot()
+        data = self._ensure_data()
+        last = self._tick_base(now)
         if now <= last:
             # 时钟回拨（NTP 校正、时区改动）：只把基准挪回来，不倒推身体。
             if now < last:
@@ -261,13 +304,24 @@ class SomaService:
                 # 该睡的时候醒着 = 在欠睡。窗口比她一晚需要的睡眠短的人，同样熬一小时
                 # 更补不回来。封顶 SLEEP_DEBT_CAP：欠到一定程度后多欠的部分已经反映在
                 # 困意里，再堆只会让后面的系数失去区分度。
-                gain = min(3.0, max(1.0, cfg.sleep_need_hours / self._night_span_hours()))
+                #
+                # 增速**只从配置取**：这里曾经内联重写了一份
+                # `min(3.0, max(1.0, sleep_need_hours / self._night_span_hours()))`，
+                # 分母用的是「日程推出来的夜」（`biological_night()`），而
+                # `config.sleep_debt_gain_per_hour` 用的是配置窗口 —— 只要模型排的睡眠
+                # 窗口不等于配置的 23–6，两份就分叉（实测日程 00:00–08:00：配置 1.1429
+                # 对 soma 1.0000），面板上调 `night_start_hour/night_end_hour` 影响不到
+                # 欠债，`sleep_need_hours` 也被日程窗口改写。配置项是唯一来源。
+                gain = float(cfg.sleep_debt_gain_per_hour)
                 debt = min(
                     SLEEP_DEBT_CAP,
                     self._get("sleep_debt", 0.0) + hours * gain,
                 )
                 self.data["sleep_debt"] = _rounded(debt)
             if self.data.get("asleep_since") is not None:
+                # 睡着→醒着的**翻转**（`asleep_since` 只在上面那一支里置位、只在这里
+                # 被 `_record_wake` 清掉），不是「每一步都记一次醒来」。
+                # 这一小段到底算不算一觉由 `_record_wake` 按碎片阈值判定。
                 self._record_wake(moment)
 
         # --- 饥饿 ---
@@ -292,7 +346,11 @@ class SomaService:
         sitting_hours = max(0.0, (moment.timestamp() - self._get("sitting_since", moment.timestamp())) / 3600.0)
         stiffness = 0.0
         if sitting_hours * 60.0 > sitting_limit:
-            stiffness = min(45.0, (sitting_hours * 60.0 - sitting_limit) / 60.0 * SITTING_DISCOMFORT_PER_HOUR * 6.0)
+            # `(sitting_hours*60 - sitting_limit)/60` 已经是「超出的小时数」，
+            # 再乘 SITTING_DISCOMFORT_PER_HOUR 语义就对了。旧写法多乘了一个 6.0，
+            # 实际速率 36 分/小时：坐 1.5 小时就顶格 45，超出门槛 75 分钟撞上限，
+            # 于是她几乎整天都在喊不舒服。
+            stiffness = min(45.0, (sitting_hours * 60.0 - sitting_limit) / 60.0 * SITTING_DISCOMFORT_PER_HOUR)
 
         thermal = self._thermal_discomfort()
         cycle = self._cycle_discomfort(moment)
@@ -327,12 +385,20 @@ class SomaService:
         以前在这里用「睡够没够 sleep_need_hours」补一笔债，会撞上一个真实现象：
         大模型每天重新生成日程，午夜那一刻当日的睡眠区间可能从 23:00–07:00 变成
         01:00–09:00，正在睡的身体会当场被判为「醒了」，只睡了两小时就被记成欠了六小时。
+
+        **只有真正的一觉才改写 `last_sleep_hours`**：日程重排让 `is_sleep_event` 在
+        相邻两步之间翻转时，会切出一小段「睡着」（实测 0.17 小时），它不是一觉。
+        这种碎片照样清 `asleep_since`（她确实醒了），但不覆盖「昨晚睡了多久」，
+        否则 schedule 的 prompt 里会出现「昨晚睡了：0.17 小时」。
         """
         since = self._get("asleep_since", 0.0)
         self.data["asleep_since"] = None
         if since <= 0:
             return
         slept_hours = max(0.0, (moment.timestamp() - since) / 3600.0)
+        if slept_hours < SLEEP_FRAGMENT_MIN_HOURS:
+            self.data["sitting_since"] = _rounded(moment.timestamp())
+            return
         self.data["last_sleep_hours"] = _rounded(min(slept_hours, 24.0))
         self.data["sleep_hours_today"] = 0.0
         self.data["last_wake_at"] = _rounded(moment.timestamp())
@@ -351,11 +417,17 @@ class SomaService:
         配置里的夜间窗口。以前是反过来的：日程被 `align_sleep_to_night` 切到 23:00→06:00
         上去，夜猫子人格凌晨四点睡、十一点起，身体却按早上六点算“该醒了”，低谷也摆在
         下午——那等于一个固定窗口替所有人决定几点睡。
+
+        `night_mode_enabled=False` 时**整个返回 None**：关掉夜间模式就是「不再有生物钟夜
+        这一层」。旧写法只在**日程没排睡眠**时才看这个开关，于是日程里只要有一段觉，
+        这个开关对核心积分就形同虚设——夜间照样加睡眠债、低谷照样锚定。
         """
         cfg = self.config
+        if not cfg.night_mode_enabled:
+            return None
         window = _sleep_window(self._slots())
         if window is None:
-            if not cfg.night_mode_enabled or cfg.night_start_hour == cfg.night_end_hour:
+            if cfg.night_start_hour == cfg.night_end_hour:
                 return None
             return float(cfg.night_start_hour), float(cfg.night_end_hour)
         return window
@@ -394,18 +466,11 @@ class SomaService:
         offset = (hour_of_day - start) % 24.0
         return 0.0 <= offset < span * ratio
 
-    def _night_span_hours(self) -> float:
+    def _night_mid_hour(self) -> float | None:
+        """生物钟夜的中点；没有生物钟夜（夜间模式关掉、窗口长度为 0）时是 None。"""
         night = self.biological_night()
         if night is None:
-            return max(1.0, self.config.night_span_hours)
-        start, end = night
-        span = end - start if end > start else (24.0 - start) + end
-        return max(1.0, min(16.0, span))
-
-    def _night_mid_hour(self) -> float:
-        night = self.biological_night()
-        if night is None:
-            return self.config.night_mid_hour
+            return None
         start, end = night
         return ((start + (end + 24.0 if end < start else end)) / 2.0) % 24.0
 
@@ -538,14 +603,18 @@ class SomaService:
 
         锚点用的是 `biological_night()`——她自己的日程里那段觉的中点，不是配置里那个
         写死的 23→6。低谷摆错位会让她下午 5 点最想睡、凌晨 3 点最清醒。"""
+        # 次低谷：午饭后。与夜间窗口无关，先算出来。
+        lunch = abs(((hour_of_day - 14.0 + 12.0) % 24.0) - 12.0)
+        secondary = max(0.0, 1.0 - lunch / 2.0) * 0.35
         anchor = self._night_mid_hour()
-        # 主低谷：生物钟夜里中点后 2 小时左右（核心体温最低点）。
+        if anchor is None:
+            # 没有生物钟夜（夜间模式关掉、或窗口长度为 0）：主低谷不锚定，
+            # 只留午后的次低谷——否则「关掉夜间模式」对核心积分等于没关。
+            return _clamp(secondary, 0.0, 1.0)
+        # 主低谷：生物钟夜里中点后 3 小时左右（核心体温最低点）。
         main = (hour_of_day - (anchor + 3.0)) % 24.0
         main_cost = min(main, 24.0 - main)
         primary = max(0.0, 1.0 - main_cost / 5.0)
-        # 次低谷：午饭后。
-        lunch = abs(((hour_of_day - 14.0 + 12.0) % 24.0) - 12.0)
-        secondary = max(0.0, 1.0 - lunch / 2.0) * 0.35
         return _clamp(max(primary, secondary), 0.0, 1.0)
 
     def _arousal_target(self, moment: datetime, hour_of_day: float) -> float:
@@ -729,14 +798,21 @@ class SomaService:
         if snap["sleep_debt"] >= 4.0:
             max_chars = min(max_chars, 50)
 
-        question_bias = 0.35
+        # `question_bias` 一律「取最严」：身体压制是一条条**收紧**的，社交渴望只允许在
+        # 完全没有身体压制时把它抬起来。
+        #
+        # 旧写法两种口径混用（前两条直接赋值、第三条用 min、第四条又直接赋值），
+        # 于是 740 行的 0.5 会**无条件覆盖**前面所有压制：实测「睡眠压力 90 + 社交渴望 70」
+        # → `max_chars=20` 却 `question_bias=0.5`，等于「只准写 20 字、但一半概率在反问」。
+        caps: list[float] = []
         if snap["hunger"] >= 88 or snap["discomfort"] >= 62:
-            question_bias = 0.05
+            caps.append(0.05)
         if snap.get("chill", 0.0) >= 45:
-            question_bias = min(question_bias, 0.15)
+            caps.append(0.15)
         if snap["sleep_pressure"] >= 72:
-            question_bias = 0.1
-        if snap["social_desire"] >= 70 and energy >= 50:
+            caps.append(0.1)
+        question_bias = min([0.35] + caps)
+        if not caps and snap["social_desire"] >= 70 and energy >= 50:
             question_bias = 0.5
 
         return {
@@ -813,8 +889,17 @@ class SomaService:
         return _clamp(ceiling, 15.0, 100.0)
 
     def note_schedule_changed(self) -> None:
-        """日程重新生成后调用：睡眠区间变了不算真的醒来。"""
-        self.data["asleep_since"] = None
+        """日程重新生成后调用：**结算**这一觉，而不是把它悄悄抹掉。
+
+        调用点（`core_instance._on_schedule_installed`）只在「上一段是睡、这一段不是睡」
+        时触发，那正是真正的睡醒边界。旧实现只把 `asleep_since` 置 None 就返回，而
+        `_record_wake` 是**唯一**会写 `last_sleep_hours` / 清 `sleep_hours_today` /
+        写 `last_wake_at` 的地方，于是这三个值永远停在上一次真正走积分路径的醒来时刻
+        （很可能停在昨天甚至更早），prompt 里「昨晚睡了多久」不再更新、`sleep_hours_today`
+        跨天累加。现在统一走 `_record_wake`，碎片仍然由它按 SLEEP_FRAGMENT_MIN_HOURS
+        判定为「不是一觉」——**睡眠区间被重排不算醒来**这条语义没有丢。
+        """
+        self._record_wake(self._clock.now())
         self._persist_if_changed()
 
     def discomfort_factor(self) -> float:

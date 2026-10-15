@@ -69,6 +69,8 @@ class Verdict:
     * `sure=False` —— 只是「攒够 N 条了，按一句处理」。这不算数：用户可能正在一个字一个字地
       连发（「你」「今天」「我好累啊」），攒够两条就发等于把它切成两半。要再等一个短的
       确认窗口看看还有没有后续（见 `Debouncer.hold`）。
+      `Debouncer.hold` 按它决定等多久：`sure=True` 只等 `settle`（短的确认窗口），
+      `sure=False` 与「没说完」一样等满 `timeout`。
     """
 
     complete: bool

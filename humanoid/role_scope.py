@@ -67,7 +67,10 @@ class RoleScope:
         `prune_expired` 直接跳过，于是 state.json 随群规模一直涨。
         注入层那些「只是查一下有没有称呼」的地方一律走这里。
         """
-        entry = self._root.get("users", {}).get(user_id)
+        # 必须和 `user_state`/`get_user`/`set_user`/`delete_user` 一样先 `str()`：
+        # 数据是按字符串 id 存的，`peek_user(123, ...)` 会去查 `users[123]` 而数据在
+        # `users["123"]`——不报错，只是**静默返回默认值**（数字 id 的调用方永远查不到）。
+        entry = self._root.get("users", {}).get(str(user_id))
         if isinstance(entry, dict):
             return entry.get(key, default)
         return default

@@ -494,3 +494,64 @@ class GroupMoodReadBoundary(unittest.TestCase):
         core.on_message("stranger2", "在吗", is_group=True)
         self.assertFalse(core.mood.has_profile("stranger2"),
                          "群里说一句就建档，陌生人档案会无限增长")
+
+
+class ProcessConfigKeysTest(unittest.TestCase):
+    """D5(b)：`services/process.py` 读的 3 个键以前**根本不存在**。
+
+    `process_min_duration` / `process_max_duration` / `process_history_limit` 在
+    `config.py` 里一个都没有，而那个服务直接 `self.config.process_min_duration`——
+    只要真把它实例化起来就是 `AttributeError`。它此前全项目零实例化，所以这个坑一直
+    没炸。面板（`_conf_schema.json`）与 dataclass 两边都必须有，且区间一致。
+    """
+
+    KEYS = {
+        "process_min_duration": (20, 1, 240),
+        "process_max_duration": (180, 5, 1440),
+        "process_history_limit": (20, 1, 200),
+    }
+
+    def test_schema_and_dataclass_agree(self):
+        for key, (default, low, high) in self.KEYS.items():
+            with self.subTest(key=key):
+                self.assertIn(key, SCHEMA, f"{key} 不在面板 schema 里")
+                spec = SCHEMA[key]
+                self.assertEqual(spec["type"], "int")
+                self.assertTrue(str(spec.get("description") or "").strip())
+                self.assertTrue(str(spec.get("hint") or "").strip())
+                self.assertEqual(spec["minimum"], low)
+                self.assertEqual(spec["maximum"], high)
+                self.assertEqual(spec["default"], default)
+                self.assertEqual(getattr(DEFAULTS, key), default)
+                self.assertEqual(
+                    getattr(HumanoidConfig.from_raw({key: default + 1}), key), default + 1
+                )
+
+    def test_values_are_clamped_to_the_documented_range(self):
+        self.assertEqual(
+            HumanoidConfig.from_raw({"process_min_duration": 0}).process_min_duration, 1
+        )
+        self.assertEqual(
+            HumanoidConfig.from_raw({"process_max_duration": 99999}).process_max_duration, 1440
+        )
+        self.assertEqual(
+            HumanoidConfig.from_raw({"process_history_limit": 0}).process_history_limit, 1
+        )
+
+    def test_service_survives_a_config_without_those_keys(self):
+        """旧配置对象上没有这 3 个键时也不能崩（`getattr` 容错取值）。"""
+        from types import SimpleNamespace
+
+        from humanoid.clock import Clock
+        from humanoid.role_scope import RoleScope
+        from humanoid.services.process import ProcessService
+
+        conf = HumanoidConfig.from_raw({"timezone_city": "北京"})
+        bare = SimpleNamespace(timezone_city="北京")
+        service = ProcessService(
+            RoleScope({"_state_version": 3, "roles": {}}, "bot1", lambda: None),
+            lambda: bare,
+            Clock(lambda: conf),
+            None,
+        )
+        self.assertEqual(service._int_cfg("process_min_duration", 20), 20)

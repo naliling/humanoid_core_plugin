@@ -21,8 +21,22 @@ MIN_LEN = 8
 SNIPPET_LEN = 26
 # 两条摘录之间至少隔多久，单位秒。太密就退化成「最近几条消息」。
 MIN_GAP_SECONDS = 1800.0
+# 超过这么久没被引用的原话就彻底作废（读取与落盘共用同一个窗口）。
+STALE_HOURS = 12.0
 
 _STRIP = re.compile(r"\s+")
+
+
+def _fresh(item: dict[str, Any], now: float, stale_hours: float = STALE_HOURS) -> bool:
+    """这条摘录还在时间窗内吗。时间戳不可信（NaN/非数值）时一律**留着**，别凭空清记忆。"""
+    try:
+        age = float(now) - float(item.get("at", 0) or 0)
+        window = float(stale_hours) * 3600.0
+    except (TypeError, ValueError):
+        return True
+    if age != age or window != window:
+        return True
+    return age <= window
 
 
 def snippet(text: str, limit: int = SNIPPET_LEN) -> str:
@@ -31,8 +45,10 @@ def snippet(text: str, limit: int = SNIPPET_LEN) -> str:
     if len(body) <= limit:
         return body
     cut = body[:limit]
-    # 在标点处收尾，别把词切一半
-    for i in range(len(cut) - 1, max(limit // 2, 0) - 1, -1):
+    # 在标点处收尾，别把词切一半。搜索下界是「截断点的一半」：更靠前的标点离得
+    # 太远，为它丢掉半句话不值得（原写法 `max(limit // 2, 0)` 的 0 是多余的）。
+    floor = max(0, limit // 2)
+    for i in range(len(cut) - 1, floor - 1, -1):
         if cut[i] in "，。！？、,.!?;；:：":
             return cut[:i].rstrip("，。！？、,.!?;；:：")
     return cut.rstrip() + "…"
@@ -51,8 +67,11 @@ def note_said(
 
     列表元素是 `{"said": 原话, "at": epoch}`，最新在前。没到长度门槛、或距上一条
     采样太近时原样返回，调用方可以拿「有没有变化」决定要不要写盘。
+
+    顺带把**已经出了时间窗**的旧摘录丢掉：它们永远不会再被注入（`recall_lines` 会
+    过滤掉），留着只是让 state.json 里多几条死数据。
     """
-    current = _as_list(existing)
+    current = [item for item in _as_list(existing) if _fresh(item, now)]
     body = str(text or "").strip()
     if len(body) < min_len:
         return current
@@ -95,15 +114,16 @@ def recall_lines(
     existing: Any,
     now: float,
     max_items: int = 1,
-    stale_hours: float = 12.0,
+    stale_hours: float = STALE_HOURS,
 ) -> list[str]:
     """把采样到的原话写成注入用的一行。太久以前的不算「之前说过」。
 
     窗口从 60 小时收到 12 小时：60 小时里挂着的是「两天半前说过的话」，真人早忘了，
     而模型看到它就会顺着翻旧账。「之前说过」本来就该只覆盖最近的一小段时间。
+    `behavior._touches_recalled` 也走这里，所以「TA是不是又提起旧事」同样只看窗口内。
     """
     items = [x for x in _as_list(existing) if str(x.get("said", "")).strip()]
-    fresh = [x for x in items if float(now) - float(x.get("at", 0) or 0) <= stale_hours * 3600.0]
+    fresh = [x for x in items if _fresh(x, now, stale_hours)]
     if not fresh:
         return []
     quotes = "、".join(f"「{x['said']}」" for x in fresh[: max(0, int(max_items))])

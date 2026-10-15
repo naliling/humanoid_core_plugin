@@ -90,19 +90,32 @@ class ThrottleAndCap(unittest.TestCase):
     """三道闸：单句封顶、同类递减、每日封顶。"""
 
     def test_same_line_decays(self):
-        """连刷同一句话越刷越不值钱。"""
+        """连刷同一句话越刷越不值钱。
+
+        **每次发之前把随机流复位**：暖话档是 `local_delta` 里 `uniform(1.4, 2.1)`
+        抽出来的，不复位的话「第 12 次 vs 第 1 次」比的是两次**不同的抽样**
+        （比值 = 抽12/抽1 × 0.2），这个断言就成了掷硬币——实测 seeds 1..40 只过
+        13 次。基线那次通过不是递减更强，只是随机序列恰好落对：v2.28.9 把
+        `generate_mood_tag` 从 `random.choice` 换成无随机的 `wording.pick`，
+        每条消息之间少了 2~3 次抽样，整条序列随之位移（实测同种子下 12 次抽到的
+        暖话量从 1.836/2.0597/1.4203… 变成 1.836/1.8543/1.7806…），硬币就翻面了。
+
+        复位之后每次抽到的量相同，比的才是递减本身：第 12 次恰好拿到
+        `REPEAT_DECAY[-1]` = 0.2（实测比值 0.2000）。加 1e-9 容差是因为这条在
+        正确实现下正好落在等号上。
+        """
         svc, clock = _svc()
-        random.seed(5)
         first = None
         last = None
         for i in range(12):
+            random.seed(5)
             d = asyncio.run(svc.update_from_message_async("u1", "我喜欢你"))
             if i == 0:
                 first = d.affection
             last = d.affection
             clock.advance(30)
         self.assertIsNotNone(first)
-        self.assertLessEqual(last, max(0.0, first * REPEAT_DECAY[-1]),
+        self.assertLessEqual(last, max(0.0, first * REPEAT_DECAY[-1]) + 1e-9,
                              f"第 12 次仍拿 {last}，first={first}")
 
     def test_daily_cap_holds(self):

@@ -567,3 +567,81 @@ def test_unknown_role_does_not_see_another_roles_row():
     target, at = SocialSignals.last_proactive(sig, "roleB")
     assert at == 1.0
     assert target == ""
+
+
+class SignalsScopeAndTtlTest(unittest.TestCase):
+    """信号文件的作用域与过期：多 Bot 下不能读到别人的数，过期后不能拿旧 TTL 判新文件。"""
+
+    def write_signals(self, payload: dict, mtime_age: float = 0.0) -> Path:
+        root = Path(tempfile.mkdtemp())
+        social = root / "plugin_data" / SOCIAL_PLUGIN_DIR_NAME
+        social.mkdir(parents=True)
+        path = social / SIGNALS_FILE_NAME
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        if mtime_age:
+            stamp = time.time() - mtime_age
+            os.utime(path, (stamp, stamp))
+        return root
+
+    def test_role_slice_does_not_fall_back_to_the_top_level(self):
+        """角色分片存在时只用分片：顶层是跨角色共用的，回落过去等于读别人的数据。"""
+        root = self.write_signals({
+            "ignored_streak": 2,
+            "ignored_by": {"42": 99},
+            "by_bid": {"bot1": {"ignored_streak": 5, "ignored_by": {"42": 5}}},
+        })
+        signals = SocialSignals(lambda: root)
+        self.assertEqual(signals.ignored_by_uid("42", "bot1"), 5, "读到了顶层的别人的数")
+        # 分片不存在时才回落顶层（单 Bot 部署就是这么写的）
+        self.assertEqual(signals.ignored_by_uid("42", "bot2"), 99)
+        self.assertEqual(signals.ignored_by_uid("42"), 99)
+
+    def test_expiry_clears_fingerprint_and_declared_ttl(self):
+        root = self.write_signals({"ttl_seconds": 120, "by_bid": {}})
+        signals = SocialSignals(lambda: root)
+        self.assertTrue(signals.read())
+        self.assertEqual(signals._declared_ttl, 120.0)
+        self.assertIsNotNone(signals._fingerprint)
+        # 把文件改成「很旧」：过期时三样缓存必须一起清。只清 payload 的话，
+        # 文件再出现时指纹没变就直接返回空；不清 declared_ttl 则会拿上一份
+        # 文件声明的保鲜期去判下一份。
+        stamp = time.time() - 10 ** 6
+        os.utime(signals_path(root), (stamp, stamp))
+        self.assertEqual(signals.read(), {})
+        self.assertIsNone(signals._fingerprint)
+        self.assertEqual(signals._declared_ttl, 0.0)
+        self.assertEqual(signals._payload, {})
+
+    def test_dead_loaded_at_field_is_gone(self):
+        signals = SocialSignals(lambda: Path(tempfile.mkdtemp()))
+        self.assertFalse(hasattr(signals, "_loaded_at"))
+
+
+class RoutineNightFallbackTest(unittest.TestCase):
+    """`biological_night()` 返回 (0, 0) 这种退化值时，不能导出「24 小时夜」。"""
+
+    class _Soma:
+        def __init__(self, night):
+            self._night = night
+
+        def biological_night(self):
+            return self._night
+
+    def _block(self, night):
+        from types import SimpleNamespace
+
+        from humanoid.config import HumanoidConfig
+        from humanoid.link import _routine_block
+
+        core = SimpleNamespace(soma=self._Soma(night))
+        return _routine_block(core, HumanoidConfig.from_raw({}), [])
+
+    def test_degenerate_night_falls_back_to_config(self):
+        block = self._block((0.0, 0.0))
+        self.assertEqual(block["night_source"], "config")
+        self.assertLess(block["night_span_hours"], 24.0, "退化的夜不该导出 24 小时")
+
+    def test_real_night_is_used(self):
+        block = self._block((23.0, 7.0))
+        self.assertEqual(block["night_source"], "schedule")
+        self.assertEqual(block["night_span_hours"], 8.0)

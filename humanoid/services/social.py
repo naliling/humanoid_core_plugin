@@ -29,6 +29,20 @@ class SocialEnergyService:
         except (TypeError, ValueError):
             return FULL
 
+    def _write(self, value: float) -> float:
+        """统一的写入口径：一律夹到 [0, FULL] 再落盘。
+
+        原来三处各夹各的（读时夹上界、扣时只夹下界、恢复时只夹上界），漏夹的那一处
+        会把越界值写进 state.json，而钳制只在 `load` 时做一次。
+        """
+        clamped = max(0.0, min(FULL, float(value)))
+        self._scope.set_self("social_energy", clamped)
+        return clamped
+
+    def _warn(self, message: str) -> None:
+        if self._log is not None:
+            self._log.warning(f"[humanoid_core] {message}")
+
     @property
     def text(self) -> str:
         if self.value > 70:
@@ -43,9 +57,7 @@ class SocialEnergyService:
             return self.value
         self.maybe_daily_reset()
         amount = max(0.0, float(cfg.social_energy_consumption_per_msg))
-        value = max(0.0, self.value - amount)
-        self._scope.set_self("social_energy", value)
-        return value
+        return self._write(self.value - amount)
 
     def recover(self, seconds: float) -> float:
         cfg = self.config
@@ -54,9 +66,7 @@ class SocialEnergyService:
         gain = max(0.0, float(cfg.social_energy_recovery_per_minute)) * (max(0.0, seconds) / 60.0)
         if gain <= 0:
             return self.value
-        value = min(FULL, self.value + gain)
-        self._scope.set_self("social_energy", value)
-        return value
+        return self._write(self.value + gain)
 
     def maybe_daily_reset(self) -> bool:
         cfg = self.config
@@ -76,16 +86,30 @@ class SocialEnergyService:
         return True
 
     def reset(self) -> float:
-        self._scope.set_self("social_energy", FULL)
-        return FULL
+        return self._write(FULL)
 
     async def run_recovery_loop(self, stop_event: asyncio.Event):
+        """恢复循环：**先结算，再等下一个间隔**。
+
+        原来是先 `wait_for(stop_event.wait(), timeout=interval)` 才做第一次恢复：刚启动
+        （或刚从一次长时间停机里恢复）的那一整个间隔内社交能量纹丝不动。生产走的
+        `core_instance._social_loop` 与这里本来是两份复制品，现在共用这一份。
+        """
         while not stop_event.is_set():
-            cfg = self.config
-            interval = float(cfg.social_energy_recovery_interval_seconds)
-            if cfg.social_energy_enabled:
-                self.recover(interval)
-                self.maybe_daily_reset()
+            # 下限 1 秒：配置里出现 0/负数时（手改 JSON、旧配置）`wait_for(..., timeout=0)`
+            # 会立刻超时 → 循环变成忙循环，把一个核烧满。
+            try:
+                interval = max(1.0, float(self.config.social_energy_recovery_interval_seconds))
+            except Exception as exc:
+                self._warn(f"社交能量恢复间隔不可用（{exc!r}），本轮用默认 60 秒")
+                interval = 60.0
+            try:
+                if self.config.social_energy_enabled:
+                    self.recover(interval)
+                    self.maybe_daily_reset()
+            except Exception as exc:
+                # 与其它后台循环一致：单轮出错只记一条，别让任务静默死掉。
+                self._warn(f"社交能量恢复出错: {exc}")
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:

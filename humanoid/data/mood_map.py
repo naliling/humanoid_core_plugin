@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import random
+from ..wording import pick
 
 _LIBIDO_AGGRESSION_BUCKETS = (0.0, 12.5, 25.0, 37.5, 50.0)
 
@@ -77,42 +77,57 @@ def get_mood_label(affection: float, libido: float, aggression: float) -> str:
     return table.get((round_to_bucket(libido), round_to_bucket(aggression)), "普通")
 
 
-def generate_mood_tag(affection: float, libido: float, aggression: float, energy: float) -> str:
+def generate_mood_tag(affection: float, libido: float, aggression: float, energy: float,
+                      seed=None) -> str:
     """心情标签：给人看的短语（如「有点疲惫，开心，想贴贴」），不进聊天上下文。
 
-    每档多条等价说法随机抽：同一个状态不该每次都念同一句。措辞都是状态词，
+    每档多条等价说法抽签：同一个状态不该每次都念同一句。措辞都是状态词，
     不带「所以该怎么说话」的指令。
+
+    `seed` 是抽签种子（调用方传 `(角色, 日期)`，见 `mood.EmotionLayer._refresh_tag`）。
+    抽签必须**稳定**：原来这里是裸 `random.choice`，同一个状态相邻两次调用 97.78%
+    不同，于是调用方「变了才写盘」的守卫形同虚设（实测 200 次调用写盘 197 次），
+    标签还会每次重启都换一遍。档位由下面的 key 体现，所以种子只需要角色与日期。
     """
+    base = () if seed is None else (seed if isinstance(seed, (tuple, list)) else (seed,))
     parts: list[str] = []
 
     if energy >= 70:
-        parts.append(random.choice(("精力充沛", "精神饱满", "状态在线", "劲头很足")))
+        parts.append(pick("mood_tag_energy_high", base,
+                          ("精力充沛", "精神饱满", "状态在线", "劲头很足")))
     elif energy >= 40:
-        parts.append(random.choice(("状态平稳", "还算有精神", "不咸不淡", "情绪平稳")))
+        parts.append(pick("mood_tag_energy_mid", base,
+                          ("状态平稳", "还算有精神", "不咸不淡", "情绪平稳")))
     else:
-        parts.append(random.choice(("有点疲惫", "犯困", "电量不足", "身上发沉")))
+        parts.append(pick("mood_tag_energy_low", base,
+                          ("有点疲惫", "犯困", "电量不足", "身上发沉")))
 
     if affection >= 70:
-        parts.append(random.choice(("开心", "心情不错", "愉快", "心里挺亮堂")))
+        parts.append(pick("mood_tag_affection_high", base,
+                          ("开心", "心情不错", "愉快", "心里挺亮堂")))
     elif affection >= 40:
-        parts.append(random.choice(("平静", "心平气和", "淡淡的", "没什么波澜")))
+        parts.append(pick("mood_tag_affection_mid", base,
+                          ("平静", "心平气和", "淡淡的", "没什么波澜")))
     else:
-        parts.append(random.choice(("冷淡", "提不起劲", "闷闷的", "兴致不高")))
+        parts.append(pick("mood_tag_affection_low", base,
+                          ("冷淡", "提不起劲", "闷闷的", "兴致不高")))
 
-    # 门槛与注入侧（prompt_builder.EMOTION_*_ONSET）一致：拿初始值（28/34）当门槛时，
-    # 「矛盾」几乎每条消息都在，那不是矛盾，那是常态。
+    # 门槛与情绪层（`emotion.AGGRESSION_UP` / `LIBIDO_UP`）同量级：拿初始值（28/34）
+    # 当门槛时，「矛盾」几乎每条消息都在，那不是矛盾，那是常态。
     if aggression >= 40 and libido >= 42:
-        parts.append(random.choice(("矛盾", "拧巴", "两个念头抣着")))
+        parts.append(pick("mood_tag_conflict", base, ("矛盾", "拧巴", "两个念头抣着")))
     elif aggression >= 40:
         # 「气鼓鼓」是角色会说的话，不是第三人称叙述；换成一组的客观状态词
-        parts.append(random.choice(("有点烦躁", "压着火气", "心里不痛快")))
+        parts.append(pick("mood_tag_aggression", base,
+                          ("有点烦躁", "压着火气", "心里不痛快")))
     elif libido >= 42:
         # 「想贴贴」同上。整块输出会变成「她今天想贴贴」——那是给她递台词。
-        parts.append(random.choice(("想亲近人", "想有人说说话", "黏糊", "松快")))
+        parts.append(pick("mood_tag_libido", base,
+                          ("想亲近人", "想有人说说话", "黏糊", "松快")))
     elif aggression <= 8 and libido <= 8:
-        parts.append(random.choice(("松弛", "自在", "没什么心事")))
+        parts.append(pick("mood_tag_calm", base, ("松弛", "自在", "没什么心事")))
     else:
-        parts.append(random.choice(("自然", "随性", "平常心")))
+        parts.append(pick("mood_tag_plain", base, ("自然", "随性", "平常心")))
 
     unique: list[str] = []
     for part in parts:

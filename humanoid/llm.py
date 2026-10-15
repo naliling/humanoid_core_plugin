@@ -33,22 +33,74 @@ MAX_TOTAL_CALL_SECONDS = 150.0
 
 # 重试只对「再试一次可能就好了」的错误有意义。鉴权失败、请求体非法、内容审核拒绝、
 # 额度用尽这几类再试一百次也是同样的结果，只会白烧每日额度与用户等待时间。
-# 判定靠错误文本的特征词——各家 provider 的异常类型并不统一，拿不到可靠的类型信息。
-_PERMANENT_RE = re.compile(
-    r"\b(400|401|403|404|422)\b"
-    r"|unauthorized|forbidden|invalid[_ -]?api[_ -]?key|authentication|permission"
+#
+# **先看 HTTP 状态码语义**：状态码是结构化的事实；而错误文本里随便一个三位数字都可能
+# 是别的东西——原来用 `\b(400|401|403|404|422)\b` 裸扫子串，「重试第 400 次」
+# 「4000 字超限」都会被判成永久失败，于是该重试的不重试。状态码拿不到时才退回特征词。
+_PERMANENT_STATUS = frozenset({400, 401, 402, 403, 404, 405, 406, 410, 413, 414, 415, 422, 451})
+# 这几个 4xx 是「等一下再来」：请求超时、冲突、过早、限流。
+_RETRYABLE_STATUS = frozenset({408, 409, 425, 429})
+
+_PERMANENT_WORDS_RE = re.compile(
+    r"unauthorized|forbidden|invalid[_ -]?api[_ -]?key|authentication|permission"
     r"|invalid[_ -]?request|bad request|content[_ -]?(policy|filter)|moderation|safety"
     r"|quota|insufficient",
     re.IGNORECASE,
 )
+# 只有明确写着「HTTP / status / code / 错误码 / 状态码」的上下文里，三位数字才当状态码读。
+_STATUS_IN_TEXT_RE = re.compile(
+    r"(?:http(?:[/ ]?\d(?:\.\d)?)?|status|code|错误码|状态码)\D{0,12}?(\d{3})\b",
+    re.IGNORECASE,
+)
+
+
+def _status_code(exc: BaseException) -> int | None:
+    """从异常里取 HTTP 状态码：先看属性，再看文本里的「状态码」上下文。"""
+    for attr in ("status_code", "status", "http_status", "code"):
+        value = getattr(exc, attr, None)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= number <= 599:
+            return number
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if value is not None and not isinstance(value, bool):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = 0
+        if 100 <= number <= 599:
+            return number
+    match = _STATUS_IN_TEXT_RE.search(f"{type(exc).__name__}: {exc}")
+    if match:
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _is_retryable(exc: BaseException) -> bool:
     """这次失败值不值得重试。
 
     默认**重试**（网络抖动、限流、5xx 都可能自己好），只把明确是「再试也一样」的挡回去。
+    判定顺序：HTTP 状态码语义 → 错误文本特征词。
     """
-    return not _PERMANENT_RE.search(f"{type(exc).__name__}: {exc}")
+    code = _status_code(exc)
+    if code is not None:
+        if code in _RETRYABLE_STATUS:
+            return True
+        if code in _PERMANENT_STATUS:
+            return False
+        if 400 <= code < 500:
+            return False
+        # 5xx / 1xx / 3xx：服务端问题，重试有意义。
+        return True
+    return not _PERMANENT_WORDS_RE.search(f"{type(exc).__name__}: {exc}")
 
 
 def _system_prompt_support(provider: Any) -> str:

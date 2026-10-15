@@ -63,8 +63,36 @@ class RoleManager:
                     name=f"humanoid-role-start-{role_id}",
                 )
                 self._start_tasks.add(task)
-                task.add_done_callback(self._start_tasks.discard)
+                task.add_done_callback(self._on_start_task_done)
         return self._instances[role_id]
+
+    def _on_start_task_done(self, task: asyncio.Task) -> None:
+        """启动任务退出时读一次结局。
+
+        原来只挂 `self._start_tasks.discard`：`instance.start()` 抛出的任何异常都没人
+        取用，于是「新角色起来了」和「根本起不来」在日志里长得一模一样。
+        """
+        self._start_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:  # pragma: no cover - 竞态：取消落在 cancelled() 之后
+            return
+        if exc is not None:
+            self._log.warning(
+                f"{LOG_PREFIX} 角色启动任务 {task.get_name()} 异常退出: {exc!r}"
+            )
+            return
+        try:
+            started = task.result()
+        except Exception:  # pragma: no cover - 上面已经取过 exception()
+            return
+        if started is False:
+            # `HumanoidCoreInstance.start()` 在已收到停止信号时明确返回 False。
+            self._log.warning(
+                f"{LOG_PREFIX} 角色启动任务 {task.get_name()} 未能启动（已收到停止信号）"
+            )
 
     def get_all(self) -> list[HumanoidCoreInstance]:
         return list(self._instances.values())
@@ -93,12 +121,28 @@ class RoleManager:
         for task in starting:
             task.cancel()
         if starting:
-            await asyncio.gather(*starting, return_exceptions=True)
+            results = await asyncio.gather(*starting, return_exceptions=True)
+            # `return_exceptions=True` 是为了不让一个角色的失败拖住其余角色，但**不能
+            # 顺手把异常丢掉**：停止阶段出的错（写盘失败、取消超时）本该有人知道。
+            for task, result in zip(starting, results):
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    self._log.warning(
+                        f"{LOG_PREFIX} 取消启动任务 {task.get_name()} 时出错: {result!r}"
+                    )
         self._start_tasks.clear()
         if pending:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 *[inst.stop() for inst in pending], return_exceptions=True
             )
+            for inst, result in zip(pending, results):
+                if isinstance(result, BaseException) and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    self._log.warning(
+                        f"{LOG_PREFIX} 角色 {inst.role_id} 停止时出错: {result!r}"
+                    )
         # 角色停了就不该还有未落盘的状态。调用方随后还会 stop 一次 StateStore，
         # 多这一次 flush 代价为零，却保证单独用 RoleManager 的代码也不丢数据。
         await self._state_store.flush()

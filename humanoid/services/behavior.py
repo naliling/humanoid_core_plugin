@@ -46,6 +46,13 @@ MAX_EVENTS_PER_USER = 12
 MAX_RELEVANT_EVENTS = 1
 
 
+def _is_finite(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 class BehaviorService:
     """短期事件、注意力和行为倾向的运行时协调器。"""
 
@@ -60,6 +67,16 @@ class BehaviorService:
     @property
     def config(self) -> HumanoidConfig:
         return self._core.config
+
+    def _warn(self, message: str) -> None:
+        """记一条 warning。`self._core` 在测试里是轻量替身，没有 `_log` 就安静跳过。"""
+        log = getattr(self._core, "_log", None)
+        if log is None:
+            return
+        try:
+            log.warning(f"[humanoid_core] {message}")
+        except Exception:
+            pass
 
     def _key(self, user_id: str) -> str:
         return f"{self._core.role_id}:{str(user_id)}"
@@ -97,6 +114,14 @@ class BehaviorService:
                 0.08,
                 {"gap_seconds": None},
             )
+
+        if not _is_finite(now) or not _is_finite(last_ts):
+            # NaN/Inf 时间戳会算出 NaN 间隔，`max(0.0, nan)` 得到 0.0，于是这里**静默**
+            # 早退——表现是「间隔事件从此再也不生成」，日志里一个字都没有。
+            self._warn(
+                f"行为服务收到非有限的时间戳（now={now!r}, last_ts={last_ts!r}），本轮不生成间隔事件"
+            )
+            return None
 
         try:
             elapsed = max(0.0, float(now) - float(last_ts))
@@ -146,6 +171,15 @@ class BehaviorService:
     def _clean(self, user_id: str, now: float) -> List[Dict[str, Any]]:
         key = self._key(user_id)
         queue = self._events.get(key, [])
+        if not queue:
+            # 空列表不留键：`_events` 按用户增长，而它只在「用户下次发言」时才被清，
+            # 群里的人可能再也不说话 → 字典只增不减。
+            self._events.pop(key, None)
+            return []
+        if not _is_finite(now):
+            # 时间戳不可信时不做淘汰（全部判过期会让事件凭空消失），但必须喊一声。
+            self._warn(f"行为服务收到非有限的时间戳（now={now!r}），本轮不淘汰短期事件")
+            return list(queue)
         fresh = []
         for event in queue:
             try:
@@ -154,11 +188,31 @@ class BehaviorService:
                 continue
             if age <= EVENT_TTL:
                 fresh.append(event)
-        self._events[key] = fresh
+        if fresh:
+            self._events[key] = fresh
+        else:
+            self._events.pop(key, None)
         return fresh
+
+    def _sweep_active(self, now: float) -> None:
+        """按 TTL 回收「回来这一轮」的事件。
+
+        `_active_event` 只在用户**下一次发言**时被清（`clear_user_events`），而群里那个
+        人可能再也不说话——条目就一直留着，每个说过话的用户一份，只增不减。
+        """
+        if not self._active_event:
+            return
+        for key, event in list(self._active_event.items()):
+            try:
+                age = float(now) - float(event.get("timestamp", now))
+            except (TypeError, ValueError):
+                age = float("inf")
+            if not age <= EVENT_TTL:  # NaN 也在这里被清掉
+                self._active_event.pop(key, None)
 
     def compute_attention(self, user_id: str, now: float) -> List[Dict[str, Any]]:
         """计算短期注意力，不写持久状态。"""
+        self._sweep_active(now)
         scored: List[Dict[str, Any]] = []
         for event in self._clean(user_id, now):
             try:
@@ -294,9 +348,17 @@ class BehaviorService:
 
         `persist=False` 用于群聊里没开成员情绪档案的场合：那种模式下连 mood 档案都不该
         建（旧版有一条测试专门卡这个），在意度更不能顺手把用户条目写出来。
+
+        **读**也必须是只读的：`scope.get_user` 走 `users.setdefault()`，读一下就给这个
+        用户建一条空 `{}`——群里每个被 `build_injection` 看到的陌生人都留下一个永久
+        空壳（不含任何会被过期清理的字段，`prune_expired` 直接跳过，文件随群规模一直涨）。
+        所以这里用 `peek_user`，并且只有**已经有这条记录**的用户才回写。
         """
         scope = self._core.scope
-        record = scope.get_user(user_id, "attention") or {}
+        record = scope.peek_user(user_id, "attention")
+        existed = isinstance(record, dict) and bool(record)
+        if not existed:
+            record = {}
         try:
             current = float(record.get("care", 0.0))
             at = float(record.get("care_at", 0.0) or 0.0)
@@ -315,7 +377,11 @@ class BehaviorService:
             decay = math.pow(0.5, hours / CARE_HALF_LIFE_HOURS) if hours > 0 else 1.0
             value = target + (current - target) * decay
         value = round(max(0.0, min(1.0, value)), 4)
-        if persist and (abs(value - current) >= 0.01 or (now - at) >= CARE_EMA_MIN_GAP_SECONDS):
+        if (
+            persist
+            and existed
+            and (abs(value - current) >= 0.01 or (now - at) >= CARE_EMA_MIN_GAP_SECONDS)
+        ):
             scope.set_user(user_id, "attention", {"care": value, "care_at": now})
         return value
 
@@ -354,12 +420,12 @@ class BehaviorService:
             lines = self._core.mood.recall_lines(user_id, 6)
         except Exception:
             return False
-        for line in lines:
-            text = str(line)
-            for word in _chunks(text):
-                if word and word in body:
-                    return True
-        return False
+        # 先把几条原话拼成一大串，再对每个片段做**一次** `in`。原来是「每条原话 × 每个
+        # 片段」各扫一遍 body（6 × 上百次子串搜索），中文长消息上纯属白烧 CPU。
+        recalled = "".join(str(line) for line in lines)
+        if not recalled:
+            return False
+        return any(word in recalled for word in _chunks(body))
 
     def _spare(self, now: float) -> float:
         """注意力余量：身体状态给她剩多少。
@@ -418,16 +484,21 @@ class BehaviorService:
         return {"care": care_value, "focus": focus_value, "spare": spare_value}
 
 
-# 中文没分词：从一段话里抽 2~4 字的滑窗当作关键词，只用于“这句话里有没有提到它”。
+# 中文没分词：从一段话里抽 3~4 字的滑窗当作关键词，只用于「这句话里有没有提到它」。
 _CHUNK_SKIP = set("，。、；！？…~（）()【】“”" + '"\' ')
 
 
 def _chunks(text: str) -> List[str]:
+    """3~4 字的滑窗片段。
+
+    以前连 2 字片段一起抽（一条消息约 117 个）：2 字片段几乎没有判别力（「今天」
+    「一个」什么都能撞上），却让 `_touches_recalled` 的子串搜索次数翻倍。
+    """
     cleaned = "".join(ch for ch in text if ch not in _CHUNK_SKIP)[:40]
-    if len(cleaned) < 2:
+    if len(cleaned) < 3:
         return []
     out: List[str] = []
-    for size in (4, 3, 2):
+    for size in (4, 3):
         for start in range(0, max(0, len(cleaned) - size + 1)):
             out.append(cleaned[start:start + size])
     return out

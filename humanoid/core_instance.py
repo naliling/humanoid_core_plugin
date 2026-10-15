@@ -14,10 +14,11 @@ from .clock import Clock, format_state_timestamp
 from .config import HumanoidConfig
 from .link import SocialSignals, build_contract
 from .llm import LLMGateway, ProviderResolver
-from .prompt_builder import PromptBuilder
+from .prompt_builder import PromptBuilder, sanitize_name
 from .role_scope import RoleScope
 from .services.energy import EnergyService
 from .services.mood import MoodService
+from .services.process import ProcessService
 from .services.schedule import ScheduleService
 from .services.social import SocialEnergyService
 from .services.weather import WeatherService
@@ -86,6 +87,10 @@ _NAME_TAIL_BAD = re.compile(r"(的|地|着|般|一样|似的|风格|样子|脾�
 # 名字里出现这些字，多半是把描述句整个吃进来了
 _NAME_DESC_WORDS = ("的", "很", "非常", "有点", "特别", "比较", "而且", "并且")
 
+# 天气服务给的是格式化好的字符串（「多云 🌡️ 12°C」/「天气：多云，气温 12℃」），
+# 数值在解析那一刻就丢了；这里统一解析一次。
+_TEMP_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*[℃°]")
+
 
 def _name_from_text(text: str) -> str:
     """从人设正文里抽一个像名字的词。抽不到就返回空串。"""
@@ -131,6 +136,11 @@ class HumanoidCoreInstance:
         self._config_provider = config_provider
         self._log = logger
         self._stop_event = stop_event
+        # 后台任务表与启动标志必须在**任何可能走到 `_spawn_background` 的构造步骤之前**
+        # 就位：日程服务拿的就是这个绑定方法，构造链里已经有几条路径会调它。
+        self._tasks: set[asyncio.Task] = set()
+        self._started = False
+        self._rebasing = False
         self._fetch_json = fetch_json
         self.persona_source = persona_source
         self.last_activity: Optional[float] = None
@@ -170,8 +180,9 @@ class HumanoidCoreInstance:
         if persona_source is not None:
             persona_source.restore(role_id, self._scope.get_self("last_umo", ""))
         # 人设可能换了 → 之前自动补的名字作废，下次重新从新的人设里取。
-        # （`char_name_auto` 是记忆项，不清的话改了人设还是叫旧名字。）
-        self._scope.set_self("char_name_auto", "")
+        # **只在人设真的换了时**才清：原来每次构造都无条件 `set_self("char_name_auto","")`，
+        # 插件一重载就白清一次（顺带把状态标脏），下一轮注入再从人设正文里重跑一遍正则。
+        self._forget_stale_char_name()
 
         # 身体（生理层）的日程与天气都是惰性取数，避开构造顺序上的环形依赖。
         # 时间源统一走 `now_epoch()`：身体积分跟她的钟（含角色级城市覆盖）同源，
@@ -206,12 +217,22 @@ class HumanoidCoreInstance:
             logger=logger,
             time_source=self.now_epoch,
         )
-        self.social = SocialEnergyService(self._scope, config_provider, self.clock)
+        self.social = SocialEnergyService(self._scope, config_provider, self.clock, logger)
         self.weather = WeatherService(
             self._scope, config_provider, self.clock, fetch_json, logger
         )
 
         self.behavior = BehaviorService(self)
+
+        # 过程（她手上这件事）：按当前日程段生成，并在段与段之间换锚点。
+        # 必须在 `self.schedule` 之后构造——它读日程拿「现在这一段是什么事」。
+        # 以前这个服务**全项目零实例化**：类写在文件里、配置项不存在、状态键没人读。
+        self.process = ProcessService(
+            self._scope,
+            config_provider,
+            self.clock,
+            self.schedule,
+        )
 
         # 社交层写回的信号（它替她主动开过口、被谁冷落了几次）。只读，文件不在就是没联动。
         self.signals = SocialSignals(lambda: data_root)
@@ -220,9 +241,6 @@ class HumanoidCoreInstance:
         self.engine_compat = _EngineCompat(self)
 
         self._rebase_after_move()
-
-        self._tasks: set[asyncio.Task] = set()
-        self._started = False
 
     def _city_override(self) -> str:
         """这个机器人单独设的城市（空 = 没单独设，跟全局配置）。Clock 靠它实现时区分离。"""
@@ -244,22 +262,38 @@ class HumanoidCoreInstance:
         旧代码就完全不知道时区变了（`/拟人 诊断` 也不会报），于是下一次精力结算会按新
         时区去解释旧时区写的墙上时间，可能凭空来一次「新的一天」——精力 20 突然跳到 80。
         """
+        if self._rebasing:
+            # `now_epoch()` 每次都会调到这里，而下面的精力结算又会读钟；留一道闸，
+            # 免得将来某条取值链把两者接成一个环。
+            return
         current = self.clock.city
         stored = str(self._scope.get_self("tz_city", "") or "")
         if stored == current:
             return
-        if stored:
-            now = self.clock.now()
-            self._scope.update_self(
-                last_update=format_state_timestamp(now),
-                _last_weather_fetch="",
-            )
-            if self._log:
-                self._log.info(
-                    f"{LOG_PREFIX} 角色 {self.role_id} 所在城市由「{stored}」改为「{current}」："
-                    "精力与天气的计时已按新时区重新起算"
+        self._rebasing = True
+        try:
+            if stored:
+                now = self.clock.now()
+                # 换锚点**之前**先把旧时区那一段精力结清：直接覆写 `last_update`
+                # 等于把「旧钟点 → 现在」整段（跨时区时可能是十几个小时）丢掉，
+                # 那段时间她既不消耗也不恢复。
+                try:
+                    self.energy.advance()
+                except Exception as exc:
+                    if self._log:
+                        self._log.debug(f"{LOG_PREFIX} 换城市前结算精力失败: {exc}")
+                self._scope.update_self(
+                    last_update=format_state_timestamp(now),
+                    _last_weather_fetch="",
                 )
-        self._scope.set_self("tz_city", current)
+                if self._log:
+                    self._log.info(
+                        f"{LOG_PREFIX} 角色 {self.role_id} 所在城市由「{stored}」改为「{current}」："
+                        "精力与天气的计时已按新时区重新起算"
+                    )
+            self._scope.set_self("tz_city", current)
+        finally:
+            self._rebasing = False
 
     def set_city_override(self, city: str) -> str:
         """单独设这个机器人的城市（`/拟人 设置 城市` 走这里）。
@@ -293,8 +327,11 @@ class HumanoidCoreInstance:
             self._scope.set_self("outfit_override", value[:200])
         return self.outfit_override()
 
-    def outfit_scene(self) -> str:
-        """此刻的场景（睡/洗/出门/冷/不适/居家），给穿搭用。"""
+    def outfit_scene(self, temp_c: float | None = None) -> str:
+        """此刻的场景（睡/洗/出门/冷/不适/居家），给穿搭用。
+
+        `temp_c` 由调用方传进来（`outfit_text` 每条只解析一次天气）；不传就自己取。
+        """
         event = ""
         try:
             slot = self.schedule.current_slot() or {}
@@ -309,14 +346,8 @@ class HumanoidCoreInstance:
             discomfort = float(snap.get("discomfort", 0.0) or 0.0)
         except Exception:
             pass
-        temp_c: float | None = None
-        try:
-            env = str((self.weather.snapshot() or {}).get("env", ""))
-            m = re.search(r"(-?\d+(?:\.\d+)?)\s*[℃°]", env)
-            if m:
-                temp_c = float(m.group(1))
-        except Exception:
-            temp_c = None
+        if temp_c is None:
+            temp_c = self.weather_temp_c()
         phase = -1
         try:
             day = int(self._scope.get_self("current_cycle_day", 1) or 1)
@@ -339,6 +370,28 @@ class HumanoidCoreInstance:
             return ""
         return str(getattr(snap, "prompt", "") or "")
 
+    def weather_temp_c(self) -> float | None:
+        """天气快照里的数值气温（℃）；拿不到（没开 / 没取到 / 只是说明书）返回 None。
+
+        天气服务给的 `env`/`weather` 是**格式化好的字符串**，数值在解析时就丢了。
+        这里解析一次、给场景判定与穿搭共用：原来只在场景判定里抠一次正则，现在
+        穿搭也要用温度，不该各自再抠一遍。
+        """
+        try:
+            snap = self.weather.snapshot() or {}
+        except Exception:
+            return None
+        if snap.get("notice"):
+            return None
+        text = str(snap.get("env") or snap.get("weather") or "")
+        match = _TEMP_RE.search(text)
+        if not match:
+            return None
+        try:
+            return float(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
     def outfit_text(self) -> str:
         """此刻穿着（未格式化）。关掉 / 判不出来 → 空串。"""
         cfg = self.config
@@ -346,13 +399,21 @@ class HumanoidCoreInstance:
             return ""
         try:
             preset = self.outfit_override() or cfg.outfit_preset
-            return outfit.resolve(
+            temp_c = self.weather_temp_c()
+            kwargs = dict(
                 preset=preset,
                 name=self.char_name(),
                 persona=self._persona_text(),
-                scene=self.outfit_scene(),
+                scene=self.outfit_scene(temp_c),
                 scene_variation=cfg.outfit_scene_variation,
             )
+            try:
+                # 把气温当**数值**传下去，别让 outfit 自己再从格式化串里抠正则。
+                return outfit.resolve(temp_c=temp_c, **kwargs)
+            except TypeError:
+                # `outfit.resolve` 还没接受 temp_c（另一条改动线）：退回旧签名，
+                # 别让一个多出来的关键字把整条穿搭弄没。
+                return outfit.resolve(**kwargs)
         except Exception:
             return ""
 
@@ -416,6 +477,10 @@ class HumanoidCoreInstance:
         if auto:
             try:
                 self._scope.set_self("char_name_auto", auto)
+                label = self._persona_label_cached()
+                if label:
+                    # 记下这个名字是从哪份人设里抽出来的，人设换了才作废。
+                    self._scope.set_self("char_name_auto_from", label)
             except Exception:
                 pass
         return auto
@@ -461,19 +526,62 @@ class HumanoidCoreInstance:
             return {"name": current, "source": "自动补的（人设里没写名字）"}
         return {"name": current, "source": "跟随人设里的名字"}
 
+    def _persona_label_cached(self) -> str:
+        """只读缓存里那份人设的 label（没预热过 → 空串，不触发任何解析）。"""
+        src = getattr(self, "persona_source", None)
+        if src is None:
+            return ""
+        try:
+            snap = src.cached_persona(self.role_id)
+        except Exception:
+            return ""
+        return str(getattr(snap, "label", "") or "")
+
+    def _forget_stale_char_name(self, label: str = "") -> None:
+        """人设真的换了才作废「自动补的参照名称」。
+
+        按人设 label 记账：label 未知（缓存还没预热、也没有现成的人设）时什么都不做，
+        宁可留着旧名字，也不要每次构造都白清一次并把状态标脏。
+        """
+        current = str(label or self._persona_label_cached() or "")
+        if not current:
+            return
+        try:
+            if str(self._scope.get_self("char_name_auto_from", "") or "") == current:
+                return
+            self._scope.set_self("char_name_auto", "")
+            self._scope.set_self("char_name_auto_from", current)
+        except Exception:
+            pass
+
     def forget_auto_char_name(self) -> None:
         """人设换了就把自动补的名字丢掉，下次重新从新的人设里取。"""
         try:
             self._scope.set_self("char_name_auto", "")
+            self._scope.set_self("char_name_auto_from", "")
         except Exception:
             pass
 
-    def set_char_name(self, name: str) -> str:
-        """管理员设定参照名称。传空/「清除」= 去掉设定，回到跟随人设名。"""
-        value = str(name or "").strip()
-        if value in ("", "清除", "默认", "跟随", "跟随人设", "无"):
+    def set_char_name(self, name: str) -> str | None:
+        """管理员设定参照名称。传空/「清除」= 去掉设定，回到跟随人设名。
+
+        这是**公开入口**（面板、脚本、其它插件都能直接调），而这个名字会被拼进每一轮
+        system_prompt 的引号里。`main.py` 那条指令路径已经用 `prompt_builder.sanitize_name`
+        洗过一遍，这里再洗一遍：指令层洗过的不能代表所有调用方。
+        清洗后为空（含代词、换行、引号、控制字符）→ **不改动现有设定**并返回 None。
+        """
+        raw = str(name or "").strip()
+        if raw in ("", "清除", "默认", "跟随", "跟随人设", "无"):
             self._scope.set_self("char_name_override", "")
             return ""
+        value = sanitize_name(raw)
+        if not value:
+            if self._log:
+                self._log.warning(
+                    f"{LOG_PREFIX} 参照名称清洗后为空（含引号/换行/代词或全是非法字符），"
+                    "已忽略本次设定"
+                )
+            return None
         self._scope.set_self("char_name_override", value)
         return value
 
@@ -517,6 +625,13 @@ class HumanoidCoreInstance:
             now_sleep = is_sleep_event(str((current or {}).get("event") or ""))
             if was_sleep and not now_sleep:
                 self.soma.note_schedule_changed()
+        except Exception:
+            pass
+        # 日程换了一段：过程跟着换锚点（同一件事续着就接着排阶段，换了事就现开一个）。
+        try:
+            process = getattr(self, "process", None)
+            if process is not None:
+                process.note_segment_changed(current or {})
         except Exception:
             pass
 
@@ -612,6 +727,9 @@ class HumanoidCoreInstance:
             return
         if persona is None or not persona.usable:
             return
+        # 真的认出人设了：如果它跟自动补名字时那份不是同一个，旧名字当场作废
+        # （下一次注入从新人设正文里重取）。
+        self._forget_stale_char_name(persona.label)
         today = self.clock.today_str()
         stamp = f"{today}:{persona.label}"
         if str(self._scope.get_self("persona_realigned", "") or "") == stamp:
@@ -647,8 +765,28 @@ class HumanoidCoreInstance:
             return None
         task = asyncio.create_task(coro, name=f"humanoid-{self.role_id}-{name}")
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._on_task_done)
         return task
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """任务退出时**必须**看一眼它的结局。
+
+        原来挂的是 `self._tasks.discard`：`discard` 只把任务从集合里拿掉，谁都没读过
+        `task.exception()`。于是 5 个后台循环里任何一个抛异常退出都是无声的——集合少
+        一个元素，日志里一个字都没有，功能「看起来在跑」。
+        """
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:  # pragma: no cover - 竞态：取消落在 cancelled() 之后
+            return
+        if exc is not None and self._log:
+            self._log.warning(
+                f"{LOG_PREFIX} 角色 {self.role_id} 的后台任务 "
+                f"{task.get_name()} 异常退出: {exc!r}"
+            )
 
     def on_message(self, user_id: str, text: str, is_group: bool = False, umo: str = "",
                    is_command: bool = False) -> None:
@@ -761,8 +899,10 @@ class HumanoidCoreInstance:
     ) -> str:
         """拼本次请求要追加的事实块。
 
-        只读不写：时间间隔、情绪、注意力都在 `on_message` 里记过账，这里再记一次就会
-        把「上一次说话」推到当前这一条上，间隔永远算不出来。
+        **不记互动**：时间间隔、情绪都在 `on_message` 里记过账，这里再记一次就会把
+        「上一次说话」推到当前这一条上，间隔永远算不出来。
+        但它并不是纯粹只读——`soma.advance()` 会把身体推进到此刻（身体本来就该随时间
+        自己走），注意力的在意度也可能回写（只限**已有**记录的用户，见 `behavior.care`）。
         """
         now = self.now_epoch()
         if self.config.soma_enabled:
@@ -927,6 +1067,13 @@ class HumanoidCoreInstance:
             result["form_policy"] = self.soma.form_policy(
                 float(self.energy.energy), float(self.social.value)
             )
+        # 她手上这件事（过程服务的产物）：只读，没有过程时给空 dict，不凭空生成。
+        try:
+            process = self.process_state()
+        except Exception:
+            process = {}
+        if process:
+            result["process"] = process
         if user_id:
             m = self.mood.profile(user_id)
             result["mood"] = {
@@ -937,6 +1084,18 @@ class HumanoidCoreInstance:
             }
             result["nickname"] = self.mood.nickname(user_id)
         return result
+
+    def process_state(self) -> dict:
+        """她手上这件事的**只读**快照（不生成、不写盘），给状态页与诊断用。"""
+        proc = self.process.peek()
+        if not proc:
+            return {}
+        return {
+            "name": str(proc.get("name", "") or ""),
+            "phase": str(proc.get("phase", "") or ""),
+            "text": self.process.describe(),
+            "history": self.process.recent(3),
+        }
 
     def body_lines(self) -> list[str]:
         """`/你的状态` 用的身体读数。这里给数字没问题，看的人是自己人。"""
@@ -1030,6 +1189,14 @@ class HumanoidCoreInstance:
             out.append(row("此刻在做什么", str(act.get("name", "")),
                             (f"在{loc}，" if loc else "")
                             + f"已 {int(act.get('duration_minutes', 0) or 0)} 分钟"))
+        # 过程服务：她手上这件事走到哪个阶段、刚做完什么。状态页看得到，注入里不带
+        # （prompt_builder 明确不把日程/活动写进事实块）。
+        proc = s.get("process") or {}
+        if proc.get("text"):
+            out.append(row("手上在做", str(proc["text"])))
+            history = [str(x) for x in (proc.get("history") or []) if str(x)]
+            if history:
+                out.append(row("刚做完", "、".join(history[:2])))
         if user_id:
             try:
                 axes = self.behavior.interest_state(user_id, self.now_epoch()) or {}
@@ -1129,32 +1296,52 @@ class HumanoidCoreInstance:
             lines.append("（正在决定下一段…）")
         return "\n".join(lines)
 
-    async def start(self):
+    async def start(self) -> bool:
+        """起 5 个后台循环；返回是否真的起来了。
+
+        `stop()` 之后 `_stop_event` 一直置着，`_spawn_background` 会把 5 个循环全部
+        拦下，而 `_started` 已经被置 True——调用方以为「启动成功」，后续再 start() 也
+        被上面那句挡掉、永远起不来。所以这里明确报失败（False）并记 warning，
+        不再是一条静悄悄的 info。
+        """
         if self._started:
-            return
-        # 已经收到停止信号就别启动了：`_spawn_background` 会把 5 个循环全部拦下，
-        # 而 `_started` 已经被置 True，后续再 start() 会被上面那句挡掉、**永远起不来**。
+            return True
         if self._stop_event.is_set():
-            self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 已在停止中，跳过启动")
-            return
+            self._log.warning(
+                f"{LOG_PREFIX} 角色 {self.role_id} 已收到停止信号，start() 不会起任何后台循环"
+            )
+            return False
         self._started = True
         self._spawn_background(self._social_loop(), "social-recovery")
         self._spawn_background(self._weather_loop(), "weather-refresh")
         self._spawn_background(self._schedule_loop(), "schedule-refresh")
         self._spawn_background(self._body_loop(), "body-tick")
+        self._spawn_background(self._process_loop(), "process-tick")
         self._spawn_background(self._maintenance_loop(), "data-maintenance")
         self.schedule.current_slots()
         self.schedule.seed_first_segment()
         self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 已启动")
+        return True
 
     async def stop(self):
-        for task in list(self._tasks):
-            if not task.done():
-                task.cancel()
-        if self._tasks:
-            await asyncio.gather(*[t for t in self._tasks if not t.done()], return_exceptions=True)
-        self._tasks.clear()
+        # 顺序有讲究：先关启动标志、再置停止事件——`_spawn_background` 之后不可能再
+        # 新建任务；然后反复 cancel+gather，**直到 `_tasks` 真的没有未完成任务为止**。
+        # 原来只取消一轮就 clear：快照与 clear 之间新建的任务逃逸出去，继续写 state.json。
         self._started = False
+        self._stop_event.set()
+        while True:
+            pending = [task for task in self._tasks if not task.done()]
+            for task in pending:
+                task.cancel()
+            if not pending:
+                break
+            await asyncio.gather(*pending, return_exceptions=True)
+        # 让 done 回调跑一轮（它们负责读异常并把自己摘掉），剩下的补读一次结局。
+        await asyncio.sleep(0)
+        for task in list(self._tasks):
+            if task.done():
+                self._on_task_done(task)
+        self._tasks.clear()
         self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 已停止")
 
     async def _maintenance_loop(self):
@@ -1179,6 +1366,29 @@ class HumanoidCoreInstance:
             except asyncio.TimeoutError:
                 pass
 
+    async def _process_loop(self):
+        """过程推进：她手上的事自己会走完、会换阶段。
+
+        没有这个循环，`ProcessService` 就只是一个躺在文件里的类（此前全项目零实例化）：
+        `current_process` 永远停在生成那一刻的第一阶段。单轮出错只记一条，绝不把循环带走。
+        """
+        while not self._stop_event.is_set():
+            try:
+                self.process.tick()
+                if self.process.pending_update:
+                    await self.process.update_async()
+            except Exception as exc:
+                self._log.warning(f"{LOG_PREFIX} 过程推进失败: {exc}")
+            try:
+                interval = max(15.0, float(self.config.body_tick_seconds))
+            except Exception as exc:
+                self._log.warning(f"{LOG_PREFIX} 过程推进间隔不可用（{exc!r}），本轮用默认 60 秒")
+                interval = 60.0
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
     async def _body_loop(self):
         """身体的时间必须自己流动。
 
@@ -1196,30 +1406,20 @@ class HumanoidCoreInstance:
                 self.refresh_contract()
             except Exception as exc:
                 self._log.warning(f"{LOG_PREFIX} 身体推进失败: {exc}")
-            interval = max(15.0, float(cfg.body_tick_seconds))
+            try:
+                interval = max(15.0, float(cfg.body_tick_seconds))
+            except Exception as exc:
+                self._log.warning(f"{LOG_PREFIX} 身体推进间隔不可用（{exc!r}），本轮用默认 60 秒")
+                interval = 60.0
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
 
     async def _social_loop(self):
-        while not self._stop_event.is_set():
-            cfg = self.config
-            interval = float(cfg.social_energy_recovery_interval_seconds)
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                pass
-            if self._stop_event.is_set():
-                break
-            try:
-                if cfg.social_energy_enabled:
-                    self.social.recover(interval)
-                    self.social.maybe_daily_reset()
-            except Exception as exc:
-                # 与其它循环一致：单轮出错只记一条，别让任务静默死掉。
-                if self._log:
-                    self._log.warning(f"{LOG_PREFIX} 社交能量循环出错: {exc}")
+        # 恢复循环**委托** `SocialEnergyService.run_recovery_loop`：这条路径原来只写在
+        # 服务里、没有任何调用点（生产走的是这里的复制品），两边早晚会改歪。
+        await self.social.run_recovery_loop(self._stop_event)
 
     async def _weather_loop(self):
         while not self._stop_event.is_set():
@@ -1229,7 +1429,11 @@ class HumanoidCoreInstance:
                 if self._log:
                     self._log.warning(f"{LOG_PREFIX} 天气刷新出错: {exc}")
             cfg = self.config
-            interval = max(60.0, float(cfg.weather_refresh_minutes) * 60)
+            try:
+                interval = max(60.0, float(cfg.weather_refresh_minutes) * 60)
+            except Exception as exc:
+                self._log.warning(f"{LOG_PREFIX} 天气刷新间隔不可用（{exc!r}），本轮用默认 3600 秒")
+                interval = 3600.0
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:

@@ -23,7 +23,12 @@
     "type": "int",
     "default": 15,
     "minimum": 1,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 1,
+      "max": 1440,
+      "step": 20
+    }
   },
   "schedule_change_chance": {
     "description": "【进阶】改主意概率(%)",
@@ -31,7 +36,12 @@
     "type": "int",
     "default": 30,
     "minimum": 0,
-    "maximum": 100
+    "maximum": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 2
+    }
   },
   "schedule_prompt_extra": {
     "description": "日程补充偏好",
@@ -57,7 +67,12 @@
     "type": "float",
     "default": 0.5,
     "minimum": 0.1,
-    "maximum": 10.0
+    "maximum": 10.0,
+    "slider": {
+      "min": 0.1,
+      "max": 10.0,
+      "step": 0.1
+    }
   },
   "input_state_timeout_seconds": {
     "description": "输入状态超时（秒）",
@@ -65,7 +80,12 @@
     "type": "float",
     "default": 120.0,
     "minimum": 10.0,
-    "maximum": 600.0
+    "maximum": 600.0,
+    "slider": {
+      "min": 10.0,
+      "max": 600.0,
+      "step": 5.0
+    }
   },
   "message_merge_timeout_seconds": {
     "description": "【进阶】拿不准时等多久(秒)",
@@ -73,7 +93,12 @@
     "type": "float",
     "default": 3.0,
     "minimum": 0,
-    "maximum": 30
+    "maximum": 30,
+    "slider": {
+      "min": 0,
+      "max": 30,
+      "step": 0.2
+    }
   },
   "message_merge_settle_seconds": {
     "description": "【进阶】说完了也再等一拍(秒)",
@@ -81,7 +106,12 @@
     "type": "float",
     "default": 1.5,
     "minimum": 0,
-    "maximum": 10
+    "maximum": 10,
+    "slider": {
+      "min": 0,
+      "max": 10,
+      "step": 0.1
+    }
   },
   "message_merge_max_count": {
     "description": "【进阶】一批最多几条",
@@ -89,7 +119,12 @@
     "type": "int",
     "default": 6,
     "minimum": 1,
-    "maximum": 50
+    "maximum": 50,
+    "slider": {
+      "min": 1,
+      "max": 50,
+      "step": 1
+    }
   },
   "inject_activity_context": {
     "description": "上下文给多少事实",
@@ -108,7 +143,12 @@
     "type": "int",
     "default": 3500,
     "minimum": 200,
-    "maximum": 20000
+    "maximum": 20000,
+    "slider": {
+      "min": 200,
+      "max": 20000,
+      "step": 200
+    }
   },
   "environment_mode": {
     "description": "生效范围",
@@ -123,7 +163,7 @@
   },
   "admin_qq": {
     "description": "管理员QQ",
-    "hint": "能���管理指令的 QQ 名单",
+    "hint": "能发管理指令的 QQ 名单",
     "type": "list",
     "default": []
   },
@@ -151,7 +191,12 @@
     "type": "int",
     "default": 28,
     "minimum": 1,
-    "maximum": 365
+    "maximum": 365,
+    "slider": {
+      "min": 1,
+      "max": 365,
+      "step": 5
+    }
   },
   "energy_decay_rate": {
     "description": "【进阶】精力变化倍率",
@@ -201,7 +246,12 @@
     "type": "int",
     "default": 2,
     "minimum": 0,
-    "maximum": 600
+    "maximum": 600,
+    "slider": {
+      "min": 0,
+      "max": 600,
+      "step": 10
+    }
   },
   "schedule_llm_timeout_seconds": {
     "description": "【进阶】单次生成超时(秒)",
@@ -209,7 +259,12 @@
     "type": "int",
     "default": 60,
     "minimum": 10,
-    "maximum": 300
+    "maximum": 300,
+    "slider": {
+      "min": 10,
+      "max": 300,
+      "step": 5
+    }
   },
   "schedule_generation_max_attempts": {
     "description": "【进阶】每模型试几次",
@@ -217,7 +272,12 @@
     "type": "int",
     "default": 2,
     "minimum": 1,
-    "maximum": 5
+    "maximum": 5,
+    "slider": {
+      "min": 1,
+      "max": 5,
+      "step": 1
+    }
   },
   "schedule_max_slots": {
     "description": "【进阶】当天最多留几段",
@@ -225,7 +285,12 @@
     "type": "int",
     "default": 96,
     "minimum": 6,
-    "maximum": 96
+    "maximum": 96,
+    "slider": {
+      "min": 6,
+      "max": 96,
+      "step": 2
+    }
   },
   "schedule_provider_cooldown_minutes": {
     "description": "【进阶】日程模型冷却(分)",
@@ -233,7 +298,12 @@
     "type": "int",
     "default": 30,
     "minimum": 0,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 0,
+      "max": 1440,
+      "step": 20
+    }
   },
   "schedule_min_interval_minutes": {
     "description": "日程间隔下限(分)",
@@ -241,7 +311,12 @@
     "type": "int",
     "default": 30,
     "minimum": 0,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 0,
+      "max": 1440,
+      "step": 20
+    }
   },
   "schedule_max_interval_minutes": {
     "description": "日程间隔上限(分)",
@@ -249,7 +324,12 @@
     "type": "int",
     "default": 60,
     "minimum": 0,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 0,
+      "max": 1440,
+      "step": 20
+    }
   },
   "llm_idle_silence_minutes": {
     "description": "空闲静默(分)",
@@ -257,7 +337,12 @@
     "type": "int",
     "default": 60,
     "minimum": 0,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 0,
+      "max": 1440,
+      "step": 20
+    }
   },
   "llm_daily_call_budget": {
     "description": "每日调用预算(次)",
@@ -265,7 +350,12 @@
     "type": "int",
     "default": 200,
     "minimum": 0,
-    "maximum": 1000000
+    "maximum": 1000000,
+    "slider": {
+      "min": 0,
+      "max": 1000000,
+      "step": 20000
+    }
   },
   "schedule_time_granularity": {
     "description": "【进阶】段起点对齐",
@@ -306,7 +396,12 @@
     "type": "int",
     "default": 60,
     "minimum": 1,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 1,
+      "max": 1440,
+      "step": 20
+    }
   },
   "enable_chat_awareness": {
     "description": "【进阶】群聊里提不提「有人看着」",
@@ -346,11 +441,16 @@
   },
   "mood_sensitivity": {
     "description": "【进阶】情绪敏感度",
-    "hint": "0-100：越高，一条消息激起的情绪波动越大。",
+    "hint": "1-100：越高，一条消息激起的情绪波动越大。0 不是「不敏感」而是冻住全部情绪变化，所以下限是 1。",
     "type": "int",
     "default": 60,
-    "minimum": 0,
-    "maximum": 100
+    "minimum": 1,
+    "maximum": 100,
+    "slider": {
+      "min": 1,
+      "max": 100,
+      "step": 2
+    }
   },
   "mood_decay_hours": {
     "description": "【进阶】情绪回缓周期",
@@ -358,7 +458,12 @@
     "type": "float",
     "default": 6.0,
     "minimum": 0.1,
-    "maximum": 720
+    "maximum": 720,
+    "slider": {
+      "min": 0.1,
+      "max": 720,
+      "step": 5.0
+    }
   },
   "mood_initial_affection": {
     "description": "【进阶】初始好感",
@@ -366,7 +471,12 @@
     "type": "int",
     "default": 35,
     "minimum": 0,
-    "maximum": 100
+    "maximum": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 2
+    }
   },
   "mood_initial_libido": {
     "description": "【进阶】初始亲近欲",
@@ -374,7 +484,12 @@
     "type": "int",
     "default": 34,
     "minimum": 0,
-    "maximum": 50
+    "maximum": 50,
+    "slider": {
+      "min": 0,
+      "max": 50,
+      "step": 1
+    }
   },
   "mood_initial_aggression": {
     "description": "【进阶】初始攻击性",
@@ -382,11 +497,16 @@
     "type": "int",
     "default": 28,
     "minimum": 0,
-    "maximum": 50
+    "maximum": 50,
+    "slider": {
+      "min": 0,
+      "max": 50,
+      "step": 1
+    }
   },
   "mood_affection_override": {
     "description": "【进阶】指定某人好感",
-    "hint": "格式 3881756548:100，多个用英文逗号分隔；钉死后不随聊天变化",
+    "hint": "每个条目写一条 QQ:数值（如 3881756548:100）；钉死后不随聊天变化",
     "type": "list",
     "default": []
   },
@@ -396,15 +516,25 @@
     "type": "int",
     "default": 2,
     "minimum": 1,
-    "maximum": 10
+    "maximum": 10,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
   },
   "mood_negative_streak_required": {
     "description": "【进阶】连着几句难听话才扣好感",
-    "hint": "1-10：默认 2。1=每句难听话都扣好感；2=一句孤立的难听话只动脾气不动好感，连着说才扣。",
+    "hint": "2-10：默认 2。2=一句孤立的难听话只动脾气不动好感，连着说才扣；数值越大越难扣（1 等于关掉这条规则，所以下限是 2）。",
     "type": "int",
     "default": 2,
-    "minimum": 1,
-    "maximum": 10
+    "minimum": 2,
+    "maximum": 10,
+    "slider": {
+      "min": 2,
+      "max": 10,
+      "step": 1
+    }
   },
   "mood_negative_softening": {
     "description": "【进阶】负向软化",
@@ -430,7 +560,12 @@
     "type": "int",
     "default": 10,
     "minimum": 0,
-    "maximum": 100
+    "maximum": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 2
+    }
   },
   "cooling_minutes": {
     "description": "【进阶】冷静期语气时长",
@@ -438,7 +573,12 @@
     "type": "int",
     "default": 15,
     "minimum": 1,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 1,
+      "max": 1440,
+      "step": 20
+    }
   },
   "cooling_no_proactive_days": {
     "description": "【进阶】冷静期不主动找 TA 的天数",
@@ -446,7 +586,12 @@
     "type": "int",
     "default": 3,
     "minimum": 0,
-    "maximum": 30
+    "maximum": 30,
+    "slider": {
+      "min": 0,
+      "max": 30,
+      "step": 1
+    }
   },
   "mood_log_enabled": {
     "description": "【进阶】情绪日志",
@@ -460,31 +605,51 @@
     "type": "int",
     "default": 28,
     "minimum": 1,
-    "maximum": 1000
+    "maximum": 1000,
+    "slider": {
+      "min": 1,
+      "max": 1000,
+      "step": 20
+    }
   },
   "mood_log_threshold_affection": {
     "description": "【进阶】好感记录阈值",
-    "hint": "一次变化超过多少才值得记一条日志。",
-    "type": "int",
-    "default": 3,
+    "hint": "同一自然日累计变化超过多少才记一条日志。生效值 = min(你填的, 内置上限 0.6)：填更小会更频繁，填更大无效。",
+    "type": "float",
+    "default": 0.6,
     "minimum": 0,
-    "maximum": 100
+    "maximum": 1.0,
+    "slider": {
+      "min": 0,
+      "max": 1.0,
+      "step": 0.01
+    }
   },
   "mood_log_threshold_libido": {
     "description": "【进阶】亲近记录阈值",
-    "hint": "同上，管亲近欲维度。",
-    "type": "int",
-    "default": 2,
+    "hint": "同上，管亲近欲维度。内置上限 0.5，填更小更频繁、填更大无效。",
+    "type": "float",
+    "default": 0.5,
     "minimum": 0,
-    "maximum": 50
+    "maximum": 1.0,
+    "slider": {
+      "min": 0,
+      "max": 1.0,
+      "step": 0.01
+    }
   },
   "mood_log_threshold_aggression": {
     "description": "【进阶】攻击记录阈值",
-    "hint": "攻击性波动多大才记一条情绪",
-    "type": "int",
-    "default": 3,
+    "hint": "攻击性波动多大才记一条情绪。内置上限 0.8，填更小更频繁、填更大无效。",
+    "type": "float",
+    "default": 0.8,
     "minimum": 0,
-    "maximum": 50
+    "maximum": 1.0,
+    "slider": {
+      "min": 0,
+      "max": 1.0,
+      "step": 0.01
+    }
   },
   "mood_update_timeout": {
     "description": "【进阶】情绪请求超时(秒)",
@@ -492,7 +657,12 @@
     "type": "float",
     "default": 120,
     "minimum": 5,
-    "maximum": 600
+    "maximum": 600,
+    "slider": {
+      "min": 5,
+      "max": 600,
+      "step": 5.0
+    }
   },
   "mood_tag_enabled": {
     "description": "【进阶】心情标签",
@@ -519,7 +689,12 @@
     "type": "int",
     "default": 5,
     "minimum": 0,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 0,
+      "max": 1440,
+      "step": 20
+    }
   },
   "mood_llm_interval_messages": {
     "description": "【进阶】多少条消息触发一次模型情绪分析",
@@ -527,7 +702,12 @@
     "type": "int",
     "default": 10,
     "minimum": 1,
-    "maximum": 100
+    "maximum": 100,
+    "slider": {
+      "min": 1,
+      "max": 100,
+      "step": 2
+    }
   },
   "mood_verbose_log": {
     "description": "【进阶】情绪计数日志",
@@ -547,7 +727,12 @@
     "type": "int",
     "default": 7,
     "minimum": 0,
-    "maximum": 365
+    "maximum": 365,
+    "slider": {
+      "min": 0,
+      "max": 365,
+      "step": 5
+    }
   },
   "auto_nickname": {
     "description": "自动认定称呼",
@@ -573,7 +758,12 @@
     "type": "float",
     "default": 0.05,
     "minimum": 0,
-    "maximum": 100
+    "maximum": 1.0,
+    "slider": {
+      "min": 0,
+      "max": 1.0,
+      "step": 0.01
+    }
   },
   "social_energy_recovery_per_minute": {
     "description": "【进阶】每分钟回血",
@@ -581,7 +771,12 @@
     "type": "float",
     "default": 1.5,
     "minimum": 0,
-    "maximum": 100
+    "maximum": 3.0,
+    "slider": {
+      "min": 0,
+      "max": 3.0,
+      "step": 0.02
+    }
   },
   "social_energy_reset_hour": {
     "description": "【进阶】每日重置钟点",
@@ -589,7 +784,12 @@
     "type": "int",
     "default": 0,
     "minimum": -1,
-    "maximum": 23
+    "maximum": 23,
+    "slider": {
+      "min": -1,
+      "max": 23,
+      "step": 1
+    }
   },
   "social_energy_recovery_interval_seconds": {
     "description": "【进阶】回血检查间隔(秒)",
@@ -597,7 +797,51 @@
     "type": "int",
     "default": 60,
     "minimum": 60,
-    "maximum": 300
+    "maximum": 300,
+    "slider": {
+      "min": 60,
+      "max": 300,
+      "step": 5
+    }
+  },
+  "process_min_duration": {
+    "description": "【进阶】一件事最短做多久(分)",
+    "hint": "她手上这件事至少持续这么久（1~240）。太短会变成「一分钟换一件事」，看起来像在跳台。",
+    "type": "int",
+    "default": 20,
+    "minimum": 1,
+    "maximum": 240,
+    "slider": {
+      "min": 1,
+      "max": 240,
+      "step": 5
+    }
+  },
+  "process_max_duration": {
+    "description": "【进阶】一件事最长做多久(分)",
+    "hint": "她手上这件事最多持续这么久（5~1440），并且不会超过当前日程那一段的剩余时间。",
+    "type": "int",
+    "default": 180,
+    "minimum": 5,
+    "maximum": 1440,
+    "slider": {
+      "min": 5,
+      "max": 1440,
+      "step": 20
+    }
+  },
+  "process_history_limit": {
+    "description": "【进阶】刚做完的事记几条",
+    "hint": "「她刚做完什么」保留几条（1~200），供上下文引用；超出丢最早的。",
+    "type": "int",
+    "default": 20,
+    "minimum": 1,
+    "maximum": 200,
+    "slider": {
+      "min": 1,
+      "max": 200,
+      "step": 2
+    }
   },
   "night_mode_enabled": {
     "description": "【进阶】生物钟夜",
@@ -607,19 +851,29 @@
   },
   "night_start_hour": {
     "description": "【进阶】夜里从几点起",
-    "hint": "0-23",
+    "hint": "0-23。与「夜里到几点止」相同 = 关闭夜间窗口（不是「全天算夜里」）：不攒睡眠债、昼夜低谷不再锚定",
     "type": "int",
     "default": 23,
     "minimum": 0,
-    "maximum": 23
+    "maximum": 23,
+    "slider": {
+      "min": 0,
+      "max": 23,
+      "step": 1
+    }
   },
   "night_end_hour": {
     "description": "【进阶】夜里到几点止",
-    "hint": "0-23",
+    "hint": "0-23。与「夜里从几点起」相同 = 关闭夜间窗口（不是「全天算夜里」）：不攒睡眠债、昼夜低谷不再锚定",
     "type": "int",
     "default": 6,
     "minimum": 0,
-    "maximum": 23
+    "maximum": 23,
+    "slider": {
+      "min": 0,
+      "max": 23,
+      "step": 1
+    }
   },
   "show_sleep_window": {
     "description": "【进阶】提不提睡眠这件事",
@@ -633,7 +887,12 @@
     "type": "float",
     "default": 0.5,
     "minimum": 0.1,
-    "maximum": 1.0
+    "maximum": 1.0,
+    "slider": {
+      "min": 0.1,
+      "max": 1.0,
+      "step": 0.01
+    }
   },
   "holidays": {
     "description": "【进阶】自定义节日",
@@ -653,7 +912,12 @@
     "type": "float",
     "default": 0.15,
     "minimum": 0,
-    "maximum": 100
+    "maximum": 0.9,
+    "slider": {
+      "min": 0,
+      "max": 0.9,
+      "step": 0.01
+    }
   },
   "energy_natural_recovery_interval_minutes": {
     "description": "【进阶】恢复计费间隔(分)",
@@ -661,7 +925,12 @@
     "type": "int",
     "default": 1,
     "minimum": 1,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 1,
+      "max": 1440,
+      "step": 20
+    }
   },
   "energy_consumption_per_msg": {
     "description": "【进阶】聊天耗精力",
@@ -669,7 +938,12 @@
     "type": "float",
     "default": 0.04,
     "minimum": 0,
-    "maximum": 100
+    "maximum": 0.9,
+    "slider": {
+      "min": 0,
+      "max": 0.9,
+      "step": 0.01
+    }
   },
   "energy_recovery_phase_multipliers": {
     "description": "【进阶】周期各段恢复倍率",
@@ -692,7 +966,12 @@
     "type": "int",
     "default": 60,
     "minimum": 1,
-    "maximum": 60
+    "maximum": 60,
+    "slider": {
+      "min": 1,
+      "max": 60,
+      "step": 1
+    }
   },
   "last_interaction_threshold_minutes": {
     "description": "【进阶】隔多久算好久没聊",
@@ -700,7 +979,12 @@
     "type": "int",
     "default": 5,
     "minimum": 0,
-    "maximum": 1440
+    "maximum": 1440,
+    "slider": {
+      "min": 0,
+      "max": 1440,
+      "step": 20
+    }
   },
   "last_interaction_mode": {
     "description": "【进阶】间隔怎么报",
@@ -724,7 +1008,12 @@
     "type": "int",
     "default": 60,
     "minimum": 15,
-    "maximum": 600
+    "maximum": 600,
+    "slider": {
+      "min": 15,
+      "max": 600,
+      "step": 10
+    }
   },
   "sleep_need_hours": {
     "description": "【进阶】一晚该睡多久",
@@ -732,7 +1021,12 @@
     "type": "float",
     "default": 8.0,
     "minimum": 3.0,
-    "maximum": 14.0
+    "maximum": 14.0,
+    "slider": {
+      "min": 3.0,
+      "max": 14.0,
+      "step": 0.1
+    }
   },
   "schedule_follow_night_window": {
     "description": "【进阶】作息贴夜间窗口",
@@ -746,7 +1040,12 @@
     "type": "float",
     "default": 4.5,
     "minimum": 1.5,
-    "maximum": 12.0
+    "maximum": 12.0,
+    "slider": {
+      "min": 1.5,
+      "max": 12.0,
+      "step": 0.1
+    }
   },
   "sitting_discomfort_minutes": {
     "description": "【进阶】坐多久开始僵",
@@ -754,7 +1053,12 @@
     "type": "int",
     "default": 90,
     "minimum": 15,
-    "maximum": 600
+    "maximum": 600,
+    "slider": {
+      "min": 15,
+      "max": 600,
+      "step": 10
+    }
   },
   "desire_refill_hours": {
     "description": "【进阶】独处多久想说话",
@@ -762,7 +1066,12 @@
     "type": "float",
     "default": 12.0,
     "minimum": 0.5,
-    "maximum": 72.0
+    "maximum": 72.0,
+    "slider": {
+      "min": 0.5,
+      "max": 72.0,
+      "step": 0.5
+    }
   },
   "weather_affects_body": {
     "description": "【进阶】冷热算进身体",
@@ -783,7 +1092,12 @@
     "obvious_hint": true,
     "default": 3000,
     "minimum": 200,
-    "maximum": 8000
+    "maximum": 8000,
+    "slider": {
+      "min": 200,
+      "max": 8000,
+      "step": 100
+    }
   },
   "mood_llm_batch_max": {
     "type": "int",
@@ -792,7 +1106,12 @@
     "obvious_hint": true,
     "default": 10,
     "minimum": 1,
-    "maximum": 30
+    "maximum": 30,
+    "slider": {
+      "min": 1,
+      "max": 30,
+      "step": 1
+    }
   },
   "mood_llm_message_chars": {
     "type": "int",
@@ -801,7 +1120,12 @@
     "obvious_hint": true,
     "default": 300,
     "minimum": 50,
-    "maximum": 2000
+    "maximum": 2000,
+    "slider": {
+      "min": 50,
+      "max": 2000,
+      "step": 20
+    }
   },
   "ccb": {
     "type": "bool",
