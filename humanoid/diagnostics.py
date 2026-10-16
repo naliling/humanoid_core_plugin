@@ -62,13 +62,22 @@ def _signals_line(signals: dict) -> str:
         # 抛 TypeError 让整条 /拟人 诊断 报错。
         age = _age_seconds(signals.get("age"))
         proactive = _age_seconds(signals.get("last_proactive_age", -1))
+        # 判 `>= 0` 而不是「真值」：她刚好在这一次刷新前开口时 age 正好是 0.0，
+        # 用真值判会把「刚刚主动开过口」说成「还没主动开过口」。
         extra = (
             f"上次刷新 {age:.0f}s 前；上次主动开口 {proactive:.0f}s 前、"
             f"冷落计数 {signals.get('ignored_streak', 0)}"
-            if proactive and proactive >= 0
+            if proactive >= 0
             else f"上次刷新 {age:.0f}s 前；还没主动开过口"
         )
         return f"- 社交层信号：读到并在用。{extra}{tail}"
+    if state == "unreadable":
+        return (
+            f"- 社交层信号：文件在、时间也新鲜，但**读不出内容**（JSON 坏了 / 编码不对 / "
+            f"没权限 / 是个目录 / 大到不像信号文件）{tail}。"
+            "这不是「她手上没事」——本插件按「读不到」处理，账本原样留着；"
+            "去社交层看一眼它写盘时有没有报错"
+        )
     if state == "stale":
         age = _age_seconds(signals.get("age"))
         return (

@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from .state import seed_cycle_day
 from . import __version__
+from . import life_log
 from . import outfit
 from .clock import Clock, format_state_timestamp
 from .config import HumanoidConfig
@@ -896,6 +897,7 @@ class HumanoidCoreInstance:
         text: str = "",
         user_name: str = "",
         char_name: str = "",
+        memory_text: str = "",
     ) -> str:
         """拼本次请求要追加的事实块。
 
@@ -903,6 +905,10 @@ class HumanoidCoreInstance:
         「上一次说话」推到当前这一条上，间隔永远算不出来。
         但它并不是纯粹只读——`soma.advance()` 会把身体推进到此刻（身体本来就该随时间
         自己走），注意力的在意度也可能回写（只限**已有**记录的用户，见 `behavior.care`）。
+
+        `memory_text` 由调用方（`main.inject_context`，异步）从记忆插件取好后传进来：
+        这里是同步的，不能在热路径上 await。空串表示没装记忆插件或这次没取到，
+        事实块照常拼，只是少那一句。
         """
         now = self.now_epoch()
         if self.config.soma_enabled:
@@ -932,6 +938,7 @@ class HumanoidCoreInstance:
             interest=interest,
             char_name=char_name or self.char_name(),
             user_name=user_name,
+            memory_text=memory_text,
         )
 
     def refresh_contract(self) -> dict | None:
@@ -987,6 +994,10 @@ class HumanoidCoreInstance:
 
     def _apply_social_signals(self) -> None:
         """把社交层写回的信号并入身体。没装社交层时什么都没发生。"""
+        # 未完事项账本刻意放在 `soma_enabled` 闸门**之前**：它记的不是身体状态，而是
+        # 「跨轮还记得什么」。挂在闸门后面的话，关掉身体层的人会连记忆一起静默失去——
+        # 这两件事没有因果关系，只是当初顺手写在同一个函数里。
+        self._ingest_open_items()
         if not self.config.soma_enabled:
             return
         try:
@@ -1031,6 +1042,44 @@ class HumanoidCoreInstance:
         except Exception as exc:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 应用按人冷落失败: {exc}")
+
+    def _ingest_open_items(self) -> None:
+        """把社交层发布的「她手上还开着的事」整本换进账本。
+
+        **只在信号文件新鲜时才换。** 文件不存在或过期时 `open_items()` 也返回空表，
+        但那个空表示「读不到」，不表示「全结了」——拿它当结论，社交层一停她的
+        未完事项就会被无声清空。那种情况下的兜底是 `life_log.OPEN_TTL_HOURS` 自己到期，
+        不是这里替她做决定。
+
+        整体替换（而不是并集）是这一层的核心：社交层那份列表**就是**「还开着」的定义，
+        它不再发布某一条，那条就算结了。只增不减会退化成一份永远清不掉的账，
+        表现就是「她一直在准备某件事」——过程系统以前锁死过的那副样子。
+        """
+        try:
+            if not self.signals.is_fresh():
+                return
+            existing = self._scope.get_self(life_log.LIFE_KEY)
+            merged = life_log.merge_open(
+                existing, self.signals.open_items(self.role_id), self.now_epoch()
+            )
+            if merged != existing:
+                self._scope.set_self(life_log.LIFE_KEY, merged)
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 应用未完事项失败: {exc}")
+
+    def life_items(self) -> list[dict[str, Any]]:
+        """她手上还开着的那几件事。已经到期的在这里就被丢掉，不再往外递。
+
+        过期只在这里**读时**过滤，不顺手写盘：这是读路径，读到一半改状态会让
+        「看一眼」变成一次写操作。盘上那几条的死数据由 `_ingest_open_items`
+        整体替换时一并清掉。
+        """
+        try:
+            raw = self._scope.get_self(life_log.LIFE_KEY)
+        except Exception:
+            return []
+        return life_log.prune(raw, self.now_epoch())
 
     def snapshot(self, user_id: Optional[str] = None, refresh: bool = True) -> dict:
         if refresh:

@@ -419,6 +419,31 @@ class DiagnosticsFallbackTest(unittest.TestCase):
         text = _signals_line({"state": "fresh", "age": "刚刚", "last_proactive_age": -1})
         self.assertIn("上次刷新 0s 前", text)
 
+    def test_signals_line_reports_a_file_it_could_not_read(self):
+        """坏 JSON / 超大 / 目录：`link.py` 报 `unreadable`，不能说成「拿不到 data 目录」。"""
+        text = _signals_line({
+            "state": "unreadable", "path": "/tmp/signals.json", "age": 3.0, "payload": {},
+        })
+        self.assertIn("读不出内容", text)
+        self.assertIn("/tmp/signals.json", text)
+        self.assertNotIn("拿不到 data 目录", text)
+
+    def test_signals_line_counts_an_immediate_proactive_as_having_spoken(self):
+        """`last_proactive_age` 正好 0.0 是「刚刚开过口」，不是「还没开过口」。"""
+        text = _signals_line({
+            "state": "fresh", "path": "/tmp/signals.json",
+            "age": 1.0, "last_proactive_age": 0.0, "ignored_streak": 0,
+        })
+        self.assertIn("上次主动开口 0s 前", text)
+        self.assertNotIn("还没主动开过口", text)
+
+    def test_signals_line_says_never_when_the_age_is_the_sentinel(self):
+        text = _signals_line({
+            "state": "fresh", "path": "/tmp/signals.json",
+            "age": 1.0, "last_proactive_age": -1.0,
+        })
+        self.assertIn("还没主动开过口", text)
+
     def test_build_report_falls_back_instead_of_raising(self):
         with self.assertLogs("humanoid.diagnostics", level="ERROR"):
             text = build_report(

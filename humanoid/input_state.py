@@ -96,6 +96,7 @@ class InputStateNotifier:
         )
         self._tasks[key] = (task, stop_event)
         self._last_active[key] = time.monotonic()
+        self._sweep_last_active()
 
     async def refresh(self, key: str, event: Any) -> None:
         """发送前补一帧，别让状态在「回复已生成、还没发出去」的空档里断掉。
@@ -115,6 +116,25 @@ class InputStateNotifier:
         if client is None:
             return
         await self._report(client, user_id)
+
+    def _sweep_last_active(self) -> None:
+        """丢掉过期的「刚显示过」时间戳。
+
+        `stop()` 末尾会补一个时间戳，好让紧接着的 `refresh()` 再补一帧（`refresh` 只认
+        60 秒窗口）。但 `_run` 的 `finally` 只在自己那条任务**还在 `_tasks` 里**时才清它，
+        而 `stop()` 已经把它 pop 走了 → 每个会话都会在 `_last_active` 里留下一个永久键。
+        这里按 `refresh` 的同一个窗口顺手扫掉，只留最近一分钟内动过的会话。
+        """
+        if not self._last_active:
+            return
+        now = time.monotonic()
+        for key, stamp in list(self._last_active.items()):
+            try:
+                age = now - float(stamp)
+            except (TypeError, ValueError):
+                age = float("inf")
+            if not age <= 60.0:  # 与 refresh 的窗口保持一致
+                self._last_active.pop(key, None)
 
     async def stop(self, key: str) -> None:
         entry = self._tasks.pop(key, None)
@@ -139,6 +159,7 @@ class InputStateNotifier:
             except Exception as exc:  # pragma: no cover - 兜底
                 self._log.debug(f"[humanoid_core] 输入状态任务收尾异常: {exc}")
         self._last_active[key] = time.monotonic()
+        self._sweep_last_active()
 
     async def stop_all(self) -> None:
         for key in list(self._tasks.keys()):

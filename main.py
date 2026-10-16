@@ -34,6 +34,7 @@ from .humanoid.state import StateStore
 from .humanoid.clock import Clock
 from .humanoid.debounce import MERGE_EXTRA_KEY, Debouncer
 from .humanoid.input_state import InputStateNotifier
+from .humanoid import memory_link
 
 DATA_SUBDIR = ("plugin_data", "humanoid_core")
 
@@ -232,6 +233,19 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
                 day = f"她这会儿正在{event}" + (f"（{loc}）" if loc else "")
         except Exception:
             day = ""
+        # 她手上还没做完的那几件事（`ongoing_tasks`，跨天跟着她）也进这一段。
+        # 它本来就只被送去社交侧，从没进过普通对话的注入——于是她「手头正压着件事」
+        # 这件事，在跟人聊天时根本不在场。放这里是**免费的**：这一段本来就是每轮重发的
+        # 临时块，多几行不增加任何前缀缓存代价（真正要省的是 system_prompt）。
+        # 它属于 I2「日程与外界」：单独成段只当她「知道」，要不要提由她自己定；
+        # 不进事实块，免得被当成一条要回应的内容。
+        try:
+            ongoing = [str(t).strip() for t in (core.schedule.ongoing_tasks() or []) if str(t).strip()]
+        except Exception:
+            ongoing = []
+        if ongoing:
+            # 一件也说「还没做完的事」，不说「几件」——件数在 1~3 之间，写死量词会数错。
+            day = "；".join(p for p in (day, "她手上还没做完的事：" + "、".join(ongoing)) if p)
         # 外界（几点/几号/周几/季节/城市/天气）与穿搭都进这一段当背景，不进事实块：
         # 单独成段、只当她「知道」，要不要提由她自己定。
         world = ""
@@ -378,6 +392,13 @@ class HumanoidCore(Star):
         )
         # 多消息合并（防抖）的按会话状态；进程内内存，键是 unified_msg_origin。
         self._debounce = Debouncer(lambda: self._config, logger)
+        # 记忆联动的桥接对象：懒解析一次（插件加载顺序不保证，构造时对面可能还没就绪）。
+        self._memory_bridge_obj: Any = None
+        self._memory_bridge_resolved = False
+        # 写回侧：每个角色最近一次**已经写过**的过程名，以及最近 24 小时写了几条。
+        # 进程内内存即可——重启后第一次只记账不写（见 `_write_finished_process`）。
+        self._last_written_process: dict[str, str] = {}
+        self._life_write_stamps: dict[str, list[float]] = {}
 
         state_path = data_dir / "state.json"
         self._state_store = StateStore(state_path, lambda: self._config.state_flush_interval_seconds, logger)
@@ -1053,6 +1074,93 @@ class HumanoidCore(Star):
         except Exception as e:
             logger.debug(f"{LOG_PREFIX} 补齐输入状态失败: {e}")
 
+    # -------------------- 长期记忆联动 --------------------
+
+    def _memory_bridge(self):
+        """拿 memory_companion 的桥接对象；没装 / 没就绪返回 None。
+
+        懒解析一次：插件加载顺序不保证，构造时对面可能还没就绪。只查宿主注册表，
+        不 importlib——没装时 `import_module` 会凭空造一个空模块（「没装却说装了」）。
+        """
+        if not self._memory_bridge_resolved:
+            self._memory_bridge_resolved = True
+            try:
+                self._memory_bridge_obj = memory_link.find_memory_bridge(
+                    getattr(self, "context", None)
+                )
+            except Exception:
+                self._memory_bridge_obj = None
+        return self._memory_bridge_obj
+
+    async def _memory_note(self, umo: str, user_id: str, said: str, is_group: bool) -> str:
+        """按 TA 这条消息去记忆库要几条相关长期记忆；拿不到返回空串。
+
+        只读。拿不到时静默降级——没有长期记忆也该照常回话，不能因为对面没装就少说话。
+        """
+        bridge = self._memory_bridge()
+        if bridge is None:
+            return ""
+        try:
+            return await memory_link.fetch_memory_text(
+                bridge, umo, user_id, query=said, is_group=is_group
+            )
+        except Exception:
+            return ""
+
+    # 她生活里的事一天最多写几条。过程几小时换一次，不封顶的话记忆库会被她自己的
+    # 流水账淹掉——那些事在**聊天里看不见**，本来就不该占掉「关于这个人」的位置。
+    LIFE_WRITE_PER_DAY = 3
+    LIFE_WRITE_WINDOW_SECONDS = 86400.0
+
+    async def _write_finished_process(self, core, umo: str, user_id: str) -> None:
+        """她做完一件事之后，往长期记忆里补一条。
+
+        为什么由这边写：这件事**在聊天里看不见**。过程一结束，`schedule.ongoing_tasks()`
+        也再报不出它，记忆插件自己更读不到——只有她（Core）知道。中间层（`life_log`）到此
+        为止，但这件事不该随过程一起消失。
+
+        第一次看到某个名字只记账不写：插件重启后 `process_history` 里已经躺着若干条，
+        照单全写等于每次重启都往记忆库塞一批旧事。
+        """
+        bridge = self._memory_bridge()
+        if bridge is None or not user_id:
+            return
+        try:
+            names = core.process.recent(1)
+        except Exception:
+            return
+        name = str(names[0]).strip() if names else ""
+        if not name:
+            return
+        bid = str(getattr(core, "role_id", "") or "")
+        previous = self._last_written_process.get(bid)
+        self._last_written_process[bid] = name
+        if previous is None or previous == name:
+            return
+        now = time.time()
+        stamps = [
+            t
+            for t in self._life_write_stamps.get(bid, [])
+            if now - t < self.LIFE_WRITE_WINDOW_SECONDS
+        ]
+        self._life_write_stamps[bid] = stamps
+        if len(stamps) >= self.LIFE_WRITE_PER_DAY:
+            return
+        try:
+            await memory_link.write_life_event(
+                bridge,
+                user_id,
+                # 不写「刚刚」：过程是 Core 按自己的节拍推进的，这边只在她下一条消息
+                # 到达时才发现它结束了，中间可能隔了几个小时。写死时间就是写错。
+                f"她做完了{name}",
+                umo=umo,
+                # 幂等键按内容算：同一件事重放不会写两条（时刻参与的话每次都是新键）。
+                key=f"proc:{name}",
+            )
+        except Exception:
+            return
+        stamps.append(now)
+
     # -------------------- LLM 请求注入钩子 --------------------
 
     @filter.on_llm_request()
@@ -1095,9 +1203,26 @@ class HumanoidCore(Star):
             if self._config.auto_identify_user:
                 user_name = _sender_name(event)
             char_name = core.char_name()
+            # 长期记忆：只读，按 TA 这条消息检索（同一会话 60 秒内只查一次，
+            # 连着发三条不会连查三次记忆库）。
+            memory_text = await self._memory_note(
+                str(getattr(event, "unified_msg_origin", "") or ""),
+                user_id,
+                said,
+                is_group,
+            )
             # 时间间隔由 Core.on_message 统一记账，这里只读。
             injection = core.build_injection(
-                user_id, is_group=is_group, text=said, user_name=user_name
+                user_id,
+                is_group=is_group,
+                text=said,
+                user_name=user_name,
+                memory_text=memory_text,
+            )
+            # 长期记忆：写。她刚做完一件事的话，交一条给记忆库——这件事只有她知道。
+            # 只在过程真的换了名字时写，所以不在回复的热路径上多出一次 IO。
+            await self._write_finished_process(
+                core, str(getattr(event, "unified_msg_origin", "") or ""), user_id
             )
 
             if self._config.debug_mode:

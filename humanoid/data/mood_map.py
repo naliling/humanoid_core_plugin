@@ -8,6 +8,10 @@ _LIBIDO_AGGRESSION_BUCKETS = (0.0, 12.5, 25.0, 37.5, 50.0)
 
 
 def round_to_bucket(value: float) -> float:
+    # NaN 与任何数比较都是 False，旧写法会一路比不过所有桶、落到最后的 50.0
+    # ——脏数据被静默当成「最强烈的档」。这里按「没有」处理，落最低档。
+    if value != value:
+        return 0.0
     for bucket in _LIBIDO_AGGRESSION_BUCKETS:
         if value <= bucket:
             return bucket
@@ -15,6 +19,10 @@ def round_to_bucket(value: float) -> float:
 
 
 def affection_rank(affection: float) -> int:
+    # 同上：NaN 在旧写法里所有 `<` 都不成立，落到最后一个 return，被当成 100
+    # ——「读不出好感」变成了「最亲密」。这里落最低档。
+    if affection != affection:
+        return 0
     if affection < 12.5:
         return 0
     if affection < 37.5:

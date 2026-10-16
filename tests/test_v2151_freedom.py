@@ -190,8 +190,22 @@ class InjectionFreedomTest(unittest.TestCase):
         text = builder._finish("【此刻】" + "很长的一段背景。" * 200, cfg())
         self.assertTrue(text.startswith(MARK_PREFIX), text[:60])
         for line in text.split("\n")[1:]:
-            self.assertTrue(line.startswith("【") and line.endswith("。"), f"半块被截进来了：{line}")
+            # 句首那个 `【此刻】` 会被 `_strip_heading_spans` 摘掉——事实块不许有标题段
+            # （`_sentence` 的规矩，也是本文件要守的东西之一）。所以这里判的只剩
+            # 「没被拦腰截断」：留下的每一块都得是一句完整的话。
+            self.assertTrue(
+                line.rstrip().endswith("。"), f"半块被截进来了：{line[:80]}"
+            )
         self.assertNotIn("不必逐条回应", text, "兜底话该在 system_prompt 里，不该每条消息重复")
+
+    def test_a_block_that_does_not_fit_is_dropped_whole(self):
+        """顶穿预算的块整块丢，不许留半块——这才是「按块丢」本身。"""
+        core = self.core(mode="low")
+        builder = PromptBuilder(core)
+        text = builder._finish([("甲" * 40, 10.0), ("乙" * 4000, 1.0)], cfg())
+        self.assertIn("甲", text)
+        self.assertNotIn("乙", text, "顶穿预算的块该整块丢，不是截一半")
+
 
     def test_gap_is_an_experience_not_a_stopwatch(self):
         """间隔两段：隔了多久 + TA离开前那句原话。都是事实，不带「要主动问起」。"""

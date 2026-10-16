@@ -18,6 +18,7 @@
 from __future__ import annotations
 from . import ccb as _ccb
 import hashlib
+import math
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,10 +44,17 @@ CCB_ADVANCE_DEDUP_SECONDS = 60.0
 
 
 def _num(value: Any, default: float = 0.0) -> float:
+    """取值：拿不到或不是有限数（NaN/±Inf）就退回默认值。
+
+    NaN 必须挡在这里而不是放行：`nan >= 阈值` 全是假，于是「该亮的情绪不亮」；
+    更糟的是**该过期的不过期**——`_cooling_line` 里 `now >= nan` 为假，冷静期
+    会永远挂着，她的每一轮都只剩「还在为那件事烦着」。inf 同理。
+    """
     try:
-        return float(value)
+        out = float(value)
     except (TypeError, ValueError):
         return default
+    return out if math.isfinite(out) else default
 
 
 def _pick(texts: Tuple[str, ...], index: int) -> str:
@@ -70,6 +78,11 @@ class EmotionLayer:
             return 0, 0
         ups = downs = 0
         for entry in entries or []:
+            # 损坏的 state 里可能混进非字典条目。没有这条守卫的话 `entry.get` 抛
+            # AttributeError，冒到 `prompt_builder._emotion_line` 的宽 except 被吞，
+            # 于是这个用户的整句「内心」**永久消失**——而且不会有人发现。
+            if not isinstance(entry, dict):
+                continue
             if not str(entry.get("time", "")).startswith(today):
                 continue
             # **逐轴判正负**：攻击性这一轴的词面与情感是反的——「攻击性上升」是她更生气
@@ -320,9 +333,16 @@ class EmotionLayer:
         """D 冷静期：她带着情绪冷着，直接返回、不参与竞争。"""
         try:
             record = self._core.mood.profile(user_id) or {}
-            until = float(record.get("cool_until", 0.0) or 0.0)
+            # 非有限数当「没有冷静期」，不能当「还在冷静」：`now >= nan` 为假，
+            # 一个坏掉的 cool_until 会让她**永远**冷着（这一条又是直接返回、
+            # 盖掉所有别的情绪），比不显示冷静期糟得多。
+            until = _num(record.get("cool_until"), 0.0)
             now = float(self._core.now_epoch())
         except Exception:
+            return None
+        if not math.isfinite(now):
+            # 「此刻」不可信就不出这一条：它是直接返回、盖掉所有别的情绪的，
+            # 拿不准的时候不该由它独占。
             return None
         if until <= 0 or now >= until:
             return None

@@ -6,7 +6,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
-from functools import lru_cache
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import HumanoidConfig
@@ -44,25 +43,30 @@ class ZoneState:
     note: str           # 退化原因；"" = 正常
 
 
-def resolve_zone(city: str) -> tuple[tzinfo | None, str]:
-    """城市 → (tzinfo 或 None, 说明)。None 表示用宿主机时钟。
+def _resolve_zone_uncached(city: str) -> tuple[tzinfo | None, str, bool]:
+    """城市 → (tzinfo 或 None, 说明, 这个结果以后会不会变)。None 表示用宿主机时钟。
 
     v2.15.1 删掉了旧版静默退回 `Asia/Shanghai` 那一手：机器上没有 tzdata 时，
     设成东京的她其实按北京时间过一天，而注入里还写着「你在东京」——错得看不出来。
     现在宁可退回宿主机时间，也要把原因说清楚（诊断与 /时间 都看得到）。
+
+    第三位是给缓存用的：**只有「这台机器缺 tzdata」是会变的**（插件可能先于 tzdata
+    启动：容器里后装、AstrBot 的依赖还没加载完），这种结果不能记住，否则
+    `_tzdata_usable()` 的 300 秒重试永远轮不到执行。其余结果（认出的城市、认不出的
+    城市名、拼错的时区名）都是确定的，可以一直记住。
     """
     name = resolve_zone_name(city)
     if not name:
         raw = (city or "").strip()
         if raw and raw != DEFAULT_CITY_PLACEHOLDER and raw != SYSTEM_TIMEZONE_LABEL:
-            return None, f"认不出城市「{raw}」，她现在按这台机器的时间过日子（可填表内城市，或直接填 Asia/Shanghai 这类时区名）"
-        return None, ""
+            return None, f"认不出城市「{raw}」，她现在按这台机器的时间过日子（可填表内城市，或直接填 Asia/Shanghai 这类时区名）", False
+        return None, "", False
     try:
-        return ZoneInfo(name), ""
+        return ZoneInfo(name), "", False
     except (ZoneInfoNotFoundError, ValueError, OSError):
         if _tzdata_usable():
-            return None, f"「{name}」这个时区名用不了（可能拼错了），她现在按这台机器的时间过日子"
-        return None, f"这台机器缺时区数据库（tzdata），{name} 用不了，她现在按这台机器的时间过日子"
+            return None, f"「{name}」这个时区名用不了（可能拼错了），她现在按这台机器的时间过日子", False
+        return None, f"这台机器缺时区数据库（tzdata），{name} 用不了，她现在按这台机器的时间过日子", True
 
 
 _tzdata_state: tuple[bool, float] | None = None
@@ -92,7 +96,36 @@ def _tzdata_usable() -> bool:
 
 
 # 城市名在每条消息上都会被查（ZoneInfo 本身有缓存，但正则与字典型查找仍不必重做）。
-resolve_zone = lru_cache(maxsize=64)(resolve_zone)
+#
+# 这里**不能用 `lru_cache`**：它会把整个 `(tz, 说明)` 元组按城市名永久记住，包括
+# 「这台机器缺 tzdata」那一条 —— 于是 `_tzdata_usable()` 那 300 秒的重试永远轮不到
+# 执行，tzdata 在插件启动之后才可用时，面板上会永远写着「缺时区数据库」。改成手动
+# 缓存：会变的结果不进表。
+_ZONE_CACHE: dict[str, tuple[tzinfo | None, str]] = {}
+_ZONE_CACHE_MAX = 64
+
+
+def _clear_zone_cache() -> None:
+    """清掉城市→时区的记忆。测试用；对外保留 `resolve_zone.cache_clear()` 这个旧名字。"""
+    _ZONE_CACHE.clear()
+
+
+def resolve_zone(city: str) -> tuple[tzinfo | None, str]:
+    """城市 → (tzinfo 或 None, 说明)。None 表示用宿主机时钟。"""
+    key = str(city or "")
+    cached = _ZONE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    tz, note, retryable = _resolve_zone_uncached(key)
+    if not retryable:
+        if len(_ZONE_CACHE) >= _ZONE_CACHE_MAX:
+            _ZONE_CACHE.clear()
+        _ZONE_CACHE[key] = (tz, note)
+    return tz, note
+
+
+# 旧名字：既有测试用 `resolve_zone.cache_clear()` 清缓存。
+resolve_zone.cache_clear = _clear_zone_cache  # type: ignore[attr-defined]
 
 
 def resolve_tzinfo(city: str) -> tzinfo | None:

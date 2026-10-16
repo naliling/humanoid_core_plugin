@@ -19,6 +19,7 @@ from humanoid.engine import HumanoidEngine
 from humanoid.link import (
     CONTRACT_VERSION,
     SIGNALS_FILE_NAME,
+    SIGNALS_MAX_BYTES,
     SIGNALS_TTL_SECONDS,
     SOCIAL_PLUGIN_DIR_NAME,
     SocialSignals,
@@ -317,19 +318,32 @@ class SignalsTest(unittest.TestCase):
     def test_writer_can_declare_its_own_ttl(self):
         """写方在信号文件里声明 `ttl_seconds` 时按它算，而不是用默认值。
 
-        社交层的心跳间隔是可配的，只有它自己知道该保鲜多久。
+        社交层的心跳间隔是可配的，只有它自己知道该保鲜多久。**第一次读就按它算**：
+        `read()` 是先解析、再判过期，声明值在判之前就已经生效了，不需要先拿默认值热身。
         """
         from humanoid.link import SocialSignals
 
+        # 声明 120 秒、文件已经 600 秒没动：第一次读就该判过期
         root = self.write_signals(
             {"ignored_streak": 4, "ttl_seconds": 120}, mtime_age=600
         )
         signals = SocialSignals(lambda: root)
-        # 第一次读之前用的是默认 TTL（足够宽），所以能读到并学到声明的值
-        self.assertEqual(signals.ignored_streak(), 4)
-        self.assertEqual(signals._ttl(), 120.0)
-        # 学到之后，10 分钟前的文件就该判过期
         self.assertEqual(signals.read(), {}, "声明了 120 秒就该按 120 秒算")
+        self.assertEqual(signals._ttl(), 120.0, "过期之后也要按写方声明的算，不许落回默认值")
+        self.assertEqual(signals.ignored_streak(), 0)
+
+        # 同一个声明，文件 60 秒前才刷新过：该采信
+        root = self.write_signals(
+            {"ignored_streak": 4, "ttl_seconds": 120}, mtime_age=60
+        )
+        signals = SocialSignals(lambda: root)
+        self.assertEqual(signals.ignored_streak(), 4, "没过期就该读到")
+
+        # 没声明 ttl 的写方走默认值，一小时前的仍算新鲜
+        root = self.write_signals({"ignored_streak": 4}, mtime_age=3600)
+        signals = SocialSignals(lambda: root)
+        self.assertEqual(signals.ignored_streak(), 4)
+        self.assertEqual(signals._ttl(), SIGNALS_TTL_SECONDS)
 
     def test_garbage_file_does_not_crash(self):
         from humanoid.link import SocialSignals
@@ -596,25 +610,141 @@ class SignalsScopeAndTtlTest(unittest.TestCase):
         self.assertEqual(signals.ignored_by_uid("42", "bot2"), 99)
         self.assertEqual(signals.ignored_by_uid("42"), 99)
 
-    def test_expiry_clears_fingerprint_and_declared_ttl(self):
+    def test_expiry_clears_fingerprint_and_payload(self):
         root = self.write_signals({"ttl_seconds": 120, "by_bid": {}})
         signals = SocialSignals(lambda: root)
         self.assertTrue(signals.read())
         self.assertEqual(signals._declared_ttl, 120.0)
         self.assertIsNotNone(signals._fingerprint)
-        # 把文件改成「很旧」：过期时三样缓存必须一起清。只清 payload 的话，
-        # 文件再出现时指纹没变就直接返回空；不清 declared_ttl 则会拿上一份
-        # 文件声明的保鲜期去判下一份。
+        # 把文件改成「很旧」：过期时指纹与 payload 必须一起清。只清 payload 的话，
+        # 文件再出现时指纹没变就直接返回空。
         stamp = time.time() - 10 ** 6
         os.utime(signals_path(root), (stamp, stamp))
         self.assertEqual(signals.read(), {})
         self.assertIsNone(signals._fingerprint)
-        self.assertEqual(signals._declared_ttl, 0.0)
         self.assertEqual(signals._payload, {})
+        # 但写方声明的保鲜期**留着**：它是写方的属性，不是这一份 payload 的。
+        # 清掉它会落回默认的 3 小时，而 `status()` 是「先 read() 再拿 _ttl() 判」，
+        # 刚判出来的「过期」会当场被改判成「新鲜」——见下面那个防抖测试。
+        self.assertEqual(signals._declared_ttl, 120.0)
+
+    def test_status_does_not_flap_after_expiry(self):
+        """社交层停了以后，`is_fresh()` 不许在真假之间跳。
+
+        `status()` 的顺序是「先 `read()`（这一步发现过期、顺手清缓存）再拿 `_ttl()` 判」。
+        清缓存时若把写方声明的保鲜期一起清掉，这一次判就会落回默认的 3 小时，于是同一份
+        文件连着读会得到 过期/新鲜/过期/新鲜 —— 社交层明明停了，Core 却有一半的时候认为
+        自己读到的是新鲜的，还拿它那份「刚主动找过谁」去改自己的好感。
+        """
+        root = self.write_signals(
+            {"ignored_streak": 4, "ttl_seconds": 120}, mtime_age=600
+        )
+        signals = SocialSignals(lambda: root)
+        self.assertEqual([signals.is_fresh() for _ in range(4)], [False] * 4)
+        self.assertEqual(signals.status()["state"], "stale")
+        self.assertEqual(signals.ignored_streak(), 0)
+
+    def test_replacing_the_file_takes_its_own_ttl_immediately(self):
+        """换了一份写方、换了保鲜期：新声明的值当场生效，不会被上一份的残留带偏。
+
+        这正是「过期时不清 `_declared_ttl`」之所以安全的原因：`read()` 先解析、再判过期。
+        """
+        root = self.write_signals(
+            {"ignored_streak": 4, "ttl_seconds": 120}, mtime_age=600
+        )
+        signals = SocialSignals(lambda: root)
+        self.assertEqual(signals.read(), {})  # 先让它过期一次，缓存被清
+        path = signals_path(root)
+        path.write_text(json.dumps({"ignored_streak": 9}), encoding="utf-8")
+        stamp = time.time() - 600
+        os.utime(path, (stamp, stamp))
+        # 新文件没声明 ttl：走默认值，10 分钟前的数据算新鲜（若沿用上一份的 120 秒，
+        # 这里会判成过期而返回 0）
+        self.assertEqual(signals.ignored_streak(), 9)
+        self.assertEqual(signals._ttl(), SIGNALS_TTL_SECONDS)
 
     def test_dead_loaded_at_field_is_gone(self):
         signals = SocialSignals(lambda: Path(tempfile.mkdtemp()))
         self.assertFalse(hasattr(signals, "_loaded_at"))
+
+
+class SignalsUnreadableTest(unittest.TestCase):
+    """文件在、时间也新鲜，但**读不出内容**——这一种不能报成 `fresh`。
+
+    `open_items()` 读不到时返回空表，和「写方说没有了」长得一模一样。这里若判成
+    `fresh`，`core_instance._ingest_open_items()` 就会拿这份空表去**整体替换**她的账本：
+    一个坏掉的 JSON 文件足以在无人知晓的情况下清空她记着的事。
+    """
+
+    def make(self, body: str = "", *, size: int = 0, as_dir: bool = False) -> Path:
+        root = Path(tempfile.mkdtemp())
+        social = root / "plugin_data" / SOCIAL_PLUGIN_DIR_NAME
+        social.mkdir(parents=True)
+        path = social / SIGNALS_FILE_NAME
+        if as_dir:
+            path.mkdir()
+        elif size:
+            path.write_text("x" * size, encoding="utf-8")
+        else:
+            path.write_text(body, encoding="utf-8")
+        return root
+
+    def test_broken_json_is_unreadable_not_fresh(self):
+        signals = SocialSignals(lambda: self.make("{ 这不是 JSON"))
+        self.assertFalse(signals.is_fresh())
+        self.assertEqual(signals.status()["state"], "unreadable")
+        self.assertEqual(signals.open_items(), [])
+
+    def test_a_json_scalar_is_unreadable_not_fresh(self):
+        signals = SocialSignals(lambda: self.make('"just a string"'))
+        self.assertFalse(signals.is_fresh())
+        self.assertEqual(signals.status()["state"], "unreadable")
+
+    def test_a_json_list_is_unreadable_not_fresh(self):
+        signals = SocialSignals(lambda: self.make("[1, 2, 3]"))
+        self.assertFalse(signals.is_fresh())
+        self.assertEqual(signals.status()["state"], "unreadable")
+
+    def test_bad_utf8_is_unreadable_not_fresh(self):
+        root = Path(tempfile.mkdtemp())
+        social = root / "plugin_data" / SOCIAL_PLUGIN_DIR_NAME
+        social.mkdir(parents=True)
+        (social / SIGNALS_FILE_NAME).write_bytes(b"\xff\xfe\x00{\"a\": 1}")
+        signals = SocialSignals(lambda: root)
+        self.assertFalse(signals.is_fresh())
+        self.assertEqual(signals.status()["state"], "unreadable")
+
+    def test_a_directory_in_place_of_the_file_is_unreadable(self):
+        signals = SocialSignals(lambda: self.make(as_dir=True))
+        self.assertFalse(signals.is_fresh())
+        self.assertEqual(signals.status()["state"], "unreadable")
+
+    def test_an_absurdly_large_file_is_refused_instead_of_read(self):
+        signals = SocialSignals(lambda: self.make(size=SIGNALS_MAX_BYTES + 1))
+        self.assertFalse(signals.is_fresh())
+        self.assertEqual(signals.status()["state"], "unreadable")
+
+    def test_a_good_file_is_still_fresh(self):
+        signals = SocialSignals(lambda: self.make(json.dumps({"ignored_streak": 3})))
+        self.assertTrue(signals.is_fresh())
+        self.assertEqual(signals.status()["state"], "fresh")
+
+    def test_a_corrupt_file_never_reports_the_last_good_payload_as_fresh(self):
+        """先读到一份好的、再坏掉：不能因为「上一次的数据还在手上」就报新鲜。"""
+        root = self.make(json.dumps({"ignored_streak": 3}))
+        signals = SocialSignals(lambda: root)
+        self.assertEqual(signals.ignored_streak(), 3)
+        signals_path(root).write_text("{ 坏的", encoding="utf-8")
+        self.assertFalse(signals.is_fresh())
+        self.assertEqual(signals.status()["state"], "unreadable")
+
+    def test_reading_recovers_once_the_file_is_good_again(self):
+        root = self.make("{ 坏的")
+        signals = SocialSignals(lambda: root)
+        self.assertFalse(signals.is_fresh())
+        signals_path(root).write_text(json.dumps({"ignored_streak": 7}), encoding="utf-8")
+        self.assertTrue(signals.is_fresh())
+        self.assertEqual(signals.ignored_streak(), 7)
 
 
 class RoutineNightFallbackTest(unittest.TestCase):

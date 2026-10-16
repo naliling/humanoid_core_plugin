@@ -21,6 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .life_log import parse_open
 from .services.schedule import (
     day_phrases,
     schedule_wake_text,
@@ -45,6 +46,9 @@ SIGNALS_TTL_MAX_SECONDS = 6 * 3600.0
 SIGNALS_TTL_MIN_SECONDS = 60.0
 SOCIAL_PLUGIN_DIR_NAME = "astrbot_plugin_autonomous_social"
 SIGNALS_FILE_NAME = "humanoid_signals.json"
+# 信号文件正常只有几百字节。涨到兆级说明写方出事了（或文件坏了），读进来只会把内存
+# 吃光；判它「读不到」比判它「里面没有内容」安全——见 `status()` 里 `unreadable` 的说明。
+SIGNALS_MAX_BYTES = 1 << 20
 
 
 def build_contract(core: Any) -> dict[str, Any]:
@@ -252,6 +256,9 @@ class SocialSignals:
         self._payload: dict[str, Any] = {}
         # 写方在信号文件里声明的保鲜期（秒）；0 表示没声明，用默认值。
         self._declared_ttl = 0.0
+        # 这一份文件到底读出来了吗。`read()` 读不到时返回的是空表（或上一次的有效数据），
+        # 调用方分不清「我读不到」和「写方说没有了」——`status()` 靠这个字段把它们分开。
+        self._unreadable = False
 
     def _ttl(self) -> float:
         """当前采信的保鲜期。
@@ -266,14 +273,21 @@ class SocialSignals:
         )
 
     def _invalidate(self) -> None:
-        """丢掉缓存的那一份（文件没了 / 过期了）：**三样一起清**。
+        """丢掉缓存的那一份（文件没了 / 过期了）：清指纹与 payload，**保鲜期留着**。
 
-        只清 `_payload` 不清 `_fingerprint`，文件再出现时指纹没变就直接返回空 payload；
-        不清 `_declared_ttl` 则会拿**上一份**文件声明的保鲜期去判下一份。
+        只清 `_payload` 不清 `_fingerprint`，文件再出现时指纹没变就直接返回空 payload，
+        所以这两样必须一起清。
+
+        `_declared_ttl` 反而**不能**清：它是写方（社交层）的属性，不是这一份 payload 的。
+        清了它，`status()` 判过期时会落回默认的 3 小时——而 `status()` 的顺序是先
+        `read()`（这一步发现过期、顺手调用了本方法）再拿 `_ttl()` 判，于是刚判出来的
+        「过期」当场被改判成「新鲜」，`is_fresh()` 在真假之间逐次跳：社交层明明停了，
+        Core 却有一半的时候认为自己读到的是新鲜的。
+        写方换版本、换了保鲜期也没关系：`read()` 是**先解析、再判过期**，新 payload
+        声明的值在判之前就已经生效了。
         """
         self._fingerprint = None
         self._payload = {}
-        self._declared_ttl = 0.0
 
     def read(self) -> dict[str, Any]:
         now = self._time()
@@ -289,32 +303,49 @@ class SocialSignals:
             stat = path.stat()
         except OSError:
             # 文件不存在或无法访问时返回空
-            return {}
-        if now - stat.st_mtime > self._ttl():
-            # 社交层停了：它写的那份「刚主动找过谁」不该继续影响身体。
-            self._invalidate()
+            self._unreadable = True
             return {}
         fingerprint = (stat.st_mtime_ns, stat.st_size)
         if fingerprint == self._fingerprint:
-            return self._payload
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            # JSON 解析失败或读取错误时保持上一次的有效数据
-            return self._payload or {}
-        except Exception:
-            # 其他未预期异常也返回上一次的有效数据
-            return self._payload or {}
-        if not isinstance(payload, dict):
-            return self._payload or {}
-        self._fingerprint = fingerprint
-        self._payload = payload
-        # 写方声明的保鲜期。第一次读之前用的是默认值（足够宽），读到之后按声明的来。
-        try:
-            declared = float(payload.get("ttl_seconds") or 0.0)
-        except (TypeError, ValueError):
-            declared = 0.0
-        self._declared_ttl = declared if declared > 0 else 0.0
+            payload = self._payload
+        else:
+            if stat.st_size > SIGNALS_MAX_BYTES:
+                # 读到一半才炸不如根本不读：见 `SIGNALS_MAX_BYTES`。
+                self._unreadable = True
+                return self._payload or {}
+            try:
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # JSON 解析失败或读取错误时保持上一次的有效数据
+                self._unreadable = True
+                return self._payload or {}
+            except Exception:
+                # 其他未预期异常也返回上一次的有效数据
+                self._unreadable = True
+                return self._payload or {}
+            if not isinstance(parsed, dict):
+                self._unreadable = True
+                return self._payload or {}
+            self._fingerprint = fingerprint
+            self._payload = parsed
+            self._unreadable = False
+            # 写方声明的保鲜期。第一次读之前用的是默认值（足够宽），读到之后按声明的来。
+            try:
+                declared = float(parsed.get("ttl_seconds") or 0.0)
+            except (TypeError, ValueError):
+                declared = 0.0
+            self._declared_ttl = declared if declared > 0 else 0.0
+            payload = parsed
+        if now - stat.st_mtime > self._ttl():
+            # 社交层停了：它写的那份「刚主动找过谁」不该继续影响身体。
+            #
+            # 顺序是**先解析、再判过期**，为的是用「手上这一份」自己声明的保鲜期来判。
+            # 原来先判过期、用的是上一次读到的 `_declared_ttl`：一旦过期，
+            # `_invalidate()` 会把它清成 0，下一次读就落回默认的 3 小时，于是「过期」
+            # 与「新鲜」逐次交替，写方声明的保鲜期实际只在第一次生效——社交层停了以后
+            # Core 还会断断续续拿它那份「刚主动找过谁」去改自己的好感。
+            self._invalidate()
+            return {}
         return payload
 
     def _scope_of(self, payload: dict[str, Any], role_id: str = "") -> dict[str, Any]:
@@ -380,6 +411,33 @@ class SocialSignals:
                     return 0
         return 0
 
+    def open_items(self, role_id: str = "") -> list[dict[str, Any]]:
+        """社交层发布的「她手上还开着的事」：`[{"text","uid","at","src"}, ...]`。
+
+        这是 Core 唯一能拿到「跨轮未完事项」的通道。会话历史只留十几轮、超了就被压缩，
+        压缩之后模型手上只剩用户刚说的那一句，于是每轮都绕着最后一句转；这份列表是
+        **不被压缩影响**的那一份索引。
+
+        没有就返回空表。注意「空」有两种意思，调用方必须分得开（见 `life_log.merge_open`）：
+
+        * 文件不存在 / 过期 / 读不到 → 空表示「**不知道**」，不能据此清掉已有账本；
+        * 文件新鲜但写方没写 `open_items` → 空表示「**确实没有了**」。
+
+        这里读不出区别（都返回空表），所以清账的判断权在调用方手上，由它看
+        `read()` 是否拿到了新鲜 payload。字段只加不改：认不出的键、认不出的元素一律丢掉，
+        写方换成新版本也不会把 Core 读崩。
+        """
+        try:
+            data = self.read()
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        row = self._scope_of(data, role_id)
+        if not isinstance(row, dict):
+            return []
+        return parse_open(row.get("open_items"))
+
     def _slots(self, data: Any, role_id: str = "") -> list:
         """社交层（signals.py）多 Bot 时写在 `by_bid[bid]` 下，单 Bot 才写顶层。
 
@@ -401,12 +459,29 @@ class SocialSignals:
             return [data]
         return []
 
+    def is_fresh(self) -> bool:
+        """信号文件现在是不是新鲜的（社交层活着、那份数据没过期）。
+
+        和 `read()` 只差一件事，但很要紧：`read()` 在文件缺失或过期时返回 `{}`，
+        调用方分不清「写方说没有了」和「**我读不到**」。删除类的动作只该在前者发生时做——
+        `open_items()` 的空表因此必须配着这个方法一起用，不然社交层一停，
+        她记着的事就会在无人知晓的情况下被清空。
+        """
+        try:
+            return self.status().get("state") == "fresh"
+        except Exception:
+            return False
+
     def status(self) -> dict[str, Any]:
         """对接到底卡在哪一步。只说「没读到」会把三种完全不同的情况当成一种。
 
         * `not_installed` —— 连社交层的数据目录都没有：那个插件没装（这不是故障）。
         * `never_written` —— 装了，但 `humanoid_signals.json` 还不存在。
         * `stale` —— 文件在，但超过 TTL 没刷新：社交层停了、被禁用，或卡住了。
+        * `unreadable` —— 文件在、时间也新鲜，但**读不出内容**（JSON 坏了、编码不对、
+          没权限、是个目录、大到不像信号文件）。这一种必须与 `fresh` 分开：两者都会让
+          `open_items()` 返回空表，而 `fresh` 的空表意思是「写方说没有了」、
+          `unreadable` 的空表意思是「我不知道」——前者会让 Core 把她的账本清空。
         * `fresh` —— 读到并使用中。
         每种都带上它去看的那个路径，排查时不用再猜目录名。
         """
@@ -427,6 +502,8 @@ class SocialSignals:
             age = max(0.0, now - path.stat().st_mtime)
         except OSError:
             age = None
+        if self._unreadable:
+            return {"state": "unreadable", "path": str(path), "age": age, "payload": {}}
         if not payload and age is not None and age > self._ttl():
             return {"state": "stale", "path": str(path), "age": age, "payload": {}}
         return {"state": "fresh", "path": str(path), "age": age, "payload": payload}

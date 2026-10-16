@@ -318,10 +318,22 @@ class ProcessService:
         if not proc.get("started_at"):
             proc["started_at"] = now.replace(second=0, microsecond=0).isoformat()
         if not proc.get("expected_end"):
-            duration = int(proc.get("duration_minutes") or random.randint(
-                self._int_cfg("process_min_duration", MIN_PROCESS_DURATION),
-                self._int_cfg("process_max_duration", MAX_PROCESS_DURATION),
-            ))
+            # `duration_minutes` 可能是脏数据（手改过的 state.json、半截写入）。
+            # 这里由只读入口 `current()` 调用，而 `current()` 在 `needs_update()` /
+            # `tick()` / `update_async()` 上被后台循环反复调到——裸 `int("abc")` 抛出的
+            # ValueError 会一路掀掉整个心跳。取不出正数就当场随机一个（与原写法
+            # 「假值就随机」语义一致）。同文件 `_advance_phase` 的 `phase_index` 早就
+            # 是这么处理的，这里当时漏了。
+            raw_duration = proc.get("duration_minutes")
+            try:
+                duration = int(raw_duration) if raw_duration else 0
+            except (TypeError, ValueError):
+                duration = 0
+            if duration <= 0:
+                duration = random.randint(
+                    self._int_cfg("process_min_duration", MIN_PROCESS_DURATION),
+                    self._int_cfg("process_max_duration", MAX_PROCESS_DURATION),
+                )
             proc["expected_end"] = (
                 self._parse_dt(proc["started_at"]) + timedelta(minutes=max(5, duration))
             ).isoformat()

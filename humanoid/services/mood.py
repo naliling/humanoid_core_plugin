@@ -165,6 +165,19 @@ def _num_or(raw: Any, default: float) -> float:
     return default if out != out else out
 
 
+def _finite(value: Any) -> bool:
+    """这个数能不能参与运算。NaN 与 ±inf 一律当「不知道」。
+
+    `_num_or` 只挡「取数」那一侧；账本、衰减这些**已经拿到 float 之后**才算的地方
+    也得挡一次，否则同一个陷阱会在下游换个形状再犯一遍（见 `_ledger_total`）。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return False
+    return out == out and out not in (float("inf"), float("-inf"))
+
+
 def _event_kind(weight: float, kind: str = "") -> str:
     """一笔账的**性质**——她要能说出「你最近在敷衍我」，就得知道这是敷衍。
 
@@ -292,8 +305,15 @@ EMOTION_MEMORY_KEY = "emotion_memory"
 #
 # `ignored_seen` 也在清理范围内：它是「被冷落」的已罚计数（见 `note_ignored_by_peer`），
 # 不清的话清档用户回来时 `now_streak <= seen` 恒成立，冷落惩罚**永久免罚**。
+#
+# `spoke_log`（她自己说过的话 + 对方接没接）与 `said` 同类：都只是喂给情绪分析器的
+# 一小段短期上下文。不清会有两个后果：一是「对方还没回应」这句话会挂上几个月，人一回来
+# 分析器就收到一句早就不成立的旧账；二是它**不在** `_STALE_SHELL_FIELDS` 里，于是条目
+# 连「90 天不活跃整条删」都进不去（那个分支要求剩下的键全在名单内），这个用户条目
+# 就永远留在 state.json 里。
 RETENTION_DROPPED_FIELDS = (
-    "mood", "mood_logs", "mood_tag", "last_message", "said", "attention", "ignored_seen",
+    "mood", "mood_logs", "mood_tag", "last_message", "said", "spoke_log", "attention",
+    "ignored_seen",
 )
 
 # 长期不活跃（D4）：只剩这些字段的用户条目**没有任何可清理的内容**——字段清理对它
@@ -637,14 +657,41 @@ class MoodService:
         return self._time()
 
     def _repair(self, record: dict, user_state: dict) -> dict:
+        """把坏掉的轴值就地修好。
+
+        坏值（`null` / 坏字符串 / NaN）**不能**按 `bounds[0]` 补齐：`_serialize` 会把
+        内存里的 NaN 写成 `null`，于是「算术里混进过一次 NaN」的档案下次启动就变成
+        好感度 0（最低档），而且一声不响——用户看到的是「她突然讨厌我了」。
+        按面板设定的初始值补齐，与 `profile()` 重建一份档案的口径一致。
+        """
+        cfg = self.config
+        defaults = {
+            "affection": _num_or(getattr(cfg, "mood_initial_affection", AFFECTION_RANGE[0]),
+                                 AFFECTION_RANGE[0]),
+            "libido": _num_or(getattr(cfg, "mood_initial_libido", LIBIDO_RANGE[0]),
+                              LIBIDO_RANGE[0]),
+            "aggression": _num_or(getattr(cfg, "mood_initial_aggression", AGGRESSION_RANGE[0]),
+                                  AGGRESSION_RANGE[0]),
+        }
         changed = False
+        reset: List[str] = []
         for key, base_key, bounds in DIMENSIONS:
+            fallback = max(bounds[0], min(bounds[1], defaults[key]))
             for target in (key, base_key):
-                value = _num_or(record.get(target, bounds[0]), bounds[0])
+                had_value = target in record
+                raw = record.get(target, fallback)
+                value = _num_or(raw, fallback)
                 clamped = max(bounds[0], min(bounds[1], value))
                 if record.get(target) != clamped:
+                    if had_value and not _finite(raw):
+                        reset.append(target)
                     record[target] = clamped
                     changed = True
+        if reset:
+            # 一条就够（只在坏值真的被改写的那一次触发，之后值已经是好的）。
+            logger.warning(
+                "情绪轴值不可用（%s），已按面板初始值补齐", "、".join(reset)
+            )
         for field in ("last_decay", "messages_since_llm", "turn_count"):
             if field not in record:
                 record[field] = 0 if field == "turn_count" else self._time()
@@ -721,8 +768,13 @@ class MoodService:
         return self._scope.peek_user(user_id, "mood_tag", "")
 
     def said(self, user_id: str) -> list:
-        """隔一段时间采样下来的对方原话。"""
-        return self._scope.get_user(user_id, "said") or []
+        """隔一段时间采样下来的对方原话。
+
+        只读：走 `peek_user`。这里以前用 `get_user`，而它是**读就建条目**的——注入层
+        每轮都会走到这条路上，于是「被看一眼」就给人留一个永久空壳（`peek_user` 的
+        文档说的正是这件事）。
+        """
+        return self._scope.peek_user(user_id, "said") or []
 
     def note_said(self, user_id: str, text: str, now: float | None = None) -> list:
         """按采样规则记一句对方原话。没变化时不写盘。"""
@@ -744,7 +796,8 @@ class MoodService:
     SPOKE_DEDUP_SECONDS = 90.0
 
     def spoke(self, user_id: str) -> list:
-        return self._scope.get_user(user_id, "spoke_log") or []
+        # 同 `said`：只读用 peek，别因为「看一眼她说过什么」就给对方建条目。
+        return self._scope.peek_user(user_id, "spoke_log") or []
 
     def note_spoke(
         self, user_id: str, text: str, now: float | None = None, *, pending: bool = True
@@ -997,6 +1050,14 @@ class MoodService:
         pruned = 0
         for uid in self._scope.all_user_ids():
             user_state = self._scope.user_state(uid)
+            if not user_state:
+                # **纯空壳**：一个键都没有，没有任何东西可丢。这不是「判不出时间戳」，
+                # 所以下面那条「判不出就不删」的安全侧不适用——旧版本 `get_user` 在群聊里
+                # 给每个说过话的陌生人留下的正是这种 `{}`，它永远不会被清，state.json
+                # 随群规模一直涨（每次落盘还要全量重写一遍）。
+                self._scope.delete_user(uid)
+                pruned += 1
+                continue
             if not any(key in user_state for key in RETENTION_DROPPED_FIELDS):
                 # 无可清理字段：字段清理对它无效，所以只能整条删。
                 if not all(key in _STALE_SHELL_FIELDS for key in user_state):
@@ -1007,6 +1068,11 @@ class MoodService:
                 try:
                     stale_stamp = float(stale_stamp)
                 except (TypeError, ValueError):
+                    # 判不出时间戳的一律不删（宁可不清也不误删）。代价是：`set_nickname`
+                    # 不盖时间戳，legacy 的 `nicknames`→`nickname` 迁移正好造出这种条目，
+                    # 「90 天不活跃」对它永远不触发 → 它会一直留在 users 里。这是**有意
+                    # 选的安全侧**（删掉一条判不出来的记录，比留一条只装着称呼的记录更糟），
+                    # 由 `test_v2278_emotion.StaleShellPrune` 钉住。
                     continue
                 if stale_stamp > stale_cutoff:
                     continue
@@ -1044,15 +1110,24 @@ class MoodService:
         return pruned
 
     def _decay_record(self, record: dict, user_state: dict, cfg: HumanoidConfig, now: float) -> bool:
+        # 时间源本身坏了（NaN/inf）就什么都不做：`nan < 0.1` 为假、`ratio = nan`，
+        # 而 `min(上界, nan)` 返回上界——亲近欲与攻击性会被**钉到 50**，`last_decay`
+        # 还会被写成 nan 一路传染下去。soma 那边是同一个态度
+        # （「时间源本身坏了（NaN/inf）：不推进也不写」）。
+        if not _finite(now):
+            return False
         try:
             last = float(record.get("last_decay", now))
         except (TypeError, ValueError):
+            last = now
+        if not _finite(last):
+            # 坏掉的时间戳就地修成「此刻」：不修的话每次都会算出一个 NaN 比率。
             last = now
         elapsed_hours = (now - last) / 3600.0
         if elapsed_hours < 0.1:
             return False
 
-        duration = max(0.5, float(cfg.mood_decay_hours))
+        duration = max(0.5, _num_or(cfg.mood_decay_hours, 6.0))
         ratio = 1.0 if elapsed_hours >= duration else (elapsed_hours / duration) ** 2
         changed = False
         for key, base_key, bounds in DIMENSIONS:
@@ -1688,7 +1763,9 @@ class MoodService:
         if not isinstance(record, dict):
             return ""
         try:
-            until = float(record.get("cool_until", 0.0) or 0.0)
+            # 非有限数算「没有冷静期」：`now >= nan` 恒假，一个 NaN 的 cool_until
+            # 会让她每一轮都顶着「还在气头上，别来吵」（与 emotion._cooling_line 同一口径）。
+            until = _num_or(record.get("cool_until"), 0.0)
             now = float(self._time())
         except (TypeError, ValueError):
             return ""
@@ -1781,7 +1858,10 @@ class MoodService:
         不跌，最后被衰减拉回 base 就算完事。
         """
         weight = float(delta.affection)
-        if abs(weight) < 1e-3:
+        # 非有限值必须挡在入账**之前**：`abs(nan) < 1e-3` 是假，NaN 会照常进账本，
+        # 而 `_ledger_total` 里 `min(100.0, nan)` 返回 100.0——一笔 NaN 权重就把
+        # 好感永久钉在满分上（`_num_or` 的注释正是警告这个陷阱）。
+        if not _finite(weight) or abs(weight) < 1e-3:
             return
         # **负向更重**：「下的快上的也快」。
         # 对称的话，一段冷淡期抵不过之前十几句好话——好感就永远悬在设定值之上，
@@ -1816,15 +1896,24 @@ class MoodService:
         if not isinstance(led, list) or not led:
             return 0.0
         half = self.LEDGER_HALF_LIFE_HOURS
+        if not _finite(now):
+            # 「此刻」不可信时不算净值：`max(0.0, nan)` 是 0.0，会把每一笔陈年旧账
+            # 都按「刚刚发生」满权重计入，好感当场被顶到上限。
+            return 0.0
         total = 0.0
         for item in led:
             if not isinstance(item, dict):
                 continue
             try:
-                age = max(0.0, (now - float(item.get("t", now))) / 3600.0)
+                raw_t = float(item.get("t", now))
                 w = float(item.get("w", 0.0))
             except (TypeError, ValueError):
                 continue
+            # 时间戳或权重不是有限数就整笔丢掉：`t` 是 NaN 时 `max(0.0, nan)` 变成 0.0
+            # （=按「刚刚」满权重），`w` 是 NaN 时 `min(100.0, nan)` 变成 100.0（=满分）。
+            if not _finite(raw_t) or not _finite(w):
+                continue
+            age = max(0.0, (now - raw_t) / 3600.0)
             total += w * (0.5 ** (age / half))
         return total
 
@@ -2077,14 +2166,23 @@ class MoodService:
                 float(data.get("affection_delta", 0)),
                 float(data.get("libido_delta", 0)),
                 float(data.get("aggression_delta", 0)),
-            ).capped(10.0)
-            if cfg.debug_mode and self._log:
-                self._log.debug(f"[humanoid_core] 情绪分析结果: {delta}")
-            return delta
+            )
         except (TypeError, ValueError):
             if self._log is not None:
                 self._warn_throttled("情绪分析失败：JSON 数值无效", "json")
             return None
+        # 非有限数必须先挡：`Delta.capped()` 用的是 `min/max`，而 `min(10.0, nan)`
+        # 返回 10.0——模型吐出 `NaN`（JSON 合法字面量，`json.loads` 照收）或
+        # `Infinity` 时，三根轴会一起被夹成**正向满分**，比不分析还糟。按「数值无效」
+        # 整条丢掉，让本地 delta 顶上。
+        if not all(_finite(v) for v in (delta.affection, delta.libido, delta.aggression)):
+            if self._log is not None:
+                self._warn_throttled("情绪分析失败：JSON 数值非有限（NaN/Infinity）", "json")
+            return None
+        delta = delta.capped(10.0)
+        if cfg.debug_mode and self._log:
+            self._log.debug(f"[humanoid_core] 情绪分析结果: {delta}")
+        return delta
 
     def _log_event(self, user_id: str, record: dict, delta: Delta):
         """写一条情绪波动日志（`emotion._today_events` 的唯一数据源）。
@@ -2149,7 +2247,15 @@ class MoodService:
         if not events:
             return
 
-        logs = self._scope.user_state(user_id).setdefault("mood_logs", [])
+        user_state = self._scope.user_state(user_id)
+        logs = user_state.get("mood_logs")
+        if not isinstance(logs, list):
+            # 和上面的 log_day/acc 一样要兜住：`mood_logs` 在 `state._LEGACY_USER_FIELDS`
+            # 里是**原样搬**的，老版本或损坏的 state 会留下非列表值。这里不兜的话
+            # `.append` 抛 AttributeError，冒到 main.py 的宽 except 被吞成一行 warning，
+            # 于是这个用户此后**每一条消息**的记账全部静默失效。
+            logs = []
+        user_state["mood_logs"] = logs
         logs.append({
             "time": self._clock.now().strftime("%Y-%m-%d %H:%M:%S") if self._clock else datetime.now().isoformat(),
             "event": "，".join(events),
@@ -2220,11 +2326,14 @@ class MoodService:
 
     def logs_text(self, user_id: str, limit: int = 10) -> str:
         logs = self._scope.peek_user(user_id, "mood_logs", [])
-        if not logs:
+        # 和 `logs()` 同一条守卫：损坏的 state 里这一项可能不是列表，元素也可能不是字典。
+        if not isinstance(logs, list) or not logs:
             return "📭 暂无情绪波动记录。"
         entries = logs[-limit:] if limit > 0 else logs
         lines = [f"📋 情绪波动记录（最近{len(entries)}条）：", "——————————————"]
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             lines.append(f"{entry.get('time', '')} | {entry.get('event', '')}")
         return "\n".join(lines)
 

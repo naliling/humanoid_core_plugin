@@ -195,12 +195,17 @@ class BehaviorService:
         return fresh
 
     def _sweep_active(self, now: float) -> None:
-        """按 TTL 回收「回来这一轮」的事件。
+        """按 TTL 回收「回来这一轮」的事件，以及只增不减的用户队列。
 
         `_active_event` 只在用户**下一次发言**时被清（`clear_user_events`），而群里那个
         人可能再也不说话——条目就一直留着，每个说过话的用户一份，只增不减。
+
+        `_events` 有同一个毛病，而且更隐蔽：它只在 `_clean(user_id)` 里按用户清，而
+        `_clean` 只由 `compute_attention(user_id)` 为**那一个**用户调用。所以「说过一次
+        话就再也没回来」的人会永久占着一个键，外加最多 MAX_EVENTS_PER_USER 条事件。
+        这里一并按 TTL 扫掉（判据与 `_active_event` 完全一致，NaN 同样被清）。
         """
-        if not self._active_event:
+        if not self._active_event and not self._events:
             return
         for key, event in list(self._active_event.items()):
             try:
@@ -209,6 +214,21 @@ class BehaviorService:
                 age = float("inf")
             if not age <= EVENT_TTL:  # NaN 也在这里被清掉
                 self._active_event.pop(key, None)
+        for key, queue in list(self._events.items()):
+            fresh: List[Dict[str, Any]] = []
+            for event in queue if isinstance(queue, list) else []:
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    age = float(now) - float(event.get("timestamp", now))
+                except (TypeError, ValueError):
+                    continue
+                if age <= EVENT_TTL:
+                    fresh.append(event)
+            if fresh:
+                self._events[key] = fresh
+            else:
+                self._events.pop(key, None)
 
     def compute_attention(self, user_id: str, now: float) -> List[Dict[str, Any]]:
         """计算短期注意力，不写持久状态。"""
@@ -338,6 +358,12 @@ class BehaviorService:
             aggression = float(profile.get("aggression", 15.0))
         except (TypeError, ValueError):
             affection, aggression = 50.0, 15.0
+        # 坏值（NaN/Inf）必须退回中性值再算：下面那对 min/max 会把 NaN 变成**上界 1.0**
+        # （`min(1.0, nan)` 返回 1.0），于是「好感度读坏了」的表现是「她对这个人满格上心」。
+        if not _is_finite(affection):
+            affection = 50.0
+        if not _is_finite(aggression):
+            aggression = 15.0
         value = affection / 100.0 * 0.78 + 0.11
         value -= min(0.22, max(0.0, aggression - 25.0) / 100.0 * 0.6)
         value += self._seed_offset(user_id) * 0.5
@@ -363,6 +389,11 @@ class BehaviorService:
             current = float(record.get("care", 0.0))
             at = float(record.get("care_at", 0.0) or 0.0)
         except (TypeError, ValueError):
+            current, at = 0.0, 0.0
+        # 非有限数按「没有历史」处理（= 重新落到目标值），别让它参与运算：NaN 算出来的
+        # value 会被 `min(1.0, value)` 夹成 1.0，然后**写回盘上**——一次坏值换来一份
+        # 钉死的满分在意度（这一轴的半衰期是 72 小时，不会自己回来）。
+        if not _is_finite(current) or not _is_finite(at):
             current, at = 0.0, 0.0
         try:
             profile = self._core.mood.profile(user_id)

@@ -75,6 +75,7 @@ class StateStore:
         "_log",
         "_path",
         "_state",
+        "_surrogate_warned",
         "_version_blocked",
         "_write_lock",
         "lock",
@@ -95,6 +96,9 @@ class StateStore:
         # 加载失败 / 盘上版本更新 → 一律拒绝写盘（见 `_write_block_reason`）。
         self._load_failed = False
         self._version_blocked = False
+        # 坏字符的那条 warning 只报一次：写不出去的那个字符会一直留在内存里，
+        # 每次落盘都会重走一次替换，每 5 秒往日志里刷一行没有任何新信息。
+        self._surrogate_warned = False
         self._disk_version = STATE_VERSION
         self._dirty_event = asyncio.Event()
         self._flush_task: asyncio.Task[None] | None = None
@@ -155,6 +159,15 @@ class StateStore:
                 self._state = fresh
                 self.mark_dirty()
             return
+
+        # JSON 里没有 NaN/Infinity，可 `json.loads` **默认接受**这三个字面量（写盘侧
+        # `allow_nan=False` 拦得住自己，拦不住手改的文件和别的版本写下的文件）。不清的话
+        # 同一份文件「读进来是 NaN、写回去是 null」，而中间这段时间里所有
+        # `x < 阈值` 对 NaN 都判假：`cool_until=NaN` → `now >= until` 恒假 → 她**永远**
+        # 出不了冷静期。在入口一次清掉，下游每个模块就不必各自再防一遍 NaN。
+        scrubbed = _scrub_nonfinite(raw)
+        if scrubbed:
+            self._warn(f"状态里有 {scrubbed} 处非有限数值（NaN/Infinity），已置空")
 
         self._state = self._migrate(raw, fresh, cycle_length)
         disk_version = _state_version_of(raw)
@@ -373,13 +386,21 @@ class StateStore:
             self._dirty = False
             self._dirty_event.clear()
             try:
-                await asyncio.to_thread(_atomic_write, self._path, payload)
+                scrubbed = await asyncio.to_thread(_atomic_write, self._path, payload)
             except Exception:
                 self._dirty = True
                 self._dirty_event.set()
                 raise
+            if scrubbed:
+                self._warn_surrogate_once()
             self.writes += 1
             return True
+
+    def _warn_surrogate_once(self) -> None:
+        if self._surrogate_warned:
+            return
+        self._surrogate_warned = True
+        self._warn("状态里有无法用 UTF-8 编码的字符（孤立代理项），已替换后写入")
 
     def flush_sync(self) -> bool:
         if not self._dirty:
@@ -388,7 +409,9 @@ class StateStore:
         if blocked:
             self._refuse_write(blocked)
             return False
-        _atomic_write(self._path, _serialize(self._state))
+        scrubbed = _atomic_write(self._path, _serialize(self._state))
+        if scrubbed:
+            self._warn_surrogate_once()
         self._dirty = False
         # 不清事件的话，异步 `_flush_loop` 醒来后会立刻再跑一轮空 flush。
         self._dirty_event.clear()
@@ -419,44 +442,107 @@ def _serialize(state: dict[str, Any]) -> str:
     别的解析器（含下次启动的自己以外的工具）读不了；状态里只要混进一个 NaN
     （坏输入算出来的浮点），整份文件就变成别人读不懂的东西。发现非有限数就把它
     降级成 null 再写——丢一个坏数值，好过写出一份坏文件。
+
+    第二次尝试同样要接住 **TypeError**：`set`/自定义对象这类值根本没有 JSON 表示，
+    而原来的写法只接 ValueError，于是它会一路冒到 `flush()`，变成「从此再也写不出
+    状态」（每次落盘都在同一个值上失败）。清洗比丢弃整棵树便宜。
     """
     try:
         return json.dumps(
             state, ensure_ascii=False, separators=(",", ":"), allow_nan=False
         )
-    except ValueError:
+    except (TypeError, ValueError):
         sanitized = _finite_safe(state)
         try:
             return json.dumps(
                 sanitized, ensure_ascii=False, separators=(",", ":"), allow_nan=False
             )
         except (TypeError, ValueError):
-            # 连清洗后都写不出来：宁可退回一份最小的合法状态，也不写出坏文件。
+            # 连清洗后都写不出来（循环引用这类）：宁可退回一份最小的合法状态，
+            # 也不写出坏文件。
             return json.dumps(
                 default_state(), ensure_ascii=False, separators=(",", ":")
             )
 
 
 def _finite_safe(value: Any) -> Any:
-    """把 NaN/±Infinity 换成 None（递归处理容器），其余原样。"""
+    """把写不进 JSON 的东西换成 None（递归处理容器），其余原样。
+
+    两类值会让 `json.dumps(allow_nan=False)` 失败：NaN/±Infinity（ValueError）与
+    没有 JSON 表示的对象，如 `set`（TypeError）。原来它只处理第一类，第二类直接
+    冒出去——**一个坏叶子就能让整份状态再也写不出去**，而下面的兜底又会把整棵树
+    换成空骨架。清洗不该以整棵树为代价。
+    """
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, dict):
-        return {key: _finite_safe(item) for key, item in value.items()}
+        out: dict[Any, Any] = {}
+        for key, item in value.items():
+            # JSON 的键只能是字符串/数字/布尔/null：tuple 之类的键会让 dumps 抛
+            # TypeError，NaN 键在 allow_nan=False 下同样抛。
+            if key is None or isinstance(key, (str, int, bool)):
+                safe_key = key
+            elif isinstance(key, float) and math.isfinite(key):
+                safe_key = key
+            else:
+                safe_key = str(key)
+            out[safe_key] = _finite_safe(item)
+        return out
     if isinstance(value, (list, tuple)):
         return [_finite_safe(item) for item in value]
-    return value
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    return None
 
 
-def _atomic_write(path: Path, payload: str) -> None:
+def _scrub_nonfinite(value: Any) -> int:
+    """**就地**把 NaN/±Infinity 换成 None，返回改掉几处。
+
+    与 `_finite_safe` 的分工：那个是「写盘前重新造一棵干净的树」，这个是「读盘后
+    只修坏叶子」，因为读进来的树接下来还要按角色/用户就地迁移，不能换对象。
+    """
+    changed = 0
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, float) and not math.isfinite(item):
+                value[key] = None
+                changed += 1
+            elif isinstance(item, (dict, list)):
+                changed += _scrub_nonfinite(item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            if isinstance(item, float) and not math.isfinite(item):
+                value[index] = None
+                changed += 1
+            elif isinstance(item, (dict, list)):
+                changed += _scrub_nonfinite(item)
+    return changed
+
+
+def _atomic_write(path: Path, payload: str) -> bool:
+    """原子写。返回值 = 是否为了写成功而替换过 payload 里的坏字符。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     # `.tmp` 固定名会让两个进程/线程互相踩（A 写完 B 又写，A 的 replace 搬走 B 的内容）。
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
+    scrubbed = False
+
+    def _write(text: str) -> None:
         with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(payload)
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
+
+    try:
+        try:
+            _write(payload)
+        except UnicodeEncodeError:
+            # 孤立代理项（`\ud800` 这类，平台昵称/消息里带进来过）用 UTF-8 编码不出来。
+            # 原来它会一路抛到 `flush()`：**此后每次落盘都在同一个字符上失败**，插件
+            # 表面照常跑，实则再也不落盘，重启就丢掉期间所有状态。换成 `?` 写下去是
+            # 有损的，但比「永远写不出去」好得多（也不能写 WTF-8：那份文件下次自己都
+            # 解不开，会被当成损坏备份走）。
+            scrubbed = True
+            _write(payload.encode("utf-8", "replace").decode("utf-8"))
         os.replace(tmp, path)
     except BaseException:
         # 失败分支别留下半截临时文件（下次启动的目录扫描会被它误导）。
@@ -468,13 +554,14 @@ def _atomic_write(path: Path, payload: str) -> None:
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
     except OSError:
-        return
+        return scrubbed
     try:
         os.fsync(dir_fd)
     except OSError:
         pass
     finally:
         os.close(dir_fd)
+    return scrubbed
 
 
 def _decode_bytes(data: bytes) -> str:

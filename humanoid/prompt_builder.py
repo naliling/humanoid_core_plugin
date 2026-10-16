@@ -23,11 +23,12 @@
 
 from __future__ import annotations
 
+from . import life_log
 from . import relstage
 import math
 import re
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from astrbot.api import logger
 
@@ -82,6 +83,12 @@ _NAME_PRONOUNS = ("她", "他", "你", "我", "它", "您", "TA")
 # 原来 `_personalize` 是 `text.replace("她", name, 1)`，任何含「她」的词都会被改坏
 # （「其他人都说她温柔」→「其小雨人都说小雨温柔」）。
 _SHE_STANDALONE_RE = re.compile(r"(?<!其)她")
+
+# 同理，只认**独立成词**的「TA」。事实块里会原样带进玩家自己说的话
+# （`recall.py` 的「TA之前说过「…」」、`_echo_lines` 的引用、社交层发布的 open item），
+# 里面出现 DATA / TAOBAO / STAR 这类含 TA 的英文词时，盲替换会把玩家的原话改成
+# 「D小明A」——模型看到的就是一句被改坏的话。前后都不挨着 ASCII 字母数字才算「TA」。
+_TA_STANDALONE_RE = re.compile(r"(?<![0-9A-Za-z])TA(?![0-9A-Za-z])")
 
 
 def sanitize_name(raw: str) -> str:
@@ -196,7 +203,6 @@ def build_state_note(char_name: str = "", user_name: str = "",
 
 # 模块级保留一份默认文案：诊断、测试这些不需要带名字的地方直接用它。
 FRAMING_TEXT = build_framing()
-
 # 注入块的尺寸红线（字符）：防止哪天拼装逻辑把注入胀到几千字。
 # 实际卡住体积的是 cfg.inject_token_budget（超了按显著度整句丢）。
 INJECT_MAX_CHARS = {"medium": 2000, "full": 3000, "mood_only": 500}
@@ -262,6 +268,63 @@ def _core_epoch(core) -> float:
         return time.time()
 
 
+# 记忆插件交回来的是一段「给人看的注入文本」：可能带小标题、项目符号、换行。
+# 事实块里只收一句和别的事实并列的话——照搬会把「标题 + 正文」的形状带进来，
+# 那正是最容易让模型照着念的形状（`_sentence` 说的同一件事）。
+_MEMORY_HEADING = re.compile(r"^(?:#{1,6}\s|[-=*_—~]{3,}$|[【\[［][^】\]］]*[】\]］]$)")
+_MEMORY_BULLET = re.compile(r"^(?:[-*•·]|\d+[.、)]|[一二三四五六七八九十]+[、.)])\s*")
+_MEMORY_WS = re.compile(r"\s+")
+_MEMORY_RUN = re.compile(r"[，。；、]{2,}")
+MEMORY_TEXT_MAX_CHARS = 220
+
+
+def _flatten_memory(text: str, limit: int = MEMORY_TEXT_MAX_CHARS) -> str:
+    """把记忆插件的一段注入文本压成一句能并进事实块的话。
+
+    「- 【长期记忆】」这种行要整行丢掉，所以得先摘掉项目符号再判标题；但「---」这种
+    分隔线摘掉一个连字符就只剩「--」，判不出来了——两个形状都判一次才不漏。剩下的一律
+    保留原话：记忆的内容不该由这里改写，这里只负责形状。
+    """
+    lines: List[str] = []
+    for raw in str(text or "").splitlines():
+        stripped = raw.strip()
+        line = _MEMORY_BULLET.sub("", stripped)
+        if not line or _MEMORY_HEADING.match(line) or _MEMORY_HEADING.match(stripped):
+            continue
+        lines.append(line)
+    body = _MEMORY_WS.sub(" ", "，".join(lines)).strip()
+    body = _MEMORY_RUN.sub("，", body).strip("，。；、 ")
+    cap = max(0, int(limit))
+    if len(body) > cap:
+        body = body[:cap].rstrip("，。；、 ") + "…"
+    return body
+
+
+# 事实块自己不用标题（`_sentence` 那条规矩），但正文里有两处内容是**别人给的**：
+# 「TA之前说过『…』」引的是用户原话，`life_items` 里是她和对方还没聊完那件事的摘要
+# ——谁都不保证里面不会夹一个【】。混进来模型就会把它当成小标题照着念。
+_HEADING_SPAN = re.compile(r"[【\[［][^】\]］]*[】\]］]")
+_LINE_BREAK = re.compile(r"[\r\n\u2028\u2029]+")
+#: 正文自带的句尾标点：有它就不再补句号，免得写出「。。」「？！。」。
+_SENTENCE_TAIL = ("。", "！", "？", "…", "」", "』", "”")
+
+
+def _strip_heading_spans(text: str) -> str:
+    """摘掉混进正文的【…】**整段**（含方括号里的字），并把换行压成空格。
+
+    为什么连里面的字一起去掉：中文里【】几乎只用来做标签（「【长期记忆】」「【重要】」），
+    而标签正是「开头一个标题然后是文本」那个毛病的引子——只摘括号留字，会得到
+    「关于TA以前的事：长期记忆他上次说的那个面试」这种把标签读进句子中间的怪话。
+    摘掉整段之后剩下的是正文本身，模型也就没有可照着念的标题了。
+
+    只做形状，不改归属：这段文字来自用户原话与社交层摘要，摘掉的是它们自带的标记，
+    不是这里的上下文改写的。事实块必须是**一行**，多一个换行就多一段，模型会当成
+    要分点回答的东西。
+    """
+    body = _HEADING_SPAN.sub("", str(text or ""))
+    return _LINE_BREAK.sub(" ", body).strip()
+
+
 class PromptBuilder:
     def __init__(self, core_instance: "HumanoidCoreInstance") -> None:
         self._core = core_instance
@@ -283,6 +346,7 @@ class PromptBuilder:
         interest: Optional[Dict[str, float]] = None,
         char_name: str = "",
         user_name: str = "",
+        memory_text: str = "",
     ) -> str:
         cfg = self.config
         events = events or []
@@ -308,17 +372,25 @@ class PromptBuilder:
                 (self._emotion_line(user_id, interest, agency, is_group), 8.5),
                 (self._sentence(self._feelings_lines(max_items=1, threshold=0.7)), 7.0),
                 (self._sentence(self._memory_lines(user_id, detailed=False)), 6.0),
+                (self._sentence(self._open_lines()), 6.0),
+                (self._memory_link_line(memory_text), 6.0),
             ]
             return self._finish(sents, cfg, char_name, user_name)
 
         if mode == "full":
             return self._finish(
-                self._build_full(user_id, is_group, events, agency, text, interest),
+                self._build_full(
+                    user_id, is_group, events, agency, text, interest,
+                    memory_text=memory_text,
+                ),
                 cfg, char_name, user_name,
             )
 
         return self._finish(
-            self._build_medium(user_id, is_group, events, agency, text, interest),
+            self._build_medium(
+                user_id, is_group, events, agency, text, interest,
+                memory_text=memory_text,
+            ),
             cfg, char_name, user_name,
         )
 
@@ -640,6 +712,45 @@ class PromptBuilder:
             return []
         return lines
 
+    def _open_lines(self) -> List[str]:
+        """她手上还开着的事：跨轮、会自己结束的未完事项。
+
+        **走事实块、不另起标题。** `_sentence` 那条规矩在这里同样成立——一个带标题的
+        独立段落最像「要念出来的内容」，模型会照着报。这里它只是跟「TA之前说过…」
+        并列的一句事实，怎么读由 `build_framing` 那段统一交代。
+
+        为什么要它：长期记忆由记忆插件负责、短期记忆由 AstrBot 的会话历史负责（只留
+        十几轮），中间那层「跨轮但会自己结束的事」两边都不管。事实块每轮重发、不落
+        历史，所以会话历史被压缩掉之后它照样在——这正是它存在的理由。
+
+        为什么条数这么少（`render_lines` 默认最多 3 条）：它是一份索引，不是记录。
+        给多了模型会当成待办清单逐条追问，而且每一轮都要重新付一遍 token。
+        """
+        try:
+            items = self._core.life_items()
+        except Exception:
+            return []
+        if not items:
+            return []
+        try:
+            return life_log.render_lines(
+                items, _core_epoch(self._core), name_of=self._core.mood.nickname
+            )
+        except Exception:
+            return []
+
+    def _memory_link_line(self, memory_text: str) -> str:
+        """长期记忆：把记忆插件拼好的那段话压成一句事实。
+
+        和上面那条「TA之前说过…」是一对——那条管这两天，这条管更早。条数由对面
+        决定（这里只封长度），因为**检索该由记忆插件做主**：它才知道哪些事对这个
+        人算重要。这里不解释、不改写，只压形状。
+        """
+        body = _flatten_memory(memory_text)
+        if not body:
+            return ""
+        return f"关于TA以前的事：{body}"
+
     def _nickname_line(self, user_id: str, is_group: bool) -> str:
         """称呼：必需品，不受情绪开关影响——用户自己设的称呼，任何档位都不能丢。
 
@@ -889,6 +1000,7 @@ class PromptBuilder:
         agency: Dict[str, float],
         interest: Dict[str, float],
         detailed: bool,
+        memory_text: str = "",
     ) -> None:
         """睡着时也不能丢的必需品：她对TA、称呼、间隔、TA说过的话。
 
@@ -918,10 +1030,16 @@ class PromptBuilder:
         memory = self._sentence(self._memory_lines(user_id, detailed=detailed))
         if memory:
             sents.append((memory, 6.0))
+        opens = self._sentence(self._open_lines())
+        if opens:
+            sents.append((opens, 6.0))
+        linked = self._memory_link_line(memory_text)
+        if linked:
+            sents.append((linked, 6.0))
 
     def _build_medium(
         self, user_id: str, is_group: bool, events, agency, text: str,
-        interest: Dict[str, float],
+        interest: Dict[str, float], memory_text: str = "",
     ) -> str:
         snap = self._core.snapshot(refresh=False)
         # 夜间精简：睡着时省掉生活细节，但必需品（关系/称呼/间隔/记忆）由
@@ -939,7 +1057,7 @@ class PromptBuilder:
                 sents.append((self._sentence(body), 9.0))
             self._append_sleep_essentials(
                 sents, user_id, is_group, events, agency, interest,
-                detailed=False,
+                detailed=False, memory_text=memory_text,
             )
             return sents
 
@@ -982,12 +1100,18 @@ class PromptBuilder:
         memory = self._sentence(self._memory_lines(user_id, detailed=False))
         if memory:
             sents.append((memory, 6.0))
+        opens = self._sentence(self._open_lines())
+        if opens:
+            sents.append((opens, 6.0))
+        linked = self._memory_link_line(memory_text)
+        if linked:
+            sents.append((linked, 6.0))
 
         return sents
 
     def _build_full(
         self, user_id: str, is_group: bool, events, agency, text: str,
-        interest: Dict[str, float],
+        interest: Dict[str, float], memory_text: str = "",
     ) -> str:
         snap = self._core.snapshot(refresh=False)
         try:
@@ -1002,7 +1126,8 @@ class PromptBuilder:
             if body:
                 sents.append((self._sentence(body), 9.0))
             self._append_sleep_essentials(
-                sents, user_id, is_group, events, agency, interest, detailed=True
+                sents, user_id, is_group, events, agency, interest,
+                detailed=True, memory_text=memory_text,
             )
             return sents
         state = self._state_lines(snap, detailed=True)
@@ -1039,6 +1164,12 @@ class PromptBuilder:
         memory = self._sentence(self._memory_lines(user_id, detailed=True))
         if memory:
             sents.append((memory, 6.0))
+        opens = self._sentence(self._open_lines())
+        if opens:
+            sents.append((opens, 6.0))
+        linked = self._memory_link_line(memory_text)
+        if linked:
+            sents.append((linked, 6.0))
         return sents
 
     def _finish(
@@ -1053,10 +1184,16 @@ class PromptBuilder:
             sents = [(sents, 10.0)]
         normalized: List[tuple[str, float]] = []
         for item in sents:
-            if isinstance(item, tuple):
-                normalized.append((str(item[0]), float(item[1])))
-            else:
+            if not isinstance(item, tuple):
                 normalized.append((str(item), 10.0))
+                continue
+            try:
+                salience = float(item[1])
+            except (TypeError, ValueError, IndexError):
+                # 显著度坏了不能连累整块注入：外面那层 except 会把整个事实块吞掉，
+                # 一句话的排序问题不该让模型这一轮失忆。退回「没给显著度」那一档。
+                salience = 10.0
+            normalized.append((str(item[0]), salience))
         if not normalized:
             return ""
         header = f"{MARK_PREFIX} {MARK_VERSION} uid={_uid_tag(self._core.role_id)}〕"
@@ -1075,13 +1212,25 @@ class PromptBuilder:
             kept_idx.append(i)
             used += cost
         kept_idx.sort()
-        body = "。".join(sents[i][0] for i in kept_idx)
+        # 用 normalized 而不是 sents：sents 里可能混着裸字符串（上面那个兼容分支），
+        # `sents[i][0]` 取到的是**一个字符**。
+        body = "。".join(normalized[i][0] for i in kept_idx)
+        if not body:
+            return ""
+        # 最后一道形状闸：正文只允许是一行、且不含【…】。正文里那两处内容来自
+        # 用户原话和社交插件发布的摘要，它们带什么进来不由这里决定。
+        body = _strip_heading_spans(body)
         if not body:
             return ""
         # **只对正文做替换，标题不动。** 标题「〔她的身体与生活 v12 uid=…〕」是
         # `MARK_PREFIX`，也是这块事实的抬头——一旦被 `_personalize` 换成
         # 「〔小雨的身体与生活…」，抬头就丢了。
-        return header + "\n" + self._personalize(body + "。", char_name, user_name)
+        #
+        # 句号只在正文没自带句尾标点时才补：正文里有引文与摘要，它们自带「。」「？」是
+        # 常事，无脑再补一个就成了「……了。。」——注入的每一个字都在花预算，也在给
+        # 模型做示范，这种双标点没必要。
+        tail = "" if body.endswith(_SENTENCE_TAIL) else "。"
+        return header + "\n" + self._personalize(body + tail, char_name, user_name)
 
     sanitize_name = staticmethod(sanitize_name)
 
@@ -1106,7 +1255,9 @@ class PromptBuilder:
             return text
         who = cls.sanitize_name(user_name)
         if who:
-            text = text.replace("TA", who)
+            # 全部**独立成词**的「TA」都换（词表里玩家一律写 TA），但不碰
+            # DATA / TAOBAO / STAR 这类词里的 TA——那些多半是玩家自己的原话。
+            text = _TA_STANDALONE_RE.sub(lambda _m: who, text)
         name = cls.sanitize_name(char_name)
         if name:
             # 情绪句例外：它是独立的内心独白，每次都该叫得出名字（「小雨内心：心里有点堵」），
