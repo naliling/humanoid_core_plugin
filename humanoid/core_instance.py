@@ -32,6 +32,30 @@ LOG_PREFIX = "[humanoid_core]"
 # 过期用户数据清理的扫描间隔。只需每小时一次：retention 以天为单位，扫得更勤没有收益。
 MAINTENANCE_INTERVAL_SECONDS = 3600.0
 
+# 指令词：名字里不该出现它们，出现了就说明存进来的是整条指令。
+_COMMAND_WORDS = ("参照名称", "拟人", "设置")
+
+
+def strip_command_words(value: str) -> str:
+    """把「拟人 参照名称 娜莉灵」剥成「娜莉灵」。
+
+    这条指令的正确入参是 `/拟人 参照名称 娜莉灵`，剥掉指令词之后只剩名字。历史上
+    有人（或某个客户端自动补全）把整条指令当成了参数，于是 `char_name_override` 存成了
+    `拟人 参照名称 娜莉灵`，每一轮注入都写成「只有拟人 参照名称 娜莉灵和TA」。
+
+    只剥**开头**的指令词，反复剥到剥不动为止；名字中间出现的同名词不动
+    （「拟人」出现在名字中间是用户自己的选择）。
+    """
+    text = str(value or "").strip()
+    changed = True
+    while changed:
+        changed = False
+        for word in _COMMAND_WORDS:
+            if text.startswith(word):
+                text = text[len(word):].strip()
+                changed = True
+    return text
+
 
 class _EngineCompat:
     def __init__(self, core: "HumanoidCoreInstance"):
@@ -457,7 +481,20 @@ class HumanoidCoreInstance:
         except Exception:
             override = ""
         if override:
-            return override
+            # 自愈：老版本可能把整条指令当成名字存了下来（`拟人 参照名称 娜莉灵`），
+            # 于是每一轮注入都写成「只有拟人 参照名称 娜莉灵和TA」。这里剥掉指令词，
+            # 剥出东西就顺手写回去——不用管理员再下一条指令。
+            cleaned = strip_command_words(override)
+            if cleaned != override:
+                if cleaned:
+                    try:
+                        self._scope.set_self("char_name_override", cleaned)
+                    except Exception:
+                        pass
+                    return cleaned
+                # 整串都是指令词：等于没设，落到下面跟随人设。
+            else:
+                return override
         source = getattr(self, "persona_source", None)
         if source is not None:
             try:
@@ -571,7 +608,7 @@ class HumanoidCoreInstance:
         洗过一遍，这里再洗一遍：指令层洗过的不能代表所有调用方。
         清洗后为空（含代词、换行、引号、控制字符）→ **不改动现有设定**并返回 None。
         """
-        raw = str(name or "").strip()
+        raw = strip_command_words(name)
         if raw in ("", "清除", "默认", "跟随", "跟随人设", "无"):
             self._scope.set_self("char_name_override", "")
             return ""

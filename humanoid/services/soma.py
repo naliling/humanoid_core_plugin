@@ -128,6 +128,24 @@ class SomaService:
         """当前时刻（走注入的时间源，仿真里可信）。"""
         return float(self._time())
 
+    def _drowsy_peak_now(self) -> bool:
+        """现在是不是「可以说困得不行」的时候。
+
+        两条任一成立：已经 21 点以后 / 凌晨 6 点以前；或者醒了 16 小时以上。
+        下午五点、醒了十三小时——那是「有点困」，不是「困得不行」。
+        """
+        try:
+            moment = self._moment_at(self.now)
+        except Exception:
+            return True  # 拿不到时间就别因为这一条把体感吞掉
+        if moment.hour >= 21 or moment.hour < 6:
+            return True
+        try:
+            awake_hours = (self.now - float(self.data.get("last_wake_at", 0.0) or 0.0)) / 3600.0
+        except (TypeError, ValueError):
+            return True
+        return awake_hours >= 16.0
+
     def _ensure_data(self) -> dict[str, Any]:
         """拿到 `soma` 子字典，必要时建一个。**写路径**才用它。"""
         raw = self._scope.get_self("soma")
@@ -705,7 +723,14 @@ class SomaService:
             out.append((_clamp(score, 0.0, top), word))
             return word
 
-        say("sleepy", snap["sleep_pressure"], 50.0, 45.0, 0.95)
+        # 睡眠压力顶格以后，措辞就永远停在「困得不行」——下午五点和凌晨两点说同一句，
+        # 用户的原话是「困意太随意」。真实的人在下午只是「有点困」，那句「困得不行」要等
+        # 真的撑不住：很晚了（21 点后），或者已经醒了 16 小时以上。
+        # 只压**说法**，不压数值：这一项照旧往上走，睡眠判定与日程不受影响。
+        pressure = float(snap["sleep_pressure"])
+        if pressure >= 88.0 and not self._drowsy_peak_now():
+            pressure = 87.0
+        say("sleepy", pressure, 50.0, 45.0, 0.95)
 
         debt = snap["sleep_debt"]
         if debt >= 1.0:

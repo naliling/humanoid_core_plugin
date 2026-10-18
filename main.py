@@ -223,8 +223,23 @@ def _append_framing(req: Any, char_name: str = "", user_name: str = "") -> None:
     req.system_prompt = current + build_framing(char_name, user_name)
 
 
+# 「你在干嘛 / 在忙什么」这类问法：只有被问到，才把「她这会儿正在X」写进去。
+# 为什么不一贯写：这句话每轮都在，而 X 一挂就是几个小时，模型就每一条都提一句
+# 「我在忙」「正在热餐」——用户的原话是「忙就忙呗，人家忙着关我啥事」。
+# 不问就不说；问了答得出（`/查看日程` 也照常有）。
+_ASK_ACTIVITY = (
+    "干嘛", "干啥", "干什么", "做什么", "在忙", "忙什么", "忙啥", "忙吗", "忙不忙",
+    "在做什么", "在干什么", "干啥呢", "忙完了", "忙完了吗",
+)
+
+
+def _asked_about_activity(text: str) -> bool:
+    body = (text or "").strip()
+    return bool(body) and any(word in body for word in _ASK_ACTIVITY)
+
+
 def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "",
-                is_group: bool = False) -> str:
+                is_group: bool = False, said: str = "") -> str:
     """I1/I2：算「此刻的她」那一段（关系阶段 + 心境 + 她这会儿在过什么）。
 
     它每轮都在变，调用方把它当临时内容块发出去（不落会话历史），不写进 system_prompt——
@@ -257,7 +272,7 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
             slot = core.schedule.current_slot() or {}
             event = str(slot.get("event", "") or "").strip()
             loc = str(slot.get("location", "") or "").strip()
-            if event:
+            if event and _asked_about_activity(said):
                 day = f"她这会儿正在{event}" + (f"（{loc}）" if loc else "")
         except Exception:
             day = ""
@@ -1240,7 +1255,9 @@ class HumanoidCore(Star):
                 # 拿不到——它会自己编。所以没有事实就不要宣告。
                 _append_framing(req, char_name, user_name)
                 # 「此刻的她」与身体事实走临时内容块：只发给模型、不落历史。
-                state_note = _state_note(core, user_id, char_name, user_name, is_group=is_group)
+                state_note = _state_note(
+                    core, user_id, char_name, user_name, is_group=is_group, said=said
+                )
                 parts = getattr(req, "extra_user_content_parts", None)
                 if not isinstance(parts, list):
                     parts = []
