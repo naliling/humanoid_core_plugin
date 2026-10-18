@@ -49,12 +49,6 @@
     "type": "string",
     "default": "劳逸结合，有动有静，节奏均衡。"
   },
-  "message_merge_enabled": {
-    "description": "消息合并",
-    "hint": "把连着发的几条并成一条处理",
-    "type": "bool",
-    "default": true
-  },
   "input_state_enabled": {
     "description": "输入状态（正在输入）",
     "hint": "私聊里她写回复的那几秒，QQ 会显示她正在输入。仅 NapCat（aiocqhttp）生效，其它平台自动跳过",
@@ -85,45 +79,6 @@
       "min": 10.0,
       "max": 600.0,
       "step": 5.0
-    }
-  },
-  "message_merge_timeout_seconds": {
-    "description": "【进阶】拿不准时等多久(秒)",
-    "hint": "判不出「说完了没」时最多等几秒",
-    "type": "float",
-    "default": 3.0,
-    "minimum": 0,
-    "maximum": 30,
-    "slider": {
-      "min": 0,
-      "max": 30,
-      "step": 0.2
-    }
-  },
-  "message_merge_settle_seconds": {
-    "description": "【进阶】说完了也再等一拍(秒)",
-    "hint": "已经说完的消息也等这么点时间，看有没有连发的下一句——不然用户快速发三条完整消息会被回三次。设 0 = 说完就发（旧行为）。",
-    "type": "float",
-    "default": 1.5,
-    "minimum": 0,
-    "maximum": 10,
-    "slider": {
-      "min": 0,
-      "max": 10,
-      "step": 0.1
-    }
-  },
-  "message_merge_max_count": {
-    "description": "【进阶】一批最多几条",
-    "hint": "防止刷屏把上下文撑爆，只保留最近这么多条。默认 6。",
-    "type": "int",
-    "default": 6,
-    "minimum": 1,
-    "maximum": 50,
-    "slider": {
-      "min": 1,
-      "max": 50,
-      "step": 1
     }
   },
   "inject_activity_context": {
@@ -734,6 +689,19 @@
       "step": 5
     }
   },
+  "stale_user_retention_days": {
+    "description": "【进阶】整条用户记录保留(天)",
+    "hint": "只剩称呼/初遇时间、没有可清理内容的用户，不活跃超过这么多天就整条删掉。原来写死 90 天，是 state.json 涨到几 MB 的主因",
+    "type": "int",
+    "default": 30,
+    "minimum": 0,
+    "maximum": 365,
+    "slider": {
+      "min": 0,
+      "max": 365,
+      "step": 5
+    }
+  },
   "auto_nickname": {
     "description": "自动认定称呼",
     "hint": "对方没设过称呼时，要不要从资料里认一个",
@@ -754,9 +722,9 @@
   },
   "social_energy_consumption_per_msg": {
     "description": "【进阶】每条消息耗能",
-    "hint": "0.05~1.0：越小越耐聊。高频聊天场景建议 0.05。",
+    "hint": "每条消息扣多少。要和「每分钟回血」一起看：只有「每条 × 每小时消息数」大于「回血 × 60」，她才会真的累下去；小于的话她会永远满格，这个机制等于不存在",
     "type": "float",
-    "default": 0.05,
+    "default": 0.5,
     "minimum": 0,
     "maximum": 1.0,
     "slider": {
@@ -767,9 +735,9 @@
   },
   "social_energy_recovery_per_minute": {
     "description": "【进阶】每分钟回血",
-    "hint": "0.1~3.0：越大，冷场后越快缓过来。",
+    "hint": "每分钟回多少。和「每条消息耗能」一起决定她多久会累：回血速率大于消耗速率时她一直满格（机制等于不存在）",
     "type": "float",
-    "default": 1.5,
+    "default": 1.0,
     "minimum": 0,
     "maximum": 3.0,
     "slider": {

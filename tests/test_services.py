@@ -545,7 +545,12 @@ class SocialEnergyTest(unittest.IsolatedAsyncioTestCase):
         return service, store, clock
 
     async def test_consume_and_recover(self):
-        service, _, _ = self.build(cfg(social_energy_consumption_per_msg=1.0))
+        # 两个速率都显式给：v2.27.38 把默认值从 0.05/1.5 校准成 0.5/1.0（原来回血是
+        # 消耗的几十倍，能量恒为 100，整个机制等于不存在）。这条测的是**换算关系**，
+        # 不是默认值，所以不该跟着默认值一起飘。
+        service, _, _ = self.build(
+            cfg(social_energy_consumption_per_msg=1.0, social_energy_recovery_per_minute=1.5)
+        )
         self.assertEqual(service.value, 100.0)
         for _ in range(10):
             service.consume_for_message()

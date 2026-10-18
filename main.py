@@ -32,7 +32,6 @@ from .humanoid.persona import PersonaSource
 from .humanoid.role_manager import RoleManager
 from .humanoid.state import StateStore
 from .humanoid.clock import Clock
-from .humanoid.debounce import MERGE_EXTRA_KEY, Debouncer
 from .humanoid.input_state import InputStateNotifier
 from .humanoid import memory_link
 
@@ -265,32 +264,6 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
         return ""
 
 
-def _apply_merged_prompt(event: Any, req: Any) -> None:
-    """把这一批里更早的几条原话前置进 req.prompt，让模型一次看到全部。
-
-    防抖胜出的那条（最后到达）自己的话已经是 req.prompt；更早那几条通过事件 extra 传进来，
-    按时间正序放到它前面。只 prepend、不覆盖，保住 AstrBot 已经做过的 prompt 前缀处理。
-    """
-    getter = getattr(event, "get_extra", None)
-    if not callable(getter):
-        return
-    try:
-        earlier = getter(MERGE_EXTRA_KEY)
-    except Exception:
-        earlier = None
-    if not earlier or not isinstance(earlier, list):
-        return
-    if not hasattr(req, "prompt"):
-        return
-    current = getattr(req, "prompt", "") or ""
-    lines = [str(x) for x in earlier if str(x).strip()]
-    if not lines:
-        return
-    if current:
-        lines.append(current)
-    req.prompt = "\n".join(lines)
-
-
 def _response_text(response: Any) -> str:
     """从 LLM 响应里取她真正输出的话。取不到就空串——**不拿对象 repr 冒充**。
 
@@ -390,8 +363,6 @@ class HumanoidCore(Star):
             interval=self._config.input_state_interval_seconds,
             timeout=self._config.input_state_timeout_seconds,
         )
-        # 多消息合并（防抖）的按会话状态；进程内内存，键是 unified_msg_origin。
-        self._debounce = Debouncer(lambda: self._config, logger)
         # 记忆联动的桥接对象：懒解析一次（插件加载顺序不保证，构造时对面可能还没就绪）。
         self._memory_bridge_obj: Any = None
         self._memory_bridge_resolved = False
@@ -490,9 +461,6 @@ class HumanoidCore(Star):
             core.schedule.current_slots()
 
     async def terminate(self) -> None:
-        # 合并缓冲里可能还压着没发出的内容（用户发了半句就没下文了）。卸载时丢掉是对的：
-        # 它的主人已经不在了，放到下一个会话里说出去反而是惊吓。
-        self._debounce.reset()
         await self._input_state.stop_all()
         await self.role_manager.stop()
         await self._state_store.stop()
@@ -921,8 +889,6 @@ class HumanoidCore(Star):
             yield event.plain_result(NO_PERMISSION)
             return
         self._config_box.reload()
-        # 合并等待秒数可能被改了，把压着的半句清掉，免得它按旧配置等完才发。
-        self._debounce.reset()
         self._input_state.configure(
             self._config.input_state_interval_seconds,
             self._config.input_state_timeout_seconds,
@@ -1181,8 +1147,6 @@ class HumanoidCore(Star):
             is_group = not _is_private_chat(event)
             if not self.engine.environment_allows(not is_group):
                 return
-            # 多消息合并：若本次是防抖胜出的合并回复，把更早那几条前置进 prompt。
-            _apply_merged_prompt(event, req)
             core = self.role_manager.get_or_create(self._self_id(event))
             user_id = self._sender(event)
             text = (getattr(event, "message_str", "") or "").strip()
@@ -1194,9 +1158,7 @@ class HumanoidCore(Star):
                 if callable(stopper):
                     stopper()
                 return
-            # 注意力（上心程度）要看用户到底说了什么：合并了几条时看合并后的全貌，
-            # 否则前几条里的问句、提到的话题都不参与判断，注意力会被算低。
-            said = self._debounce.peek_text(event, text)
+            said = text
             # 对话对方的名字：开关开着才用真名（默认关=写「TA」）。取的是**这条消息的
             # 发送者名**——群聊是群名片、私聊是 QQ 昵称，不依赖 AstrBot 的任何配置开关。
             user_name = ""
@@ -1362,75 +1324,6 @@ class HumanoidCore(Star):
         except Exception:
             pass
         return out
-
-    @filter.on_waiting_llm_request()
-    async def debounce_merge(self, event: AstrMessageEvent):
-        """把同一会话连续触发机器人的多条消息合并成一次回复。
-
-        放这个钩子有三个原因：
-
-        1. 它只在**确定要调 LLM** 时才触发，指令不会走到这里（否则 `/好感度` 也会被等 3 秒）。
-        2. 它在**抢会话锁之前**：等一句不占锁，也不挡别的会话。
-        3. 同一会话的多条消息各自是并发的 pipeline 任务（event_bus 用 create_task 派发），
-           所以等的时候后面的消息能进来把自己顶掉。
-
-        判定「这句话说完了吗」用 `humanoid/merge.py` 的规则而不是固定时间窗：句末有标点或
-        语气词的消息等一个短确认窗口（`message_merge_settle_seconds`），拿不准的等满
-        `message_merge_timeout_seconds`。两者都会把等待期间到达的后续句并进来——
-        「用户发三条、他就回三条」正是因为第一条说完就被零延迟放走了。
-
-        被合并掉的旧消息走 `stop_event()`，它**没有走到 on_llm_request**（所以不会被注入
-        事实块），但 `on_message` 照旧逐条记账——身体/情绪/记忆按每条真实发言算，
-        只有「回复」是合一的。内容不会丢：一直在 buffer 里，由胜出者带走。
-        """
-        try:
-            cfg = self._config
-            if not cfg.message_merge_enabled:
-                return
-            is_group = not _is_private_chat(event)
-            if not self.engine.environment_allows(not is_group):
-                return
-            text = (getattr(event, "message_str", "") or "").strip()
-            if not text:
-                # 只对纯文本消息做合并；图片/语音这类照常单独回复。
-                return
-            # 防御：真指令不该进合并（框架上指令不走到 LLM 阶段，但插件委托的
-            # provider_request 可能从其他路径进来）。命中指令名单时直接放行。
-            if _is_command_message(text, bool(getattr(event, "is_at_or_wake_command", True))):
-                return
-            # 只对同一会话做合并，但**分桶的键要带上发送者**：
-            # 群里一个 umo 下所有人共用一格，原来只按 umo 合并，会把 A 一句 B 一句
-            # 拼成一条批处理——模型拿到两个不相干的人的话，分不清在回谁，
-            # 于是写一条长消息把人逐个回一遍（比不合并还糟）。
-            # 按（会话, 发送者）分开：同一个人连发才合并，不同的人各回各的。
-            try:
-                umo = str(getattr(event, "unified_msg_origin", "") or "")
-            except Exception:
-                umo = ""
-            try:
-                sender_id = str(self._sender(event) or "")
-            except Exception:
-                sender_id = ""
-            # **跳过自己发的**。`on_message` 有这道检查，合并这里原来没有——
-            # 于是她自己在群里说的每句话（尤其是主动消息插件发的那些）都可能被
-            # 攒进 buffer 当成「用户刚说了什么」，表现出来就是**随时都在触发**，
-            # 而且模型分不清那是不是在回对方。
-            if sender_id and sender_id == str(self._self_id(event)):
-                return
-            # 兄弟 bot 的消息也不进合并：那是机器人，不是「用户刚说了什么」。
-            if sender_id and sender_id in self._known_role_ids(exclude=str(self._self_id(event))):
-                return
-            if not umo:
-                return
-            key = f"{umo}|{sender_id}" if sender_id else umo
-            proceed = await self._debounce.hold(
-                event, key=key, text=text, stop_event=event.stop_event,
-                sender=_sender_name(event) or "TA",
-            )
-            if not proceed:
-                return
-        except Exception as e:
-            logger.warning(f"{LOG_PREFIX} 消息合并失败: {e}")
 
 
     # -------------------- 消息事件监听 --------------------

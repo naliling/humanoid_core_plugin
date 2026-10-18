@@ -411,6 +411,38 @@ class SocialSignals:
                     return 0
         return 0
 
+    def ignored_by_map(self, role_id: str = "") -> dict[str, int]:
+        """整个 `ignored_by` 表（uid -> 累计次数），**一次读取**。
+
+        `ignored_by_uid` 是「问一个人」，每问一次都要走一遍 `read()`（一次路径拼装 +
+        一次 `stat`）。`_apply_ignored_affection` 按用户全量问一遍，7062 个用户就是
+        7062 次 `read()`——实测 1.5 秒，而那段代码跑在**事件循环**上，整台 AstrBot
+        陪它一起停：消息不回、LLM 不调，看门狗日志里就是 `Event loop stalled for 30s`。
+
+        这里反过来：读一次，把表整个拿走。调用方仍然按自己的用户集合去取，
+        所以「只给本角色认识的人记账」这条没有变。
+        """
+        try:
+            data = self.read()
+        except Exception:
+            return {}
+        out: dict[str, int] = {}
+        for slot in self._slots(data, role_id):
+            if not isinstance(slot, dict):
+                continue
+            by = slot.get("ignored_by")
+            if isinstance(by, dict):
+                for uid, raw in by.items():
+                    try:
+                        count = int(raw or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if count > 0:
+                        out[str(uid or "")] = count
+                # 与 `ignored_by_uid` 同口径：只看第一个带表的槽，后面的不叠。
+                return out
+        return out
+
     def open_items(self, role_id: str = "") -> list[dict[str, Any]]:
         """社交层发布的「她手上还开着的事」：`[{"text","uid","at","src"}, ...]`。
 

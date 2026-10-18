@@ -320,7 +320,8 @@ RETENTION_DROPPED_FIELDS = (
 # 无效，原来的 `prune_expired` 直接 `continue`，于是它们永久留在 state.json 里。
 # 名单之外还有别的键（亲密计数、情绪记忆…）就保留：「有好感/有记忆的用户」不删。
 _STALE_SHELL_FIELDS = ("nickname", "nickname_src", "first_met", "last_interaction")
-# 整条删除的静默期（天）。配置项由主会话另行添加，这里先用常量。
+# 整条删除的静默期（天）的**兜底值**。真正的取值来自配置项
+# `stale_user_retention_days`（v2.27.38 起可配；之前这里是唯一来源、写死 90 天）。
 STALE_USER_RETENTION_DAYS = 90
 
 # 自动认定称呼的硬性门槛：来源是消息带的名字（群聊是群名片、私聊是 QQ 昵称），
@@ -1046,7 +1047,15 @@ class MoodService:
 
         now = self._time() if now is None else float(now)
         cutoff = now - days * 86400.0
-        stale_cutoff = now - STALE_USER_RETENTION_DAYS * 86400.0
+        # 整条删除的静默期可配（v2.27.38）：写死 90 天时，一个 bot 攒到 7000+ 用户、
+        # state.json 2.5 MB 也清不下来。配了非正数就退回常量（= 保持旧行为）。
+        try:
+            stale_days = int(getattr(cfg, "stale_user_retention_days", STALE_USER_RETENTION_DAYS))
+        except (TypeError, ValueError):
+            stale_days = STALE_USER_RETENTION_DAYS
+        if stale_days <= 0:
+            stale_days = STALE_USER_RETENTION_DAYS
+        stale_cutoff = now - stale_days * 86400.0
         pruned = 0
         for uid in self._scope.all_user_ids():
             user_state = self._scope.user_state(uid)

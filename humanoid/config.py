@@ -280,13 +280,6 @@ class HumanoidConfig:
     weather_location: str = ""
     weather_refresh_minutes: int = 60
 
-    # 多消息合并（防抖）：连续触发机器人的多条消息，合并成一次模型请求、只回一条。
-    # 判定「说完了吗」用规则（humanoid/merge.py）而不是固定时间窗：句末有标点/语气词的
-    # 零延迟放行，只有像「今天真的好累啊」这种拿不准的才等一句。整体做法参考
-    # astrbot_plugin_debounce，但它靠 BERT 模型（要 onnxruntime+transformers+modelscope
-    # 四个依赖、运行时再从 ModelScope 拉模型），本机实测装那几个包跑了 5 分钟没装完，
-    # 拉不到模型还会静默失效，所以不引入。
-    message_merge_enabled: bool = True
     # 输入状态（正在输入）。
     #
     # 回复期间向 QQ 报「正在输入」，做法照市场插件 astrbot_plugin_input_state_by_nc：
@@ -296,19 +289,6 @@ class HumanoidConfig:
     input_state_enabled: bool = True
     input_state_interval_seconds: float = 0.5
     input_state_timeout_seconds: float = 120.0
-    # 规则判不出来时（没标点、长度中等）最多等这么久，等后续那句一起并进来。
-    # 0 = 不等待，等于只看标点。
-    message_merge_timeout_seconds: float = 3.0
-    # 已经说完的消息也再等一小拍，看有没有连发。
-    #
-    # 原来「句末有标点/语气词」是零延迟直接发的——那对「一句话」确实最快，
-    # 但用户快速连发三条完整消息时，第一条立刻就被放走了，时机已经错过，
-    # 后两条只能各自回一次，防抖等于没开。所以完整消息也要等一个短确认窗口：
-    # 窗口内没有新消息就发（只多这么多延迟），有新消息就把它们并成一条。
-    # 0 = 恢复到旧行为（完整消息零延迟）。
-    message_merge_settle_seconds: float = 1.5
-    # 一批最多合并多少条：防刷屏把 prompt 撑爆，只保留最近这么多条。
-    message_merge_max_count: int = 6
 
     inject_activity_context: str = "medium"
     # 注入的 Token 硬预算：超了按显著度从低到高丢句，必需品（时间/称呼/场景）永不丢。
@@ -376,6 +356,11 @@ class HumanoidConfig:
     mood_verbose_log: bool = False
     mood_enabled_in_group: bool = False
     mood_data_retention_days: int = 7
+    # 整条用户记录的静默期（天）：只剩称呼/初遇时间这种「没有可清理内容」的条目，
+    # 不活跃超过这么久就**整条删掉**。原来写死 90 天（`mood.STALE_USER_RETENTION_DAYS`，
+    # 代码注释里就写着「配置项由主会话另行添加」）——一个 bot 攒到 7000+ 用户、
+    # state.json 2.5 MB，就是这个数字撑出来的。0 = 永不整条删除（不推荐）。
+    stale_user_retention_days: int = 30
     # 自动认定称呼：用户还没设过称呼时，从消息带的名字（群聊优先群名片）认一次怎么叫 TA。
     # 只填空白、门槛很严、认过之后永不改动——用户 /叫我 设的更不会被它碰。
     auto_nickname: bool = True
@@ -384,8 +369,18 @@ class HumanoidConfig:
     auto_identify_user: bool = False
 
     social_energy_enabled: bool = True
-    social_energy_consumption_per_msg: float = 0.05
-    social_energy_recovery_per_minute: float = 1.5
+    # 社交能量：这两个数**必须和群里的实际消息量对得上**，否则整个机制等于不存在。
+    #
+    # 原来 0.05/条 + 1.5/分钟（= 90/小时）。线上 4 个号一天上万条消息，也就是每分钟
+    # 好几条；每条扣 0.05、每分钟回 1.5——回血速度是消耗的几十倍，于是六个角色的
+    # `social_energy` 长期恒等于 100.0，`behavior.py` 里 <30 / <60 / >85 三档判定和
+    # `soma.form_policy` 永远走同一支。面板上 5 个开关，实际零影响。
+    #
+    # 校准方法：把「每条扣多少 × 每小时消息数」和「每分钟回血 × 60」放一起看——
+    # 只有消耗速率**大于**回血速率，她才会真的累下去。0.5/条 + 1.0/分钟下，
+    # 一小时 140 条 ≈ 扣 70、回 60，净掉 10；安静下来约 100 分钟回满。
+    social_energy_consumption_per_msg: float = 0.5
+    social_energy_recovery_per_minute: float = 1.0
     social_energy_reset_hour: int = 0
     social_energy_recovery_interval_seconds: int = 60
 
@@ -506,13 +501,9 @@ class HumanoidConfig:
             weather_api_key=s_opt("weather_api_key"),
             weather_location=s_opt("weather_location"),
             weather_refresh_minutes=i("weather_refresh_minutes", 1, 1440),
-            message_merge_enabled=b("message_merge_enabled"),
             input_state_enabled=b("input_state_enabled"),
             input_state_interval_seconds=f("input_state_interval_seconds", 0.1, 10.0),
             input_state_timeout_seconds=f("input_state_timeout_seconds", 10.0, 600.0),
-            message_merge_timeout_seconds=f("message_merge_timeout_seconds", 0.0, 30.0),
-            message_merge_settle_seconds=f("message_merge_settle_seconds", 0.0, 10.0),
-            message_merge_max_count=i("message_merge_max_count", 1, 50),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
             # 这一项曾经是 113 个字段里唯一不走 i()/f() 的（直接 int(src.get(...))），
             # 面板里填个 'abc' 或 '3000.0' 就会抛 ValueError 一路冒到 initialize()，
@@ -570,6 +561,7 @@ class HumanoidConfig:
             mood_verbose_log=b("mood_verbose_log"),
             mood_enabled_in_group=b("mood_enabled_in_group"),
             mood_data_retention_days=i("mood_data_retention_days", 0, 365),
+            stale_user_retention_days=i("stale_user_retention_days", 0, 365),
             auto_nickname=b("auto_nickname"),
             auto_identify_user=b("auto_identify_user"),
             social_energy_enabled=b("social_energy_enabled"),

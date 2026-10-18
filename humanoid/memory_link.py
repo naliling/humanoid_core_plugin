@@ -53,6 +53,9 @@ READ_CACHE_MAX_ENTRIES = 256
 FAIL_MISSING = "missing"      # 注册表里没有它（没装 / 未激活 / 宿主没有注册表 API）
 FAIL_SIGNATURE = "signature"  # 找到了它，但桥接工厂或所需方法不可调用（接口对不上）
 FAIL_EXCEPTION = "exception"  # 注册表、工厂或桥接方法调用时抛了异常
+# 对面装了、也激活了，但把桥接开关关了（`private_companion_bridge.enabled`）。
+# 这是**用户在配置页上做的一个选择**，不是故障——降级到「没有记忆」是预期行为。
+FAIL_DISABLED = "disabled"
 
 _THROTTLE_WINDOW_SECONDS = 600.0
 #: 最近一次失败分类 + 原因；空串表示这轮没出过问题。
@@ -98,7 +101,8 @@ def last_error() -> str:
 def _note_failure(reason: str, detail: str) -> None:
     """记一次失败：留痕（`last_error`）总是更新，日志按同类窗口限流。
 
-    「没装」是正常降级，走 debug；「签名不符」「调用抛异常」是真故障，走 warning。
+    「没装」和「对面关了桥接」都是正常降级，走 debug；
+    「签名不符」「调用抛异常」是真故障，走 warning。
     """
     global _LAST_ERROR
     _LAST_ERROR = f"{reason}: {detail}"
@@ -109,7 +113,7 @@ def _note_failure(reason: str, detail: str) -> None:
         + _THROTTLE.summary(reason)
     )
     try:
-        if reason == FAIL_MISSING:
+        if reason in (FAIL_MISSING, FAIL_DISABLED):
             logger.debug(message)
         else:
             logger.warning(message)
@@ -167,8 +171,14 @@ def _bridge_from(meta: Any) -> Optional[Any]:
         _note_failure(FAIL_EXCEPTION, f"get_memory_companion_bridge() 抛异常：{_brief(exc)}")
         return None
     if bridge is None:
+        # 工厂返回 None 只说明 `_ACTIVE_BRIDGE` 是空的，而那个变量由**对面的配置开关**
+        # 决定：`private_companion_bridge.enabled` 关掉时它被设成 None（见它 main.py
+        # 里那行赋值）。所以这里不是「接口签名不符」，而是「对面没开桥接」——用户自己
+        # 的选择。按 WARNING 报会在日志里刷成故障，按 debug 记并把开关名写出来。
         _note_failure(
-            FAIL_SIGNATURE, "get_memory_companion_bridge() 返回 None（对面尚未就绪）"
+            FAIL_DISABLED,
+            "memory_companion 的桥接开关是关的（配置页「记忆插件协同 → 启用桥接 API」"
+            "= private_companion_bridge.enabled）；要用记忆就把那个开关打开",
         )
     return bridge if bridge is not None else None
 

@@ -19,7 +19,7 @@ desc: |
   写回去；没装也照常跑。
 
   使用轻量 配置不复杂 需要调的东西就一些 额外的都标上【进阶】。
-version: 2.27.33
+version: 2.27.38
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"

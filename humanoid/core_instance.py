@@ -1035,8 +1035,16 @@ class HumanoidCoreInstance:
         增量去重，所以每轮重复调用是安全的。
         """
         try:
+            # **读一次**，再按本角色的用户集合去取。原来是对每个用户各调一次
+            # `ignored_by_uid`，而那个方法每次都 `read()` 一遍（路径拼装 + stat）：
+            # 7062 个用户 = 7062 次 read，实测 1.5 秒。这段代码跑在**事件循环**上，
+            # 于是每个 tick 都把整台 AstrBot 冻住一次——消息回不出去、LLM 不调用，
+            # 看门狗日志里写的就是 `Event loop stalled for 30s`。
+            ignored = self.signals.ignored_by_map(self.role_id)
+            if not ignored:
+                return
             for uid in self.scope.all_user_ids():
-                per = self.signals.ignored_by_uid(uid, self.role_id)
+                per = ignored.get(uid, 0)
                 if per > 0:
                     self.mood.note_ignored_by_peer(uid, per)
         except Exception as exc:
@@ -1446,15 +1454,28 @@ class HumanoidCoreInstance:
         """
         while not self._stop_event.is_set():
             cfg = self.config
+            started = time.monotonic()
             try:
                 if cfg.soma_enabled:
                     self.soma.advance()
+                    # 每步之间把控制权交还事件循环：这几步都是同步 IO / 计算，连在一起
+                    # 跑就会把消息处理整段冻住（`sleep(0)` 只是让出，不真的睡）。
+                    await asyncio.sleep(0)
                     self._apply_social_signals()
+                    await asyncio.sleep(0)
                 self.energy.advance()
                 self.energy.advance_cycle()
+                await asyncio.sleep(0)
                 self.refresh_contract()
             except Exception as exc:
                 self._log.warning(f"{LOG_PREFIX} 身体推进失败: {exc}")
+            elapsed = time.monotonic() - started
+            if elapsed > 2.0:
+                # 留一条线：以后再往身体推进里塞同步重活，日志里能直接看到秒数，
+                # 不用再去翻 event_loop_watchdog 的线程栈。
+                self._log.warning(
+                    f"{LOG_PREFIX} 身体推进耗时 {elapsed:.1f} 秒（事件循环被占用，消息要排队）"
+                )
             try:
                 interval = max(15.0, float(cfg.body_tick_seconds))
             except Exception as exc:

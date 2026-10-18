@@ -570,16 +570,28 @@ class StaleShellPrune(unittest.TestCase):
         svc, _clock = _svc()
         svc.profile("7")
         svc._scope.set_user("7", "nickname", "阿哲")
-        self._stale(svc, "7", 30)
+        # 10 天：情绪档案（7 天窗口）该清掉，但记录还在（整条删除的窗口默认 30 天）
+        self._stale(svc, "7", 10)
         self.assertEqual(svc.prune_expired(), 1, "情绪档案该被清掉")
         state = svc._scope.user_state("7")
         self.assertNotIn("mood", state)
         self.assertIsNotNone(state.get("last_interaction"), "没留下下次判定的时间戳")
-        self.assertEqual(svc.prune_expired(), 0, "还没到 90 天")
+        self.assertEqual(svc.prune_expired(), 0, "还没到整条删除的窗口")
         self.assertEqual(
-            svc.prune_expired(now=svc._time() + 91 * 86400.0), 1, "90 天后该整条删除"
+            svc.prune_expired(now=svc._time() + 31 * 86400.0), 1, "过了窗口该整条删除"
         )
         self.assertNotIn("7", svc._scope.all_user_ids())
+
+    def test_retention_window_is_configurable(self):
+        """整条删除的静默期现在是配置项（v2.27.38）。原来写死 90 天，面板上改不动——
+        一个 bot 攒到 7000+ 用户、state.json 2.5 MB 就是这么来的。"""
+        svc, _clock = _svc(stale_user_retention_days=5)
+        self._stale(svc, "x", 6, nickname="小明")
+        self.assertEqual(svc.prune_expired(), 1, "窗口 5 天时，6 天前的空壳该被删")
+
+        svc2, _clock2 = _svc(stale_user_retention_days=5)
+        self._stale(svc2, "y", 4, nickname="小明")
+        self.assertEqual(svc2.prune_expired(), 0, "窗口内不该删")
 
 
 class IgnoredSeenRetention(unittest.TestCase):

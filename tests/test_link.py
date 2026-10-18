@@ -410,6 +410,42 @@ class SignalsTest(unittest.TestCase):
         after = float(core.mood.profile("42")["affection"])
         self.assertLess(after, before, "被冷落 3 次该让好感往下走")
 
+    def test_apply_ignored_affection_reads_signals_once(self):
+        """用户数不该等于 `read()` 次数。
+
+        原来按 `all_user_ids()` 逐个调 `ignored_by_uid`，而那个方法每次都要走一遍
+        `read()`（路径拼装 + stat）。线上 `3632823490` 这个角色有 7062 个用户，
+        实测 1.5 秒；这段代码跑在**事件循环**上，于是每个 tick 都把整台 AstrBot
+        冻住一次——消息回不出去、LLM 不调用，看门狗日志里就是
+        `Event loop stalled for 30s`。这里钉住：用户再多，`read()` 也只走一次。
+        """
+        harness = Harness()
+        core = harness.roles.get_or_create("bot1")
+        root = harness.root / "plugin_data" / SOCIAL_PLUGIN_DIR_NAME
+        root.mkdir(parents=True, exist_ok=True)
+        (root / SIGNALS_FILE_NAME).write_text(json.dumps({
+            "schema": 1,
+            "by_bid": {"bot1": {"ignored_streak": 2, "ignored_by": {"u1": 2}}},
+        }), encoding="utf-8")
+        for i in range(300):
+            core.mood.profile(f"u{i}")
+        core.mood.profile("u1")
+        before = float(core.mood.profile("u1")["affection"])
+        calls = {"n": 0}
+        original = core.signals.read
+
+        def counting_read():
+            calls["n"] += 1
+            return original()
+
+        core.signals.read = counting_read
+        core._apply_ignored_affection()
+        self.assertLessEqual(
+            calls["n"], 1, f"read() 被调了 {calls['n']} 次，不该随用户数线性增长"
+        )
+        after = float(core.mood.profile("u1")["affection"])
+        self.assertLess(after, before, "一次读取也要把被冷落真的记进好感账本")
+
     def test_ignored_streak_is_recorded_but_never_scripted(self):
         """被冷落要记进身体（给契约/诊断用），但不许变成台词或「所以别先开口」。"""
         harness = Harness()
