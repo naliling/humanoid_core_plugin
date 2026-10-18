@@ -14,12 +14,13 @@ v1.7.4 的社交层直接按结构读 Core 的 state.json（`roles[bid].self.ene
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .life_log import parse_open
 from .services.schedule import (
@@ -28,7 +29,11 @@ from .services.schedule import (
     sleep_spans,
 )
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
+#: 结构标识。社交层拿它和 `fields_hash` 一起做一致性校验（只告警 + 降级，不抛错）。
+CONTRACT_SCHEMA = "humanoid.contract/2"
+#: 这一版契约提供的能力。社交层按能力判断走哪条路，不靠版本号猜。
+CONTRACT_CAPABILITIES = ("body", "feelings", "form", "activity", "day", "ongoing", "routine")
 
 # 社交层写回的信号文件：超过这个秒数就不采信。
 #
@@ -83,7 +88,7 @@ def build_contract(core: Any) -> dict[str, Any]:
             feelings = []
     offset = now.utcoffset()
     zone = getattr(now.tzinfo, "key", "") or ""
-    return {
+    contract = {
         "v": CONTRACT_VERSION,
         "core_version": getattr(core, "version", "") or "",
         "generated_at": round(now.timestamp(), 1),
@@ -163,6 +168,34 @@ def build_contract(core: Any) -> dict[str, Any]:
             "user_said": "roles.<bid>.users.<uid>.said",
         },
     }
+    # ─── 握手三键（契约 v2）：只加不改 ───────────────────
+    #
+    # 社交层以前只能靠 `v >= 1` 猜「对面是不是新版本」，字段对不上时静默拿到 None。
+    # 这三键把「猜」变成「校验」：结构不一致能留一条能搜到的日志，而不是行为悄悄变了。
+    #
+    # `fields_hash` 只覆盖**结构**（键名），不含取值——取值随时在变，那是 `generated_at`
+    # 的活。所以它稳定、可缓存，只有真的增删字段时才会变。
+    contract["schema"] = CONTRACT_SCHEMA
+    contract["capabilities"] = list(CONTRACT_CAPABILITIES)
+    contract["fields_hash"] = _fields_hash(contract)
+    return contract
+
+
+def _fields_hash(contract: dict[str, Any]) -> str:
+    """结构指纹：排序后的「键路径」的 sha256 前 16 位。"""
+    paths: list[str] = []
+
+    def walk(node: Any, prefix: str) -> None:
+        if not isinstance(node, dict):
+            return
+        for key in sorted(node):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            paths.append(path)
+            walk(node[key], path)
+
+    walk(contract, "")
+    raw = "\n".join(sorted(paths)).encode("utf-8")
+    return "sha256:" + hashlib.sha256(raw).hexdigest()[:16]
 
 
 def _contract_weather(weather: Any) -> str:
@@ -443,31 +476,35 @@ class SocialSignals:
                 return out
         return out
 
-    def open_items(self, role_id: str = "") -> list[dict[str, Any]]:
+    def open_items(self, role_id: str = "") -> Optional[list[dict[str, Any]]]:
         """社交层发布的「她手上还开着的事」：`[{"text","uid","at","src"}, ...]`。
 
         这是 Core 唯一能拿到「跨轮未完事项」的通道。会话历史只留十几轮、超了就被压缩，
         压缩之后模型手上只剩用户刚说的那一句，于是每轮都绕着最后一句转；这份列表是
         **不被压缩影响**的那一份索引。
 
-        没有就返回空表。注意「空」有两种意思，调用方必须分得开（见 `life_log.merge_open`）：
+        返回值有**三种**，调用方必须分得开（见 `life_log.merge_open`）：
 
-        * 文件不存在 / 过期 / 读不到 → 空表示「**不知道**」，不能据此清掉已有账本；
-        * 文件新鲜但写方没写 `open_items` → 空表示「**确实没有了**」。
+        * `None` → 文件不存在 / 过期 / 读不到 / 写方根本没写这个键。表示「**不知道**」，
+          不能据此清掉已有账本；
+        * `[]` → 文件新鲜，写方明确写了一个空表。表示「**确实没有了**」；
+        * 非空 → 就是还开着的那几条。
 
-        这里读不出区别（都返回空表），所以清账的判断权在调用方手上，由它看
-        `read()` 是否拿到了新鲜 payload。字段只加不改：认不出的键、认不出的元素一律丢掉，
-        写方换成新版本也不会把 Core 读崩。
+        以前这三种全返回空表，于是「写方没写这个键」被当成「全结了」——换成一个还没
+        写 `open_items` 的旧版社交层，Core 每轮都会把她的未完事项整本清空一次。
+        字段只加不改：认不出的键、认不出的元素一律丢掉，写方换版本也不会把 Core 读崩。
         """
         try:
             data = self.read()
         except Exception:
-            return []
+            return None
         if not isinstance(data, dict):
-            return []
+            return None
         row = self._scope_of(data, role_id)
         if not isinstance(row, dict):
-            return []
+            return None
+        if "open_items" not in row:
+            return None
         return parse_open(row.get("open_items"))
 
     def _slots(self, data: Any, role_id: str = "") -> list:

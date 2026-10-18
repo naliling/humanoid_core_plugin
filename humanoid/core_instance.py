@@ -998,6 +998,9 @@ class HumanoidCoreInstance:
         # 「跨轮还记得什么」。挂在闸门后面的话，关掉身体层的人会连记忆一起静默失去——
         # 这两件事没有因果关系，只是当初顺手写在同一个函数里。
         self._ingest_open_items()
+        # 同理：按人扣好感写的是**情绪账本**，不是身体。关掉身体层的人照样该记
+        # 「她主动找了 TA、TA 没回」——这条以前也在闸门后面，于是被静默跳过。
+        self._apply_ignored_affection()
         if not self.config.soma_enabled:
             return
         try:
@@ -1012,8 +1015,6 @@ class HumanoidCoreInstance:
         except Exception as exc:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 应用冷落计数失败: {exc}")
-        # 按人把「被冷落」记进好感账本（这条链路 v2.27.0 起就该接上）
-        self._apply_ignored_affection()
         if at <= 0:
             return
         try:
@@ -1054,9 +1055,10 @@ class HumanoidCoreInstance:
     def _ingest_open_items(self) -> None:
         """把社交层发布的「她手上还开着的事」整本换进账本。
 
-        **只在信号文件新鲜时才换。** 文件不存在或过期时 `open_items()` 也返回空表，
-        但那个空表示「读不到」，不表示「全结了」——拿它当结论，社交层一停她的
-        未完事项就会被无声清空。那种情况下的兜底是 `life_log.OPEN_TTL_HOURS` 自己到期，
+        **只在信号文件新鲜、且写方真的写了这个键时才换。** 文件不存在或过期时
+        `open_items()` 返回 `None`，写方没写这个键时也是 `None`——那两种都表示「读不到」，
+        不表示「全结了」。拿它当结论，社交层一停（或换回一个不写 `open_items` 的旧版本）
+        她的未完事项就会被无声清空。那种情况下的兜底是 `life_log.OPEN_TTL_HOURS` 自己到期，
         不是这里替她做决定。
 
         整体替换（而不是并集）是这一层的核心：社交层那份列表**就是**「还开着」的定义，
@@ -1066,10 +1068,13 @@ class HumanoidCoreInstance:
         try:
             if not self.signals.is_fresh():
                 return
+            published = self.signals.open_items(self.role_id)
+            # `None` = 写方根本没写这个键（旧版社交层 / 只写了别的信号）。
+            # 那不是「全结了」，是「不知道」——拿它清账会把她的未完事项每轮清空一次。
+            if published is None:
+                return
             existing = self._scope.get_self(life_log.LIFE_KEY)
-            merged = life_log.merge_open(
-                existing, self.signals.open_items(self.role_id), self.now_epoch()
-            )
+            merged = life_log.merge_open(existing, published, self.now_epoch())
             if merged != existing:
                 self._scope.set_self(life_log.LIFE_KEY, merged)
         except Exception as exc:
@@ -1446,6 +1451,38 @@ class HumanoidCoreInstance:
             except asyncio.TimeoutError:
                 pass
 
+    async def _body_step(self) -> None:
+        """推进一格身体。抽出来是为了能被**单步**调用：整条 `_body_loop` 是个死循环，
+        而「关掉身体层之后社交信号还进不进得来」这件事必须在测试里跑一次真路径，
+        光看调用点缩进是测不出来的。"""
+        cfg = self.config
+        started = time.monotonic()
+        try:
+            if cfg.soma_enabled:
+                self.soma.advance()
+                # 每步之间把控制权交还事件循环：这几步都是同步 IO / 计算，连在一起
+                # 跑就会把消息处理整段冻住（`sleep(0)` 只是让出，不真的睡）。
+                await asyncio.sleep(0)
+            # 社交信号**不归身体层管**，所以必须在 `soma_enabled` 闸门之外：
+            # `_apply_social_signals` 自己的注释（见 997-1000）早就写明「未完事项账本
+            # 刻意放在闸门之前」，可它的唯一调用点却挂在闸门里面——关掉身体层的人
+            # 于是连「跨轮还记得什么」一起静默失去，而那两件事没有因果关系。
+            self._apply_social_signals()
+            await asyncio.sleep(0)
+            self.energy.advance()
+            self.energy.advance_cycle()
+            await asyncio.sleep(0)
+            self.refresh_contract()
+        except Exception as exc:
+            self._log.warning(f"{LOG_PREFIX} 身体推进失败: {exc}")
+        elapsed = time.monotonic() - started
+        if elapsed > 2.0:
+            # 留一条线：以后再往身体推进里塞同步重活，日志里能直接看到秒数，
+            # 不用再去翻 event_loop_watchdog 的线程栈。
+            self._log.warning(
+                f"{LOG_PREFIX} 身体推进耗时 {elapsed:.1f} 秒（事件循环被占用，消息要排队）"
+            )
+
     async def _body_loop(self):
         """身体的时间必须自己流动。
 
@@ -1454,28 +1491,7 @@ class HumanoidCoreInstance:
         """
         while not self._stop_event.is_set():
             cfg = self.config
-            started = time.monotonic()
-            try:
-                if cfg.soma_enabled:
-                    self.soma.advance()
-                    # 每步之间把控制权交还事件循环：这几步都是同步 IO / 计算，连在一起
-                    # 跑就会把消息处理整段冻住（`sleep(0)` 只是让出，不真的睡）。
-                    await asyncio.sleep(0)
-                    self._apply_social_signals()
-                    await asyncio.sleep(0)
-                self.energy.advance()
-                self.energy.advance_cycle()
-                await asyncio.sleep(0)
-                self.refresh_contract()
-            except Exception as exc:
-                self._log.warning(f"{LOG_PREFIX} 身体推进失败: {exc}")
-            elapsed = time.monotonic() - started
-            if elapsed > 2.0:
-                # 留一条线：以后再往身体推进里塞同步重活，日志里能直接看到秒数，
-                # 不用再去翻 event_loop_watchdog 的线程栈。
-                self._log.warning(
-                    f"{LOG_PREFIX} 身体推进耗时 {elapsed:.1f} 秒（事件循环被占用，消息要排队）"
-                )
+            await self._body_step()
             try:
                 interval = max(15.0, float(cfg.body_tick_seconds))
             except Exception as exc:

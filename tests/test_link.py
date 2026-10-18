@@ -707,9 +707,10 @@ class SignalsScopeAndTtlTest(unittest.TestCase):
 class SignalsUnreadableTest(unittest.TestCase):
     """文件在、时间也新鲜，但**读不出内容**——这一种不能报成 `fresh`。
 
-    `open_items()` 读不到时返回空表，和「写方说没有了」长得一模一样。这里若判成
-    `fresh`，`core_instance._ingest_open_items()` 就会拿这份空表去**整体替换**她的账本：
-    一个坏掉的 JSON 文件足以在无人知晓的情况下清空她记着的事。
+    `open_items()` 在读不到时返回 `None`（而不是空表），调用方据此知道「不知道」，
+    不会拿它去整体替换她的账本。这条契约是 v2.27.39 改的：以前三种情况全返回空表，
+    一个坏掉的 JSON、或者一个还没写 `open_items` 的旧版社交层，都足以在无人知晓的
+    情况下清空她记着的事。
     """
 
     def make(self, body: str = "", *, size: int = 0, as_dir: bool = False) -> Path:
@@ -729,7 +730,8 @@ class SignalsUnreadableTest(unittest.TestCase):
         signals = SocialSignals(lambda: self.make("{ 这不是 JSON"))
         self.assertFalse(signals.is_fresh())
         self.assertEqual(signals.status()["state"], "unreadable")
-        self.assertEqual(signals.open_items(), [])
+        # 读不到 = 「不知道」，不是「全结了」：必须是 None，不能是 []
+        self.assertIsNone(signals.open_items())
 
     def test_a_json_scalar_is_unreadable_not_fresh(self):
         signals = SocialSignals(lambda: self.make('"just a string"'))

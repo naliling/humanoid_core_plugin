@@ -61,6 +61,38 @@ def _pick(texts: Tuple[str, ...], index: int) -> str:
     return texts[max(0, index) % len(texts)]
 
 
+def ccb_coerced_within(
+    user_state: Any, moment: float, window: float = 3600.0
+) -> bool:
+    """这个人是不是**刚刚**被强迫过（`window` 秒内）。
+
+    `ccb_coerced_at` 有两个可能的位置，必须都认：
+
+    * `users.<uid>` 顶层——未来迁移后的位置，也是这里优先读的；
+    * `users.<uid>.mood` 子字典——**当前写侧实际写的就是这里**
+      （`services/mood.py::_apply_intimacy_request` 拿到的 `record` 就是那份 mood dict）。
+
+    以前只读顶层，两侧永不相等，于是「刚被强迫 → 本轮不进场景」这道安全阀恒为 False。
+    这是安全阀，不是功能开关：读错方向时它不会报错，只会静默失效。
+    """
+    if not isinstance(user_state, dict):
+        return False
+    raw = user_state.get("ccb_coerced_at")
+    if raw is None:
+        mood_state = user_state.get("mood")
+        if isinstance(mood_state, dict):
+            raw = mood_state.get("ccb_coerced_at")
+    if raw is None:
+        return False
+    try:
+        stamp = float(raw)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(stamp) or stamp <= 0:
+        return False
+    return (float(moment) - stamp) < float(window)
+
+
 class EmotionLayer:
     """按维度产出候选，带显著度，最后由调用方取最高的那一条。"""
 
@@ -451,10 +483,7 @@ class EmotionLayer:
         idx = int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big") % 2
         user_state = self._core._scope.user_state(user_id)
         _cfg = self._core.config
-        try:
-            coerced = (float(moment) - float(user_state.get("ccb_coerced_at", 0.0) or 0.0)) < 3600.0
-        except (TypeError, ValueError):
-            coerced = False
+        coerced = ccb_coerced_within(user_state, moment)
         # 门槛从配置取。写死在这个模块里的话，用户看到「够不着」却无处可调——
         # 而这个开关默认的 affection 门槛对多数人是永远够不着的。
         libido_min = getattr(_cfg, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN)

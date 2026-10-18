@@ -72,6 +72,35 @@ NO_PERMISSION = "❌ 权限不足，该指令仅管理员可用。"
 # 前置进 prompt。走事件自带的 extra、不走全局字典，合并数据随事件走，跨事件不会串。
 LOG_PREFIX = "[humanoid_core] "
 
+# -------------------- 跨插件门面（契约 v2 主路径） --------------------
+#
+# 别的插件怎么找到这里：宿主注册表 → `meta.star_cls.__module__` → `sys.modules[模块]`
+# → 调本模块的 `get_core_facade()`。这套写法本仓库已经给 memory_companion 用过一遍
+# （`humanoid/memory_link.py::find_memory_bridge`），社交层那边也有同一份。
+#
+# 为什么要有门面：社交层原来只能读写盘的 state.json 快照，会旧、形状靠猜、而且
+# 它自己另拼一套上下文。门面按需现算、结构化返回、框架句只有一份（见 `humanoid/api.py`）。
+_ACTIVE_PLUGIN: Any = None
+_FACADE: Any = None
+
+
+def get_core_facade() -> Any:
+    """给别的插件拿只读门面。插件还没起来时返回 None（对方会退回读文件）。"""
+    global _FACADE
+    plugin = _ACTIVE_PLUGIN
+    if plugin is None:
+        return None
+    try:
+        if _FACADE is None:
+            from .humanoid.api import get_core_facade as _build
+
+            _FACADE = _build(getattr(plugin, "role_manager", None), logger)
+        return _FACADE
+    except Exception as exc:  # 门面自身坏掉不该让调用方连坐
+        logger.debug(f"{LOG_PREFIX} 构建门面失败: {exc}")
+        return None
+
+
 # 默认值一次性迁移的标记文件。AstrBot 更新配置只补缺不覆盖，不调这一手的话老用户
 # 会永远停在装插件那一版的行为上。
 #
@@ -406,6 +435,12 @@ class HumanoidCore(Star):
             context, self._config_box, data_dir, logger, self._fetch_json, self.role_manager
         )
 
+        # 把活着的实例登记到模块级，供 `get_core_facade()` 取用。插件被卸载/重载时
+        # `terminate()` 会清掉它，否则别的插件会拿到一个已经停掉的角色管理器。
+        global _ACTIVE_PLUGIN, _FACADE
+        _ACTIVE_PLUGIN = self
+        _FACADE = None
+
         logger.info(f"{LOG_PREFIX} 插件已加载 (v{__version__})")
 
     @property
@@ -461,6 +496,10 @@ class HumanoidCore(Star):
             core.schedule.current_slots()
 
     async def terminate(self) -> None:
+        global _ACTIVE_PLUGIN, _FACADE
+        # 先摘掉门面再停：停的过程中别的插件来问，应该拿到 None 而不是半个死对象。
+        _ACTIVE_PLUGIN = None
+        _FACADE = None
         await self._input_state.stop_all()
         await self.role_manager.stop()
         await self._state_store.stop()
