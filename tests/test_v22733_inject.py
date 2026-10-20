@@ -195,9 +195,17 @@ class FinishTest(unittest.TestCase):
         return self.h.core.prompt_builder._finish(sents, cfg, **kw)
 
     # ── 形状 ──────────────────────────────────────────────
-    def test_header_carries_the_mark_and_the_role_tag(self):
+    def test_header_carries_the_mark_but_no_fake_role_tag(self):
+        """v2.27.42：抬头不再带 `uid=<角色 id 末 8 位>`。
+
+        那个标签打的是**机器人自己**的 id、只取末 8 位，对每个用户都一样，
+        对模型来说就是一串没有来源的编号（线上每轮都在刷 `uid=32823490`）。
+        抬头本身必须还在——`MARK_PREFIX` 是这块事实的识别符。
+        """
         block = self.finish([("甲" * 20, 10.0)])
-        self.assertEqual(block.split("\n", 1)[0], f"{MARK_PREFIX} {MARK_VERSION} uid=bot1〕")
+        head = block.split("\n", 1)[0]
+        self.assertEqual(head, f"{MARK_PREFIX} {MARK_VERSION}〕")
+        self.assertNotIn("uid=", head, "不要再把角色 id 冒充成 uid")
 
     def test_the_body_is_one_line(self):
         block = self.finish([("甲\n乙", 10.0), ("丙", 5.0)])
