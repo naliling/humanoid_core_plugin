@@ -209,8 +209,30 @@ class EmotionLayer:
         return 0.0, ""
 
     def _intimacy(self, interest: Dict[str, Any], profile: Dict[str, Any], index: int) -> Tuple[float, str]:
-        """她愿意说多少。关系亲密度 × 当天基调。"""
-        care = _num(interest.get("care"), 0.5)
+        """她愿意说多少。关系亲密度 × 当天基调。
+
+        ## 没有信号就**不出声**，不要拿填充句占位（v2.27.42）
+
+        原来最后一条兜底返回「今天跟平时一样」/「今天跟你说话挺正常的」，分数 0.45。
+        它的本意是「没什么特别」，但它在提示词里长得和别的情绪一模一样：
+
+            她被心里的事缠着       ← 真信号
+            今天跟你说话挺正常的   ← 填充句
+
+        模型分不出这两种。它读到后者，就会把它当成「她此刻的内心」照演——于是每一轮
+        都有一句毫无来由的情绪陈述，角色扮演时最容易演化成「毫无来由的亲密/关心」，
+        用户的原话是「情绪参考过于虚假，导致角色扮演类模型会虚假互动」。
+
+        更糟的是它对**从没说过话的人**也这么写：`interest` 缺 `care` 时按 0.5 兜底，
+        一路掉进最后那条，于是 `turn_count=0` 的用户也会看到「今天跟你说话挺正常的」
+        ——一句关于不存在对话的评价。
+
+        现在只在**真有可读信号**时出这一维：care 明确高/低；读不到 care 就不猜。
+        """
+        try:
+            care = float(interest.get("care"))
+        except (TypeError, ValueError):
+            return 0.0, ""
         aff = _num(profile.get("affection"), 46.0)
         base_aff = _num(profile.get("base_affection"), aff)
         aggr = _num(profile.get("aggression"), 28.0)
@@ -223,7 +245,7 @@ class EmotionLayer:
             return 0.68, _pick(("不太想多说", "今天不太想说真心话"), index)
         if care < 0.25:
             return 0.55, _pick(("跟你还有点距离", "不太愿意提私事"), index)
-        return 0.45, _pick(("今天跟平时一样", "今天跟你说话挺正常的"), index)
+        return 0.0, ""
 
     def _willingness(self, agency: Dict[str, Any], index: int) -> Tuple[float, str]:
         """主动性：她想不想开话头。"""
