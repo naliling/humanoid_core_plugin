@@ -263,8 +263,21 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
         affection = 0.0
         stage = tone = style = ""
         if readable:
-            affection = float((core.mood.profile(user_id) or {}).get("affection", 0.0) or 0.0)
-            stage = relstage.line_for(affection)
+            _profile = core.mood.profile(user_id) or {}
+            affection = float(_profile.get("affection", 0.0) or 0.0)
+            # 档位不只看好感：相处够久的人不该被写成「还在互相认识」（见 relstage 顶部）。
+            # `first_met` 在没有情绪档案时也可能存在（称呼是故意保留的），所以这里两条
+            # 都从同一个 profile 取，取不到就当 0（退回纯好感判定，与改前一致）。
+            try:
+                _turns = int(_profile.get("turn_count") or 0)
+            except (TypeError, ValueError):
+                _turns = 0
+            try:
+                _first = float(_profile.get("first_met") or 0.0)
+                _days = max(0.0, (core.now_epoch() - _first) / 86400.0) if _first > 0 else 0.0
+            except (TypeError, ValueError, AttributeError):
+                _days = 0.0
+            stage = relstage.line_for(affection, turns=_turns, days=_days)
             tone = core.mood.current_tone(user_id)
             style = core.mood.style_tendency(user_id)
         day = ""
