@@ -10,6 +10,7 @@ from typing import Any, Optional
 from .state import seed_cycle_day
 from . import __version__
 from . import life_log
+from . import ccb as _ccb
 from . import outfit
 from .clock import Clock, format_state_timestamp
 from .config import HumanoidConfig
@@ -847,6 +848,29 @@ class HumanoidCoreInstance:
         if not is_command:
             try:
                 self.schedule.note_interruption(is_group=is_group)
+            except Exception:
+                pass
+
+        # 亲密「到底发生过没有」：独立于 ccb 状态机（门槛 78 好感多数人够不着，
+        # 线上 9136 个用户条目里 ccb_done_count 全是 0）。只看正文，命中就记一次。
+        if not is_command and getattr(cfg, 'ccb', False):
+            try:
+                if _ccb.detect_occurrence(text):
+                    _us = self._scope.user_state(user_id)
+                    if _ccb.note_occurrence(_us, now):
+                        # 结算：明确拒绝 → 掉好感；到基线且不是第一次 → 多涨并降攻击。
+                        _prof = self.mood.profile(user_id) or {}
+                        _eff = _ccb.occurrence_effects(
+                            _us, _prof, refused=_ccb.detect_refusal(text)
+                        )
+                        # 只走已有的公开 setter：好感一个、其余三个直接写档案。
+                        if "affection" in _eff:
+                            self.mood.set_affection(user_id, _eff["affection"])
+                        for _k in ("libido", "aggression"):
+                            if _k in _eff:
+                                _prof[_k] = _eff[_k]
+                        if _eff:
+                            self.mood.mark_dirty() if hasattr(self.mood, "mark_dirty") else None
             except Exception:
                 pass
 
