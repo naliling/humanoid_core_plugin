@@ -127,6 +127,42 @@ def clean_label(raw: str) -> str:
     return name
 
 
+# 她开口喊这个人时最多叫几个字。超过就只叫前一段。
+_CALL_NAME_MAX = 6
+# 昵称里常见的「隔断符」：真人会把 `爱筝挽起·冲击波冠军` 只叫前半截。
+_NAME_SPLIT = re.compile(r"[·•・|｜/\\．.\s]+")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def short_name(raw: str) -> str:
+    """她在消息里**喊**这个人时用的名字：太长的中文昵称只叫前一段。
+
+    线上真实消息：
+
+        (休息) 忙着吃饭，爱筝挽起·冲击波冠军，想你❤️
+
+    真人不会把群名片一个字不落地念出来。规则只处理中文昵称：
+
+    * ≤6 字：原样（「小明」「阿澈」「游鱼」）；
+    * 带隔断符：取第一段（至少 2 字）——`爱筝挽起·冲击波冠军` → `爱筝挽起`；
+    * 其余：取前 4 个字；
+    * **纯英文/数字不动**：`Regnator` / `hanhandouya` / `Luture` 本来就是全称，
+      硬缩成 `Regn` 反而像系统截断。
+
+    只影响「怎么称呼」，不动存下来的昵称本身（`/查看昵称` 还是全名）。
+    """
+    name = str(raw or "").strip()
+    if not name or len(name) <= _CALL_NAME_MAX:
+        return name
+    if not _CJK_RE.search(name):
+        return name
+    parts = [p for p in _NAME_SPLIT.split(name) if p.strip()]
+    if parts and 2 <= len(parts[0]) <= _CALL_NAME_MAX:
+        return parts[0]
+    return name[: _CALL_NAME_MAX - 2].strip() or name
+
+
+
 # 会「换行 / 改方向 / 不可见」的字符：嵌进一行引号里之前必须清掉。
 _QUOTE_STRIP = re.compile(r"[\r\n\u2028\u2029\u202a-\u202e\u200b-\u200f\ufeff]+")
 
@@ -326,9 +362,14 @@ def _strip_heading_spans(text: str) -> str:
 
 
 class PromptBuilder:
+    # 天气重复注入的最短间隔（秒）。见 `_weather_worth_saying`。
+    WEATHER_REPEAT_SECONDS = 4 * 3600.0
+
     def __init__(self, core_instance: "HumanoidCoreInstance") -> None:
         self._core = core_instance
         self._emotion = EmotionLayer(core_instance)
+        # 上次写进注入的天气：(文本, 时刻)。None = 还没写过。
+        self._weather_seen: Optional[tuple] = None
 
     @property
     def config(self) -> HumanoidConfig:
@@ -372,7 +413,7 @@ class PromptBuilder:
                 (self._emotion_line(user_id, interest, agency, is_group), 8.5),
                 (self._sentence(self._feelings_lines(max_items=1, threshold=0.7)), 7.0),
                 (self._sentence(self._memory_lines(user_id, detailed=False)), 6.0),
-                (self._sentence(self._open_lines()), 6.0),
+                (self._sentence(self._open_lines(user_id, is_group)), 6.0),
                 (self._memory_link_line(memory_text), 6.0),
             ]
             return self._finish(sents, cfg, char_name, user_name)
@@ -712,7 +753,7 @@ class PromptBuilder:
             return []
         return lines
 
-    def _open_lines(self) -> List[str]:
+    def _open_lines(self, user_id: str = "", is_group: bool = False) -> List[str]:
         """她手上还开着的事：跨轮、会自己结束的未完事项。
 
         **走事实块、不另起标题。** `_sentence` 那条规矩在这里同样成立——一个带标题的
@@ -725,6 +766,12 @@ class PromptBuilder:
 
         为什么条数这么少（`render_lines` 默认最多 3 条）：它是一份索引，不是记录。
         给多了模型会当成待办清单逐条追问，而且每一轮都要重新付一遍 token。
+
+        **私聊只给这个人自己的事。** 这张账本是角色级的（社交层写进来的），里面有她
+        跟**所有人**没结的事。原来不分人一律塞进每一轮，于是每个人都会看到
+        「和星辰之间还有件事没完：讲述姐姐们的事情」——那是别人的事，模型拿它当话头
+        就会对着一个陌生人问起另一个人的私事；就算不问，也是每轮都占着位置的一份
+        噪音。群聊里不筛：一群人的事混着说是正常的，而且这里拿不到在场名单。
         """
         try:
             items = self._core.life_items()
@@ -732,6 +779,17 @@ class PromptBuilder:
             return []
         if not items:
             return []
+        if user_id and not is_group:
+            mine = str(user_id)
+            try:
+                items = [
+                    item for item in items
+                    if not str((item or {}).get("uid") or "") or str(item.get("uid")) == mine
+                ]
+            except Exception:
+                pass
+            if not items:
+                return []
         try:
             return life_log.render_lines(
                 items, _core_epoch(self._core), name_of=self._core.mood.nickname
@@ -760,7 +818,11 @@ class PromptBuilder:
             nickname = sanitize_name(self._core.mood.nickname(user_id))
         except Exception:
             return ""
-        return f"对TA的称呼是「{nickname}」" if nickname else ""
+        if not nickname:
+            return ""
+        # 太长只给前半截：这条是写给模型看的「她平时怎么叫」，模型会照抄；
+        # 挂上 `爱筝挽起·冲击波冠军` 它就会一句一句把全名念出来（见 `short_name`）。
+        return f"对TA的称呼是「{short_name(nickname)}」"
 
     def _scene_lines(self, is_group: bool) -> List[str]:
         """场景：这是群聊还是私聊。
@@ -852,9 +914,34 @@ class PromptBuilder:
         except Exception:
             weather = {}
         temp = _short_weather(weather)
-        if temp:
+        if temp and self._weather_worth_saying(temp):
             lines.append(f"外头{temp}")
         return lines
+
+    def _weather_worth_saying(self, text: str) -> bool:
+        """天气这一句，这一轮该不该再写一遍。
+
+        「外头阴，多云，气温 8℃」是**永远有值、永远具体**的一条，每轮都摆在注入最
+        前面就会被念成开场白——线上真实主动消息里 `(守汤) 多云，hanhandouya那边呢？`、
+        `(放下餐具) 外头阴沉7度，有点冷呢` 都是这么来的。
+
+        判据：**变了才说**；没变的话至少隔 4 小时才再提一次（真人不会每分钟看一次
+        气温，但隔半天会觉得冷）。天气照样每轮进 Core 的 `snapshot()`，只是不再每轮
+        进**模型**的上下文。
+        """
+        now = 0.0
+        try:
+            now = float(self._core.now_epoch())
+        except Exception:
+            now = 0.0
+        prev = self._weather_seen
+        if prev is not None:
+            prev_text, prev_at = prev
+            if prev_text == text and now > 0 and prev_at > 0:
+                if (now - prev_at) < self.WEATHER_REPEAT_SECONDS:
+                    return False
+        self._weather_seen = (text, now)
+        return True
 
     def background_note(self) -> str:
         """一段「她此刻的世界」，拼进【此刻的她】那一段；拿不到就返回空串。"""
@@ -1030,7 +1117,7 @@ class PromptBuilder:
         memory = self._sentence(self._memory_lines(user_id, detailed=detailed))
         if memory:
             sents.append((memory, 6.0))
-        opens = self._sentence(self._open_lines())
+        opens = self._sentence(self._open_lines(user_id, is_group))
         if opens:
             sents.append((opens, 6.0))
         linked = self._memory_link_line(memory_text)
@@ -1100,7 +1187,7 @@ class PromptBuilder:
         memory = self._sentence(self._memory_lines(user_id, detailed=False))
         if memory:
             sents.append((memory, 6.0))
-        opens = self._sentence(self._open_lines())
+        opens = self._sentence(self._open_lines(user_id, is_group))
         if opens:
             sents.append((opens, 6.0))
         linked = self._memory_link_line(memory_text)
@@ -1164,7 +1251,7 @@ class PromptBuilder:
         memory = self._sentence(self._memory_lines(user_id, detailed=True))
         if memory:
             sents.append((memory, 6.0))
-        opens = self._sentence(self._open_lines())
+        opens = self._sentence(self._open_lines(user_id, is_group))
         if opens:
             sents.append((opens, 6.0))
         linked = self._memory_link_line(memory_text)
@@ -1196,7 +1283,13 @@ class PromptBuilder:
             normalized.append((str(item[0]), salience))
         if not normalized:
             return ""
-        header = f"{MARK_PREFIX} {MARK_VERSION} uid={_uid_tag(self._core.role_id)}〕"
+        # 抬头只留版本号，不再写 `uid=`。
+        #
+        # 那个 `uid={_uid_tag(role_id)}` 打的是**角色 id**（机器人自己），不是用户的，
+        # 而且只取末 8 位——所有人看到的都是同一串 `uid=32823490`，模型则把它当成
+        # 一个真实存在的编号。它不是任何东西的 id，只是给模型的一条假事实；
+        # 真正需要它的地方（区分不同角色的块）由 `MARK_PREFIX` 本身就够了。
+        header = f"{MARK_PREFIX} {MARK_VERSION}〕"
         budget = max(200, int(cfg.inject_token_budget))
         # Token 硬预算：按显著度从高到低收，超预算丢低显著度句；原顺序拼装。
         # 场景/称呼（显著度 10）永远排最前，永不丢。
@@ -1222,7 +1315,7 @@ class PromptBuilder:
         body = _strip_heading_spans(body)
         if not body:
             return ""
-        # **只对正文做替换，标题不动。** 标题「〔她的身体与生活 v12 uid=…〕」是
+        # **只对正文做替换，标题不动。** 标题「〔她的身体与生活 v12〕」是
         # `MARK_PREFIX`，也是这块事实的抬头——一旦被 `_personalize` 换成
         # 「〔小雨的身体与生活…」，抬头就丢了。
         #
@@ -1283,6 +1376,12 @@ def is_notice(text: str) -> bool:
 
 
 def _uid_tag(role_id: str) -> str:
+    """角色 id 的短标签。
+
+    **已经不再拼进抬头**（v2.27.42）：它打的是机器人自己的 id、只取末 8 位，对模型
+    来说是一串没有来源的编号，而且对每个用户都一样。留着这个函数是因为老的
+    `state.json` 里可能还存着带 `uid=` 的旧块文本，将来要辨识时还用得上。
+    """
     return re.sub(r"[^0-9A-Za-z]", "", str(role_id))[-8:] or "self"
 
 
