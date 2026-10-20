@@ -1097,32 +1097,35 @@
   },
   "ccb": {
     "type": "bool",
-    "description": "ccb",
-    "default": false
+    "description": "亲密场景模拟（ccb）：拟人的亲密场景模拟：好感与亲近欲达标后，她会进入相应的情境并作出反应。默认关闭，开启前请确认使用场景合规。",
+    "default": false,
+    "hint": "关闭时完全不影响聊天；开启后只影响她自己的情绪与措辞。"
   },
   "ccb_libido_min": {
     "type": "float",
     "default": 38.0,
-    "description": "【进阶】ccb 阈值（0~50）"
+    "description": "亲近欲达到多少才可能进入情境（0~50）。",
+    "hint": "越低越容易被触发。"
   },
   "ccb_libido_rise": {
     "type": "float",
     "default": 4.0,
-    "description": "【进阶】ccb 阈值（0~20）"
+    "description": "比自己的基线高出多少才算「明显想要」（0~20）。"
   },
   "ccb_affection_min": {
     "type": "float",
     "default": 50.0,
-    "description": "【进阶】ccb 阈值（0~100）"
+    "description": "好感达到多少才可能进入情境（0~100）。",
+    "hint": "线上用户好感多在 35~60，设太高会永远触发不到。"
   },
   "ccb_affection_rise": {
     "type": "float",
     "default": 8.0,
-    "description": "【进阶】ccb 阈值（0~50）"
+    "description": "比基线高出多少才算「明显亲近」（0~50）。"
   },
   "ccb_affection_deep": {
     "type": "float",
     "default": 75.0,
-    "description": "【进阶】ccb 阈值（0~100）"
+    "description": "好感达到这条线进入更亲密的一档（0~100）。"
   }
 }
