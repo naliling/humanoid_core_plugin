@@ -39,19 +39,53 @@ def _fresh(item: dict[str, Any], now: float, stale_hours: float = STALE_HOURS) -
     return age <= window
 
 
+_OPENERS = "([（［【「『"
+_CLOSERS = {")": "(", "）": "（", "]": "[", "］": "［", "】": "【", "」": "「", "』": "『"}
+_TAIL_PUNCT = "，。！？、,.!?;；:： "
+
+
+def _close_brackets(text: str) -> str:
+    """把括号配平：丢掉落单的右括号，未闭合的左括号及其后面全部截掉。
+
+    线上真实注入过：`TA之前说过「抱着亲爱的灵灵摸摸头)」` —— 摘录是从一句语C动作
+    的第 8 个字起截的，左括号早就落在窗口外，右括号却留下来了。这句被当成「TA
+    说过的话」递给模型，读起来像坏掉的数据；模型照着它接，接出来的也是半截动作。
+    """
+    body = str(text or "").rstrip()
+    if not body:
+        return ""
+    stack: list[int] = []
+    drop: set[int] = set()
+    for i, ch in enumerate(body):
+        if ch in _OPENERS:
+            stack.append(i)
+        elif ch in _CLOSERS:
+            if stack and body[stack[-1]] == _CLOSERS[ch]:
+                stack.pop()
+            else:
+                drop.add(i)          # 落单的右括号：删掉它，别删它后面的正文
+    # 未闭合的左括号：它后面全是半句话，从最早的那个左括号起截掉
+    cut = stack[0] if stack else len(body)
+    kept = "".join(
+        ch for i, ch in enumerate(body) if i < cut and i not in drop
+    )
+    return kept.rstrip(_TAIL_PUNCT)
+
+
 def snippet(text: str, limit: int = SNIPPET_LEN) -> str:
     """把一句话收成一段能引用的短摘录。"""
     body = _STRIP.sub(" ", str(text or "")).strip()
     if len(body) <= limit:
-        return body
+        return _close_brackets(body)
     cut = body[:limit]
     # 在标点处收尾，别把词切一半。搜索下界是「截断点的一半」：更靠前的标点离得
     # 太远，为它丢掉半句话不值得（原写法 `max(limit // 2, 0)` 的 0 是多余的）。
     floor = max(0, limit // 2)
     for i in range(len(cut) - 1, floor - 1, -1):
         if cut[i] in "，。！？、,.!?;；:：":
-            return cut[:i].rstrip("，。！？、,.!?;；:：")
-    return cut.rstrip() + "…"
+            return _close_brackets(cut[:i].rstrip("，。！？、,.!?;；:："))
+    closed = _close_brackets(cut.rstrip())
+    return (closed + "…") if closed else ""
 
 
 def note_said(
@@ -77,6 +111,10 @@ def note_said(
         return current
     piece = snippet(body)
     if not piece:
+        return current
+    # 括号配平之后可能只剩几个字（整条都是语C动作时几乎必然如此）。那种半句话
+    # 存下来比不存更糟：它会在下一轮以「TA之前说过「…」」的身份出现。
+    if len(piece) < 4:
         return current
     if current and str(current[0].get("said", "")) == piece:
         return current
@@ -121,10 +159,21 @@ def recall_lines(
     窗口从 60 小时收到 12 小时：60 小时里挂着的是「两天半前说过的话」，真人早忘了，
     而模型看到它就会顺着翻旧账。「之前说过」本来就该只覆盖最近的一小段时间。
     `behavior._touches_recalled` 也走这里，所以「TA是不是又提起旧事」同样只看窗口内。
+
+    **读的时候也要过一遍括号配平**：盘上已经存着的条目是旧版写进去的，
+    其中有 `抱着亲爱的灵灵摸摸头)` 这种从语C动作中间截出来的半句。只在写入侧修
+    治不好已有的数据——而这份数据每一天都在被注入到模型眼前。
     """
     items = [x for x in _as_list(existing) if str(x.get("said", "")).strip()]
     fresh = [x for x in items if _fresh(x, now, stale_hours)]
     if not fresh:
         return []
-    quotes = "、".join(f"「{x['said']}」" for x in fresh[: max(0, int(max_items))])
-    return [f"TA之前说过{quotes}"]
+    quotes: list[str] = []
+    for item in fresh[: max(0, int(max_items))]:
+        cleaned = _close_brackets(str(item.get("said", "")).strip())
+        if len(cleaned) < 4:
+            continue
+        quotes.append(f"「{cleaned}」")
+    if not quotes:
+        return []
+    return [f"TA之前说过{'、'.join(quotes)}"]
