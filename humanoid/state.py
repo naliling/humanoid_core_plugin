@@ -543,7 +543,7 @@ def _atomic_write(path: Path, payload: str) -> bool:
             # 解不开，会被当成损坏备份走）。
             scrubbed = True
             _write(payload.encode("utf-8", "replace").decode("utf-8"))
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except BaseException:
         # 失败分支别留下半截临时文件（下次启动的目录扫描会被它误导）。
         with contextlib.suppress(OSError):
@@ -590,3 +590,27 @@ def _clamp_float(value: Any, default: float, low: float, high: float) -> float:
     if out != out:
         return default
     return max(low, min(high, out))
+
+def _replace_with_retry(tmp, path, attempts: int = 4) -> None:
+    """`os.replace` 带重试。
+
+    线上出现过 `[WinError 5] 拒绝访问`（杀软/索引/同步工具短暂持有目标文件）：
+    一次失败就等于这一轮状态没落盘，紧接着的命令读到旧数据——用户看到的就是
+    「问好感度没反应/数字不对」。重试几次几乎总能过去；仍失败才让它抛。
+    """
+    import time as _time
+
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:      # WinError 5 / EACCES
+            last = exc
+            _time.sleep(0.05 * (i + 1))
+        except OSError as exc:
+            # 目标被占用也会走这里；同样退避重试一次
+            last = exc
+            _time.sleep(0.05 * (i + 1))
+    if last is not None:
+        raise last
