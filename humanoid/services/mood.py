@@ -213,6 +213,22 @@ LABEL_ANCHOR_DRIFT = 6.0
 # 情绪分析失败日志的限速（秒）：同一条理由这么久内只报一次。
 MOOD_WARN_INTERVAL_SECONDS = 300.0
 
+# ── 基线棘轮（v2.27.43）──────────────────────────────────────────────
+#
+# 好感 = 基线 + 账本净值，而**基线从来不变**。于是账本衰减多少，关系就退回多少：
+# 聊得再久，好感也只在初始值附近晃。线上实测 2485 个用户里 98.4% 卡在最低档，
+# 聊过 2000 轮的人好感 39.9 —— 关系永远不会「长」，只会「衰减」。
+#
+# 真人不是这样：处久了，关系的**下限**会抬起来——吵一架也不会回到第一次见面。
+# 所以让基线极慢地跟上此刻的好感：只有**已经处了一阵子**（聊过 20 轮以上）、
+# 且此刻好感明显高于基线（≥5 分）时，每 12 小时往上挪一小步，最高到 65。
+# 慢到一天最多 1 分；高到「足够久、足够稳的关系能自己长上去」。
+RATCHET_MIN_TURNS = 20
+RATCHET_GAP = 5.0
+RATCHET_INTERVAL_SECONDS = 12 * 3600.0
+RATCHET_STEP_RATIO = 0.2
+RATCHET_MAX_BASE = 65.0
+
 # 本地情绪已经判得足够死时（好感跌到这个值以下），模型那一票本来就不会被采纳
 # ——见 `_resolve_delta`。这条消息就**别调模型了**：结果一模一样，省掉一次网络往返。
 # 注意两处必须用同一个值，否则会出现"调了但没用"或"没调却被当成算了"。
@@ -1166,11 +1182,55 @@ class MoodService:
         if abs(target - current_aff) > 1e-4:
             record["affection"] = target
             changed = True
+        # ── 基线棘轮 ──（见文件头 `RATCHET_*` 的说明）
+        # 不挂在 `if changed` 下面：好感稳定时上面不会改任何东西，而棘轮恰恰要在
+        # 「关系稳定地高着」的时候动。它自己的四道闸会挡住不该动的情况。
+        if self._ratchet_base(record, base_aff, target, now):
+            changed = True
         if changed:
             record["last_decay"] = now
             user_state["mood"] = record
             self._scope.mark_dirty()
         return changed
+
+    def _ratchet_base(
+        self, record: dict, base_aff: float, affection: float, now: float
+    ) -> bool:
+        """让关系的**下限**慢慢跟上此刻的好感。返回是否改动。
+
+        四道闸缺一不可（少任何一道，一次投缘的聊天就能把基线永久抬上去）：
+
+        1. 已经处了一阵子（`turn_count` 够）；
+        2. 此刻好感比基线高出 `RATCHET_GAP` 以上 —— 偶然的 +3 不算；
+        3. 距上次棘轮 ≥12 小时 —— 一天最多动两次；
+        4. 基线本身还没到上限。
+
+        改不动就返回 False（`_decay_record` 据此决定要不要写盘）。
+        """
+        try:
+            turns = int(record.get("turn_count") or 0)
+        except (TypeError, ValueError):
+            turns = 0
+        if turns < RATCHET_MIN_TURNS:
+            return False
+        gap = float(affection) - float(base_aff)
+        if gap < RATCHET_GAP:
+            return False
+        if base_aff >= RATCHET_MAX_BASE:
+            return False
+        try:
+            last = float(record.get("base_ratchet_at") or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if last > 0 and (now - last) < RATCHET_INTERVAL_SECONDS:
+            return False
+        step = min(1.0, gap * RATCHET_STEP_RATIO)
+        new_base = min(RATCHET_MAX_BASE, float(base_aff) + step, float(affection) - 1.0)
+        if new_base <= float(base_aff) + 1e-4:
+            return False
+        record["base_affection"] = new_base
+        record["base_ratchet_at"] = now
+        return True
 
     async def update_from_message(self, user_id: str, text: str, *args, **kwargs) -> Optional[Delta]:
         return await self.update_from_message_async(user_id, text)
