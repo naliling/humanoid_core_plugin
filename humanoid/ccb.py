@@ -403,3 +403,116 @@ def evaluate(
         stage = 1
         words = ladder[0][2]
     return score, words[index % len(words)], stage
+
+# ─── 「这件事到底发生过没有」：独立于状态机 ────────────────────────
+# 状态机（`evaluate`）只回答「现在该不该进场景」，门槛 78 好感对多数人永远够不着；
+# 而聊天里**真的发生过**的记录不能由它决定。线上实测：9136 个用户条目里
+# `ccb_done_count` 全为 0——因为没有任何代码去看过这件事。
+_CCB_HAPPENED = (
+    "做了", "做爱", "操了", "被操", "干了", "插进", "进入身体", "内射", "射在",
+    "高潮", "到了顶点", "一起去了", "弄坏了", "要了你", "操我", "插我", "进来", "要我",
+)
+_CCB_NEGATION = ("不要", "别", "停", "没做", "不想", "拒绝", "算了", "还没")
+_CCB_PROFANITY = (
+    "操你妈", "操你大爷", "我操", "卧槽", "我靠", "操蛋", "操他", "草泥马", "干你妈",
+    "干死你", "去你妈", "妈的", "傻逼", "滚蛋", "滚",
+)
+_CCB_OBJECT = ("你", "我", "她", "他", "身体", "里面", "怀里", "床上", "一起")
+
+
+def detect_occurrence(text: str) -> bool:
+    """这条正文是在说「已经发生了」，而不是在讨论/拒绝/开玩笑。
+
+    保守判据：必须命中一个明确动作词，且该词前后 6 个字里没有否定词。
+    宁可漏记也不误记——误记会污染「一辈子的次数」。
+    """
+    s = str(text or "")
+    if not s.strip():
+        return False
+# 「别停」「不要停」是**鼓励**不是否定：先把它们中和掉，否则最典型的一句会被判成「没发生」。
+    for encourage in ("别停", "不要停", "不许停", "不准停", "别停下"):
+        s = s.replace(encourage, "继续")
+    if any(bad in s for bad in _CCB_PROFANITY):
+        return False
+    if not any(obj in s for obj in _CCB_OBJECT):
+        return False
+    for word in _CCB_HAPPENED:
+        start = 0
+        while True:
+            i = s.find(word, start)
+            if i < 0:
+                break
+            window = s[max(0, i - 6): i + len(word) + 6]
+            if not any(neg in window for neg in _CCB_NEGATION):
+                return True
+            start = i + len(word)
+    return False
+
+
+def note_occurrence(user_state: Dict[str, Any], moment: float) -> bool:
+    """记一次「真的发生了」。返回是否新记（去重看 `ccb_advance_at`）。"""
+    try:
+        last = float(user_state.get("ccb_advance_at", 0.0) or 0.0)
+        if float(moment) - last < 60.0:
+            return False
+        user_state["ccb_done_count"] = float(user_state.get("ccb_done_count", 0.0) or 0.0) + 1.0
+        user_state["ccb_last_at"] = float(moment)
+        user_state["ccb_advance_at"] = float(moment)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+# ─── 「她是明确拒绝的」与「事后怎么结算」 ─────────────────────
+# 用户要求：明确拒绝（不是开玩笑、不是欲拒还迎）却仍然发生 → 好感掉；
+# 已经到基线且此前有过 → 好感涨得更多，亲近欲也涨，攻击性下降。
+_CCB_REFUSE = (
+    "不要", "不行", "住手", "放开我", "我不想", "别碰", "讨厌", "停下", "拒绝",
+    "不想要", "别这样", "我不愿意",
+)
+_CCB_JOKE = ("哈哈", "笑死", "开玩笑", "逗你", "哼", "才不", "讨厌啦")
+
+
+def detect_refusal(text: str) -> bool:
+    """明确拒绝（排除调侃/欲拒还迎）。"""
+    s = str(text or "")
+    if not s.strip():
+        return False
+    if any(j in s for j in _CCB_JOKE):
+        return False
+    return any(r in s for r in _CCB_REFUSE)
+
+
+def occurrence_effects(
+    user_state: Dict[str, Any], profile: Dict[str, Any], *, refused: bool
+) -> Dict[str, float]:
+    """一次「发生过」之后的关系结算。返回实际增量（便于日志/状态展示）。
+
+    规则来自用户：
+    * 明确拒绝却被发生 → 好感 -4，攻击性 +6（她会记着这件事）；
+    * 否则好感 +2；若此前已有记录（不是第一次）且已到基线 → 额外 +3，亲近欲 +3，攻击性 -3；
+    * 亲近欲每次 +2（被满足会拉高，不是清空）。
+    """
+    out: Dict[str, float] = {}
+    try:
+        aff = float(profile.get("affection", 46.0) or 46.0)
+        lib = float(profile.get("libido", 34.0) or 34.0)
+        agg = float(profile.get("aggression", 0.0) or 0.0)
+        base = float(profile.get("base_affection", aff) or aff)
+        done = float(user_state.get("ccb_done_count", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return out
+
+    if refused:
+        out["affection"] = max(0.0, aff - 4.0)
+        out["aggression"] = min(100.0, agg + 6.0)
+        out["libido"] = max(0.0, lib - 6.0)
+        return out
+
+    gain = 2.0
+    if done > 1 and aff >= base:
+        gain += 3.0
+        out["libido"] = min(100.0, lib + 3.0)
+        out["aggression"] = max(0.0, agg - 3.0)
+    out["affection"] = min(100.0, aff + gain)
+    out.setdefault("libido", min(100.0, lib + 2.0))
+    return out
