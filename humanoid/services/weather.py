@@ -46,14 +46,21 @@ def parse_payload(payload: dict[str, Any]) -> dict[str, str] | None:
         temp = float(payload["main"]["temp"])
     except (KeyError, IndexError, TypeError, ValueError):
         return None
-    weather_str = f"{desc} 🌡️ {temp:g}°C"
+    # 温度取整：`{temp:g}` 会把 8.44 原样写进注入，而**没有人知道自己那边的气温是
+    # 8.44 度**——那句话一眼就是机器读数，模型照着念就露馅（「外头多云，气温 8.44℃」）。
+    # 真人说的是「八度多」。天气服务的精度本来就是整数级别的体感。
+    temp_i = round(temp)
+    weather_str = f"{desc} 🌡️ {temp_i}°C"
     # env 是给模型看的：不再拼 location——那是配置里的英文名+国家码（如
     # 「Zelenogradsk,RU」），而场景层已经说过一次「你在泽列诺格拉茨克」，
     # 同一个地方在一句话里出现两次，其中一次还是英文，看着像两处。
-    env = f"天气：{desc}，气温 {temp:g}℃"
+    env = f"天气：{desc}，气温 {temp_i}℃"
     humid = payload.get("main", {}).get("humidity")
     if humid is not None:
-        env += f"，湿度 {humid}%"
+        try:
+            env += f"，湿度 {round(float(humid)):.0f}%"
+        except (TypeError, ValueError):
+            env += f"，湿度 {humid}%"
     return {"weather": weather_str, "env": env}
 
 
