@@ -85,6 +85,9 @@ class BriefShapeTest(unittest.TestCase):
         self.assertIn("day", brief)
         self.assertIn("self_state", brief)
         self.assertIn("ongoing", brief)
+        # v2.28.0：梦与醒来状态也走门面（旧契约缺它们时安全降级为空）。
+        self.assertIn("dreams", brief["day"])
+        self.assertIn("wake", brief)
 
     def test_proactive_brief_also_carries_events(self):
         chat = self.facade.brief("bot1", "10001", task="chat")

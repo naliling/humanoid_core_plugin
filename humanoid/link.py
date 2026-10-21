@@ -33,7 +33,12 @@ CONTRACT_VERSION = 2
 #: 结构标识。社交层拿它和 `fields_hash` 一起做一致性校验（只告警 + 降级，不抛错）。
 CONTRACT_SCHEMA = "humanoid.contract/2"
 #: 这一版契约提供的能力。社交层按能力判断走哪条路，不靠版本号猜。
-CONTRACT_CAPABILITIES = ("body", "feelings", "form", "activity", "day", "ongoing", "routine")
+#: 只加不改：`dreams`（她昨晚做的梦）与 `wake`（醒来状态/睡眠惯性）是 v2.28.0 新增的，
+#: 旧社交层不认这两个能力就照旧走老字段，不会因为多了两个词而坏掉。
+CONTRACT_CAPABILITIES = (
+    "body", "feelings", "form", "activity", "day", "ongoing", "routine",
+    "dreams", "wake",
+)
 
 # 社交层写回的信号文件：超过这个秒数就不采信。
 #
@@ -150,7 +155,15 @@ def build_contract(core: Any) -> dict[str, Any]:
             "doing": str(day.get("doing") or ""),
             "done": [str(x) for x in (day.get("done") or []) if str(x).strip()],
             "next": [str(x) for x in (day.get("next") or []) if str(x).strip()],
+            # 今天最近一段睡眠的梦（最多 3 条）。旧日程没有这个键 → 空列表；
+            # 社交层拿它派「梦」由头（「她昨晚做了个梦」），没有就不说。
+            "dreams": [
+                str(x).strip() for x in (day.get("dreams") or []) if str(x or "").strip()
+            ][:3],
         },
+        # 醒来状态：睡着没有、醒来多久、睡眠惯性还剩几分钟、是不是被消息吵醒的。
+        # 社交层可以用它避免「明明在睡却像生龙活虎」；拿不到时是空 dict（旧 Core 也一样）。
+        "wake": _wake_block(core),
         # 日程是按哪个 AstrBot 人设排的：社交层靠它确认两边用的是同一个人。
         "persona": str(core.schedule.status().get("persona", "") or ""),
         # 作息：社交层靠它知道她睡够没睡够，诊断靠它提示两套时间不一致。
@@ -196,6 +209,36 @@ def _fields_hash(contract: dict[str, Any]) -> str:
     walk(contract, "")
     raw = "\n".join(sorted(paths)).encode("utf-8")
     return "sha256:" + hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _wake_block(core: Any) -> dict[str, Any]:
+    """醒来状态：`soma.wake_state()` 的安全导出（拿不到 / 坏数据 → 空 dict）。
+
+    只导出固定六个键并做类型清洗：契约是跨插件接口，对面不该因为 Core 内部换了
+    一个字段形状就拿到一个藏着 None/NaN 的字典。
+    """
+    try:
+        state = core.soma.wake_state()
+    except Exception:
+        return {}
+    if not isinstance(state, dict):
+        return {}
+
+    def _num(value: Any) -> float:
+        try:
+            out = float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return out if out == out else 0.0
+
+    return {
+        "asleep": bool(state.get("asleep", False)),
+        "wake_at": round(_num(state.get("wake_at")), 1),
+        "inertia_until": round(_num(state.get("inertia_until")), 1),
+        "inertia_minutes_left": max(0, int(_num(state.get("inertia_minutes_left")))),
+        "disturbed": bool(state.get("disturbed", False)),
+        "last_sleep_hours": round(_num(state.get("last_sleep_hours")), 2),
+    }
 
 
 def _contract_weather(weather: Any) -> str:

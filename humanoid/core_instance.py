@@ -258,6 +258,9 @@ class HumanoidCoreInstance:
             config_provider,
             self.clock,
             self.schedule,
+            # 人设特质：夜猫子/懒散/勤快决定过程模板的取向（C5）。同步读缓存，
+            # 不在这里触发任何 IO；拿不到人设时返回 None，行为与旧版完全一致。
+            traits_provider=self._persona_traits,
         )
 
         # 社交层写回的信号（它替她主动开过口、被谁冷落了几次）。只读，文件不在就是没联动。
@@ -395,6 +398,22 @@ class HumanoidCoreInstance:
         except Exception:
             return ""
         return str(getattr(snap, "prompt", "") or "")
+
+    def _persona_traits(self):
+        """从缓存人设里识别生活特质（C5：过程模板按「她是不是勤快」选）。
+
+        同步、无 IO：过程服务在后台 tick 里会反复问，不能让它触发人格解析。
+        人设还没预热 / 正文为空 / 解析失败 → None（过程服务走默认模板，行为同旧版）。
+        """
+        try:
+            from .traits import detect
+
+            text = self._persona_text()
+            if not text.strip():
+                return None
+            return detect(text)
+        except Exception:
+            return None
 
     def weather_temp_c(self) -> float | None:
         """天气快照里的数值气温（℃）；拿不到（没开 / 没取到 / 只是说明书）返回 None。
@@ -876,6 +895,15 @@ class HumanoidCoreInstance:
 
         # 先把身体推进到「现在」，再记账：否则本轮用的是上一轮的困意与饥饿。
         if cfg.soma_enabled:
+            # 在推进之前看「她此刻是不是在睡」：消息不掀被子（睡着的那一段不重掷），
+            # 但要留一个「被吵到」的痕迹，醒来时睡眠惯性会更长（C2）。
+            # 指令不算：发个 /查看日程 不是有人来找她说话。
+            if not is_command:
+                try:
+                    if self.soma.wake_state().get("asleep"):
+                        self.soma.note_disturbed(now)
+                except Exception:
+                    pass
             self.soma.advance(now)
         self.energy.advance_cycle()
 
@@ -1407,9 +1435,16 @@ class HumanoidCoreInstance:
         active = self.schedule.active_segment()
         for slot in segs:
             mark = "▶" if active is not None and slot.get("start") == active.get("start") else " "
+            # 睡眠段的梦附在行尾（C1）：`/查看日程` 是最直接能看到「她昨晚梦到什么」的地方。
+            dreams = [
+                str(x).strip()
+                for x in (slot.get("dreams") or [])
+                if str(x or "").strip()
+            ][:3]
+            dream_text = f"（梦：{'；'.join(dreams)}）" if dreams else ""
             lines.append(
                 f"{mark} {slot.get('start', '')}-{slot.get('end', '')}  "
-                f"【{slot.get('event', '')}】@{slot.get('location', '')}"
+                f"【{slot.get('event', '')}】@{slot.get('location', '')}{dream_text}"
             )
         carry_end = self.schedule.carry_end_text()
         if carry_end:

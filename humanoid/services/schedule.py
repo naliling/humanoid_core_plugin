@@ -30,6 +30,7 @@ from ..slots import (
     parse_time,
     sleep_window_minutes,
 )
+from ..traits import detect as detect_traits, trait_hints
 from ..wording import pick
 
 PURPOSE = "日程生成"
@@ -56,9 +57,16 @@ SEGMENT_GAP_MERGE_MINUTES = 30
 
 # 身体越线：不等这一段结束，当场重新决定（饿到发慌还在做事、困到不行还醒着）。
 CHANGE_TRIGGER_HUNGER = 78.0
-CHANGE_TRIGGER_SLEEP_PRESSURE = 88.0
+# 困意越线从 88 降到 80：用户原话是「困意 86 还在厨房煮饭」。88 那一档实际上
+# 只有快撑不住时才够得着，而 80 已经明显不该再做需要精神的事了（prompt 里也
+# 用同一条线告诉模型「这一段优先睡一会儿/闭眼休息」）。
+CHANGE_TRIGGER_SLEEP_PRESSURE = 80.0
 # 本地兜底里「夜里该睡了」的困意门槛：比模型路径宽，因为没有模型替她权衡。
 LOCAL_NIGHT_SLEEP_PRESSURE = 70.0
+# 本地兜底里「白天困到该补一觉」的困意门槛：比夜里那条高，避免有点困就躺下。
+# 触发后安排 45~90 分钟小睡/补觉——用户原话是「白天确实该困，但是白天不睡觉，
+# 而是困意 86 在厨房煮饭」，所以白天的高困意必须有地方去，不能靠"再撑撑"。
+LOCAL_DAY_NAP_PRESSURE = 82.0
 
 # 睡觉跨午夜时，今天这半截之后接到明天的那一截。
 CARRY_KEY = "segment_carry"
@@ -158,6 +166,48 @@ _ACTION_HEADS = frozenset("在坐躺站靠趴蹲爬走跑跳吃喝做玩看读�
 
 _EVENT_PHRASE_MAX = 24
 
+# 梦：模型给的是自由文本，可能带空串、重复、超长、甚至非字符串。
+# 只留能说出口的一小句：每条封顶 20 字（prompt 里教的是 15 字，留一点余量），
+# 一觉最多 3 条（白天睡的那一觉给 3 条，夜里给 2 条，见 `segment_prompt`）。
+DREAM_MAX_ITEMS = 3
+DREAM_MAX_CHARS = 20
+# 模型常把梦写成「梦到…」「梦见…」。契约与社交层约定的是**梦的内容本身**
+# （社交层会自己加「梦到」做由头），这里统一剥掉句首的引导词，避免出现
+# 「她刚从梦里醒过来（梦到梦到一片海）」这种叠字。
+_DREAM_PREFIXES = ("我梦见", "我梦到", "梦见", "梦到")
+
+
+def _clean_dreams(raw: Any) -> list[str]:
+    """把 `dreams` 字段洗成「去空、去重、限长、限条数」的字符串列表。
+
+    旧状态的 slot 没有这个键，坏数据、单条字符串、数字混在里面都可能出现。
+    所有读取路径（parse / carry / migrate / day_phrases / 契约）都走这里，
+    保证外面拿到的一定是 `list[str]`，不会因为一条脏数据把契约导出整段带崩。
+    """
+    if isinstance(raw, str):
+        items: list[Any] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return []
+    out: list[str] = []
+    for item in items:
+        # 非字符串一律忽略：模型偶尔会把「梦」写成对象/数字，那种不是能说出口的话。
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        for prefix in _DREAM_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                break
+        text = text[:DREAM_MAX_CHARS]
+        if not text or text in out:
+            continue
+        out.append(text)
+        if len(out) >= DREAM_MAX_ITEMS:
+            break
+    return out
+
 
 def _event_phrase(event: str) -> str:
     """把时段名削成能放进一句口语里的动作。
@@ -201,19 +251,25 @@ def day_phrases(
 
     滚动分段日程里没有预排的未来，所以「接下来」通常只有正在做的这一段的自然
     结束；她不会提前宣布等下要去哪——那本来就是排出来之前不知道的事。
+
+    `dreams` 是当天**最近一段睡眠**的梦：契约和社交层拿它说「她昨晚梦到什么」。
+    旧日程没有这个字段，所有旧 slot 读出来都是空列表——调用方不需要区分
+    「没有梦」和「旧版本没记」。
     """
     doing = ""
     done: list[str] = []
     upcoming: list[str] = []
-    ordered: list[tuple[int, int, str]] = []
+    dreams: list[str] = []
+    # 把 slot 本体一起带上：梦要从**同一段**里取，不能只留事件名再去反查。
+    ordered: list[tuple[int, int, str, Slot]] = []
     for slot in slots:
         lo = parse_time(slot.get("start"))
         hi = parse_time(slot.get("end"))
         if lo is None or hi is None or hi <= lo:
             continue
-        ordered.append((lo, hi, str(slot.get("event") or "").strip()))
+        ordered.append((lo, hi, str(slot.get("event") or "").strip(), slot))
 
-    for lo, hi, event in ordered:
+    for lo, hi, event, _slot in ordered:
         if lo <= now_minutes < hi:
             phrase = _event_phrase(event)
             if phrase:
@@ -240,6 +296,13 @@ def day_phrases(
                     else f"{period_of(lo)}还要{phrase}"
                 )
 
+    # 梦：按开始时间排序后取**最后一段睡眠**（跨午夜结转的那一截也算）。
+    # 不按 end 取：23:00→24:00 与 00:00→07:00 是同一觉拆成的两段，按 end 比
+    # 24:00 会永远赢过 07:00；按开始时间取最后一段就对了（两段的梦本来就该一致）。
+    for _lo, _hi, event, slot in ordered:
+        if is_sleep_event(event):
+            dreams = _clean_dreams(slot.get("dreams"))
+
     # 「她自己想做的」：今天（以及接下来）标了 wants 的那几段。
     wants: list[str] = []
     for slot in slots or []:
@@ -255,6 +318,9 @@ def day_phrases(
         # 今天想做的事。**空列表也要给这个键**——社交侧按 `day.get("wants")` 取，
         # 缺键和空列表要能分开处理（今天是合法的「没有」）。
         "wants": wants[:3],
+        # 当天最近一段睡眠的梦。同样**空列表也要给键**：社交侧用它派「梦」由头，
+        # 旧日程没有 dreams 时这里返回 []，调用方按「今天没有可分享的梦」处理。
+        "dreams": dreams,
     }
 
 
@@ -294,6 +360,29 @@ def persona_block(persona: Persona | None, limit: int = PERSONA_PROMPT_MAX) -> s
         # 退休的人、自由职业者、全职带孩子的角色都会被凭空安一份工位。
         "不要假设她的职业或身份。排一段中性、多数人都成立的日子：有自己的住处、"
         "有事要做、会累。这些怎么安排、她具体在做什么，由她自己说。\n"
+    )
+
+
+def persona_traits_block(persona: Persona | None) -> str:
+    """从人设里识别出的生活特质，拼成 prompt 里的一小块线索。
+
+    为什么要有这一块：用户原话「不是每一个角色都是勤劳的」「夜猫子凌晨活动被砍」。
+    人设里明明写着「夜猫子」「懒散」，以前的日程 prompt 一个字都不读，于是默认
+    按「作息规律、勤快」去排。这里只递**从她自己的设定里读出来的线索**，不是
+    插件新加的性格标签；识别不出来时整块不出现，行为与旧版完全一致。
+    """
+    if persona is None or not persona.usable:
+        return ""
+    try:
+        hints = trait_hints(detect_traits(persona.prompt))
+    except Exception:
+        return ""
+    if not hints:
+        return ""
+    return (
+        "【她这个人的作息与劲头】（从人设里读出来的，安排这一段时参考；没提到的别替她补）\n"
+        + "\n".join(f"- {hint}" for hint in hints)
+        + "\n\n"
     )
 
 
@@ -390,6 +479,11 @@ def segment_prompt(
     ongoing: list[str] | None = None,
     is_night: bool = False,
     interrupted: bool = False,
+    # 上一段是不是睡眠：决定要不要提醒她「刚醒，不必马上起」（C1 的赖床规则）。
+    prev_sleep: bool = False,
+    # 困意是否已经越线（>= CHANGE_TRIGGER_SLEEP_PRESSURE）。调用方从身体快照算，
+    # 这里不重复取数——prompt 里那句「困意已经 80+/100」必须和本地兜底同一条线。
+    body_pressure: bool = False,
     weather: str = "",
     holiday: str = "",
     day_frame: str = "",
@@ -465,9 +559,47 @@ def segment_prompt(
         f"{day_frame}\n\n"
         if day_frame else ""
     )
+    # 困意越线：调用方传的 flag 优先；没传时这里自己从 body 读一次（C1 要求
+    # 「body_pressure 或困意 >=80」都算），两条线必须和 `CHANGE_TRIGGER_SLEEP_PRESSURE` 同值。
+    try:
+        _pressure = float((body or {}).get("sleep_pressure", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        _pressure = 0.0
+    pressure_crossed = bool(body_pressure) or _pressure >= CHANGE_TRIGGER_SLEEP_PRESSURE
+    # 「怎么决定」从 9 起顺延。9/10 是每个角色都该看到的规则（凌晨也是她的一天、
+    # 勤快不是默认值）；后面两条只在对应处境下出现，编号顺延，免得平时白占 prompt。
+    rule_no = 9
+    extra_rules = (
+        f"{rule_no}. 00:00-06:00 也是完整的一天，不是天然的睡觉时段：\n"
+        "   人设是夜猫子/夜班/白天补觉的，凌晨可以排夜里的活动"
+        "（出门、值班、打游戏、写东西、散步、吃夜宵）；\n"
+        "   别因为过了零点就默认她在睡。早起型的人凌晨在睡是正常的。\n"
+    )
+    rule_no += 1
+    extra_rules += (
+        f"{rule_no}. 勤快不是默认值：人设没写她勤快/自律，就别把一天排满工作、学习、家务；\n"
+        "   懒散、拖延、躺一天、刷手机、临时改主意都是正常的一天。\n"
+    )
+    if prev_sleep:
+        rule_no += 1
+        extra_rules += (
+            f"{rule_no}. 她刚醒，上一段是睡眠：不必马上起。\n"
+            "   没急事、睡得不够、或人设不勤快，可以先赖床、回笼觉、"
+            "在被窝里刷一会儿手机——这也是她的一天。\n"
+        )
+    if pressure_crossed:
+        rule_no += 1
+        extra_rules += (
+            f"{rule_no}. 困意已经 80+/100：这一段优先睡一会儿/闭眼休息；\n"
+            "   除非人设里有非做不可的理由（值班、赶工），"
+            "否则别排做饭、工作、出门、社交这类要精神的事。\n"
+        )
 
     return (
         persona_block(persona, cfg.schedule_persona_max_chars)
+        # 人设线索紧跟在人设原文后面：模型先读到「她是谁」，再读从这段文字里
+        # 认出来的作息与劲头，两段不会隔着别的规则各说各的。
+        + persona_traits_block(persona)
         + f"\n现在是 {now_text}（星期{weekday}）。请决定她【从现在开始的这一段】在做什么——"
         "只这一段：之后的事到了时候会再决定，现在不要排。\n\n"
         + prev_line
@@ -513,7 +645,8 @@ def segment_prompt(
         "8. ongoing 只在这件事**要跨好几天**时才写（一份要整理三天的个案笔记），"
         "一次能做完的别写。写了它就一直跟着你，明天你也会接着这件事——"
         + (_ongoing_block or "（目前没有还没做完的事。）") + "\n"
-        "\n"
+        + extra_rules
+        + "\n"
         "【输出格式】\n"
         "1. 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释文字。\n"
         # 这里原来只有一个占位式示例 {"event": "<她在做的事>"}，理由写的是
@@ -537,14 +670,22 @@ def segment_prompt(
         "多数日常小事落在 20~60 分钟，真正要花时间的事才写长。\n"
         "5. energy_rate 是这一段对精力的作用：睡眠/休息为正（0.05~0.2），"
         "工作/外出/社交为负（-0.05~-0.15）。\n"
+        # 梦：夜里 2 条、白天睡的那一觉 3 条。不是睡眠就不写这个字段——写空数组
+        # 会让契约/社交层以为「她做了个没有内容的梦」。
+        "6. 如果这一段是睡眠，额外给 \"dreams\" 字段：普通夜里睡给 2 条梦，"
+        "白天（06:00-20:00）睡的这一觉给 3 条；\n"
+        "   每条 15 字以内，从她最近经历、惦记的事（上面「还没做完的事」、今天的时段）"
+        "里长出来，不要解释梦、不要写「梦见」。不是睡眠就不要写 dreams。\n"
         + (
             # 当天第一次决定时顺带把「今天大概是什么日子」定下来（不另开一次调用）。
-            "6. 这是今天第一次决定：再多给一个 \"today\" 字段——一句话说今天大概是什么日子"
+            "7. 这是今天第一次决定：再多给一个 \"today\" 字段——一句话说今天大概是什么日子"
             "（30 字内，不要引号，别排任务清单）。\n"
             if want_day_frame else ""
         )
         + "\n"
-        + routine_prompt(cfg, 6)
+        # 作息那条排在 extra_rules 后面，编号必须跟着 rule_no 走：写死一个数会与
+        # 「怎么决定」里已有的条目重号（原来写死 6，与第 6 条重号；改成动态顺延）。
+        + routine_prompt(cfg, rule_no + 1)
     )
 
 
@@ -647,6 +788,13 @@ def parse_segment(
         "emotion": emotion,
         "energy_rate": clamp_rate(rate_raw),
     }
+    if sleeping:
+        # 梦只属于睡眠段。`continue=true` 接着睡时模型通常不会把梦再写一遍，
+        # 沿用上一段的梦——否则同一觉被拆成两段后，后一段会把梦洗掉。
+        raw_dreams = raw.get("dreams")
+        if raw_dreams is None and want_continue:
+            raw_dreams = prev.get("dreams")
+        slot["dreams"] = _clean_dreams(raw_dreams)
     if end > DAY_MINUTES:
         slot["carry_end"] = format_time(end - DAY_MINUTES)
     return slot
@@ -727,12 +875,21 @@ def dynamic_segment(
     # 身体优先：饿到线就吃，困到线或在夜里就睡，不等哪张表写着。
     if asleep or (in_night and pressure >= LOCAL_NIGHT_SLEEP_PRESSURE):
         if in_night:
-            # 睡到生物钟夜结束；跨午夜的部分由结转接到明天
+            # 睡到生物钟夜结束（她的自然醒点）；跨午夜的部分由结转接到明天。
             logical_end = night_end if night_end > now_minute else night_end + DAY_MINUTES
             minutes = max(SEGMENT_MIN_MINUTES, min(SEGMENT_SLEEP_MAX_MINUTES, logical_end - now_minute))
         else:
-            minutes = 120
+            # 白天（或不在生物钟夜里）已经睡着：给「睡到自然醒」的兜底，最多 90 分钟。
+            # 旧写法对不在夜里的 asleep 写死 120 分钟，一觉被排成两小时的既定事实；
+            # 滚动分段的语义是醒了再重新判断，所以收短。
+            minutes = 90
         event, location, emotion, rate = "睡一觉", "卧室", "沉睡", 0.15
+    elif pressure >= LOCAL_DAY_NAP_PRESSURE and not in_night:
+        # 白天困到越线：不能继续排「在厨房煮饭」这种要精神的事，但也不用睡一整天。
+        # 45~90 分钟的小睡/补觉，时长按 (角色, 日期, 钟点) 抽签，同一天稳定。
+        minutes = random.Random("|".join(str(x) for x in seed_key)).randint(45, 90)
+        event = pick("seg_nap", seed_key, ("小睡一会儿", "补觉睡一会儿", "趴着睡一会儿"))
+        location, emotion, rate = "家里", "困", 0.12
     elif hunger >= CHANGE_TRIGGER_HUNGER:
         event = pick("seg_eat", seed_key, ("有点饿了", "想找点吃的", "肚子空着"))
         location, emotion, rate, minutes = "家里", "饿", 0.08, 40
@@ -908,6 +1065,8 @@ class ScheduleService:
             "location": str(carry.get("location") or "卧室"),
             "emotion": str(carry.get("emotion") or "沉睡"),
             "energy_rate": clamp_rate(carry.get("energy_rate", 0.15)),
+            # 梦跟着这一觉跨过午夜：旧结转没有这个键，洗成空列表即可。
+            "dreams": _clean_dreams(carry.get("dreams")),
         }
 
     # 「还没做完的事」最多留 3 件、每件最多记 4 天。
@@ -1166,6 +1325,9 @@ class ScheduleService:
             "location": str(carry.get("location") or "卧室"),
             "emotion": str(carry.get("emotion") or "沉睡"),
             "energy_rate": clamp_rate(carry.get("energy_rate", 0.15)),
+            # 跨夜那一觉的梦要跟着接过来：否则她早上醒来时，昨天夜里做的梦
+            # 在今天的日程里没有落点，社交层也没得分享。
+            "dreams": _clean_dreams(carry.get("dreams")),
         }
         updates: dict[str, Any] = {
             "today_date": today,
@@ -1487,12 +1649,20 @@ class ScheduleService:
         frame = await self._ensure_day_frame()
         history, history_note = self._history_for_prompt()
         world = self._world_snapshot()
+        body = self._body_snapshot()
+        # 困意越线与「上一段是不是睡眠」都是这一刻的处境：现取一次，和本地兜底走
+        # 同一条阈值（CHANGE_TRIGGER_SLEEP_PRESSURE），不让 prompt 与兜底各说各的。
+        try:
+            sleep_pressure = float(body.get("sleep_pressure", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            sleep_pressure = 0.0
+        prev_sleep = bool(prev) and is_sleep_event(str((prev or {}).get("event") or ""))
         prompt = segment_prompt(
             cfg,
             now_text=now.strftime("%H:%M"),
             weekday=self._clock.weekday(),
             persona=persona,
-            body=self._body_snapshot(),
+            body=body,
             prev=prev,
             elapsed_minutes=elapsed,
             history=history,
@@ -1500,6 +1670,8 @@ class ScheduleService:
             ongoing=self.ongoing_tasks(),
             is_night=in_scheduled_night(self.current_slots(), now),
             interrupted=interrupted,
+            prev_sleep=prev_sleep,
+            body_pressure=sleep_pressure >= CHANGE_TRIGGER_SLEEP_PRESSURE,
             weather=str(world.get("weather") or ""),
             holiday=str(world.get("holiday") or ""),
             day_frame=frame,
@@ -1642,7 +1814,7 @@ class ScheduleService:
                 # （「专注」→「有点累」、「还差 4 份」→「还差 2 份」）。旧写法只同步
                 # `end`/`energy_rate`，于是进度文字永远停在第一版，`_note_ongoing(installed)`
                 # 拿到的也是旧段。
-                for key in ("location", "emotion", "ongoing", "wants"):
+                for key in ("location", "emotion", "ongoing", "wants", "dreams"):
                     if key in slot:
                         last[key] = slot[key]
                 segs[-1] = last
@@ -1670,6 +1842,8 @@ class ScheduleService:
                 "location": installed.get("location"),
                 "emotion": installed.get("emotion"),
                 "energy_rate": installed.get("energy_rate"),
+                # 梦跟着跨夜结转走（见 `_migrate_new_day` 与 `_carry_slot`）。
+                "dreams": _clean_dreams(installed.get("dreams")),
             }
             updates[CARRY_KEY] = carry
         elif str(self._scope.get_self(CARRY_KEY, "") or ""):
@@ -1705,6 +1879,21 @@ class ScheduleService:
         self.last_persona = persona.label if persona and persona.usable else ""
         return persona
 
+    def last_dreams(self) -> list[str]:
+        """当天最近一段睡眠的梦（没有/旧日程没记 → 空列表）。
+
+        给聊天注入的「刚醒时可提梦」与契约导出共用这一个口径；读取失败一律退化成
+        空列表——注入热路径上的一个坏日程不该把整轮上下文带走。
+        """
+        try:
+            now = self._clock.now()
+            phrases = day_phrases(
+                self.current_slots(), now.hour * 60 + now.minute
+            )
+            return _clean_dreams(phrases.get("dreams"))
+        except Exception:
+            return []
+
     def status(self) -> dict:
         today = self._clock.today_str()
         segs = self.segments()
@@ -1722,6 +1911,8 @@ class ScheduleService:
                 f"{s.get('start')}-{s.get('end')} {s.get('event')}" for s in sleep_spans(self.current_slots())
             ],
             "wake_at": schedule_wake_text(self.current_slots()),
+            # 当天最近一段梦：`/查看日程`、诊断与契约都从这里取（旧日程 → []）。
+            "dreams": self.last_dreams(),
             "source": self.source,
             "source_text": self.source_text,
             "persona": str(self._scope.get_self("schedule_persona", "") or "") or self.last_persona,

@@ -297,7 +297,9 @@ class SleepSentenceTest(unittest.TestCase):
         )
         core.soma.data["asleep_since"] = core.soma.now - 3600.0
         text = core.build_injection("42", is_group=False)
-        self.assertIn("她这会儿在睡", text, f"睡着没说、或又说两遍主语：{text}")
+        # v2.28.0 起睡着那句由 `_sleep_state_lines` 给（并带被吵到/没醒透的细分），
+        # 体感里那句「这会儿在睡」不再重复——断言跟着句子更新，防病句的意图不变。
+        self.assertIn("她这会儿正睡着", text, f"睡着没说、或又说两遍主语：{text}")
         self.assertNotIn("她她", text, f"病句：{text}")
         self.assertNotIn("她这会儿她在睡", text, f"主语重复：{text}")
 
@@ -375,8 +377,10 @@ class SwitchEffectsTest(unittest.TestCase):
     def test_show_sleep_window_also_hides_being_asleep(self):
         on = self._sleeping(show_sleep_window=True).build_injection("42", is_group=False)
         off = self._sleeping(show_sleep_window=False).build_injection("42", is_group=False)
-        self.assertIn("在睡", on, on)
+        # v2.28.0 起睡着的事实句是「她这会儿正睡着」（更细：被吵到/没醒透）。
+        self.assertIn("睡着", on, on)
         self.assertNotIn("在睡", off, "关掉睡眠提示后，换句话仍在说她睡着")
+        self.assertNotIn("睡着", off, "关掉睡眠提示后，换句话仍在说她睡着")
         self.assertNotIn("睡眠时段", off, off)
 
     def test_social_energy_off_hides_the_line(self):

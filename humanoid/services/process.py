@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import random
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
 from ..config import HumanoidConfig
 from ..role_scope import RoleScope
 from ..slots import Slot, is_meal_event, is_sleep_event
+from ..traits import PersonaTraits
 
 
 # 每个大类不再只有几个固定动作，而是由“过程模板 + 阶段”组成。
@@ -89,6 +91,15 @@ DEFAULT_TEMPLATE = {
     "phases": ["开始活动", "继续一会儿", "短暂调整", "再做一点", "慢慢收尾"],
 }
 
+# 人设特质 → 模板取向（C5）。用户原话：「不是每一个角色都是勤劳的；所有功能每个
+# 生产模块都应该有识别机制与更多参考细节」。日程已经定了这一段是工作/学习/家务，
+# 过程服务不罢工，只在**同类模板里**挑更贴她性子的那一档：
+# * 懒散的人做正事：低强度、间歇、整理——不是不做，是做得慢一点；
+# * 懒散的人休息：随性、留白、安静——不是把休息也排成任务；
+# * 勤快的人：保持原模板，不额外加码（别把「勤快」写成加班）。
+_LOW_INTENSITY_STYLES = ("低刺激", "间歇", "整理", "轻量", "日常")
+_RELAXED_STYLES = ("随性", "留白", "安静")
+
 MIN_PROCESS_DURATION = 15
 MAX_PROCESS_DURATION = 90
 MIN_PHASE_MINUTES = 5
@@ -106,18 +117,39 @@ _WORK_WORDS = (
 class ProcessService:
     """管理一个角色的持续生活过程，以及过程内部的阶段变化。"""
 
-    def __init__(self, scope: RoleScope, config_provider, clock, schedule_service, spawn_fn=None):
+    def __init__(
+        self,
+        scope: RoleScope,
+        config_provider,
+        clock,
+        schedule_service,
+        spawn_fn=None,
+        traits_provider: Callable[[], PersonaTraits | None] | None = None,
+    ):
         self._scope = scope
         self._config = config_provider
         self._clock = clock
         self._schedule = schedule_service
         self._spawn = spawn_fn
+        # 人设特质的来源：`() -> PersonaTraits | None`。没递时整个过程服务的行为
+        # 与旧版**完全一致**（模板池不动）。Core 里递的是同步读缓存人设的闭包。
+        self._traits_provider = traits_provider
         self._pending_update = False
         self._last_update_attempt = 0.0
 
     @property
     def config(self) -> HumanoidConfig:
         return self._config()
+
+    def _traits(self) -> PersonaTraits | None:
+        """取一次特质；没来源 / 抛错 / 形状不对都按「没有特质」处理。"""
+        if self._traits_provider is None:
+            return None
+        try:
+            traits = self._traits_provider()
+        except Exception:
+            return None
+        return traits if isinstance(traits, PersonaTraits) else None
 
     def _int_cfg(self, key: str, default: int) -> int:
         """容错取一个整数配置。
@@ -400,10 +432,39 @@ class ProcessService:
             second=0, microsecond=0,
         )
 
+    def _templates_for(self, category: str) -> list[dict[str, Any]]:
+        """按类别 + 人设特质挑模板池；**不改变类别推断本身**。
+
+        没有特质（None）、特质识别不出、或过滤后为空 → 原样返回 `PROCESS_TEMPLATES`
+        里那一组，行为与旧版一致。
+        """
+        templates = PROCESS_TEMPLATES.get(category) or [DEFAULT_TEMPLATE]
+        traits = self._traits()
+        if traits is None:
+            return templates
+        try:
+            preferred: list[dict[str, Any]] = []
+            # 懒散 × 工作/学习/家务：不罢工（这一段是日程定的），偏向低强度风格；
+            # 勤快与懒散同时命中时不做这个偏置——两条线索打架，走默认最稳。
+            if traits.lazy and not traits.diligent and category in ("工作", "学习", "家务"):
+                preferred = [
+                    item for item in templates
+                    if str(item.get("style", "")) in _LOW_INTENSITY_STYLES
+                ]
+            elif traits.lazy and not traits.diligent and category in ("休息", "自由时间"):
+                preferred = [
+                    item for item in templates
+                    if str(item.get("style", "")) in _RELAXED_STYLES
+                ]
+            # 勤快 × 工作/学习：保持现有模板，不额外加码（有意不加分支）。
+        except Exception:
+            preferred = []
+        return preferred or templates
+
     def _generate_process_for_slot(self, now: datetime, slot: Slot) -> dict:
         minutes = now.hour * 60 + now.minute
         category = self._infer_category(slot)
-        templates = PROCESS_TEMPLATES.get(category) or [DEFAULT_TEMPLATE]
+        templates = self._templates_for(category)
         template = random.choice(templates)
 
         min_duration = max(5, self._int_cfg("process_min_duration", MIN_PROCESS_DURATION))

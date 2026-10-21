@@ -32,7 +32,8 @@ from typing import Any, Dict, List, Optional
 API_VERSION = 2
 
 #: 门面能力清单。社交层按这个判断「要不要走门面」，不靠版本号猜。
-CAPABILITIES = ("brief", "clock", "events", "fingerprint")
+#: 只加不改：`dreams` / `wake` 是 v2.28.0 新增的只读能力，API_VERSION 保持 2。
+CAPABILITIES = ("brief", "clock", "events", "fingerprint", "dreams", "wake")
 
 
 def _s(value: Any) -> str:
@@ -178,7 +179,11 @@ class CoreFacade:
                     "done": [_s(x) for x in (day.get("done") or []) if _s(x)],
                     "next": [_s(x) for x in (day.get("next") or []) if _s(x)],
                     "wants": [_s(x) for x in (contract.get("wants") or []) if _s(x)],
+                    # 今天最近一段睡眠的梦（最多 3 条）：旧契约没有这个键 → 空列表。
+                    "dreams": [_s(x) for x in (day.get("dreams") or []) if _s(x)][:3],
                 },
+                # 醒来状态：优先现算（门面的意义就是「不过期」），拿不到再退回契约里那份。
+                "wake": self._wake(core, contract),
                 "ongoing": self._ongoing(core),
             }
             if task in ("proactive", "status"):
@@ -252,6 +257,34 @@ class CoreFacade:
                     "salience": round(1.0 - idx / (total + 1), 2),
                 })
         return out
+
+    def _wake(self, core: Any, contract: Dict[str, Any]) -> Dict[str, Any]:
+        """醒来状态：现算优先，拿不到退回契约那份，都没有就空 dict。"""
+        try:
+            state = core.soma.wake_state()
+        except Exception:
+            state = None
+        if isinstance(state, dict) and state:
+            out: Dict[str, Any] = {
+                "asleep": bool(state.get("asleep", False)),
+                "wake_at": _num(state.get("wake_at")),
+                "inertia_until": _num(state.get("inertia_until")),
+                "inertia_minutes_left": max(0, int(_num(state.get("inertia_minutes_left")))),
+                "disturbed": bool(state.get("disturbed", False)),
+                "last_sleep_hours": _num(state.get("last_sleep_hours")),
+            }
+            return out
+        raw = contract.get("wake")
+        if isinstance(raw, dict) and raw:
+            return {
+                "asleep": bool(raw.get("asleep", False)),
+                "wake_at": _num(raw.get("wake_at")),
+                "inertia_until": _num(raw.get("inertia_until")),
+                "inertia_minutes_left": max(0, int(_num(raw.get("inertia_minutes_left")))),
+                "disturbed": bool(raw.get("disturbed", False)),
+                "last_sleep_hours": _num(raw.get("last_sleep_hours")),
+            }
+        return {}
 
     def _ongoing(self, core: Any) -> List[Dict[str, Any]]:
         """她手上还开着的事：日程侧（`ongoing_tasks`）+ 社交侧发布（`life_log`）。
@@ -341,6 +374,8 @@ class CoreFacade:
                 _s(payload.get("day", {}).get("doing")),
                 "|".join(_s(x) for x in payload.get("day", {}).get("done", []) or []),
                 "|".join(_s(x) for x in payload.get("day", {}).get("next", []) or []),
+                # 梦变了（睡了一觉/换了日程）也是状态变化：社交层缓存该失效。
+                "|".join(_s(x) for x in payload.get("day", {}).get("dreams", []) or []),
                 "|".join(_s(i.get("text")) for i in payload.get("ongoing", []) or []),
                 str(int(core.now_epoch()) // 60),
             ]

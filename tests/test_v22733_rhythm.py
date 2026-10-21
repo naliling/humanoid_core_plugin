@@ -504,11 +504,13 @@ class DynamicSegmentTest(unittest.TestCase):
 
 
 class DayPhrasesTest(unittest.TestCase):
-    def test_the_four_keys_are_always_present(self):
-        """社交侧靠 `day.get("wants")` 区分「缺键」与「今天没有」，键不能省。"""
+    def test_the_five_keys_are_always_present(self):
+        """社交侧靠 `day.get("wants")` / `day.get("dreams")` 区分「缺键」与「今天没有」，
+        键不能省（v2.28.0 起多了 dreams：当天最近一段睡眠的梦）。"""
         out = day_phrases([], 600)
-        self.assertEqual(set(out), {"doing", "done", "next", "wants"})
+        self.assertEqual(set(out), {"doing", "done", "next", "wants", "dreams"})
         self.assertEqual(out["wants"], [])
+        self.assertEqual(out["dreams"], [])
 
     def test_empty_schedule_does_not_raise(self):
         for minutes in (0, 1, 720, 1439):

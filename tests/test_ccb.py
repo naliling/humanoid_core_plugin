@@ -309,7 +309,13 @@ class State(unittest.TestCase):
         self.assertLess(keys.index("ccb"), keys.index("ccb_libido_min"),
                         "开关应当在它的参数之前")
         self.assertEqual(data["ccb"]["default"], False)
-        self.assertEqual(data["ccb"]["description"], "ccb")
+        # v2.28.0（C6）：这里原来断言 `description == "ccb"`，而面板上的实际描述
+        # 早就是一句完整的中文说明。基线因此 1 failed——这是陈旧断言，不是功能回归；
+        # 改成盯「它还是一句说清用途的描述」，不再把文案写死在测试里。
+        self.assertTrue(
+            str(data["ccb"]["description"]).startswith("亲密场景模拟"),
+            f"ccb 的描述不像给用户看的那句：{data['ccb']['description']!r}",
+        )
         # 四个门槛必须存在且与代码默认值一致——不一致的话用户按面板调，
         # 实际生效的是另一套数。
         from humanoid import ccb as _c

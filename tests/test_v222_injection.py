@@ -172,11 +172,12 @@ class InjectionLayerTest(unittest.TestCase):
     # 事实给准数、不给档位话
     # ------------------------------------------------------------------
 
-    def test_days_never_reach_the_context(self):
-        """认识多久**不进上下文**，只留在 `/你的状态` 面板。
+    def test_days_reach_the_context(self):
+        """认识多久**要进上下文**（C3，用户明确要求的有意反转）。
 
-        把天数递给模型，它就会拿去念（「我们认识这么久了」是聊天里最没劲的一句话）。
-        关系深浅由注入里的位置词（关系亲密／普通）承载，那才是她表达时需要的东西。
+        旧规则（「认识多久不进上下文」）担心模型把天数拿去念「我们认识这么久了」，
+        那个风险仍在——所以注入里只给一句陈述事实的短句，不写引导复述的话；
+        `/你的状态` 面板仍然给准数与「个月/年」档，两处口径分开。
         """
         from humanoid.prompt_builder import PromptBuilder
 
@@ -185,12 +186,15 @@ class InjectionLayerTest(unittest.TestCase):
         record["first_met"] = core.now_epoch() - 400 * 86400  # 认识了一年多
         core.scope.mark_dirty()
         text = core.build_injection("42", is_group=False)
-        for leaked in ("认识1年", "认识400", "你们认识", "个月了", "天了"):
-            self.assertNotIn(leaked, text, f"认识天数漏进上下文：{leaked}\n{text}")
+        self.assertIn("你们已经认识 400 天了", text, f"认识天数没进上下文：\n{text}")
+        # 每轮最多一条：同一天数不该在注入里出现两遍。
+        self.assertEqual(text.count("你们已经认识"), 1, f"认识天数说了不止一次：\n{text}")
+        # 档位话（「认识几天了」）在任何地方都不该出现（这条旧断言保留）。
+        for leak in ("认识几天了", "认识 1 年", "个月了"):
+            self.assertNotIn(leak, text, f"旧档位话漏进上下文：{leak}\n{text}")
         # 面板上照给准数
         panel = "\n".join(core.status_lines("42"))
         self.assertIn("认识 1 年", panel, f"面板上该看得到认识多久：\n{panel}")
-        # 档位话（「认识几天了」）在任何地方都不该再出现
         self.assertNotIn("认识几天了", panel)
         self.assertEqual(
             PromptBuilder._days_line(3 * 86400), "认识 3 天",

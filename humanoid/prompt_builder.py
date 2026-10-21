@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 from .config import HumanoidConfig
 from .data.mood_map import get_mood_label
 from .emotion import EmotionLayer, bracket
+from .services.soma import WAKE_DISTURBED_WINDOW_SECONDS
 from .wording import (
     AGENCY_CONTINUATION,
     CARE_WORDS,
@@ -59,6 +60,10 @@ FRAMING_MARK = "【她的身体与生活】"
 
 # 「此刻的她」那一段（I1）的标题：每轮变化，作为临时内容块发出（不落历史）。
 STATE_MARK = "【此刻的她】"
+
+# 刚醒 30 分钟内可以提一句梦：再晚她已经在过新的一段了，梦不该追着说。
+# 与「她刚睡醒」那句 90 分钟的余韵窗口分开：梦比睡醒的余韵退得更快。
+DREAM_WINDOW_SECONDS = 30 * 60
 
 # 给 system_prompt 的那段话：说明下面这些是什么、按什么方式读它。稳定文本，不含事实。
 # 只划参考边界，不下指令：说什么、怎么说、说多长，都由她自己判断。
@@ -628,14 +633,16 @@ class PromptBuilder:
         if position:
             lines.append(position)
 
+        # 认识多久（C3，**有意反转旧规则**）：用户明确要求「把认识了几天加到提示词」。
+        # 旧规则担心模型会拿去念「我们认识这么久了」——那个理由仍然成立，所以这里只给
+        # 一句陈述事实的短句，不加任何「所以你们应该…」的引导；每轮最多一条。
+        days_line = self._met_days_line(user_id)
+        if days_line:
+            lines.append(days_line)
+
         # 关系到了哪一步（「到什么程度可以说什么」）不再在这里说——【此刻的她】
         # 那一段已经有一句一样的关系阶段。两处都说，模型每轮都被同一件事推着，
         # 调子会卡在一个点上、看着重复（插件自己的规矩是「同一件事只说一遍」）。
-
-        # **认识多久不进上下文。** 关系深浅已经由上面那句位置词承载（「她对TA关系亲密」比
-        # 「你们认识 400 天」更能指导她怎么说话），而把天数递给模型，它就会拿去念——
-        # 「我们认识这么久了」是聊天里最没劲的一句话。想知道天数用 `/你的状态`，那里给你看。
-        # 很久没见这件事也不需要专门说一句：间隔那块会报「TA有 7 天没吭声了」。
 
         # 冷静期：好感跌破门槛后的一段时间里，她带着情绪冷着，想让他先别来吵（D3）。
         try:
@@ -693,12 +700,35 @@ class PromptBuilder:
             return f"她对TA{care_word}"
         return f"她对TA{label}" if label else ""
 
+    def _met_days_line(self, user_id: str) -> str:
+        """「你们已经认识 N 天了」——进上下文，每轮最多一条。
+
+        **这是用户明确要求的有意反转。** 旧规则（旧版 `_days_line` 的注释）是
+        「认识多久不进上下文」，理由是模型会把天数拿去念「我们认识这么久了」。
+        那个风险还在，所以这里只给一句**陈述事实**的短句，不写任何引导复述的话；
+        具体厚度仍由上面的关系位置词承载。想知道准数用 `/你的状态` 面板。
+        """
+        try:
+            first_met = float(self._core.mood.first_met(user_id) or 0.0)
+        except Exception:
+            return ""
+        if first_met <= 0:
+            return ""
+        try:
+            now = float(self._core.now_epoch())
+        except Exception:
+            return ""
+        days = int(max(0.0, now - first_met) // 86400.0)
+        if days >= 1:
+            return f"你们已经认识 {days} 天了"
+        return "你们刚认识不久"
+
     @staticmethod
     def _days_line(elapsed: float) -> str:
-        """认识多久——**只给 `/你的状态` 面板看，不进上下文**。
+        """认识多久——**面板与诊断用**，格式与注入里的那句事实不同。
 
-        「你们认识几天了」这种档位话回答不了「几天」，而具体天数递进模型会被拿去念。
-        面板里给准数，是为了你自己能核对；模型那边靠关系位置词（「关系亲密／普通」）就够。
+        面板给人看，给的是准数与「个月/年」这种容易读的档位；注入里（`_met_days_line`）
+        只说「认识 N 天/刚认识不久」，免得每轮都像在报纪念日。
         """
         seconds = max(0.0, float(elapsed))
         days = seconds / 86400.0
@@ -711,6 +741,55 @@ class PromptBuilder:
         if days < 365:
             return f"认识 {int(days // 30)} 个月"
         return f"认识 {int(days // 365)} 年"
+
+    def _sleep_state_lines(self) -> List[str]:
+        """她此刻的睡眠状态：正睡着 / 被消息吵到 / 刚醒还没缓过来。
+
+        为什么要有这一块：用户原话「就算别人来吵或者给角色发消息，也不会显得明明在
+        睡觉却生龙活虎」「刚醒还没缓过来」。以前睡着只说「她在睡」，醒来立刻就是完全
+        清醒的人，中间那段「人还没醒透」根本不存在。
+
+        只给事实，不写台词（和 `_night_lines` 同一条规矩）。
+        `show_sleep_window=False` 时整块不出——用户关掉的就是「提她睡没睡」这类事实。
+        """
+        cfg = self.config
+        if not cfg.show_sleep_window:
+            return []
+        core = self._core
+        try:
+            state = core.soma.wake_state()
+        except Exception:
+            return []
+        if not isinstance(state, dict):
+            return []
+        now = _core_epoch(core)
+        if state.get("asleep"):
+            lines = ["她这会儿正睡着"]
+            try:
+                disturbed_at = float(core.soma.data.get("sleep_disturbed_at", 0.0) or 0.0)
+            except (TypeError, ValueError, AttributeError):
+                disturbed_at = 0.0
+            # 只认最近 10 分钟内的那一次：更早被吵醒的人已经睡回去了，再说「刚被吵到」
+            # 是假话。
+            if disturbed_at > 0 and 0 <= now - disturbed_at <= WAKE_DISTURBED_WINDOW_SECONDS:
+                lines.append("刚被这条消息吵到，还没醒透")
+            return lines
+        try:
+            until = float(state.get("inertia_until", 0.0) or 0.0)
+            wake_at = float(state.get("wake_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return []
+        if until <= 0 or now <= 0 or now >= until:
+            return []
+        minutes = int(max(0.0, now - wake_at) // 60.0) if wake_at > 0 else 0
+        line = (
+            f"她刚醒（{minutes} 分钟前），人还没完全缓过来"
+            if minutes >= 1
+            else "她刚醒，人还没完全缓过来"
+        )
+        if state.get("disturbed"):
+            line += "，是被消息吵醒的"
+        return [line]
 
     def _echo_lines(self) -> List[str]:
         """她刚：带着上一件事的余韵进来。剩的只有身体事实。
@@ -743,6 +822,20 @@ class PromptBuilder:
                     lines.append(
                         f"她刚睡醒，睡了{slept:.0f}小时" if slept >= 1.0 else "她刚睡醒"
                     )
+            # 刚醒 30 分钟内可以提一句梦：最多一条，不解释、不追问。
+            # 窗口比上面那句余韵短——梦退得比「刚睡醒」快，过了半小就别再提。
+            try:
+                state = core.soma.wake_state()
+                wake_at = float(state.get("wake_at", 0.0) or 0.0) if isinstance(state, dict) else 0.0
+            except Exception:
+                wake_at = 0.0
+            if wake_at > 0 and 0 <= _core_epoch(self._core) - wake_at <= DREAM_WINDOW_SECONDS:
+                try:
+                    dreams = core.schedule.last_dreams()
+                except Exception:
+                    dreams = []
+                if dreams:
+                    lines.append(f"她刚从梦里醒过来（梦到{dreams[0]}）")
         return lines
 
     def _memory_lines(self, user_id: str, detailed: bool) -> List[str]:
@@ -1101,6 +1194,11 @@ class PromptBuilder:
             relation = relation + [nickname]
         if relation:
             sents.append((self._sentence(relation), 8.0))
+        # 睡眠状态（正睡着/被吵到/没醒透）放在关系之后、其余必需品之前：
+        # 它是这一轮最该被看见的处境，又必须保证一定进得去（不随预算被挤掉）。
+        sleep_state = self._sleep_state_lines()
+        if sleep_state:
+            sents.append((self._sentence(sleep_state), 9.5))
         sents.append((self._emotion_line(user_id, interest, agency, is_group), 8.5))
         situ = self._behavior_lines(
             user_id, events, agency,
@@ -1140,6 +1238,10 @@ class PromptBuilder:
         ]
         if asleep:
             body = self._feelings_lines(MAX_FEELINGS_LOW, 0.0)
+            # 「她在睡」这件事由更细的睡眠状态句（正睡着 / 被吵到 / 没醒透）承载，
+            # 体感里那句「这会儿在睡」不与它重复（同一件事只说一遍）。
+            if self._sleep_state_lines():
+                body = [line for line in body if "在睡" not in line]
             if body:
                 sents.append((self._sentence(body), 9.0))
             self._append_sleep_essentials(
@@ -1155,9 +1257,18 @@ class PromptBuilder:
         if body:
             sents.append((self._sentence(body), 8.0))
 
-        echo = self._sentence(self._echo_lines())
+        # 刚醒的睡眠惯性（不是刚醒就是空）：只在醒来后一小段里出现。
+        # 有它时不再重复「她刚睡醒」——两句说的是同一件事，模型会当成两件。
+        sleep_state = self._sleep_state_lines()
+        echo_lines = self._echo_lines()
+        if sleep_state:
+            echo_lines = [line for line in echo_lines if "刚睡醒" not in line]
+        echo = self._sentence(echo_lines)
         if echo:
             sents.append((echo, 6.0))
+        wake_state = self._sentence(sleep_state)
+        if wake_state:
+            sents.append((wake_state, 8.5))
 
         relation = self._relation_lines(user_id, is_group, interest=interest)
         nickname = self._nickname_line(user_id, is_group)
@@ -1210,6 +1321,8 @@ class PromptBuilder:
         ]
         if asleep:
             body = self._feelings_lines(MAX_FEELINGS_FULL, 0.0)
+            if self._sleep_state_lines():
+                body = [line for line in body if "在睡" not in line]
             if body:
                 sents.append((self._sentence(body), 9.0))
             self._append_sleep_essentials(
@@ -1226,9 +1339,17 @@ class PromptBuilder:
             body = body + [sleep_cause]
         if body:
             sents.append((self._sentence(body), 8.0))
-        echo = self._sentence(self._echo_lines())
+        # 与 medium 档同一口径：睡眠惯性句在时不再重复「她刚睡醒」。
+        sleep_state = self._sleep_state_lines()
+        echo_lines = self._echo_lines()
+        if sleep_state:
+            echo_lines = [line for line in echo_lines if "刚睡醒" not in line]
+        echo = self._sentence(echo_lines)
         if echo:
             sents.append((echo, 6.0))
+        wake_state = self._sentence(sleep_state)
+        if wake_state:
+            sents.append((wake_state, 8.5))
         relation = self._relation_lines(user_id, is_group, interest=interest)
         nickname = self._nickname_line(user_id, is_group)
         if nickname:

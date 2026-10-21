@@ -83,6 +83,14 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(contract["v"], CONTRACT_VERSION)
         for key in ("time", "body", "feelings", "form", "activity", "weather", "paths", "routine"):
             self.assertIn(key, contract)
+        # v2.28.0：梦与醒来状态是只加不改的新契约字段（旧社交层不认也不受影响）。
+        self.assertIn("wake", contract)
+        self.assertEqual(
+            set(contract["wake"]),
+            {"asleep", "wake_at", "inertia_until", "inertia_minutes_left",
+             "disturbed", "last_sleep_hours"},
+        )
+        self.assertIn("dreams", contract["day"])
         for key in (
             "energy", "sleep_pressure", "sleep_debt", "hunger", "discomfort",
             "arousal", "asleep", "social_energy", "social_desire", "cycle_day",

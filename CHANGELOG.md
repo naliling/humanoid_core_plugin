@@ -1,3 +1,121 @@
+## v2.28.0 — 凌晨、梦境、睡眠惯性，以及「不是每个人都勤快」
+
+### 为什么
+
+这一版全是「已有机制缺了输入」的修补，不是新功能堆叠。用户原话：
+
+- 「日程不包括凌晨，夜猫子凌晨活动被砍」——日程本身是滚动分段、任何时刻都能生成，
+  但 prompt 没说清「凌晨也是完整的一天」，也没从人设里认出夜猫子/早起；
+- 「白天/凌晨我觉得要加上梦境；凌晨的或许可以生成两个，白天睡觉的可以生成三个」——
+  睡眠段只有一个「睡眠」事件，醒来没有任何可回忆的内容，社交层也无事可分享；
+- 「在角色这一睡觉时间段可以加一个睡眠懒觉……就算别人来吵或者给角色发消息，也不会
+  显得明明在睡觉却生龙活虎」——睡着被消息吵到时注入里只有「这会儿在睡」，醒来立刻
+  就是生龙活虎的完全清醒状态；
+- 「白天确实该困，但是白天不睡觉，而是困意 86 在厨房煮饭」——困意越线阈值 88 太晚，
+  prompt 也没把「困意 ≥80 不能排要精神的事」说清楚，本地兜底白天不会小睡；
+- 「不是每一个角色都是勤劳的；所有功能每个生产模块都应该有识别机制与更多参考细节」——
+  日程 prompt 默认「把一天排满」，`ProcessService` 完全不读人设；
+- 「提示词 prompt 可以给把认识了几天加到提示词了」——旧规则明确写着「认识多久不进上下文」，
+  这次是用户明确要求的**有意反转**；
+- 「更多避免被一个毛病带回来，可以去更新文档文件」——本版补上 `docs/REGRESSIONS.md`。
+
+### 做了什么
+
+#### C1 凌晨日程 + 夜猫子/勤快/懒散识别（`humanoid/traits.py`、`services/schedule.py`）
+
+- 新增 `humanoid/traits.py`：`PersonaTraits` + `detect()` + `trait_hints()`，从人设正文里
+  保守识别夜猫子/早起/勤快/懒散/宅/外向/倒班/学生/上班；简单否定（「不熬夜」「不爱出门」）
+  不算命中；勤快与懒散同时命中时提示词只留更明确的一条。
+- 日程 prompt：
+  - 人设原文后面插入「她这个人的作息与劲头」线索块（识别不出时整块不出现，行为同旧版）；
+  - 「怎么决定」新增：**00:00-06:00 也是完整的一天**、**勤快不是默认值**、
+    上一段是睡眠时允许**赖床/回笼觉**、困意 ≥80 时优先休息不排要精神的事；
+  - 输出格式新增 `dreams`：普通夜里 2 条、白天（06:00-20:00）睡的那一觉 3 条，
+    每条 ≤15 字，不是睡眠就不写。
+- `dreams` 全链路：`parse_segment`（去空/去重/≤20 字/≤3 条/非字符串忽略/剥句首「梦到」）、
+  `_append_segment` 跨夜 carry、`_migrate_new_day` 跨天接续、`day_phrases`、`status()`、
+  `ScheduleService.last_dreams()`、`/查看日程` 行尾「（梦：…）」。
+- 困意越线 `CHANGE_TRIGGER_SLEEP_PRESSURE` 88 → **80**（常量与注释同步）；`_generate_segment`
+  把 `body_pressure` 与 `prev_sleep` 递进 prompt。
+- 本地兜底：白天困意 ≥82 时安排 45~90 分钟小睡/补觉；不在生物钟夜里的 `asleep` 从
+  120 分钟收到最多 90 分钟；夜里仍睡到窗口结束（既有行为不变）。
+- 兼容：旧 slot 没有 `dreams` / 旧 carry 没有 `dreams` → 一律读成 `[]`，不报错。
+
+#### C2 睡眠懒觉 / 被吵醒 / 睡眠惯性（`services/soma.py`、`core_instance.py`、`prompt_builder.py`）
+
+- soma 新增状态：`wake_at`、`wake_inertia_until`、`wake_disturbed`、`sleep_disturbed_at`；
+  `snapshot()` 结构**保持不变**（新状态只走 `wake_state()`）。
+- `note_disturbed(now)`：睡着时被消息吵到就记一笔，**不改睡眠状态**（消息不掀被子）。
+- `_record_wake`：真正一觉才写惯性——自然醒 10 分钟、短睡 25 分钟、被吵醒 +15 分钟、
+  封顶 45 分钟；碎片（<0.5 小时）保持原逻辑。醒来时结算并清掉 `sleep_disturbed_at`。
+- `core_instance.on_message`：在 `soma.advance()` **之前**、非指令消息时记 `note_disturbed`。
+- 注入：睡着时给「她这会儿正睡着」+ 10 分钟内「刚被这条消息吵到，还没醒透」；
+  醒来惯性期给「她刚醒（X 分钟前），人还没完全缓过来」，被吵醒的加「是被消息吵醒的」；
+  睡眠惯性句在场时不再重复「她刚睡醒」；关闭 `show_sleep_window` 时整块不出现。
+- 刚醒 30 分钟内可提一句梦：「她刚从梦里醒过来（梦到…）」，最多一条。
+
+#### C3 把「认识了几天」加进提示词（`prompt_builder.py`）
+
+- `_relation_lines` 在关系位置句之后、情绪事件之前加一句事实：
+  ≥1 天 → 「你们已经认识 N 天了」；<1 天 → 「你们刚认识不久」。每轮最多一条。
+- **这是用户明确要求的有意反转。** 旧规则的理由（模型会拿去念）仍然成立，所以这里只给
+  陈述句、不写引导复述的话；`_days_line` 保留给 `/你的状态` 面板（准数/月/年）。
+- 同步更新既有测试：`tests/test_v222_injection.py` 里「认识多久不进上下文」改为
+  「必须进上下文」（保留「不出现『认识几天了』这种档位话」的断言）。
+
+#### C4 契约与门面导出梦 + 醒来状态（`link.py`、`api.py`）
+
+- `build_contract`：`day.dreams`（≤3 条）+ 顶层 `wake`（asleep/wake_at/inertia_until/
+  inertia_minutes_left/disturbed/last_sleep_hours）；`CONTRACT_CAPABILITIES` 追加
+  `dreams`、`wake`，`CONTRACT_VERSION` 保持 2（只加不改）。
+- `CoreFacade.brief`：`day.dreams`、顶层 `wake`（优先现算，拿不到退回契约）；
+  `CAPABILITIES` 追加 `dreams`、`wake`，`API_VERSION` 保持 2；缓存指纹纳入 `day.dreams`。
+- 兼容：旧 Core 写下的契约缺字段 → 空列表/空 dict；旧 Social 不认新字段 → 照旧走老字段。
+
+#### C5 过程服务识别「不是每个角色都勤劳」（`services/process.py`）
+
+- `ProcessService.__init__` 新增可选 `traits_provider`；`core_instance` 传同步读缓存人设的闭包。
+- `_generate_process_for_slot` 按特质选模板，**不改变类别推断**：
+  懒散 + 工作/学习/家务 → 低强度/间歇/整理风格；懒散 + 休息/自由时间 → 随性/留白/安静；
+  勤快 + 工作/学习 → 保持原模板；没有特质 → 与旧版逐字段一致（不罢工）。
+- `_infer_category` 未改。
+
+#### C6 修掉基线里一条陈旧断言
+
+- 配置面板底部那组隐藏开关的「说明文案」测试：它原来断言 schema 里 description
+  等于一个短代号，而面板上早就是一句完整中文说明——基线因此 1 failed。
+  按现实改成断言描述以「亲密场景模拟」开头。**这是修测试，不是功能改动。**
+
+#### C7 文档 / 版本
+
+- `humanoid/__init__.py` → `2.28.0`，`metadata.yaml` → `2.28.0`；
+- 新增 `docs/REGRESSIONS.md`；README 日程/睡眠/人设段落更新。
+
+### 没做什么
+
+- 没加新配置项：这一版补的是已有机制缺失的输入与识别，不是再开一个开关；
+- 没改滚动分段/跨夜 carry/睡眠保护的主干逻辑：睡着不重掷、消息不掀被子都保持原样，
+  新增的只是「被吵到」的痕迹与醒来后的惯性；
+- 没有把「梦」写进聊天上下文每一条消息：只在刚醒 30 分钟窗口里提一句；
+- 没有替模型决定她勤快与否：特质只作为人设线索进 prompt / 过程模板取向，
+  排出来是什么样仍由模型按人设与身体判断。
+
+### 验证
+
+- 全量测试：**1343 passed / 1 skipped / 0 failed**（3029 个 subtests 全过）。
+  基线 1260 passed / 1 skipped / 1 failed（失败项即 C6 修掉的那条陈旧断言）。
+- 新增 `tests/test_v2280_traits.py`、`test_v2280_schedule_dreams.py`、
+  `test_v2280_sleep_inertia.py`、`test_v2280_contract.py`、`test_v2280_relation_days.py`。
+  这些断言在旧行为下会红：没有 `traits.py`（导入失败）、没有 `dreams` 链路、
+  `dynamic_segment` 白天不睡、困意 80 不触发、没有 `wake_state()`/`wake` 契约字段、
+  注入里没有「正睡着/刚醒/梦」、认识天数不进上下文。
+- 既有测试只做语义更新，未删除：`test_v222_injection`（认识天数反转）、
+  `test_v2192_checkup`（睡着的事实句换成更细的「正睡着」）、
+  `test_v22733_rhythm`（`day_phrases` 多一个 dreams 键）、
+  `test_link` / `test_v22740_facade`（补契约与门面的新字段断言）。
+
+
+
 # 更新日志
 
 ## v2.27.55 — 与「主动消息」同版本号

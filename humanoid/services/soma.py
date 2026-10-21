@@ -61,6 +61,17 @@ MIN_PERSIST_INTERVAL_SECONDS = 300.0
 # 阈值取 0.5 与 `prompt_builder` 的「睡了 >= 0.5 小时才算睡了一觉」同一口径。
 SLEEP_FRAGMENT_MIN_HOURS = 0.5
 
+# 睡眠惯性：醒来之后「人还没缓过来」的那一小段时间。
+# 自然醒 10 分钟；睡不够（不足需要时长的 85%）25 分钟；被消息吵醒 +15 分钟；
+# 封顶 45 分钟——再长就不像刚醒，像生病了。用户原话是「刚醒还没缓过来」要能看出来，
+# 但也不能让她一上午都迷迷糊糊。
+WAKE_INERTIA_MINUTES = 10
+WAKE_INERTIA_SHORT_MINUTES = 25
+WAKE_INERTIA_DISTURBED_EXTRA = 15
+WAKE_INERTIA_MAX_MINUTES = 45
+# 消息把睡眠「吵到」的判定窗口：醒来时距最后一次吵醒不超过这么久，才算被这条吵醒的。
+WAKE_DISTURBED_WINDOW_SECONDS = 600.0
+
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     # NaN 必须单独拦：`min(100.0, nan)` 在 Python 下返回 **100.0**（nan 与任何数比较
@@ -73,6 +84,21 @@ def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
 
 def _rounded(value: float) -> float:
     return round(value, 2)
+
+
+def _flag(value: Any) -> bool:
+    """状态文件里的布尔值：用户能手改成 "false"/"0"，不能一律 `bool(...)`。
+
+    `bool("false")` 是 True——手改坏的 state 会把「没被吵醒」读成「被吵醒」，
+    注入里就会多一句「是被消息吵醒的」。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on", "是", "开")
+    return False
 
 
 def _sleep_window(slots: list[dict]) -> tuple[float, float] | None:
@@ -419,14 +445,93 @@ class SomaService:
             return
         self.data["last_sleep_hours"] = _rounded(min(slept_hours, 24.0))
         self.data["sleep_hours_today"] = 0.0
-        self.data["last_wake_at"] = _rounded(moment.timestamp())
-        self.data["sitting_since"] = _rounded(moment.timestamp())
+        now_ts = moment.timestamp()
+        self.data["last_wake_at"] = _rounded(now_ts)
+        # `wake_at` 与 `last_wake_at` 同值：前者供 `wake_state()` 这个新视图读，
+        # 后者是注入/旧逻辑已经在用的字段。旧状态没有 `wake_at` 时 `wake_state()`
+        # 会回退读 `last_wake_at`，所以两个字段不会分叉。
+        self.data["wake_at"] = _rounded(now_ts)
+        self.data["sitting_since"] = _rounded(now_ts)
+        # ── 睡眠惯性（C2）────────────────────────────────────────────
+        # 刚醒的人不是「生龙活虎」：自然醒 10 分钟；睡不够 25 分钟；被消息吵醒再加
+        # 15 分钟；封顶 45 分钟。只有真正的一觉才写（碎片在上面已经 return）。
+        need = max(1.0, float(self.config.sleep_need_hours))
+        short = slept_hours < need * 0.85
+        disturbed = False
+        try:
+            disturbed_at = float(self.data.get("sleep_disturbed_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            disturbed_at = 0.0
+        if disturbed_at > 0 and 0 <= now_ts - disturbed_at <= WAKE_DISTURBED_WINDOW_SECONDS:
+            disturbed = True
+        inertia = WAKE_INERTIA_SHORT_MINUTES if short else WAKE_INERTIA_MINUTES
+        if disturbed:
+            inertia += WAKE_INERTIA_DISTURBED_EXTRA
+        inertia = min(WAKE_INERTIA_MAX_MINUTES, max(1, inertia))
+        self.data["wake_inertia_until"] = _rounded(now_ts + inertia * 60.0)
+        self.data["wake_disturbed"] = bool(disturbed)
+        # 这一次已经结算：旧的「被吵到」不能带到下一觉。
+        self.data["sleep_disturbed_at"] = None
+        self._scope.mark_dirty()
         # 睡够了一晚：困意落到低位，醒来该是清醒的（起落要看得出来）。
         # 睡着时积分里本来就在按 sleep_relief_per_hour 清，这里只是把「睡够」后
         # 的残留按上限夹低——是夹上限，不是再减一次，不会把同一夜算两遍。
-        need = max(1.0, float(self.config.sleep_need_hours))
-        if slept_hours >= need * 0.85:
+        if not short:
             self._set("sleep_pressure", min(self._get("sleep_pressure", 20.0), 12.0))
+
+    def note_disturbed(self, now: float | None = None) -> bool:
+        """她在睡的时候被一条消息吵到：记下时间，**不动睡眠状态**。
+
+        消息不撕被子是既有设计（睡着的那一段不重掷、不越线打断）——这里只留一个
+        「刚被吵到」的痕迹，醒来时 `_record_wake` 据此加长睡眠惯性，注入里也就有了
+        「被这条消息吵到，还没醒透」这句事实。
+
+        返回 True 表示真的记下了（当前在睡）；醒着时返回 False，什么都不写。
+        指令消息不该走到这里（调用方在 `core_instance.on_message` 里挡了）。
+        """
+        if not self.data.get("asleep_since"):
+            return False
+        moment = self.now if now is None else float(now)
+        if not math.isfinite(moment):
+            return False
+        self._ensure_data()["sleep_disturbed_at"] = _rounded(moment)
+        # 这一项不在 `snapshot()` 里（快照结构保持不动），`_persist_if_changed` 看不到
+        # 它的变化，所以直接标脏，让「被吵到」这件事跟着下一次落盘存下来。
+        self._scope.mark_dirty()
+        return True
+
+    def wake_state(self) -> dict[str, Any]:
+        """醒来状态（只读）：给注入与契约用，**不改 `snapshot()` 的结构**。
+
+        旧版 soma 没有这些字段：`wake_at` 回退到 `last_wake_at`，惯性/被吵标记按
+        0/False 处理，不会因为缺键报错。所有数值都做坏值容错——state.json 是用户
+        能手改的文件。
+        """
+        data = self.data
+
+        def _num(key: str, default: float = 0.0) -> float:
+            try:
+                value = float(data.get(key, default) or default)
+            except (TypeError, ValueError):
+                return default
+            return value if math.isfinite(value) else default
+
+        asleep = bool(data.get("asleep_since"))
+        # 旧状态只有 last_wake_at；新状态两个都写，读哪个都对。
+        wake_at = _num("wake_at") or _num("last_wake_at")
+        inertia_until = _num("wake_inertia_until")
+        now = self.now
+        minutes_left = 0
+        if inertia_until > 0 and math.isfinite(now) and inertia_until > now:
+            minutes_left = int(math.ceil((inertia_until - now) / 60.0))
+        return {
+            "asleep": bool(asleep),
+            "wake_at": wake_at,
+            "inertia_until": inertia_until,
+            "inertia_minutes_left": minutes_left,
+            "disturbed": _flag(data.get("wake_disturbed", False)),
+            "last_sleep_hours": _rounded(self._get("last_sleep_hours", 0.0)),
+        }
 
     def biological_night(self) -> tuple[float, float] | None:
         """她的生物钟夜里是哪一段：**(起始小时, 结束小时)**，跨午夜用 start > end 表示。

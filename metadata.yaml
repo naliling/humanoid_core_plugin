@@ -25,7 +25,7 @@ desc: |
   她会按你的话去读，也把自己生活里的事写回去；没装也照常跑。
 
   配置不复杂，要调的就那几项，剩下的都标了【进阶】。
-version: 2.27.51
+version: 2.28.0
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"
