@@ -48,8 +48,20 @@ except Exception as exc:  # pragma: no cover
 
 
 class FakeResult:
-    def __init__(self, text: str) -> None:
+    """消息发送结果的替身。
+
+    真实 `MessageEventResult` 有 `result_content_type` 与 `get_plain_text()`，
+    main.py 的 `note_her_reply` / `capture_reply_on_send` / `note_her_outgoing`
+    三条钩子都靠这两个判断「这是不是她说的话」。替身必须照单全收，
+    否则那些钩子在测试里会被误判成「不是 LLM 结果」而静默跳过。
+    """
+
+    def __init__(self, text: str, content_type: str = "LLM_RESULT") -> None:
         self.text = text
+        self.result_content_type = type("CT", (), {"name": content_type})()
+
+    def get_plain_text(self) -> str:
+        return self.text
 
 
 class FakeEvent:

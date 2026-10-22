@@ -302,6 +302,51 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
         if ongoing:
             # 一件也说「还没做完的事」，不说「几件」——件数在 1~3 之间，写死量词会数错。
             day = "；".join(p for p in (day, "她手上还没做完的事：" + "、".join(ongoing)) if p)
+        # 身体轴也进这一段（v2.28.1 选项 B）。
+        #
+        # 为什么补：v2.27.38 把「〔她的身体与生活〕」标记块从每轮注入改成只在主动消息时
+        # 注入，普通聊天里她就只剩时间/日程/关系/心境——回一句「在干嘛」时看不到自己
+        # 困不困、饿不饿。用户看到的就是「上下文里没有插件的任何痕迹」。
+        #
+        # 为什么不把标记块原样加回来：那里面混着契约版本号、uid、块头，
+        # 每轮重发既胀 token 又像「要回应的内容」。这里只取**中性的身体事实**
+        # （`soma.feelings()` 已经过滤掉台词与情绪倾向，只留 sleepy/debt/hunger/
+        # discomfort/arousal 五个轴的档位词），不进数字、不进块头。
+        #
+        # 走的是同一条临时块（`mark_as_temp()`，不落会话历史），前缀缓存代价为零。
+        body_lines = []
+        try:
+            if core.config.soma_enabled:
+                feelings = core.soma.feelings(float(core.energy.energy))
+                picked = [
+                    (float(score), str(text))
+                    for score, text in feelings
+                    if float(score) >= 0.75
+                ]
+                picked.sort(key=lambda item: item[0], reverse=True)
+                # 每条都带主语（「她饿得发慌」），但用「、」连起来时不能重复主语：
+                # 「她困得不行、她饿得发慌」读起来像两条独立通报。
+                # 所以第一条带主语，后续几条把主语去掉，由连接词承担。
+                raw = [
+                    text if text.startswith("她") else f"她{text}"
+                    for _, text in picked[:3]
+                ]
+                body_lines = [raw[0]] if raw else []
+                body_lines += [t[1:] if t.startswith("她") else t for t in raw[1:]]
+        except Exception:
+            body_lines = []
+        # 关掉「提她睡没睡」时，睡眠那几句也不在这里换句话出现（同一事实只说一遍）。
+        # 读配置也走安全路径：拿不到就当「开着」——与 `_feelings_lines` 同口径，
+        # 一个缺字段不该把整段 state_note 带走。
+        try:
+            _show_sleep = bool(core.config.show_sleep_window)
+        except Exception:
+            _show_sleep = True
+        if not _show_sleep:
+            body_lines = [l for l in body_lines if "睡" not in l]
+        if body_lines:
+            day = "；".join(p for p in (day, "、".join(body_lines)) if p)
+
         # 外界（几点/几号/周几/季节/城市/天气）与穿搭都进这一段当背景，不进事实块：
         # 单独成段、只当她「知道」，要不要提由她自己定。
         world = ""
@@ -1323,6 +1368,70 @@ class HumanoidCore(Star):
                     pass
         except Exception as e:
             logger.debug(f"{LOG_PREFIX} 记录她的发言失败: {e}")
+
+    # -------------------- 她自己发出去的话（含别的插件主动发的） --------------------
+
+    @filter.after_message_sent()
+    async def note_her_outgoing(self, event: AstrMessageEvent):
+        """她发出去的一句话，Core 也要知道。
+
+        **为什么需要这个钩子**：Core 原先只通过 `on_message`（用户发来的消息）学
+        「这个会话里发生过什么」。而主动消息是别的插件用 `context.send_message`
+        发出的——它**不经过 respond 阶段、不产生消息事件**，Core 因此永远看不到
+        她主动说过的话。后果有两个：
+
+        1. 她主动找过这个人，Core 却以为这人一直在沉默。用户下次开口时
+           `process_interval` 算出的间隔是「从上次**用户**说话至今」，把她主动那次
+           接触整段吞掉——注入里出现「你们有 N 天没说话了」，而实际几天前她才找过他；
+        2. `mood.spoke_log`（她自己说过的话 + 对方接没接）只记主链路回复，
+           情绪分析看不到她主动开口这件事。
+
+        `after_message_sent` 是官方钩子：AstrBot 在 `event.send()` 之后、
+        `event.clear_result()` 之前触发它（见 `core/pipeline/respond/stage.py`），
+        此时 `event.get_result()` 拿得到刚发出去的内容。
+
+        三条限定：
+
+        * 只收 LLM 类结果（`LLM_RESULT` / `STREAMING_FINISH`）——指令回显、报错回显
+          不是她的话；
+        * 只记**私聊**——群里的一句话可能是回复任何一个人的，按发话人记会串；
+        * `mood.note_spoke` 自带 90 秒同文去重，与 `note_her_reply` /
+          `capture_reply_on_send` 三条路径不会重复攒。
+        """
+        try:
+            is_group = not _is_private_chat(event)
+            if is_group:
+                return
+            if not self.engine.environment_allows(False):
+                return
+            result = event.get_result()
+            if result is None:
+                return
+            ctype = getattr(result, "result_content_type", None)
+            name = getattr(ctype, "name", "")
+            if name not in ("LLM_RESULT", "STREAMING_FINISH"):
+                return
+            getter = getattr(result, "get_plain_text", None)
+            if not callable(getter):
+                return
+            text = str(getter() or "").strip()
+            if not text:
+                return
+            cfg = self._config
+            core = self.role_manager.get_or_create(self._self_id(event))
+            user_id = self._sender(event)
+            if not core.mood.readable(user_id, False, enabled=cfg.mood_enabled,
+                                      in_group=cfg.mood_enabled_in_group):
+                return
+            core.mood.note_spoke(user_id, text)
+            # 她主动开口也是「这段关系刚有过接触」：不推进这个时间戳的话，
+            # 用户下次开口时会被算成「你们有 N 天没说话了」。
+            try:
+                core.scope.set_user(user_id, "last_interaction", core.now_epoch())
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 记录她发出的话失败: {e}")
 
     # -------------------- 发送前兜底（第三方 runner / 流式） --------------------
 
