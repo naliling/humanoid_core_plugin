@@ -452,6 +452,24 @@ class SocialSignals:
         target = str(row.get("last_target_uid", "") or "")
         return target, at
 
+    def last_proactive_text(self, role_id: str = "") -> str:
+        """社交层最近一次主动开口的**原文**（v2.28.2 起由社交层发布）。
+
+        为什么需要它：主动消息走 `context.send_message` → `platform.send_by_session`，
+        不经过 respond 阶段、不产生消息事件，Core 收不到任何事件。
+        社交层把原话写进信号文件，Core 在下一轮取信号时就能把这句话补记进
+        `mood.spoke_log`，并推进这个人的 `last_interaction`。
+
+        旧版社交插件没有这个字段：缺键 / 坏值一律返回空串，调用方按「只知道她开过口、
+        不知道说了什么」降级——不会因为字段缺失把整条信号读坏。
+        """
+        row = self._scope_of(self.read(), role_id)
+        try:
+            text = str(row.get("last_proactive_text", "") or "")
+        except Exception:
+            return ""
+        return text[:200]
+
     def ignored_streak(self, role_id: str = "") -> int:
         """被冷落的角色级计数。传了 role_id 就按角色取——多 Bot 时顶层那个是冻结的。"""
         try:

@@ -152,10 +152,6 @@ class _Filter:
     def on_decorating_result(self, **kw):
         return self._register("on_decorating_result", "")
 
-    def after_message_sent(self, **kw):
-        """她自己发出去一句话之后触发。真实签名见 astrbot.api.event.filter。"""
-        return self._register("after_message_sent", "")
-
     def on_waiting_llm_request(self, **kw):
         return self._register("on_waiting_llm_request", "")
 

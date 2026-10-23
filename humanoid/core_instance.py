@@ -1090,10 +1090,19 @@ class HumanoidCoreInstance:
         # 同理：按人扣好感写的是**情绪账本**，不是身体。关掉身体层的人照样该记
         # 「她主动找了 TA、TA 没回」——这条以前也在闸门后面，于是被静默跳过。
         self._apply_ignored_affection()
+        try:
+            target, at = self.signals.last_proactive(self.role_id)
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 读取社交信号失败: {exc}")
+            target, at = "", 0.0
+        # 她主动开口这件事不归身体层管：关掉生理层的人，同样该知道「她刚找过 TA」。
+        # 主动消息走 `context.send_message`，不经过 respond 阶段、不产生消息事件，
+        # 所以这里是它唯一能进 Core 的通道（社交层 v1.28.3 起把原文写进信号文件）。
+        self._note_social_outgoing(target, at)
         if not self.config.soma_enabled:
             return
         try:
-            _, at = self.signals.last_proactive(self.role_id)
             streak = self.signals.ignored_streak(self.role_id)
         except Exception as exc:
             if self._log:
@@ -1115,6 +1124,60 @@ class HumanoidCoreInstance:
         except Exception as exc:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 应用主动消息反馈失败: {exc}")
+
+    def _note_social_outgoing(self, target: str, at: float) -> None:
+        """把社交层发布的「她刚主动说了什么」补记进情绪账本与间隔账本。
+
+        为什么需要绕这一道：主动消息走 `StarContext.send_message` →
+        `platform.send_by_session`，不经过 respond 阶段、不产生消息事件，
+        Core 收不到任何事件。没有这份信号，Core 会以为这个人一直在沉默：
+        `process_interval` 把她主动那次接触整段吞掉（注入里出现
+        「你们有 N 天没说话了」），`mood.spoke_log` 也看不到她主动开口。
+
+        - 只在信号时间戳**前进**时记一次（旧文件里同一个 at 不重复记）；
+        - 原文缺失（旧版社交插件）就只当没发生，不拿占位文本污染 `spoke_log`；
+        - `last_interaction` 只往后推，不覆盖用户后来的发言。
+        """
+        uid = str(target or "").strip()
+        try:
+            at = float(at)
+        except (TypeError, ValueError):
+            return
+        if not uid or at <= 0:
+            return
+        try:
+            last_at = float(self._scope.get_self("_last_signal_spoke_at", 0.0) or 0.0)
+            if at <= last_at:
+                return
+            # 先落去重时间戳再取文本：旧版社交插件永远没有文本，不该每轮重读 + 重试。
+            self._scope.set_self("_last_signal_spoke_at", at)
+        except Exception:
+            return
+        text = ""
+        try:
+            text = str(self.signals.last_proactive_text(self.role_id) or "").strip()
+        except Exception:
+            text = ""
+        if not text:
+            return
+        try:
+            readable = self.mood.readable(
+                uid, False,
+                enabled=self.config.mood_enabled,
+                in_group=self.config.mood_enabled_in_group,
+            )
+        except Exception:
+            readable = False
+        if not readable:
+            return
+        try:
+            self.mood.note_spoke(uid, text, at)
+            current = float(self.scope.get_user(uid, "last_interaction", 0.0) or 0.0)
+            if at > current:
+                self.scope.set_user(uid, "last_interaction", at)
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 记录她主动发的话失败: {exc}")
 
     def _apply_ignored_affection(self) -> None:
         """把「她主动找了 TA、TA 没回」按人记进好感账本。

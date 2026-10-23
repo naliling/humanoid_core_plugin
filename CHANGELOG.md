@@ -6,7 +6,91 @@ v2.28.1 清理：删掉了 15 条「与主动消息同版本号 / 版本对齐 /
 需要完整版本轨迹的看 metadata.yaml 的 version 与 git tag。
 -->
 
+## v2.28.4 — 删掉 2.28.1 那两个没用的功能，只留真正生效的那一条
+
+用户原话：「那两个包里没用的功能都删掉 但是两个都要升级X.28.4」。
+
+2.28.1 加了三个改动，检查之后：**一个从未生效，一个是多余的，一个有实际价值**。
+本版把前两个删干净，第三个（主动消息的原文）换成真正能走通的路。
+
+### 删掉的：`note_her_outgoing` 钩子（2.28.1 的「主动消息 Core 也知道」）
+
+**为什么删**：它想接的主动消息根本不会触发它。
+
+AstrBot 4.29.1 源码里，`OnAfterMessageSentEvent` 只在 respond 阶段末尾触发
+（`core/pipeline/respond/stage.py:349`）；而主动消息走的是
+`StarContext.send_message` → `platform.send_by_session`（`core/star/context.py:677-679`），
+**不经过 respond 阶段、不产生消息事件**。全仓 grep `OnAfterMessageSentEvent` 只有 5 处命中，
+`send_by_session` 链路一处都没有。
+
+线上日志能对上：
+
+    10-22 23:54:34 [autonomous_social] presence（沉默 30 分钟）3231002996
+                             → 已主动联系 3231002996（类型=check_in）
+    —— 同一秒没有 respond.stage 的「Prepare to send」行
+    —— 该用户 humanoid state 的 spoke_log 里没有 23:54 这条
+    —— 他的 last_interaction 停在 04:26（他自己后来的发言）
+
+原来那批测试（`test_v2281_outgoing_spoke.py`）是**直接调** `note_her_outgoing(...)`
+的，所以永远是绿的——它测的是钩子内部逻辑，不是「钩子会不会被 AstrBot 调用」。
+留着它只会给人「已经接上了」的错觉，所以连钩子带测试一起删。
+
+**主动消息本身怎么办**：改走信号桥（见下），那条路是真的。
+
+### 删掉的：`_state_note()` 里的身体事实（2.28.1 的「普通聊天里她知道自己的身体」）
+
+**为什么删**：前提不成立，而且造成了重复注入。
+
+2.28.1 的依据是「v2.27.38 把标记块从每轮注入改成只在主动消息时注入」。查 git 历史，
+`b764a07`（v2.27.38）改的是社交能量校准和用户记录保留期，跟标记块无关；CHANGELOG 里
+也搜不到这个说法。实际代码里，每轮 `on_llm_request` 都会把 `core.build_injection()`
+整块作为临时内容块追加，而 `prompt_builder._feelings_lines()` 在 `medium` / `full` /
+`mood_only` 三档里都在（阈值本来就是 0.75）。
+
+实跑一次构造，两个块拼起来是：
+
+    〔她的身体与生活 v12〕
+    私聊，只有她和TA。她很困，她身体不适。她对TA关系普通…
+
+    【此刻的她】
+    她和TA还在互相认识…她很困、身体不适、饿得发慌。今天是…
+
+`身体不适` 出现两次，`困` 出现两次（措辞不同）。这是 2.28.1 加出来的，2.28.0 没有。
+所以 `_state_note()` 里那段拼身体的代码整段删除——身体事实仍然有，仍然每轮进上下文，
+只是回到唯一来源 `build_injection()`。
+
+### 留下的：主动消息原文走信号桥（这才是真正生效的修法）
+
+- 社交插件 v1.28.4 在 `humanoid_signals.json` 里多写一个 `last_proactive_text`
+  （按 `by_bid` 分片；单 Bot 才写顶层），内容就是真正发出去的 `segments[0]`；
+- Core 新增 `SocialSignals.last_proactive_text()` 与
+  `core_instance._note_social_outgoing()`：信号里的 `last_proactive_at` 前进时，
+  把原文补记进 `mood.spoke_log`（`note_spoke(text, at)`），并把该用户的
+  `last_interaction` 推到发送时刻——**只往后推**，不会把用户后来发言的时间戳推回去；
+- 旧版社交插件 / 字段缺失：按「只知道她开过口、不知道说了什么」降级，不写占位文本；
+- `soma_enabled=False` 时照样记：这句话归情绪账本，不归身体层；
+- 增量是「只加不改」：`CONTRACT_VERSION` / `API_VERSION` / 信号 schema 都没动。
+
+### 保留未动的：注入时间精确到秒
+
+`_background_lines()` 的 `现在是15:20` → `现在是15:20:33`（2.28.1 的另一项）。
+实测不影响行为，且 `tests/test_v2281_time_seconds.py` 钉着时段词禁令与框架句未放宽，
+予以保留。
+
+### 验证
+
+- humanoid_core 全量：**1368 passed / 1 skipped**（新增 `test_v2282_signal_outgoing.py` 7 条、
+  改写后的 `test_v2281_body_in_chat.py`；已删除 `test_v2281_outgoing_spoke.py` 及其 8 条）；
+- autonomous_social 全量：**1257 passed / 478 subtests**（新增 `SignalsProactiveTextTest` 5 条）；
+- 两个插件配合：社交层发一条主动消息 → Core 下一轮取信号 → `spoke_log` 出现原文、
+  `last_interaction` 等于发送时刻（`test_v2282_signal_outgoing.py` 用真实
+  `humanoid_signals.json` 覆盖）。
+
 ## v2.28.1 — 主动消息说的话，Core 现在也知道了
+
+> 注：本节标题说的事**没有发生**。下面描述的 `after_message_sent` 通道在 v2.28.4 被证伪
+> 并整块删除，主动消息改走信号桥。**本节的正文仅作历史记录，不要再照着它改代码。**
+> 真正生效的只有「注入时间精确到秒」和（2.28.4 的）信号桥。
 
 ### 追加改动：注入里的时间精确到秒
 
