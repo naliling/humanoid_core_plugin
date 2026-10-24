@@ -482,7 +482,7 @@ class HumanoidCore(Star):
 
     @staticmethod
     def _migrate_defaults(raw_config: Any, data_dir: Path) -> None:
-        """把仍等于旧默认值的配置项一次性提升本版默认值，并写回配置文件。
+        """把仍等于旧默认值的配置项一次性提升
 
         标记只在**真正落盘成功之后**才写。以前不是：`save_config` 不可调用时
         （普通 dict，或框架换了配置对象）改动只留在内存里，日志却宣告「已提升」、
@@ -1317,6 +1317,9 @@ class HumanoidCore(Star):
                                       in_group=cfg.mood_enabled_in_group):
                 return
             core.mood.note_spoke(user_id, text)
+            # P1：她**自己说出口**的话也进 ccb 的账。原来只有用户那一路
+            # （`core.on_message`），她先开口或她在场景里说的，一条都不算。
+            core.note_her_words(user_id, text, is_group=is_group)
             # 给发送前兜底留一个「这轮已记过」的标记：本地 runner 两条路径都会经过，
             # 没有它的时候，若框架给回复加了前缀（先发设置里有「回复前缀」），
             # 兜底看到的文本与 completion_text 不同、去重拦不住，同一句话会被记两遍。
@@ -1375,6 +1378,9 @@ class HumanoidCore(Star):
                 return
             # note_spoke 带 90 秒同文去重：on_llm_response 已经记过时这一步是空操作。
             core.mood.note_spoke(user_id, text)
+            # P1：与 on_llm_response 同一条口径。note_occurrence 自带 60 秒去重，
+            # 两条路径都走到时只算一次。
+            core.note_her_words(user_id, text, is_group=is_group)
         except Exception as e:
             logger.debug(f"{LOG_PREFIX} 发送前记录她的发言失败: {e}")
 

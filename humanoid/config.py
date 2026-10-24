@@ -148,7 +148,7 @@ def _as_float_tuple(value: Any, default: tuple[float, ...]) -> tuple[float, ...]
 def _phase_multipliers(value: Any, default: tuple[float, ...]) -> tuple[float, ...]:
     """周期恢复倍率：长度不等于阶段数（8）时按默认值走。
 
-    老版本是 6 段，本版索引语义改成了 8 段（月经/卵泡早中晚/排卵/黄体早中晚）。
+    老版本是 6 段，。
     旧列表留着会**静默错位**：面板显示 8 段顺序，代码却按旧顺序取值，
     中间几段的恢复倍率对不上。长度对不上就整体用新默认（6 个数本来就写不出 8 段）。
     """
@@ -158,7 +158,7 @@ def _phase_multipliers(value: Any, default: tuple[float, ...]) -> tuple[float, .
         # 退回让用户以为自己的 6 个倍率还在生效。面板不拦、代码丢，只能在这里喊。
         logger.warning(
             "energy_recovery_phase_multipliers 需要恰好 %d 个数，收到 %d 个："
-            "已整表退回默认值（旧版是 6 段，本版索引语义是 8 段）",
+            "已整表退回默认值（旧版是 6 段，",
             len(default),
             len(out),
         )
@@ -318,6 +318,36 @@ class HumanoidConfig:
     ccb_affection_min: float = 50.0
     ccb_affection_rise: float = 8.0
     ccb_affection_deep: float = 75.0
+    # P1：她的身体唤醒（soma.arousal）参与「她有多想」。
+    # 关掉**只去掉身体那一项**（等价于恒按 arousal=50 算），主动度里另外三项
+    # （亲近欲涨幅 / 有没有在生气 / 关系档位）照常参与——这一点别写成
+    # 「关掉 = 回到旧版」，第四档仍然可能开。
+    ccb_use_arousal: bool = True
+    # P1：允许她主动开口（社交层按 `CoreFacade.intimacy()` 派由头）。
+    # 默认关：没装 autonomous_social 的部署不该因为升级多出一个出口。
+    ccb_proactive: bool = False
+    # (C 数据层）：**静态**身体档案。初始化一次就固定，之后改面板不会动
+    # 已经定下的值——用户明确要的「不管多久以后」。
+    #
+    # 深度上限是**阈值**，不是"此刻有多深"：每轮只被比较一次，不参与计算。
+    # 他的长度是**每个用户各一份**，这里给的是第一次的初值。
+    ccb_body_depth_cap_cm: float = 14.0
+    ccb_body_sensitivity: int = 60
+    ccb_partner_length_cm: float = 13.0
+    # (B 表现层）：场景内要不要多给那段姿势/位置/深度/阶段。
+    # 关掉就退回纯单行注入，与 2.28.6 完全一致。
+    ccb_scene_detail: bool = True
+    # (D）：到顶之后的余韵窗（分钟）。0 = 到顶就什么都不剩。
+    ccb_aftercare_minutes: int = 120
+    # 
+    # 谁说的 / 命中哪个词 / 判成什么 / 原文前 40 字。
+    # 这是"判断好不好"唯一能验证的办法——不打开就不知道命中率有多低。
+    ccb_scene_log_debug: bool = False
+    # 。0 = 不回落。
+    #
+    # 不回落的话，亲近欲（ccb 的主门槛）只涨不退，等于每做一次都给下一次续火。
+    # 只动 libido，不动好感——好感是长线评价，不该被一次性事件拉下来。
+    ccb_refractory_libido: float = 12.0
     mood_initial_libido: int = 34
     mood_initial_aggression: int = 28
     mood_affection_override: tuple[str, ...] = ()
@@ -530,6 +560,15 @@ class HumanoidConfig:
             ccb_affection_min=f("ccb_affection_min", 0.0, 100.0),
             ccb_affection_rise=f("ccb_affection_rise", 0.0, 50.0),
             ccb_affection_deep=f("ccb_affection_deep", 0.0, 100.0),
+            ccb_use_arousal=b("ccb_use_arousal"),
+            ccb_proactive=b("ccb_proactive"),
+            ccb_body_depth_cap_cm=f("ccb_body_depth_cap_cm", 1.0, 18.0),
+            ccb_body_sensitivity=i("ccb_body_sensitivity", 0, 100),
+            ccb_partner_length_cm=f("ccb_partner_length_cm", 0.0, 30.0),
+            ccb_scene_detail=b("ccb_scene_detail"),
+            ccb_aftercare_minutes=i("ccb_aftercare_minutes", 0, 720),
+            ccb_scene_log_debug=b("ccb_scene_log_debug"),
+            ccb_refractory_libido=f("ccb_refractory_libido", 0.0, 30.0),
             mood_initial_libido=i("mood_initial_libido", 0, 50),
             mood_initial_aggression=i("mood_initial_aggression", 0, 50),
             mood_affection_override=_as_str_tuple(pick("mood_affection_override")),

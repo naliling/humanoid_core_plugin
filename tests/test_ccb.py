@@ -188,6 +188,11 @@ class EndToEnd(unittest.TestCase):
         v.update(kw)
         core._scope.user_state("u1")["mood"] = v
         core._scope.set_self("energy", kw.get("energy", 70.0))
+        # 
+        # 退回关键词）。这一组用例验证的是**数值门槛**，所以直接给一个兜底信号，
+        # 让它们继续只测原来那件事——进门判断本身由 `test_v2286_scene.py` 的
+        # `SceneGate` 单独钉。
+        core._scope.user_state("u1")["ccb_intimacy_at"] = core.now_epoch()
 
     def _line(self, core, is_group=False):
         import re
@@ -301,11 +306,20 @@ class State(unittest.TestCase):
         data = json.loads(
             (Path(__file__).resolve().parent.parent / "_conf_schema.json").read_text(encoding="utf-8"))
         keys = list(data)
-        # 开关本身仍然要待在**最后四个之前**的那一组里——它是个默认关闭的隐藏开关，
-        # 排在配置面板最底下才不显眼。v2.25.0 往后它跟了四个门槛参数（都可调，
-        # 调的是「够不够得着」而不是「开不开」），所以断言从「必须是最后一个」
-        # 放宽成「必须落在最后五个里，且开关在参数之前」。
-        self.assertIn("ccb", keys[-6:], "ccb 这一组应该待在配置项最底下")
+        # 开关本身仍然要待在**最后那一组**里——它是个默认关闭的隐藏开关，
+        # 排在配置面板最底下才不显眼。
+        #
+        # 
+        # （v2.25.0 从"必须是最后一个"放宽到 5，v2.28.6 改成 8，。
+        # 窗口本身是个错误的不变量：它盯的是"恰好有几个"，而真正要守的是
+        # **这一组必须在面板最末尾**。改成结构性断言：`"ccb"` 之后**不许再出现
+        # 任何不是 ccb_ 开头的配置项**。这样加参数不用改测试，上移一格立刻命中。
+        idx = keys.index("ccb")
+        strays = [k for k in keys[idx:] if k != "ccb" and not k.startswith("ccb_")]
+        self.assertEqual(
+            strays, [],
+            f"ccb 组之后混进了别的配置项：{strays}（这一组必须待在面板最底下）",
+        )
         self.assertLess(keys.index("ccb"), keys.index("ccb_libido_min"),
                         "开关应当在它的参数之前")
         self.assertEqual(data["ccb"]["default"], False)

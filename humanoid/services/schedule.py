@@ -83,6 +83,43 @@ INTERRUPT_QUIET_GAP_SECONDS = 2700.0
 INTERRUPT_COOLDOWN_SECONDS = 3600.0
 INTERRUPT_TTL_SECONDS = 3600.0
 
+# ─────────────────────────────────────────────────────────────
+# 事件：别人说的话真的能改写她的日子
+#
+# 上面那三道闸只管「有人来过」，不管「她经历了什么」。于是日程只能被身体读数
+# （饿/困）推动，用户骂她一句、夸她一句，日程照走——她正做着的事不会因为
+# 一句话停下来。那不是一个人的一天。
+#
+# 事件闸是分开的、宽得多的三条：
+# - 极性分向：正向（被夸/被关心）与负向（被骂/被敷衍）都算，方向决定提示词
+#   往哪边写；中性的（问句、陈述）不计入——不然每句话都重排一次。
+# - 强度门槛：只有账本认得出轻重的事才算（kind 由 mood 层的 _event_kind 给）。
+# - 保鲜期短：事件是「刚刚」，隔了两小时就不该再影响她这会儿在做什么。
+#
+# 事件**不绕过**闸门/频率/预算：它只是多一条进入 refresh_due 的路，
+# 该省的调用一次都不多花。
+EVENT_TTL_SECONDS = 1800.0
+EVENT_COOLDOWN_SECONDS = 300.0
+
+# 事件的措辞。kind 来自 mood 层的账本（_event_kind），那边负责判定轻重，
+# 这边只负责把它说成「她刚刚经历了什么」。同一个 kind 备几套说法，
+# 由 (角色, 事件, 日期) 抽签——同一天不会把同一句话说两遍。
+_EVENT_PHRASES: dict[str, tuple[str, ...]] = {
+    "很上心": ("刚才被人好好放在心上", "刚才那句被人接住了"),
+    "温和": ("刚才那句话让她挺舒服", "刚才有人对她很温和"),
+    "有点冷": ("刚才那句话有点噎人", "刚才那句让她不太痛快"),
+    "很敷衍": ("刚才被人敷衍了", "刚才那句很难听"),
+    "一直没被理": ("刚才她说的没人接", "刚才等了个空"),
+}
+
+
+def event_phrase(kind: str, seed: list[Any]) -> str:
+    """把账本里的 kind 翻成一句「她刚刚经历了什么」。认不出的 kind 返回空串。"""
+    options = _EVENT_PHRASES.get(str(kind or "").strip())
+    if not options:
+        return ""
+    return pick("sched_event", seed, options)
+
 
 def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
     """作息那一条怎么写进分段 prompt。
@@ -479,6 +516,9 @@ def segment_prompt(
     ongoing: list[str] | None = None,
     is_night: bool = False,
     interrupted: bool = False,
+    # 刚刚发生的事够重（被夸/被骂/被敷衍）——一句「她经历了什么」。
+    # 与 interrupted 分开：那个是「有人来过」，这个是「那句话是什么分量」。
+    event_phrase: str = "",
     # 上一段是不是睡眠：决定要不要提醒她「刚醒，不必马上起」（C1 的赖床规则）。
     prev_sleep: bool = False,
     # 困意是否已经越线（>= CHANGE_TRIGGER_SLEEP_PRESSURE）。调用方从身体快照算，
@@ -533,6 +573,15 @@ def segment_prompt(
         "【刚刚发生了个小插曲】刚才有人来找她说话、或者有件小事插了进来。"
         "她可以放下手上的事去应付，也可以先继续做、回头再说——看哪样更像她。\n\n"
         if interrupted else ""
+    )
+    # 别人刚说的话够重：这是用户的话唯一能进日程的路。
+    # 只递「她经历了什么」这一句事实，不写「所以她应该……」——
+    # 停下、改主意、还是装作没往心里去都由她自己定（test_v2151_freedom 的规矩）。
+    event_line = (
+        f"【刚刚的事】{event_phrase}。"
+        "这件事可能让她想放下手上正在做的，也可能让她更有劲头做完，"
+        "也可能她压根没往心里去——看她是谁，也看这件事的分量。\n\n"
+        if event_phrase else ""
     )
     # 「还没做完的事」——她要能有一件跨天的事，今天接着昨天做。
     _ongoing = [str(x).strip() for x in (ongoing or []) if str(x or "").strip()][:3]
@@ -611,6 +660,7 @@ def segment_prompt(
         + extra_block
         + night_line
         + interrupt_line
+        + event_line
         + "【怎么决定】\n"
         "1. 身体读数是决策输入：饿到不行就去吃，困到不行就去睡——怎么权衡由你决定。\n"
         "2. 一件事做到一半接着做很正常（continue=true）；做很久了、或身体不允许时就换。\n"
@@ -1001,6 +1051,10 @@ class ScheduleService:
         # 拿 0 当基准会把第一条来访白白挡掉。
         self._last_message_at: float | None = None
         self._last_interrupt_at: float | None = None
+        # 待处理的事件（别人刚说的话够重）：一次性，refresh_due 消费掉。
+        self._event_at = 0.0
+        self._event_phrase = ""
+        self._last_event_at: float | None = None
 
         self.resolver = None
         self.gateway = None
@@ -1410,6 +1464,86 @@ class ScheduleService:
         self._last_interrupt_at = t
         self._interrupt_at = t
 
+    # ------------------------------------------------------------------
+    # 事件：一句话改写她这一天
+    # ------------------------------------------------------------------
+
+    def note_event(
+        self,
+        *,
+        kind: str,
+        seed: list[Any] | None = None,
+        is_group: bool = False,
+        now: float | None = None,
+    ) -> bool:
+        """别人刚说的话够重，记一次事件，让日程有机会因此停下或改主意。
+
+        与 `note_interruption` 的分工：
+
+        - `note_interruption` 管「有人来过」——三道宽闸，多用户部署里自然很少触发。
+        - `note_event` 管「她经历了什么」——只看这句话的**性质**（kind 由 mood
+          层的账本给，那边做本地词典 + 模型融合的判定，这里不重复判一遍）。
+
+        群消息也记：群里发生的事她一样该知道。真正的闸在下面：保鲜期短
+        （`EVENT_TTL_SECONDS`，隔了两小时就不该再影响她这会儿在做什么），
+        且两次事件之间至少隔 `EVENT_COOLDOWN_SECONDS`——被连骂三句只算一件事，
+        否则一句话就能让她一整天都在重排。
+
+        只设不排：要不要真停下来由 refresh_due 与闸门（频率/预算/冷却）决定。
+        """
+        phrase = event_phrase(kind, list(seed or []) + [self._clock.today_str()])
+        if not phrase:
+            return False
+        t = float(self._monotonic() if now is None else now)
+        if (
+            self._last_event_at is not None
+            and t - self._last_event_at < EVENT_COOLDOWN_SECONDS
+        ):
+            return False
+        self._last_event_at = t
+        self._event_at = t
+        self._event_phrase = phrase
+        return True
+
+    def _fresh_event(self, *, clear: bool = True) -> str:
+        """待处理的事件措辞；没有或过期了返回空串。"""
+        if not self._event_phrase or self._event_at <= 0:
+            return ""
+        if self._monotonic() - self._event_at > EVENT_TTL_SECONDS:
+            if clear:
+                self._event_at = 0.0
+                self._event_phrase = ""
+            return ""
+        return self._event_phrase
+
+    def _consume_event(self) -> str:
+        """取走一次待处理事件（一次性）。返回的是原始措辞。
+
+        生成被闸门挡回时要原样还回（只把标记放回去、不重新计时），
+        否则反复被挡就能把保鲜期一次次续满——与 `_consume_interruption` 同理。
+        """
+        phrase = self._fresh_event()
+        if not phrase:
+            return ""
+        self._event_at = 0.0
+        self._event_phrase = ""
+        return phrase
+
+    def pending_event(self) -> dict[str, Any]:
+        """待处理事件的一份只读快照。没有就返回空 dict。
+
+        给契约导出用：社交层要靠它说得出「她刚被人敷衍了」，而当它正在决定
+        下一段时不能把这个事件**取走**——取了这一轮就没了。所以这里只读。
+        """
+        phrase = self._fresh_event(clear=False)
+        if not phrase:
+            return {}
+        return {
+            "phrase": phrase,
+            "age_seconds": max(0.0, self._monotonic() - self._event_at),
+            "ttl": EVENT_TTL_SECONDS,
+        }
+
     def _fresh_interruption(self, *, clear: bool = True) -> bool:
         """有没有还新鲜（未过期）的待处理「来访」；过期的顺手清掉。
 
@@ -1486,6 +1620,11 @@ class ScheduleService:
         # 只有走大模型日程时才有意义：纯模板兜底没有「让模型改主意」这一层，
         # 放它进来只会白白重排一次模板。
         if cfg.use_llm_schedule and self._fresh_interruption(clear=roll) and self._gate_allows():
+            return True
+        # 刚发生的事够重（被夸/被骂/被敷衍）：给她一次因此停下、改主意、
+        # 或反过来被激励的时机。这是用户的话唯一能进日程的路。
+        # 睡着的那段已经在上面 return 了——消息不掀被子，被夸也一样。
+        if cfg.use_llm_schedule and self._fresh_event(clear=roll) and self._gate_allows():
             return True
         if cfg.use_llm_schedule and self.source != SOURCE_LLM:
             # 本地兜底段还占着位：尽快让大模型接手（退避会挡住砸模型的频率）。
@@ -1596,11 +1735,14 @@ class ScheduleService:
                 and (force or ignore_cooldown or self.retry_after <= 0)
             )
             interrupted_ts = 0.0
+            event_phrase = ""
             if attempt_llm:
                 # 「这次是不是被人打断触发的」只在**真的要去生成**时才取走；
                 # 退避中不取，留到下一轮。取走时拿到原始时间戳，被闸门挡回时
                 # 原样还回（不重新计时，保鲜期才拦得住无限续命）。
                 interrupted_ts = self._consume_interruption()
+                # 同理：事件也在「真的要去生成」时才取走。被闸门挡回时还回。
+                event_phrase = self._consume_event()
 
         slot: Slot | None = None
         if attempt_llm:
@@ -1609,7 +1751,7 @@ class ScheduleService:
             if attempt_llm:
                 slot = await self._generate_segment(
                     cfg, now, minutes, prev, elapsed, ignore_cooldown,
-                    interrupted_ts=interrupted_ts,
+                    interrupted_ts=interrupted_ts, event_phrase=event_phrase,
                 )
             async with self._lock:
                 if slot is None and (active is None or force or not cfg.use_llm_schedule):
@@ -1639,6 +1781,7 @@ class ScheduleService:
         elapsed: int,
         ignore_cooldown: bool,
         interrupted_ts: float = 0.0,
+        event_phrase: str = "",
     ) -> Slot | None:
         interrupted = interrupted_ts > 0.0
         if self.gateway is None:
@@ -1670,6 +1813,7 @@ class ScheduleService:
             ongoing=self.ongoing_tasks(),
             is_night=in_scheduled_night(self.current_slots(), now),
             interrupted=interrupted,
+            event_phrase=event_phrase,
             prev_sleep=prev_sleep,
             body_pressure=sleep_pressure >= CHANGE_TRIGGER_SLEEP_PRESSURE,
             weather=str(world.get("weather") or ""),
@@ -1713,6 +1857,10 @@ class ScheduleService:
                     # 这次「来访」只是没挤进队列（闸门被别的调用占着），**原样**还回去：
                     # 保留原始时间戳，不重新计时——否则反复被挡就能一直续命、突破保鲜期。
                     self._interrupt_at = interrupted_ts
+                if event_phrase:
+                    # 同理：事件被挡回时原样还回，不重新计时。
+                    self._event_phrase = event_phrase
+                    self._event_at = self._monotonic() - 1.0
                 if self._log and cfg.debug_mode:
                     self._log.debug(f"[humanoid_core] 日程被节流跳过: {result.detail}")
                 return None

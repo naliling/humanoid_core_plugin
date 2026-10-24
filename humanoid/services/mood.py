@@ -2175,8 +2175,15 @@ class MoodService:
         system_prompt = (
             "你是情绪变化分析器。分析用户这几条消息**合起来**对角色的影响。\n"
             "返回严格 JSON，不要 Markdown："
-            '{"affection_delta": 0, "libido_delta": 0, "aggression_delta": 0}.\n'
+            '{"affection_delta": 0, "libido_delta": 0, "aggression_delta": 0, "scene": 0.0}.\n'
             "数值范围：affection -10~10，libido -5~5，aggression -5~5。\n"
+            # 
+            # 零新增开销；而"这一段对话在做什么"只有看得到上下文的模型判得准，
+            # 关键词表判不准（用户原话：就靠那几个关键词吗？这也不行）。
+            "`scene` 是 0~1 的小数，回答**这一段对话有没有进入亲密场景**："
+            "0 = 完全没有（日常、工作、闲扯），0.5 = 有暧昧/试探但没进入，"
+            "1 = 明确在进行。它是**这一段话的性质**，不是你对尺度好恶的表态；"
+            "拿不准就给中间值，不要给 0 也不要给 1。\n"
             "给的是**这一整段的净变化**，不是每条的平均，也不是最后一条的影响。\n"
             # 以前 libido 和另外两根轴一样只给了范围，模型不知道什么时候该给正数，
             # 于是它多半给 0 或者负数——这根轴常年卡在基线附近，ccb 的门槛
@@ -2249,9 +2256,37 @@ class MoodService:
                 self._warn_throttled("情绪分析失败：JSON 数值非有限（NaN/Infinity）", "json")
             return None
         delta = delta.capped(10.0)
+        # ，不猜、不默认 0。
+        #
+        # 为什么单独落盘而不是塞进 Delta：Delta 是三根情绪轴，语义不同；
+        # 塞进去会让所有构造 Delta 的地方都要多传一个参数。
+        self._note_scene_score(user_id, data.get("scene"))
         if cfg.debug_mode and self._log:
             self._log.debug(f"[humanoid_core] 情绪分析结果: {delta}")
         return delta
+
+    def _note_scene_score(self, user_id: str, raw: Any) -> None:
+        """把模型给的 `scene` 分写到用户状态上（拿不到就写 -1）。
+
+        `-1` = 不知道，不是 0。这两者必须分开：0 表示"模型明确说是闲聊"，
+        而 -1 表示"这一批还没跑 / 模型没给 / 老版本 provider 不返回这个键"——
+        后者要退回关键词兜底，前者应该直接拦住。
+        """
+        value = -1.0
+        try:
+            if raw is not None:
+                candidate = float(raw)
+                if _finite(candidate):
+                    value = max(0.0, min(1.0, candidate))
+        except (TypeError, ValueError):
+            value = -1.0
+        try:
+            state = self._scope.user_state(user_id)
+        except Exception:
+            return
+        state["ccb_scene_score"] = value
+        state["ccb_scene_at"] = float(self._time())
+        self._scope.mark_dirty()
 
     def _log_event(self, user_id: str, record: dict, delta: Delta):
         """写一条情绪波动日志（`emotion._today_events` 的唯一数据源）。
@@ -2374,6 +2409,33 @@ class MoodService:
         self._scope.user_state(user_id)["mood"] = record
         self._scope.mark_dirty()
         return clamped
+
+    def note_refractory(self, user_id: str, drop: float) -> float:
+        """收场之后欲望回落。
+
+        为什么必须有：亲近欲是亲密场景的主门槛，只涨不退等于每做一次都自己
+        给下一次续火——用户原话「如果模拟场景不会退欲望，这是不行的」。
+        旧实现里收场只扣精力，`occurrence_effects` 还给 libido +2/+3，方向是反的。
+
+        只动 libido，**不动好感**：好感是长线评价，不该被一次性事件拉下来。
+        返回回落后的值（夹在 [0, 50]）。
+        """
+        record = self.profile(user_id)
+        try:
+            drop_v = float(drop)
+        except (TypeError, ValueError):
+            return float(record.get("libido", 0.0) or 0.0)
+        if drop_v <= 0:
+            return float(record.get("libido", 0.0) or 0.0)
+        try:
+            current = float(record.get("libido", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            current = 0.0
+        new = max(0.0, min(50.0, current - drop_v))
+        record["libido"] = new
+        self._scope.user_state(user_id)["mood"] = record
+        self._scope.mark_dirty()
+        return new
 
     def set_affection_batch(self, pairs: list[tuple[str, float]]) -> int:
         applied = 0

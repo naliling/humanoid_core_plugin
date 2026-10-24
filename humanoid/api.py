@@ -33,7 +33,10 @@ API_VERSION = 2
 
 #: 门面能力清单。社交层按这个判断「要不要走门面」，不靠版本号猜。
 #: 只加不改：`dreams` / `wake` 是 v2.28.0 新增的只读能力，API_VERSION 保持 2。
-CAPABILITIES = ("brief", "clock", "events", "fingerprint", "dreams", "wake")
+#: `intimacy`（v2.28.6）补的是 CHANGELOG v2.27.13 声称「契约快照多导出亲密次数/
+#: 上次时间/上头值」但实际从未实现的那一条——契约仍然**不带** per-user 数据
+#: （1000 人会把 state.json 撑大），改由门面按需现取。
+CAPABILITIES = ("brief", "clock", "events", "fingerprint", "dreams", "wake", "intimacy")
 
 
 def _s(value: Any) -> str:
@@ -219,6 +222,88 @@ class CoreFacade:
         except Exception:
             return ""
 
+    # ─── 关系与亲密（按用户，只读）──────────────────────
+
+    def intimacy(self, role_id: str, user_id: str) -> Dict[str, Any]:
+        """她对某个人的亲密档案：到哪一档、有过几次、上一次什么时候、上头多少。
+
+        存在的理由：`CHANGELOG` v2.27.13 写着「契约快照多导出亲密次数 / 上次时间 /
+        上头值，供社交层读」，可契约里从来没有这三样（`link.py` 的 `paths` 只有
+        好感/称呼/上次互动/说过的话）。社交层据此判断「要不要对这个人开口」——
+        这条链路一直是断的。
+
+        **为什么不加进契约**：契约是角色级快照，按用户的数据放进去，1000 个用户
+        会把 state.json 撑大（`link.py` 对这件事已有明确注释）。门面本来就是为了
+        「按需现算、不过期」而存在的，这里才是它该待的地方。
+
+        约束同本模块头三条：只读、不抛异常、不猜。三个键全部走 `peek_user`，
+        不会因为社交层问一句就给陌生人建一条永久空壳。
+
+        返回 `{}` 表示「拿不到」（角色不存在 / 没有这个用户 / 超出可解释范围），
+        调用方按「不知道」处理，不要当成「没发生过」。
+        """
+        core = self._core(role_id)
+        if core is None:
+            return {}
+        uid = _s(user_id)
+        if not uid:
+            return {}
+        try:
+            scope = core.scope
+            done = _num(scope.peek_user(uid, "ccb_done_count", 0.0))
+            satisfy = _num(scope.peek_user(uid, "ccb_satisfy", 0.0))
+            last_at = _num(scope.peek_user(uid, "ccb_last_at", 0.0))
+            stage = int(_num(scope.peek_user(uid, "ccb_stage", 0.0)))
+        except Exception as exc:
+            self._debug(f"intimacy 失败: {exc}")
+            return {}
+        # 历史数据（做过几次/什么时候）与「她这会儿想不想」分开授权：
+        # 前者是事实，`ccb` 开着就允许读；后者会变成一条主动消息，
+        # 只有 `ccb_proactive` 打开时才给。没装社交层时它永远是空串。
+        proactive = False
+        try:
+            proactive = bool(getattr(core.config, "ccb_proactive", False))
+        except Exception:
+            proactive = False
+        if done <= 0 and last_at <= 0 and stage <= 0:
+            # 一条记录都没有：不是「拿不到」，是「确实还没有」。给调用方一个能
+            # 判断的确定答案，而不是让它去区分空 dict 的两种含义。
+            return {"stage": 0, "satisfy": 0.0, "done_count": 0.0,
+                    "last_at": 0.0, "want_line": ""}
+        return {
+            "stage": stage,
+            "satisfy": round(satisfy, 1),
+            "done_count": done,
+            "last_at": last_at,
+            "want_line": (
+                self._intimacy_want(core, uid, stage, satisfy) if proactive else ""
+            ),
+        }
+
+    def _intimacy_want(self, core: Any, user_id: str, stage: int, satisfy: float) -> str:
+        """一句「她这会儿想不想」——**只读、只描述状态，不下指令**。
+
+        措辞纪律照抄 `emotion.py`：说状态，不说行为约束；不写器官、不写情节。
+        社交层拿它当主动开口的由头，要不要说、怎么说由它自己定。
+        拿不到就空串（不编）。
+        """
+        try:
+            profile = core.mood.profile(user_id) or {}
+        except Exception:
+            return ""
+        try:
+            libido = float(profile.get("libido", 0.0) or 0.0)
+            base = float(profile.get("base_libido", libido) or libido)
+        except (TypeError, ValueError):
+            return ""
+        if satisfy >= 60.0:
+            return "她这会儿还带着点他的余温，说话会软一点"
+        if libido - base >= 6.0 and libido >= 38.0:
+            return "她这会儿有点想他，忍着没说"
+        if stage >= 2:
+            return "她记得上一次，还没过去"
+        return ""
+
     # ─── 内部拼装（全部 try 兜住）───────────────────────
 
     def _framing(self, core: Any, char_name: str, user_name: str) -> str:
@@ -324,13 +409,33 @@ class CoreFacade:
         return out[:6]
 
     def _events(self, core: Any, *, limit: int = 5, since: float = 0.0) -> List[Dict[str, Any]]:
-        """近期事件。这一版只有「还没结束的事」这一种来源（`life_log`）。
+        """近期事件。两种来源，按时间倒序：
 
-        Core 的账本目前**没有 `kind` 字段**，也没有任何一处写「做过」条目——
-        所以这里如实标成 `open`，不假装有「刚做完 X」。（社交层那条永远不命中的
-        「刚做完」派生在 v1.27.39 已删除。）
+        1. **刚发生的事**（``kind="recent"``）：日程层那个事件机制——她被夸了/
+           被骂了/被敷衍了。v2.29.0 起契约里有 `event` 块，这里转成同一形状。
+        2. **还没结束的事**（``kind="open"``）：`life_log` 的未完成项。
+
+        社交层拿它们当主动开口的由头。旧 Core 两个都没有 → 空列表，
+        按「没有由头」处理即可。
         """
         out: List[Dict[str, Any]] = []
+        # 1. 刚刚发生的事（只读，不取走——取了这一轮决定就用不上了）
+        try:
+            pending = core.schedule.pending_event()
+        except Exception:
+            pending = {}
+        if isinstance(pending, dict) and pending:
+            phrase = _s(pending.get("phrase"))
+            if phrase:
+                at = core.now_epoch() - _num(pending.get("age_seconds"))
+                out.append({
+                    "id": _item_id("recent", phrase),
+                    "kind": "recent",
+                    "text": phrase,
+                    "at": round(at, 1),
+                    "ttl": _num(pending.get("ttl")),
+                })
+        # 2. 还没做完的事
         try:
             for entry in core.life_items() or []:
                 if not isinstance(entry, dict):
@@ -359,11 +464,22 @@ class CoreFacade:
             user_state = core.scope.user_state(user_id) or {}
         except Exception:
             return {}
+        # 亲密三键（P0-5）与 `intimacy()` 同源：CHANGELOG v2.27.13 声称契约导出了
+        # 它们，实际没有；`status` 这条路上补一份，社交层不必多调一次门面。
+        try:
+            done = _num(core.scope.peek_user(user_id, "ccb_done_count", 0.0))
+            satisfy = _num(core.scope.peek_user(user_id, "ccb_satisfy", 0.0))
+            last_at = _num(core.scope.peek_user(user_id, "ccb_last_at", 0.0))
+        except Exception:
+            done, satisfy, last_at = 0.0, 0.0, 0.0
         return {
             "affection": _num(profile.get("affection")),
             "base_affection": _num(profile.get("base_affection")),
             "nickname": _s(user_state.get("nickname")),
             "last_interaction": _num(user_state.get("last_interaction")),
+            "intimacy_done_count": done,
+            "intimacy_satisfy": round(satisfy, 1),
+            "intimacy_last_at": last_at,
         }
 
     def _fingerprint(self, core: Any, payload: Dict[str, Any]) -> str:

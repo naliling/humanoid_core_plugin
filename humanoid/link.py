@@ -34,10 +34,10 @@ CONTRACT_VERSION = 2
 CONTRACT_SCHEMA = "humanoid.contract/2"
 #: 这一版契约提供的能力。社交层按能力判断走哪条路，不靠版本号猜。
 #: 只加不改：`dreams`（她昨晚做的梦）与 `wake`（醒来状态/睡眠惯性）是 v2.28.0 新增的，
-#: 旧社交层不认这两个能力就照旧走老字段，不会因为多了两个词而坏掉。
+#: `event`（刚刚发生的事够重）是 v2.29.0 新增的只读能力，API_VERSION 保持 2。
 CONTRACT_CAPABILITIES = (
     "body", "feelings", "form", "activity", "day", "ongoing", "routine",
-    "dreams", "wake",
+    "dreams", "wake", "event",
 )
 
 # 社交层写回的信号文件：超过这个秒数就不采信。
@@ -151,6 +151,10 @@ def build_contract(core: Any) -> dict[str, Any]:
         # 「她自己想做的」——社交层拿它当由头（"她今天想去那家书店"），
         # 这是最像人的一种主动开口：说自己真想做的事，不是天气、也不是工作。
         "wants": [str(x) for x in (day.get("wants") or []) if str(x).strip()][:2],
+        # 刚刚发生的事够重（被夸/被骂/被敷衍）。社交层拿它当由头——
+        # 她被骂了一句却反过来主动找你说话，那才是活人；不知道这件事，
+        # 它只会说天气和节日。空 dict = 这会儿没有这样一件事。
+        "event": _event_block(core),
         "day": {
             "doing": str(day.get("doing") or ""),
             "done": [str(x) for x in (day.get("done") or []) if str(x).strip()],
@@ -192,6 +196,29 @@ def build_contract(core: Any) -> dict[str, Any]:
     contract["capabilities"] = list(CONTRACT_CAPABILITIES)
     contract["fields_hash"] = _fields_hash(contract)
     return contract
+
+
+def _event_block(core: Any) -> dict[str, Any]:
+    """刚刚发生的事够重——一句「她经历了什么」。
+
+    只读、不取走：契约是给社交层看的快照，取了这一轮决定就用不上了。
+    拿不到（旧 Core / 没这个机制）时空 dict，社交层按「没有这件事」处理。
+
+    **故意不带 `age_seconds`**：它在事件存在的 30 分钟里每秒都在变，而契约挂在
+    每分钟一次的身体推进上，于是那半小时里每分钟都要重写一遍全量 state.json
+    （线上那份已经 2.4 MB）。社交层不需要精确秒数——由头有时效，
+    那是 anchors 的 TTL 在管，不是这里的活。
+    """
+    try:
+        pending = core.schedule.pending_event()
+    except Exception:
+        return {}
+    if not isinstance(pending, dict) or not pending:
+        return {}
+    phrase = str(pending.get("phrase") or "").strip()
+    if not phrase:
+        return {}
+    return {"phrase": phrase}
 
 
 def _fields_hash(contract: dict[str, Any]) -> str:

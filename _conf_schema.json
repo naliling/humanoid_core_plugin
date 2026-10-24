@@ -1127,5 +1127,93 @@
     "type": "float",
     "default": 75.0,
     "description": "好感达到这条线进入更亲密的一档（0~100）。"
+  },
+  "ccb_use_arousal": {
+    "type": "bool",
+    "default": true,
+    "description": "让她的身体唤醒参与「她现在有多想」。",
+    "hint": "关掉只去掉身体这一项，其他三项照常参与。"
+  },
+  "ccb_proactive": {
+    "type": "bool",
+    "default": false,
+    "description": "允许她主动开口表达想要（需要装自主社交插件）。",
+    "hint": "默认关闭。开启后社交层可能因此替她主动发一条消息。"
+  },
+  "ccb_body_depth_cap_cm": {
+    "type": "float",
+    "default": 14.0,
+    "minimum": 1.0,
+    "maximum": 18.0,
+    "slider": {
+      "min": 1.0,
+      "max": 18.0,
+      "step": 0.5
+    },
+    "description": "她身体能容纳的最深处（cm）。这是固定上限，不是此刻的深度。",
+    "hint": "只在第一次读取时生效，之后固定不再变。"
+  },
+  "ccb_body_sensitivity": {
+    "type": "int",
+    "default": 60,
+    "minimum": 0,
+    "maximum": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 5
+    },
+    "description": "她的敏感程度（0~100），影响反应措辞的强度。",
+    "hint": "只在第一次读取时生效，之后固定不再变。"
+  },
+  "ccb_partner_length_cm": {
+    "type": "float",
+    "default": 13.0,
+    "minimum": 0.0,
+    "maximum": 30.0,
+    "slider": {
+      "min": 0.0,
+      "max": 30.0,
+      "step": 0.5
+    },
+    "description": "对方尺寸的初值（cm）。0 表示不判定深度。",
+    "hint": "每个用户各存一份初值，第一次进入场景时定下，之后不再变。"
+  },
+  "ccb_scene_detail": {
+    "type": "bool",
+    "default": true,
+    "description": "场景进行中额外给出一句姿势 / 位置 / 深度 / 阶段。",
+    "hint": "关掉后退回纯单行，与上一版行为一致。"
+  },
+  "ccb_aftercare_minutes": {
+    "type": "int",
+    "default": 120,
+    "minimum": 0,
+    "maximum": 720,
+    "slider": {
+      "min": 0,
+      "max": 720,
+      "step": 10
+    },
+    "description": "收场之后的余韵时长（分钟）。0 表示不留余韵。"
+  },
+  "ccb_scene_log_debug": {
+    "type": "bool",
+    "default": false,
+    "description": "把每次姿势/位置判定写进日志（命中词、判成了什么、原文）。",
+    "hint": "用来验证判定准不准；平时关着，排查时才开。"
+  },
+  "ccb_refractory_libido": {
+    "type": "float",
+    "default": 12.0,
+    "minimum": 0.0,
+    "maximum": 30.0,
+    "slider": {
+      "min": 0.0,
+      "max": 30.0,
+      "step": 1.0
+    },
+    "description": "收场之后亲近欲回落多少（0~30）。0 表示不回落。",
+    "hint": "不回落的话，欲望只会越做越高，下一次更容易被触发。"
   }
 }

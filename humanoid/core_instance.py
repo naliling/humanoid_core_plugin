@@ -869,29 +869,61 @@ class HumanoidCoreInstance:
                 self.schedule.note_interruption(is_group=is_group)
             except Exception:
                 pass
+            # 别人刚说的话够重，让日程也有机会因此停下或改主意。
+            # 极性不在这里判：mood 层已经有本地词典 + 模型融合的结论（账本），
+            # 重复判一遍就会出现「两个情绪层各说各话」。这里只把那一笔的
+            # 性质（kind）转交给日程，措辞由日程层按天抽签。
+            try:
+                self._note_schedule_event(user_id, text, is_group=is_group, now=now)
+            except Exception:
+                pass
 
         # 亲密「到底发生过没有」：独立于 ccb 状态机（门槛 78 好感多数人够不着，
         # 线上 9136 个用户条目里 ccb_done_count 全是 0）。只看正文，命中就记一次。
-        if not is_command and getattr(cfg, 'ccb', False):
+        #
+        # **群里不记**（P0-1）：`ccb.evaluate` 的 `is_group` 是硬闸，可这条记录层
+        # 原来没有同一条闸——群里一句「你做了什么」照样 +1 次、照样结算好感/亲近欲/
+        # 攻击性。状态机说"这里绝不可能发生"，账上却在加，规矩自己破了。
+        # `readable()` 与 main.py 的同款判断一致：情绪层关着时她根本没有"这段关系"。
+        if not is_command and not is_group and getattr(cfg, 'ccb', False):
             try:
-                if _ccb.detect_occurrence(text):
-                    _us = self._scope.user_state(user_id)
-                    if _ccb.note_occurrence(_us, now):
-                        # 结算：明确拒绝 → 掉好感；到基线且不是第一次 → 多涨并降攻击。
-                        _prof = self.mood.profile(user_id) or {}
-                        _eff = _ccb.occurrence_effects(
-                            _us, _prof, refused=_ccb.detect_refusal(text)
-                        )
-                        # 只走已有的公开 setter：好感一个、其余三个直接写档案。
-                        if "affection" in _eff:
-                            self.mood.set_affection(user_id, _eff["affection"])
-                        for _k in ("libido", "aggression"):
-                            if _k in _eff:
-                                _prof[_k] = _eff[_k]
-                        if _eff:
-                            self.mood.mark_dirty() if hasattr(self.mood, "mark_dirty") else None
+                # (P3）：安全闸。未成年 / 血缘人设**连账都不记**——
+                # 状态机那边已经拦了，这边不同口径的话，账上会留下"发生过 N 次"
+                # 而场景一次都没出过，比不拦更糟。
+                if not self.ccb_safety() and self.mood.readable(
+                    user_id, False, enabled=cfg.mood_enabled,
+                    in_group=cfg.mood_enabled_in_group,
+                ):
+                    if _ccb.detect_occurrence(text):
+                        _us = self._scope.user_state(user_id)
+                        if _ccb.note_occurrence(_us, now):
+                            # 结算：明确拒绝 → 掉好感；到基线且不是第一次 → 多涨并降攻击。
+                            # P1：拒绝有两个来源——**他**这条消息在拒绝（他不想），
+                            # 或者**她**刚刚明确说过不要（她不想要）却仍然发生了。
+                            # 后者才是真正该扣好感的那种，所以两处都要看。
+                            _prof = self.mood.profile(user_id) or {}
+                            _eff = _ccb.occurrence_effects(
+                                _us, _prof,
+                                refused=_ccb.detect_refusal(text)
+                                or _ccb.refused_within(_us, now),
+                            )
+                            # 只走已有的公开 setter：好感一个、其余三个直接写档案。
+                            if "affection" in _eff:
+                                self.mood.set_affection(user_id, _eff["affection"])
+                            for _k in ("libido", "aggression"):
+                                if _k in _eff:
+                                    _prof[_k] = _eff[_k]
+                            if _eff:
+                                self.mood.mark_dirty() if hasattr(self.mood, "mark_dirty") else None
             except Exception:
                 pass
+
+        # (B + D）：场景内的姿势/位置感知与强制收场。
+        # 只在私聊——群里没有场景（`evaluate` 的 is_group 是硬闸）。
+        if not is_command and not is_group and getattr(cfg, "ccb", False):
+            self._ccb_end_if_stale(user_id, now)
+            self._ccb_note_intimacy(user_id, text, now)
+            self._ccb_note_scene_text(user_id, text, now, source="user")
 
         # 先把身体推进到「现在」，再记账：否则本轮用的是上一轮的困意与饥饿。
         if cfg.soma_enabled:
@@ -965,6 +997,64 @@ class HumanoidCoreInstance:
             self.soma.note_chat(now)
         if not is_command:
             self._dispatch_async(user_id, text, is_group=is_group)
+
+    def _note_schedule_event(
+        self, user_id: str, text: str, *, is_group: bool = False, now: float = 0.0
+    ) -> bool:
+        """别人刚说的话够重，让日程也有机会因此停下或改主意。
+
+        极性**不在这里判**。mood 层已经有本地词典 + 模型融合的结论，而且它把
+        每一笔的**性质**（kind：很上心 / 温和 / 有点冷 / 很敷衍 / 一直没被理）
+        写进了账本。在这里重复判一遍，就会出现「两个情绪层各说各话」——
+        插件说她被夸了，日程说她被骂了。
+
+        所以这里只做两件事：用同一个 `local_delta` 看这句话有多重，
+        再把这一笔的性质转交给日程。措辞由日程层按（角色, 事件, 日期）抽签，
+        同一天不会把同一句话说两遍。
+
+        群消息也记：群里发生的事她一样该知道。真正的闸在日程层（保鲜期 + 冷却），
+        被连骂三句只算一件事，一句话不会让她一整天都在重排。
+        """
+        body = str(text or "").strip()
+        if not body:
+            return False
+        cfg = self.config
+        # 情绪层没开时日程也不该凭空知道她被骂了——同一个开关，同一个口径。
+        if not cfg.mood_enabled:
+            return False
+        if is_group and not cfg.mood_enabled_in_group:
+            return False
+
+        try:
+            from .services.mood import _event_kind, local_delta
+        except Exception:
+            return False
+
+        try:
+            delta = local_delta(body)
+        except Exception:
+            return False
+        weight = float(getattr(delta, "affection", 0.0) or 0.0)
+        # 中性的话（问句、陈述、客套）不进日程：不然每句话都值得重排一次，
+        # 多用户部署里她整天在改主意，反而没有日子了。
+        if abs(weight) < 1e-3:
+            return False
+
+        kind = _event_kind(weight)
+        if not kind:
+            return False
+
+        try:
+            return bool(
+                self.schedule.note_event(
+                    kind=kind,
+                    seed=[self.role_id, user_id],
+                    is_group=is_group,
+                    now=now or self.now_epoch(),
+                )
+            )
+        except Exception:
+            return False
 
     def _dispatch_async(self, user_id: str, text: str, is_group: bool = False):
         cfg = self.config
@@ -1063,9 +1153,14 @@ class HumanoidCoreInstance:
         # 比较会让这个方法本身变成常驻写盘源）；其余字段变了就该重写——尤其 weather/
         # holiday/day/routine 这些**独立于身体**、社交层还要用的外部事实。以前只比
         # body/feelings/form/activity，于是天气变了契约却还留着旧值。
+        #
+        # `event` 必须在列：漏了它，装了新 Core 但契约里还留着旧结构时，
+        # 新算出来的 event 键**永远写不进去**（其它键都没变 → 直接 return previous）。
+        # 社交层于是永远拿不到「她刚经历了什么」，而且不报错。
         keys = (
             "body", "feelings", "form", "activity",
             "ongoing", "wants", "day", "persona", "routine", "weather", "holiday",
+            "event",
         )
         try:
             if isinstance(previous, dict) and all(previous.get(key) == contract.get(key) for key in keys):
@@ -1175,9 +1270,269 @@ class HumanoidCoreInstance:
             current = float(self.scope.get_user(uid, "last_interaction", 0.0) or 0.0)
             if at > current:
                 self.scope.set_user(uid, "last_interaction", at)
+            # P1：她主动说出口的话也进 ccb 的账（含社交层代发的主动消息）。
+            self.note_her_words(uid, text, now=at)
         except Exception as exc:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 记录她主动发的话失败: {exc}")
+
+    def note_her_words(
+        self, user_id: str, text: str, *, is_group: bool = False,
+        now: float | None = None,
+    ) -> None:
+        """她**刚说出口**的话也进 ccb 的账（P1：双边）。
+
+        为什么需要它：v2.28.5 之前 ccb 只有一个入口——**用户**说的话
+        （`on_message` → `detect_occurrence`）。她先说出口的、她在场景里描述的、
+        她主动开口的，一条都不算。于是「一辈子的次数」只有半本账，社交层
+        「有没有和对方亲密过」也只能看到一半。
+
+        两道闸，缺一不可：
+
+        1. **只在场景里记**（`ccb_stage > 0`）。她的回复是从注入里长出来的，
+           不设这道闸的话，模型复述一句内心状态就能自己把计数器刷上去——
+           那是自证，不是发生。
+        2. **她说「不要」是「不发生」**，不是「没记录」：记一笔 `ccb_refused_at`
+           并结束场景，不计数。用的是严格词表（见 `ccb.detect_refusal_hard`），
+           一次撒娇不该被判成拒绝。
+
+        与用户那一路共用 `ccb_event_dedup_at`：一件事只记一次，谁先说都一样。
+        """
+        cfg = self.config
+        if not bool(getattr(cfg, "ccb", False)) or is_group:
+            return
+        body = str(text or "").strip()
+        if not body:
+            return
+        try:
+            if not self.mood.readable(
+                user_id, False,
+                enabled=cfg.mood_enabled,
+                in_group=cfg.mood_enabled_in_group,
+            ):
+                return
+        except Exception:
+            return
+        try:
+            moment = self.now_epoch() if now is None else float(now)
+            state = self._scope.user_state(user_id)
+            # 
+            # 放在拒绝判定之前：判姿势与拒绝互不影响，先记下来更省事。
+            self._ccb_note_intimacy(user_id, body, moment)
+            self._ccb_note_scene_text(user_id, body, moment, source="her")
+            if _ccb.detect_refusal_hard(body):
+                state["ccb_refused_at"] = moment
+                _ccb.reset_scene(state)
+                self._scope.mark_dirty()
+                return
+            if float(state.get("ccb_stage", 0.0) or 0.0) <= 0:
+                return
+            if not _ccb.detect_occurrence(body):
+                return
+            if not _ccb.note_occurrence(state, moment):
+                return
+            prof = self.mood.profile(user_id) or {}
+            eff = _ccb.occurrence_effects(state, prof, refused=False)
+            if "affection" in eff:
+                self.mood.set_affection(user_id, eff["affection"])
+            for key in ("libido", "aggression"):
+                if key in eff:
+                    prof[key] = eff[key]
+            self._scope.mark_dirty()
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 记录她的话（亲密）失败: {exc}")
+
+    # ─── 
+
+    def ccb_body(self) -> dict:
+        """她的静态身体档案（**角色级**，所有用户共享）。
+
+        初始化一次就固定：之后改配置**不会**动已经定下的值——这是用户明确要的
+        「不管多久以后」。存 `self` 而不是 `users.*`，否则 10 个用户就存 10 份
+        一模一样的她的身体数据。
+        """
+        state = self._scope.self_state
+        current = state.get(_ccb.BODY_KEY)
+        if isinstance(current, dict) and "depth_cap_cm" in current:
+            return current
+        profile = _ccb.body_profile(
+            depth_cap_cm=float(getattr(self.config, "ccb_body_depth_cap_cm", 14.0) or 14.0),
+            sensitivity=float(getattr(self.config, "ccb_body_sensitivity", 60) or 60),
+        )
+        self._scope.set_self(_ccb.BODY_KEY, profile)
+        return profile
+
+    def ccb_partner(self, user_id: str) -> dict:
+        """对方（这个用户）的静态档案，**按人各一份**。同样初始化一次就固定。"""
+        state = self._scope.user_state(user_id)
+        current = state.get(_ccb.BODY_LENGTH_KEY)
+        if isinstance(current, dict) and "length_cm" in current:
+            return current
+        profile = _ccb.partner_profile(
+            length_cm=float(getattr(self.config, "ccb_partner_length_cm", 13.0) or 0.0)
+        )
+        state[_ccb.BODY_LENGTH_KEY] = profile
+        self._scope.mark_dirty()
+        return profile
+
+    def ccb_safety(self) -> str:
+        """人设安全闸的判定结果（缓存按人设正文，避免每轮重跑正则）。
+
+        返回拒绝理由，空串表示允许。拿不到人设时放行——与 `looks_female`
+        的「判不出按女」同向：拿不到不等于有风险；真正兜底的是总开关默认关闭。
+
+        **S7：放行但不能静默。** 人设取不到（还没加载 / 加载失败）时这道闸实际
+        等于没生效，而用户只会觉得"功能怪怪的"。所以第一次遇到空人设就记一条
+        warning——排查时至少能在日志里看到它，而不是靠猜。
+        """
+        prompt = ""
+        try:
+            source = getattr(self, "persona_source", None)
+            if source is not None:
+                snap = source.cached_persona(self.role_id)
+                prompt = str(getattr(snap, "prompt", "") or "")
+        except Exception:
+            prompt = ""
+        cached = getattr(self, "_ccb_safety_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == prompt:
+            return cached[1]
+        if not prompt.strip() and not getattr(self, "_ccb_safety_warned", False):
+            self._ccb_safety_warned = True
+            if self._log:
+                self._log.warning(
+                    f"{LOG_PREFIX} 拿不到人设正文，安全闸本轮不生效（年龄/血缘判断被跳过）"
+                )
+        reason = _ccb.safety_block(prompt)
+        self._ccb_safety_cache = (prompt, reason)
+        return reason
+
+    def ccb_settle(self, user_id: str, now: float) -> None:
+        """收场结算：**欲望必须真的退下去**。
+
+        旧行为是收场只扣 12 点精力，而亲近欲（ccb 的主门槛）不但不退，
+        `occurrence_effects` 还会 +2/+3 —— 等于每做一次都自己给自己续火，
+        下一次触发更近。那不成立。
+
+        这里做两件事：
+        1. 亲近欲按 `ccb_refractory_libido` 回落（默认 12，可配，0 = 不回落）；
+        2. 记一笔 `peak` 进账本，让余韵有据可依。
+
+        只动 libido，不动好感——好感是长线，不该被一次性事件拉下来。
+        """
+        drop = 0.0
+        try:
+            drop = float(getattr(self.config, "ccb_refractory_libido", 12.0) or 0.0)
+        except (TypeError, ValueError):
+            drop = 12.0
+        if drop > 0:
+            try:
+                self.mood.note_refractory(user_id, drop)
+            except Exception as exc:
+                if self._log:
+                    self._log.debug(f"{LOG_PREFIX} 欲望回落失败: {exc}")
+
+    def _ccb_note_intimacy(self, user_id: str, text: str, now: float) -> None:
+        """记一次"这句话有亲密意图"的时刻。
+
+        它是**兜底信号**：模型分拿不到（没配分析 provider / 调用失败 / 这一批
+        还没跑）时，进门判断退回它。只在"有没有"上做一次廉价判断，不承担
+        主判断——主判断是模型给的 `scene` 分。
+        """
+        try:
+            if not bool(getattr(self.config, "ccb", False)):
+                return
+            if not _ccb.detect_intimacy(text):
+                return
+            state = self._scope.user_state(user_id)
+            state["ccb_intimacy_at"] = float(now)
+            self._scope.mark_dirty()
+        except Exception:
+            pass
+
+    def _ccb_note_scene_text(self, user_id: str, text: str, now: float, *,
+                             source: str = "user") -> None:
+        """从一句话里更新姿势 / 位置，并记进场景账本（B 的动态感知 + D 账本）。
+
+        **两个来源都要扫**（`source` 只是日志标签）：
+        姿势/位置绝大多数是**她自己**在正文里写出来的，只扫用户那句会漏掉大半。
+        这是"判断好不好"最直接的一条改进。
+
+        三件事按顺序做：
+        1. 判姿势 / 位置（带否定护栏与歧义丢弃）；
+        2. 只有当值**真的变了**才写状态、才记账（不记每一轮）；
+        3. `ccb_scene_log_debug` 打开时，把"谁说的、命中哪个词、判成什么"
+           写进 debug 日志——判错了才查得动，判不出才知道要不要加词。
+        """
+        try:
+            if not bool(getattr(self.config, "ccb", False)):
+                return
+            cfg = self.config
+            state = self._scope.user_state(user_id)
+            if float(state.get("ccb_stage", 0.0) or 0.0) <= 0:
+                return
+            debug = bool(getattr(cfg, "ccb_scene_log_debug", False))
+            pose, pose_word = _ccb.detect_pose_detail(text)
+            site, site_word = _ccb.detect_site_detail(text)
+            if debug and self._log:
+                self._log.info(
+                    f"{LOG_PREFIX} 场景判定[{source}] 用户={user_id} "
+                    f"姿势={_ccb.POSE_NAMES[pose] if pose is not None else '未判出'}"
+                    f"(词={pose_word or '-'}) "
+                    f"位置={_ccb.SITE_NAMES[site] if site is not None else '未判出'}"
+                    f"(词={site_word or '-'}) 原文={str(text)[:40]!r}"
+                )
+            changed = False
+            if pose is not None:
+                try:
+                    current_pose = int(float(state.get("ccb_pose", float(_ccb.POSE_UNKNOWN)) or 0))
+                except (TypeError, ValueError):
+                    current_pose = _ccb.POSE_UNKNOWN
+                if pose != current_pose:
+                    state["ccb_pose"] = float(pose)
+                    _ccb.log_append(state, "pose", pose, now)
+                    changed = True
+            if site is not None:
+                try:
+                    current_site = int(float(state.get("ccb_site", float(_ccb.POSE_UNKNOWN)) or 0))
+                except (TypeError, ValueError):
+                    current_site = _ccb.POSE_UNKNOWN
+                if site != current_site:
+                    state["ccb_site"] = float(site)
+                    _ccb.log_append(state, "site", site, now)
+                    changed = True
+            if changed:
+                self._scope.mark_dirty()
+        except Exception:
+            # 纯增强项：判定失败绝不影响聊天主流程。
+            pass
+
+    def _ccb_end_if_stale(self, user_id: str, now: float) -> None:
+        """场景的两个**强制收场**条件。
+
+        1. 闲置太久：6 小时没人说话，那一场早就过去了。不收的话 `ccb_stage`
+           会挂着过夜，第二天她还在"场景里"。
+        2. 精力见底：低于 `CCB_ENERGY_MIN` 就强制结束。注意这与 v2.27.17 的
+           「暂时条件不清场景」不同——那条讲的是**冷却/封顶/群聊**（还在场景里，
+           只是这一轮进不去）；精力见底是**撑不下去了**，场景真的结束。
+        """
+        try:
+            state = self._scope.user_state(user_id)
+            if float(state.get("ccb_stage", 0.0) or 0.0) <= 0:
+                return
+            idle = _ccb.scene_idle_expired(
+                last_at=float(state.get("ccb_last_at", 0.0) or 0.0), now=now
+            )
+            drained = False
+            try:
+                drained = float(self.energy.energy) < _ccb.CCB_ENERGY_MIN
+            except (TypeError, ValueError, AttributeError):
+                drained = False
+            if idle or drained:
+                _ccb.reset_scene(state)
+                self._scope.mark_dirty()
+        except Exception:
+            pass
 
     def _apply_ignored_affection(self) -> None:
         """把「她主动找了 TA、TA 没回」按人记进好感账本。

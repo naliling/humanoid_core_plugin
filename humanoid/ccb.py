@@ -64,9 +64,316 @@ CCB_ENERGY_MIN = 30.0
 # 门槛已经很高，冷却就该短：当天可以再来一次，只要条件仍然全中
 CCB_COOLDOWN_SECONDS = 5 * 3600.0
 
+# ─── P3：硬闸────────────────────────────────────
+#
+# 这四条**不是**阈值，是"整条功能不生效"的开关。它们排在 `evaluate` 最前面，
+# 比 enabled 之外的一切都早；命中就 return None，不降档、不软化、不"只做浅的"。
+#
+# 为什么年龄只用来判"是否成年"，绝不参与数值推导：
+#   · 把年龄接进"深度上限"这类数值，等于用年龄给性能力建模——这条线不能碰；
+#   · 数值只来自配置（静态档案），年龄只回答一个是非题。
+#
+# 误伤风险是刻意接受的：一个人设写着「14岁」的角色，宁可整个功能不生效，
+# 也不做"打个折"的处理。
+_MINOR_WORDS = (
+    "幼女", "萝莉", "loli", "小学生", "初中生", "初中", "儿童", "未成年",
+    "小学", "幼童", "女童", "童女",
+)
+# 明确指向**配对关系**的乱伦词。刻意不收「哥哥」「妹妹」这类单独称谓——
+# 中文角色扮演里"哥哥"是极常见的爱称，收进来会把绝大多数人设一起打掉。
+_INCEST_WORDS = ("亲兄妹", "亲姐弟", "亲父女", "亲母子", "父女", "母子", "乱伦", "骨科")
+# 中文数字的小龄段：12~17 岁（十八及以上不在此列）
+_MINOR_CN_AGE = ("十一岁", "十二岁", "十三岁", "十四岁", "十五岁", "十六岁", "十七岁")
+# 数字边界两个方向都要卡（S2）：
+#
+# 原来写的是 `(\d{1,2})\s*(?:岁|周岁)`，实测「你是300岁的神」会从第三位匹配出
+# `00岁` → 判成 0 岁 → 整条功能被拒。1200 岁、300 岁这类**奇幻人设**是常见写法，
+# 误伤成本很高（用户只会看到"功能没生效"，不会知道是被年龄闸拦了）。
+# `(?<!\d)` 挡左侧残留、`(?!\d)` 挡右侧续位。
+_AGE_RE = re.compile(r"(?<!\d)(\d{1,2})(?!\d)\s*(?:岁|周岁)")
+ADULT_AGE = 18
+
+
+def safety_block(persona_prompt: str) -> str:
+    """这条人设能不能开亲密场景。返回拒绝理由，空串表示允许。
+
+    判据只有两条，都很窄——宁严勿宽：
+
+    1. **年龄**：正文里出现 `\\d+岁` 且小于 18，或命中中文小龄段词；
+       或命中幼态词（幼女/萝莉/小学生…）。**年龄只回答是否成年，不参与任何数值。**
+    2. **血缘**：只认明确指向配对的词（亲兄妹/父女/母子/乱伦…），
+       不收「哥哥」「妹妹」这类单独称谓。
+
+    `persona_prompt` 为空（拿不到人设）时**放行**——这与 `looks_female` 的
+    "判不出按女"同向：拿不到不等于有风险，静默关掉整个功能比放行更难排查。
+    真正挡住未知情况的是 `ccb` 总开关默认关闭。
+    """
+    body = str(persona_prompt or "")[:PERSONA_PROMPT_MAX]
+    if not body.strip():
+        return ""
+    for word in _INCEST_WORDS:
+        if word in body:
+            return f"人设命中血缘关系（{word}）"
+    for word in _MINOR_WORDS:
+        if word in body:
+            return f"人设命中未成年标识（{word}）"
+    for word in _MINOR_CN_AGE:
+        if word in body:
+            return f"人设命中未成年标识（{word}）"
+    for match in _AGE_RE.finditer(body):
+        try:
+            age = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if age < ADULT_AGE:
+            return f"人设年龄 {age} 岁，未成年"
+    return ""
+
+
+# ─── 静态身体档案（C 数据层）─────────────────────────────────────────
+#
+# 分两处放，**绝不合并**：
+#   · 她的（深度上限 / 敏感度）→ `roles.<bid>.self` 下一个键，所有用户共享；
+#   · 他的（长度）→ `users.<uid>` 下一个键，每人一份。
+#
+# 写进 per-user 的只有她自己的深度上限时，10 个用户就存 10 份一模一样的值；
+# 反过来把"他的长度"放角色级，又会变成所有用户共用一个尺寸——两头都错。
+#
+# 两条纪律：
+#   · **初始化一次就固定**（"不管多久以后"都按这个）；改配置不会动已经定下的档案。
+#   · 深度上限是**阈值**，不是"当前有多深"；它每轮只被比较一次，不参与计算。
+BODY_KEY = "body"
+BODY_LENGTH_KEY = "body"
+
+# 当前探入深度的估算比例（按阶段推，不存盘）。它不是测量值，是**判定用的代理**：
+# 阶段越高，越接近全长。所以"过深"在临界/爆发期才可能出现——这与直觉一致。
+# 键是阶段号：0 不在场景 / 1 动情 / 2 平台 / 3 临界 / 4 爆发 / 5 余韵。
+_DEPTH_RATIO = {0: 0.0, 1: 0.60, 2: 0.85, 3: 1.0, 4: 1.0, 5: 0.0}
+# 阶段名。"余韵"是到顶之后的窗口，不属于场景本身（`ccb_stage` 那时已经归零）。
+PHASE_NAMES = ("", "动情", "平台", "临界", "爆发", "余韵")
+# 余韵窗（秒）：到顶之后的一段时间里她还在余韵里，过了就回到日常。
+CCB_AFTERCARE_SECONDS = 2 * 3600.0
+# 场景闲置多久算结束（秒）。6 小时没人说话，那一场早就过去了；
+# 不靠它收场，`ccb_stage` 会挂着过夜，第二天她还在"场景里"。
+CCB_SCENE_IDLE_SECONDS = 6 * 3600.0
+
+# 姿势与探入位置。取值是**互斥枚举**，`-1` 表示"还不知道"。
+# 判不出来时保持上一次的值；一次都判不出来就整段不出（A 的兜底）。
+POSE_UNKNOWN = -1
+POSE_NAMES = ("后入", "前入", "坐姿", "躺姿")
+SITE_NAMES = ("前面", "后面")
+
+# ─── 判断层────────────────────
+#
+# 所以这一层按三条做，而不是简单关键词命中：
+#
+# 1. **双向扫描**：姿势/位置绝大多数是**她自己**在正文里写出来的
+#    （"从后面""转过来"），只扫用户那句会漏掉大半。两个来源都扫。
+# 2. **强词优先**：一个词只属于一种姿势时算强命中，直接采纳；
+#    弱词（"后面"这种既可能指姿势也可能指位置的）只在没有歧义时才算。
+# 3. **否定护栏**：命中词前面 4 个字里有"别/不要/不停"之类，判为**否定**不动。
+#    不然一句"别从后面"会把姿势改成正相反的那个。
+#
+# 另外每个判定都返回**命中的那个词**（`*_detail`）：诊断日志里能直接看到
+# "这一轮是靠哪个词判出来的"，判错了才查得动。
+_POSE_WORDS = (
+    ("后入", "从后面", "后入", "背后", "趴着", "趴在", "背对"),
+    ("前入", "前入", "正面", "面对面", "仰面", "转过来"),
+    ("坐姿", "坐上来", "跨坐", "骑在", "骑上", "坐上"),
+    ("躺姿", "躺下", "平躺", "仰卧", "躺着", "躺好"),
+)
+# 位置词面：**必须明确指向入口**。裸的「前面」「后面」一律不收——
+# 实测「从后面抱住你」里的"后面"说的是体位，不是入口，收了就会把位置判错，
+# 而判错位置比不知道位置出戏得多（触感描写整套歪掉）。
+_SITE_WORDS = (
+    ("前面那里", "前面进", "前穴"),
+    ("后穴", "后庭", "肛门", "后面那里", "后面进"),
+)
+# 否定词：命中词**前面**这几个字里有它，就不算数。只看前面——"别停"里的
+# "停"在词后面，那是鼓励而不是否定（`detect_occurrence` 里踩过同一个坑）。
+_NEG_PREFIX = ("别", "不要", "不用", "不想", "没有", "不准", "不许", "没")
+# 单字否定「别」不能整词匹配：中文里「特别」「区别」「告别」「分别」「性别」「个别」
+# 全都含这个字。实测「告别之后做过了」「区别在于我们做过了」都被判成否定而漏记。
+# 所以对「别」单独判：**它前面那个字**是构词前缀时不算否定。
+_NEG_SINGLE = "别"
+_NEG_SINGLE_COMPOUND = "特区告分性个类差离辨鉴级班派秒"
+_NEG_WINDOW = 4
+
+
+def _negated(s: str, pos: int, words=_NEG_PREFIX, window: int = _NEG_WINDOW) -> bool:
+    """命中词 `pos` 之前那一小段里有没有否定。只看**前面**。
+
+    「别停」里的"停"在词后面，那是鼓励不是否定。
+
+    `words` 里的「别」按单字处理（排除构词）；其余按整词匹配。
+    """
+    start = max(0, pos - window)
+    lead = s[start: pos]
+    if any(w in lead for w in words if w != _NEG_SINGLE):
+        return True
+    if _NEG_SINGLE in words:
+        idx = lead.rfind(_NEG_SINGLE)
+        if idx >= 0:
+            # 用**绝对位置**取前一个字：窗口恰好从「别」开始时，相对位置拿不到
+            # 前面那个字（「区别在于…」的"区"会被窗口切掉），构词判断就失效了。
+            absolute = start + idx
+            before = s[absolute - 1] if absolute > 0 else ""
+            # 注意：`"" in "任何串"` 恒为 True（空串是任何字符串的子串），
+            # 所以必须先判空——否则「别」出现在句首时会被当成构词放过。
+            if not before or before not in _NEG_SINGLE_COMPOUND:
+                return True
+    return False
+
+# ─── D：场景账本 ─────────────────────────────────────────────────────
+#
+# 为什么需要它：姿势、位置、阶段都是**会变**的，而"她记得刚才是什么姿势"
+# 靠的不能是单点状态——换两次姿势之后，只留最后一个值就丢掉了过程，
+# 于是她说不出"刚换过来"这种话。
+#
+# 三条硬约束（不遵守就会变成第二个 2.4MB 的 state.json）：
+#   · **只记变化**，不记每一轮；
+#   · **只留这一场**：进场景时清空，余韵结束清空；
+#   · 条数硬上限 `LOG_MAX`，超了丢最老的。
+LOG_KEY = "ccb_log"
+LOG_MAX = 24
+LOG_KINDS = ("pose", "site", "phase", "peak", "exit")
+
+# ─── 进门判断（v2.28.6 叠加，第二层）──────────────────────────────────
+#
+#
+# 所以进门判断分两层，**模型是主力、关键词只是兜底**：
+#
+# 1. **模型判断**：复用现成的情绪分析批（每 `mood_llm_interval_messages` 条消息
+#    调一次，一次看最近 1~10 条），在那次 JSON 里多要一个 `scene`（0~1）。
+#    它看的是"这一段对话在做什么"，不是有没有某个词。**零新增调用**。
+# 2. **关键词兜底**：模型没配 / 调用失败 / 这一批还没跑过 → 用 `detect_intimacy`
+#    在**最近一段时间**里找有没有亲密信号。它只保证"功能不瘫"，不承担主判断。
+#
+# 注意模型不可能每轮都给分（默认 10 条一次），所以分数带 TTL：
+# 过期的分数一律当"不知道"，退回兜底。**不能拿半小时前的结论决定现在进不进。**
+CCB_SCENE_ENTER = 0.65      # 进场景要多少分
+CCB_SCENE_EXIT = 0.35       # 低于这个分才考虑结束（滞回，不抖动）
+CCB_SCENE_EXIT_ROUNDS = 2   # 连续几次低分才真的结束
+CCB_SCENE_SCORE_TTL = 30 * 60.0     # 分数保鲜期（秒）
+CCB_INTIMACY_WINDOW = 15 * 60.0     # 兜底信号的回看窗口（秒）
+
+# 兜底用的亲密信号词面（**只在模型判断不可用时生效**）。
+#
+# S1：原来这里面有「继续」「里面」「要我」三个泛词，实测「继续上班吧」「里面坐吧」
+# 「要不要我帮你拿」全部被判成亲密信号 → 没配情绪分析模型时（默认配置！）
+# 闲聊也会进场景。那正是这套判断要解决的问题，等于绕了一圈回到原地。
+#
+# 现在只留**明确指向性亲密**的说法，宁可漏（漏的后果是"不进场景"，
+# 比"聊着工作突然进场景"轻得多）。同一个决定在 `_CCB_HAPPENED` 里已经做过一次
+# ——「要我」在那里就是因为误报率高被删掉的，这里不应该再放回来。
+_INTIMACY_WORDS = (
+    "想要你", "想抱你", "抱着我", "抱抱我", "亲我", "吻我",
+    "别停", "太深", "很深", "好深", "一起睡", "贴着我",
+)
+
+
+def detect_intimacy(text: str) -> bool:
+    """兜底信号：这句话里有没有明确的亲密意图。
+
+    **不是主判断**——主判断是模型给的 `scene` 分。这里只在模型不可用时顶上，
+    所以宁可漏（退回'不进门'），也不要把普通对话读成邀约。
+    """
+    s = str(text or "")
+    if not s.strip():
+        return False
+    return any(word in s for word in _INTIMACY_WORDS)
+
+
+def scene_score_fresh(score_at: float, now: float) -> bool:
+    """这个 scene 分还新不新鲜。过期一律当"不知道"。"""
+    try:
+        at = float(score_at or 0.0)
+        moment = float(now)
+    except (TypeError, ValueError):
+        return False
+    if at <= 0:
+        return False
+    return (moment - at) <= CCB_SCENE_SCORE_TTL
+
+
+def scene_gate(
+    *,
+    in_scene: bool,
+    scene_score: float,
+    intimacy_hint: bool,
+) -> bool:
+    """「现在能不能进/留在场景里」——只回答这一件事。
+
+    * 已经在场景里：不拦（续场不该被新一轮判断打断）；
+    * 有新鲜的模型分：≥ `CCB_SCENE_ENTER` 才放行；
+    * 没有分（没配 / 失败 / 过期）：退回关键词兜底，有信号才放行。
+
+    最后一条是刻意的：模型判断不可用时**不是全放行**，而是"要一点证据"。
+    全放行等于回到"聊天气也可能进场景"。
+    """
+    if in_scene:
+        return True
+    try:
+        score = float(scene_score)
+    except (TypeError, ValueError):
+        score = -1.0
+    if score >= 0.0:
+        return score >= CCB_SCENE_ENTER
+    return bool(intimacy_hint)
+
+
+
+
+# ─── P1：她自己那一侧 ────────────────────────────────────────────────
+#
+# v2.28.5 之前，"想不想"只由 libido 的绝对值 + 涨幅决定，而那是**情绪层**的数字，
+# 不是她此刻的身体和心气。她自己想不想要，至少要同时看四件事：
+#
+#   · 亲近欲涨了多少（她自己涨上来的，不是初始值）
+#   · 身体的唤醒（soma.arousal——`note_chat` / `note_message` 一直在推它，
+#     而 ccb 一次都没读过）
+#   · 有没有在生气（aggression 高的时候，想靠近和不想示弱是两件事）
+#   · 关系到哪一步了（`relstage`，聊了两千轮还停在"还在认识"的人不该有这一档）
+#
+# 她主动度 ≥ 0.70 且好感已经进了"深入"档时，多开一档（见 `evaluate` 的 stage 4）。
+# 这一档不靠掷骰子，条件全中就出——和原来那三档同一个性质。
+CCB_INITIATIVE_DEEP = 0.70
+# 她明确拒绝之后的静默窗（秒）。不是 5 小时硬冷却：她只是**这会儿**不想，
+# 不是"这件事不许再提"。
+CCB_REFUSE_COOLDOWN_SECONDS = 30 * 60.0
+# 身体唤醒在 `initiative` 里的参考区间：低于 50 不加分，高到 90 封顶。
+_AROUSAL_SPAN = 40.0
+# 第四档的措辞：**行为层级**，不写器官结构、不第三人称、不长于一句念头。
+# 用户明确要求「允许更明确的行为层级」，但纪律仍在——把边界说清楚：
+# 可以说"想让你别停"，不可以写解剖学名词，也不可以把镜头拉远成一段描写。
+_INITIATIVE_WORDS = (
+    "想让你别停",
+    "不想要你走",
+    "想再要一次",
+    "抱紧一点别松",
+)
+
 # ccb_done_count：一辈子的次数（不分天）。社交层拿它判断「有没有和对方色色过」，
 # 从而决定要不要主动问一句——它不是当天次数（那是 ccb_turns）。
-STATE_KEYS = ("ccb_stage", "ccb_last_at", "ccb_satisfy", "ccb_day", "ccb_turns", "ccb_done_count")
+STATE_KEYS = (
+    "ccb_stage", "ccb_last_at", "ccb_satisfy", "ccb_day", "ccb_turns", "ccb_done_count",
+    # P0-3 / P0-4：冷却锚点与记录层去重各自独立，不再和 `ccb_last_at` / `ccb_advance_at`
+    # 抢同一根键。
+    "ccb_gate_at", "ccb_event_dedup_at",
+    # P1：她明确拒绝的时刻（与她被强迫的 `ccb_coerced_at` 分开记）。
+    "ccb_refused_at",
+    # (B 表现层）：场景内三根动态键。`-1` = 还不知道，由关键词检测填；
+    # 判不出就一直保持原值（`-1` 时那一段整行不出，退回单行注入）。
+    "ccb_pose", "ccb_site",
+    # 
+    "ccb_aftercare_until",
+    # (D）：这一场到过的最深值（单调不减，换场景清零）。
+    # 注意：账本 `ccb_log` **不在** 这里——`read_state` 会把每个键转成 float，
+    # 而账本是 list；放进来会被吞成 0.0。
+    "ccb_peak_depth",
+    # 
+    "ccb_scene_score", "ccb_scene_at", "ccb_intimacy_at",
+)
 
 # 满足：场景里累积，到顶算「收场」。
 #
@@ -197,6 +504,14 @@ def reset_scene(user_state: Dict[str, Any]) -> None:
     """
     user_state["ccb_stage"] = 0.0
     user_state["ccb_satisfy"] = 0.0
+    # 
+    # 留着的话，下一场开头会拿上一次的姿势开局——那是明确的出戏。
+    user_state["ccb_pose"] = float(POSE_UNKNOWN)
+    user_state["ccb_site"] = float(POSE_UNKNOWN)
+    # D：账本与"这一场到过的最大深度"也跟着清。它们属于**这一场**，
+    # 不跨场保留——跨场保留会变成第二份 state.json 体积来源。
+    user_state["ccb_peak_depth"] = 0.0
+    user_state[LOG_KEY] = []
 
 
 def decay_satisfy(user_state: Dict[str, Any], now: float) -> None:
@@ -340,6 +655,415 @@ def scene_lapsed(
     )
 
 
+def _clamp01(value: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if out != out:  # NaN
+        return 0.0
+    return max(0.0, min(1.0, out))
+
+
+def initiative(
+    *,
+    libido: float,
+    base_libido: float,
+    arousal: float = 50.0,
+    aggression: float = 25.0,
+    relstage_index: int = 0,
+    affection: float = 0.0,
+    affection_min: float = CCB_AFFECTION_MIN,
+    use_arousal: bool = True,
+) -> float:
+    """她自己有多想（0~1）。**纯函数，不写状态**——它每轮都要算。
+
+    为什么需要这个数：`evaluate` 原来只问"数值够不够"，那回答的是
+    「该不该」，不是「她想不想」。同一条门槛下，一个刚被骂完的人和一个
+    身体正热的人给出同一句话，那就不像人了。
+
+    四项权重刻意不等：亲近欲占大头（那本来就是她的欲望），身体次之，
+    心气与关系各占一小份。`use_arousal=False` 时第二项归零（面板可关）——
+    注意这**只关掉身体那一项**，另外三项照常参与，所以它不是「回到旧版」的
+    开关，只是「别让身体读数影响她」的开关。
+
+    返回值**不落盘**：它随时在变，落盘会让 `refresh_contract` 每分钟重写
+    全量 state.json（线上那份 2.4 MB，同类坑在 link.py 里已经踩过一次）。
+    """
+    try:
+        lib = float(libido)
+        base = float(base_libido)
+    except (TypeError, ValueError):
+        return 0.0
+    lib_span = 12.0
+    lib_part = _clamp01((lib - base) / lib_span)
+    if use_arousal:
+        try:
+            ar = float(arousal)
+        except (TypeError, ValueError):
+            ar = 50.0
+        if ar != ar:  # NaN → 当"不知道"，不加不减
+            ar = 50.0
+        arousal_part = _clamp01((ar - 50.0) / _AROUSAL_SPAN)
+    else:
+        arousal_part = 0.0
+    try:
+        agg = float(aggression)
+    except (TypeError, ValueError):
+        agg = 25.0
+    calm_part = _clamp01(1.0 - agg / 50.0)
+    try:
+        stage_part = _clamp01(float(relstage_index) / 3.0)
+    except (TypeError, ValueError):
+        stage_part = 0.0
+    raw = 0.45 * lib_part + 0.25 * arousal_part + 0.15 * calm_part + 0.15 * stage_part
+    # 好感没到门槛时整体压低：数值上"想"，但她不会对还不够近的人主动。
+    try:
+        aff = float(affection)
+        floor = float(affection_min)
+    except (TypeError, ValueError):
+        return _clamp01(raw)
+    gate = _clamp01((aff - floor * 0.5) / max(1.0, floor * 0.5))
+    return _clamp01(raw * (0.35 + 0.65 * gate))
+
+
+def refused_within(user_state: Dict[str, Any], moment: float,
+                   window: float = CCB_REFUSE_COOLDOWN_SECONDS) -> bool:
+    """她是不是**刚刚**明确说过不要（`window` 秒内）。
+
+    与 `ccb_coerced_at`（他强迫她）分开：那是"他越界"，这是"她不想要"。
+    两者都该挡住场景，但结算不同——她拒绝之后仍然发生，才算他越界。
+    """
+    if not isinstance(user_state, dict):
+        return False
+    try:
+        stamp = float(user_state.get("ccb_refused_at", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not (stamp > 0):
+        return False
+    try:
+        return (float(moment) - stamp) < float(window)
+    except (TypeError, ValueError):
+        return False
+
+
+def body_profile(*, depth_cap_cm: float = 14.0, sensitivity: float = 60.0) -> Dict[str, Any]:
+    """她的静态身体档案。**只在第一次建，之后再也不改**（见 `core_instance`）。
+
+    做成纯函数是为了可测：这里不碰 state，调用方负责"已经有了就别覆盖"。
+    """
+    try:
+        cap = float(depth_cap_cm)
+    except (TypeError, ValueError):
+        cap = 14.0
+    # NaN 单独处理：`min/max` 遇上 NaN 会静默给出一个"看起来正常"的值
+    # （Python 里 `min(18.0, nan)` 返回 18.0）——那会把坏数据变成合法数据。
+    if cap != cap:
+        cap = 14.0
+    cap = max(1.0, min(18.0, cap))
+    try:
+        sens = float(sensitivity)
+    except (TypeError, ValueError):
+        sens = 60.0
+    if not (sens == sens):
+        sens = 60.0
+    return {"depth_cap_cm": round(cap, 1), "sensitivity": int(max(0, min(100, sens)))}
+
+
+def partner_profile(*, length_cm: float = 13.0) -> Dict[str, Any]:
+    """对方（用户）的静态档案，按人各一份。0 表示"不设定"，那就跳过深度判定。"""
+    try:
+        val = float(length_cm)
+    except (TypeError, ValueError):
+        val = 13.0
+    if not (val == val) or val < 0:
+        val = 0.0
+    return {"length_cm": round(min(30.0, val), 1)}
+
+
+def phase_of(
+    *, satisfy: float, stage: float, aftercare_until: float, now: float
+) -> int:
+    """性反应周期到哪一段。0 = 不在场景，5 = 余韵。
+
+    纯推导，**不写状态**——它每轮都要算，落盘会让 `refresh_contract` 变成
+    常驻写盘源（同一个坑在 link.py 里已经踩过）。
+    """
+    try:
+        until = float(aftercare_until or 0.0)
+        moment = float(now)
+    except (TypeError, ValueError):
+        until, moment = 0.0, 0.0
+    if until > 0 and moment < until:
+        return 5
+    try:
+        st = float(stage or 0.0)
+        sat = float(satisfy or 0.0)
+    except (TypeError, ValueError):
+        return 0
+    if st <= 0:
+        return 0
+    if sat >= 100.0:
+        return 4
+    if sat >= 80.0:
+        return 3
+    if sat >= 40.0:
+        return 2
+    return 1
+
+
+def depth_estimate(length_cm: float, phase: int) -> float:
+    """按阶段估一个"此刻大概到多深"（cm）。**不是测量值**，是给判定用的代理。"""
+    try:
+        length = float(length_cm)
+    except (TypeError, ValueError):
+        return 0.0
+    if length <= 0:
+        return 0.0
+    ratio = _DEPTH_RATIO.get(int(phase), 0.0)
+    return round(max(0.0, length * ratio), 1)
+
+
+def is_over_depth(depth_cm: float, cap_cm: float) -> bool:
+    """超过她自己的上限 = "太深/撑满"。上限是**阈值**，不参与任何动态计算。"""
+    try:
+        return float(depth_cm) > float(cap_cm)
+    except (TypeError, ValueError):
+        return False
+
+
+def _negated_after(s: str, pos: int, words=_NEG_PREFIX, window: int = _NEG_WINDOW) -> bool:
+    """命中词**后面**那一小段里有没有否定（只给 `detect_occurrence` 用）。
+
+    它原来的窗口是双向的（「做过了，不要再提」该被挡）；而姿势/位置只看前面
+    （「别停」里的"停"在后面是鼓励）。所以两条路不能共用同一个方向。
+    """
+    tail = s[pos: pos + window]
+    if any(w in tail for w in words if w != _NEG_SINGLE):
+        return True
+    if _NEG_SINGLE in words:
+        idx = tail.find(_NEG_SINGLE)
+        while idx >= 0:
+            g = pos + idx
+            before = s[g - 1] if g > 0 else ""
+            # 同 `_negated`：空串必须单独判，否则 `"" in 串` 恒真。
+            if not before or before not in _NEG_SINGLE_COMPOUND:
+                return True
+            idx = tail.find(_NEG_SINGLE, idx + 1)
+    return False
+
+
+def _hit_detail(text: str, table) -> Tuple[Optional[int], str]:
+    """在词表里找命中，返回 `(序号, 命中的词)`。带否定护栏与歧义丢弃。
+
+    这是判断层的唯一入口：`detect_pose` / `detect_site` 都走它，
+    保证两条路的"否定/歧义"口径一致。
+    """
+    s = str(text or "")
+    if not s.strip():
+        return None, ""
+    hits: list[Tuple[int, str]] = []
+    for index, words in enumerate(table):
+        for word in words:
+            start = 0
+            while True:
+                pos = s.find(word, start)
+                if pos < 0:
+                    break
+                if _negated(s, pos):
+                    start = pos + len(word)
+                    continue
+                hits.append((index, word))
+                break
+    if not hits:
+        return None, ""
+    kinds = {index for index, _w in hits}
+    if len(kinds) != 1:
+        # 两种姿势同时命中（"转过来" + "从后面"）→ 有歧义，不猜。
+        return None, ""
+    index = next(iter(kinds))
+    # 同一类里取**最长**的那个词当命中证据：越长越具体，日志里更好读。
+    word = max((w for i, w in hits if i == index), key=len, default="")
+    return index, word
+
+
+def detect_pose_detail(text: str) -> Tuple[Optional[int], str]:
+    """判姿势，并给出**是靠哪个词判出来的**（诊断日志用）。"""
+    return _hit_detail(text, _POSE_WORDS)
+
+
+def detect_site_detail(text: str) -> Tuple[Optional[int], str]:
+    """判探入位置，同样带命中证据。"""
+    return _hit_detail(text, _SITE_WORDS)
+
+
+def detect_pose(text: str) -> Optional[int]:
+    """从一句话里判姿势。判不出/有歧义返回 None（调用方保持原值）。"""
+    return detect_pose_detail(text)[0]
+
+
+def detect_site(text: str) -> Optional[int]:
+    """从一句话里判探入位置。判不出返回 None。"""
+    return detect_site_detail(text)[0]
+
+
+# ─── D：账本读写 ─────────────────────────────────────────────────────
+
+def log_append(user_state: Dict[str, Any], kind: str, value: Any, at: float) -> None:
+    """记一笔场景变化。**只记变化**，条数硬上限，超了丢最老的。
+
+    调用方负责"只在真的变了时调"——这里不做去重，因为"同一姿势又提了一次"
+    也可能是有意义的信息（她在强调）。判重放在调用方更省。
+    """
+    if not isinstance(user_state, dict):
+        return
+    kind = str(kind or "")
+    if not kind:
+        return
+    rows = user_state.get(LOG_KEY)
+    if not isinstance(rows, list):
+        rows = []
+    try:
+        stamp = round(float(at), 1)
+    except (TypeError, ValueError):
+        stamp = 0.0
+    rows = [r for r in rows if isinstance(r, dict)]
+    rows.append({"kind": kind, "value": value, "at": stamp})
+    user_state[LOG_KEY] = rows[-LOG_MAX:]
+
+
+def log_clear(user_state: Dict[str, Any]) -> None:
+    if isinstance(user_state, dict):
+        user_state[LOG_KEY] = []
+
+
+def log_changes(user_state: Dict[str, Any], kind: str) -> int:
+    """这一类变化一共发生了几次（"换过几次姿势"）。"""
+    rows = user_state.get(LOG_KEY) if isinstance(user_state, dict) else None
+    if not isinstance(rows, list):
+        return 0
+    return sum(1 for r in rows if isinstance(r, dict) and r.get("kind") == kind)
+
+
+def log_last(user_state: Dict[str, Any], kind: str) -> float:
+    """这一类最近一次发生的时间；没有则 0。"""
+    rows = user_state.get(LOG_KEY) if isinstance(user_state, dict) else None
+    if not isinstance(rows, list):
+        return 0.0
+    for row in reversed(rows):
+        if isinstance(row, dict) and row.get("kind") == kind:
+            try:
+                return float(row.get("at") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def note_peak_depth(user_state: Dict[str, Any], depth_cm: float) -> float:
+    """这一场里**到过**的最深值，单调不减。
+
+    为什么要单调：深度是按阶段估的代理值，阶段回退（比如 satisfy 因跨天回落）
+    会让"刚才说撑到疼"变成"现在还没到底"，前后矛盾。场景内只升不降；
+    换场景时由 `reset_scene` 清零。
+    """
+    try:
+        cur = float(user_state.get("ccb_peak_depth", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        cur = 0.0
+    try:
+        new = max(cur, float(depth_cm))
+    except (TypeError, ValueError):
+        new = cur
+    user_state["ccb_peak_depth"] = new
+    return new
+
+
+def aftercare_ratio(*, aftercare_until: float, now: float, window: float) -> float:
+    """余韵还剩多少（0~1）。给显著度做衰减用。
+
+    窗口长度拿不到（配成 0 或者坏值）时按"刚开始"给 1.0——宁可让她这会儿软一点，
+    也不要因为一个坏配置把整段余韵静默吞掉。
+    """
+    try:
+        until = float(aftercare_until or 0.0)
+        moment = float(now)
+        span = float(window or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if until <= 0 or moment >= until:
+        return 0.0
+    if span <= 0:
+        return 1.0
+    return max(0.0, min(1.0, (until - moment) / span))
+
+
+def aftercare_note(*, aftercare_until: float, now: float, window: float) -> str:
+    """余韵期那一句。窗口过了一半之后语气再淡一档。
+
+    没有这段的话，"到顶"在体验上等于"突然什么都没了"——用户明确要的
+    事后余韵就落在这一句上。
+    """
+    try:
+        until = float(aftercare_until or 0.0)
+        moment = float(now)
+        span = float(window or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if until <= 0 or moment >= until:
+        return ""
+    left = until - moment
+    if span > 0 and left > span * 0.5:
+        return "刚结束，还软着"
+    return "还没缓过来"
+
+
+def scene_note(
+    *,
+    pose: int,
+    site: int,
+    phase: int,
+    depth_cm: float,
+    cap_cm: float,
+) -> str:
+    """场景内那一段紧凑状态：姿势 / 位置 / 深度判断 / 阶段。
+
+    返回空串表示**没有可说的**——一个都判不出来时整段不出（A 的兜底：
+    退回纯单行注入，绝不因为缺字段就报错或中断）。
+
+    为什么不做成四行：注入通道是"每轮一句"（`prompt_builder` 把各维度拼成
+    一句、句号收尾），四行会被模型当成清单逐条复述。四个要素压进一个短语，
+    信息一样不少，但读起来仍是一句状态。
+    """
+    bits = []
+    if 0 <= int(pose) < len(POSE_NAMES):
+        bits.append(POSE_NAMES[int(pose)])
+    if 0 <= int(site) < len(SITE_NAMES):
+        bits.append(SITE_NAMES[int(site)])
+    if float(depth_cm) > 0:
+        over = is_over_depth(depth_cm, cap_cm)
+        bits.append(f"约{float(depth_cm):.0f}cm/{float(cap_cm):.0f}cm·{'过深' if over else '未过深'}")
+    name = PHASE_NAMES[int(phase)] if 0 <= int(phase) < len(PHASE_NAMES) else ""
+    if name:
+        bits.append(name)
+    return "·".join(b for b in bits if b)
+
+
+def scene_idle_expired(*, last_at: float, now: float) -> bool:
+    """这一场是不是早就过去了（长时间没人说话）。
+
+    `last_at` 取 `ccb_last_at`；为 0（从没发生过）时不算过期。
+    """
+    try:
+        last = float(last_at or 0.0)
+        moment = float(now)
+    except (TypeError, ValueError):
+        return False
+    if last <= 0:
+        return False
+    return (moment - last) > CCB_SCENE_IDLE_SECONDS
+
+
 def evaluate(
     *,
     enabled: bool,
@@ -360,12 +1084,27 @@ def evaluate(
     affection_deep: float = CCB_AFFECTION_DEEP,
     coerced: bool = False,
     index: int = 0,
+    initiative_score: float = 0.0,
+    refused: bool = False,
+    safety_reason: str = "",
+    in_scene: bool = False,
+    scene_score: float = -1.0,
+    intimacy_hint: bool = True,
 ) -> Optional[Tuple[float, str, int]]:
     """条件全中就返回 `(显著度, 内心话, 阶段)`；任何一条不满足都返回 None。
 
     群里是**硬闸**：直接 None，不参与后面的竞争——按语气说的话没法在群里收场。
     """
     if not enabled:
+        return None
+    # P3：安全闸排在最前面，比一切都早。命中就不降档、不软化——
+    # 未成年 / 血缘这两类人设**整条功能不生效**。
+    if safety_reason:
+        return None
+    # P1：她刚刚明确说过不要。这条与 coerced 是两件事——coerced 是「他越界」，
+    # 这里是「她不想要」；两者都该挡住场景，但**不该**清掉场景状态
+    # （所以它不进 `scene_lapsed`，见那个函数的说明）。
+    if refused:
         return None
     # E4/E6：刚被强迫过（无视拒绝/胁迫）→ 不进入，谈不上「享受」
     if not _qualifies(
@@ -384,8 +1123,19 @@ def evaluate(
         return None
     if energy < CCB_ENERGY_MIN:
         return None
-    # 冷却很短（门槛已经很高），但同一条连着两轮也是「刚说过」
-    if last_at > 0 and (now - last_at) < CCB_COOLDOWN_SECONDS:
+    # 冷却只挡**开新的一场**，不挡**继续这一场**。
+    #
+    # 原来无条件挡：`satisfy` 每进一次 +40、到顶要 3 次，而冷却 5 小时——
+    # 于是"一次完整的场景"实际横跨 15 小时、跨到第二天，所谓"临界/爆发"
+    # 永远只在第三天出现。实测模拟里第 2 轮就被冷却挡回，satisfy 卡在 40。
+    # 场景进行中（`in_scene`）不再受冷却约束；收场之后（stage 归零）冷却照旧生效。
+    if not in_scene and last_at > 0 and (now - last_at) < CCB_COOLDOWN_SECONDS:
+        return None
+    # 进门判断：模型说"这一段在做什么"，关键词只在模型不可用时兜底。
+    # 这一条排在数值门槛**之后**——先算"她够不够",再问"这会儿合不合适"。
+    if not scene_gate(
+        in_scene=in_scene, scene_score=scene_score, intimacy_hint=intimacy_hint
+    ):
         return None
     # 一天封顶。门槛全中时它会一直亮着，不封顶就能一直刷下去。
     if turns_today >= CCB_DAILY_MAX:
@@ -402,6 +1152,20 @@ def evaluate(
     if affection < float(affection_deep):
         stage = 1
         words = ladder[0][2]
+    # P1 第四档：她**自己**主动度够高时，才开这一档。
+    #
+    # 为什么不做成第四根 libido 档位：`bands()` 的档位是从触发阈值线性推出来的，
+    # 而亲近欲上限是 50 —— 38 起、步长 5，第四档落在 53，永远够不着（除非把
+    # 步长降到 3，那会改掉现有三档的边界）。所以这一档挂在**另一个维度**上：
+    # 数值已经到顶（stage == len(ladder)）+ 好感已进深入档 + 她自己够主动。
+    # 三条同时成立才算，缺一条就退回原档——它没有放宽任何既有门槛。
+    if (
+        stage >= len(ladder)
+        and affection >= float(affection_deep)
+        and float(initiative_score) >= CCB_INITIATIVE_DEEP
+    ):
+        stage = len(ladder) + 1
+        words = _INITIATIVE_WORDS
     return score, words[index % len(words)], stage
 
 # ─── 「这件事到底发生过没有」：独立于状态机 ────────────────────────
@@ -409,10 +1173,19 @@ def evaluate(
 # 而聊天里**真的发生过**的记录不能由它决定。线上实测：9136 个用户条目里
 # `ccb_done_count` 全为 0——因为没有任何代码去看过这件事。
 _CCB_HAPPENED = (
-    "做了", "做爱", "操了", "被操", "干了", "插进", "进入身体", "内射", "射在",
-    "高潮", "到了顶点", "一起去了", "弄坏了", "要了你", "操我", "插我", "进来", "要我",
+    "做爱", "做过了", "操了", "被操", "干了", "插进", "进入身体", "内射", "射在",
+    "高潮", "到了顶点", "一起去了", "弄坏了", "要了你", "操我", "插我",
 )
 _CCB_NEGATION = ("不要", "别", "停", "没做", "不想", "拒绝", "算了", "还没")
+# P0-2：「在说这件事」不是「这件事发生了」。
+#
+# 原来词表里有裸的「做了」「进来」「要我」——于是
+#   「你做了什么」→ 命中「你」+「做了」→ 记成一次
+#   「你进来吧」  → 记成一次
+#   「你要我怎么说」→ 记成一次
+# 后果不只是次数虚高：`note_occurrence` 还会写冷却锚点，一句普通闲聊能把真正的
+# 触发推到 5 小时之后。三处一起处理：词表去掉歧义词，再加一道「谈论守护」。
+_CCB_TALK_GUARD = ("问", "说", "想", "让", "吗", "？", "?")
 _CCB_PROFANITY = (
     "操你妈", "操你大爷", "我操", "卧槽", "我靠", "操蛋", "操他", "草泥马", "干你妈",
     "干死你", "去你妈", "妈的", "傻逼", "滚蛋", "滚",
@@ -442,22 +1215,43 @@ def detect_occurrence(text: str) -> bool:
             i = s.find(word, start)
             if i < 0:
                 break
-            window = s[max(0, i - 6): i + len(word) + 6]
-            if not any(neg in window for neg in _CCB_NEGATION):
-                return True
-            start = i + len(word)
+            # S4：否定判定统一走 `_negated` / `_negated_after`——它们把单字「别」
+            # 当构词排除处理，否则「告别之后做过了」「区别在于我们做过了」会被漏记。
+            # 这里保留**双向**（「做过了，不要再提」该被挡），姿势/位置只看前面。
+            if _negated(s, i, _CCB_NEGATION, 6) or _negated_after(
+                s, i + len(word), _CCB_NEGATION, 6
+            ):
+                start = i + len(word)
+                continue
+            # 谈论守护只看**动作词之前**那三个字：疑问/转述/打算都长在词前面
+            # （「做了什么」「问做过了吗」「想…」）。放进整窗会把「我要你了」误杀
+            # ——那句里的「要」在词内部/前面，却是真的发生了。
+            lead = s[max(0, i - 3): i]
+            if any(talk in lead for talk in _CCB_TALK_GUARD):
+                start = i + len(word)
+                continue
+            return True
     return False
 
 
 def note_occurrence(user_state: Dict[str, Any], moment: float) -> bool:
-    """记一次「真的发生了」。返回是否新记（去重看 `ccb_advance_at`）。"""
+    """记一次「真的发生了」。返回是否新记。
+
+    P0-4：去重改用**自己的键** `ccb_event_dedup_at`。原来它用的是
+    `ccb_advance_at`，而那根键同时是 `_ccb_line` 的渲染去重——于是一次误记
+    会让接下来 60 秒里真正的场景推进被抑制（只出文本、不推状态）。
+
+    P0-3：这里**不再写冷却锚点**。冷却改读 `ccb_gate_at`，只在真的进场景时写；
+    `ccb_last_at` 退回它本来的语义「上一次发生是什么时候」，给 `/好感度` 和
+    社交层看。原来两者共用一个键，一句普通闲聊就能把真触发的冷却推到 5 小时后。
+    """
     try:
-        last = float(user_state.get("ccb_advance_at", 0.0) or 0.0)
+        last = float(user_state.get("ccb_event_dedup_at", 0.0) or 0.0)
         if float(moment) - last < 60.0:
             return False
         user_state["ccb_done_count"] = float(user_state.get("ccb_done_count", 0.0) or 0.0) + 1.0
         user_state["ccb_last_at"] = float(moment)
-        user_state["ccb_advance_at"] = float(moment)
+        user_state["ccb_event_dedup_at"] = float(moment)
         return True
     except (TypeError, ValueError):
         return False
@@ -471,6 +1265,23 @@ _CCB_REFUSE = (
 )
 _CCB_JOKE = ("哈哈", "笑死", "开玩笑", "逗你", "哼", "才不", "讨厌啦")
 
+# 「她自己说不」的**严格**子集（P1）。
+#
+# 不能直接复用 `_CCB_REFUSE`：那份词表是拿来看**用户**的话的，用户说
+# 「不要」多半是拒绝推进；而她自己说「讨厌」可能是撒娇。拿宽词表看她的话，
+# 一次撒娇就会被判成拒绝 → 结束场景 + 30 分钟静默，代价太大。
+# 所以只收无歧义的硬拒绝，其余一律当没看见（宁可漏记）。
+_CCB_REFUSE_HARD = ("住手", "放开我", "我不愿意", "不想要", "别碰我", "停下", "别这样")
+
+
+def detect_refusal_hard(text: str) -> bool:
+    """她自己说的**明确**拒绝。只认硬词，且排除调侃/撒娇。"""
+    s = str(text or "")
+    if not s.strip():
+        return False
+    if any(j in s for j in _CCB_JOKE):
+        return False
+    return any(r in s for r in _CCB_REFUSE_HARD)
 
 def detect_refusal(text: str) -> bool:
     """明确拒绝（排除调侃/欲拒还迎）。"""

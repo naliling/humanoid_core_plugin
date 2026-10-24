@@ -461,6 +461,12 @@ class EmotionLayer:
         note = self._memory_note(user_id, index)
         if note[1]:
             pools.append(note)
+        # (D）：余韵。它**不进 ccb 的直出通道**——余韵不是"这一刻必须
+        # 说"的状态，只是她这两小时里说话会软一点。所以它作为一个普通候选
+        # 参与竞争，显著度压得比常态低，别的情绪该赢还是赢。
+        after = self._aftercare_line(user_id)
+        if after[1]:
+            pools.append(after)
 
         # 冷静期优先于一切：她正在气头上，别的情绪都让位。
         cool = self._cooling_line(user_id, index)
@@ -481,6 +487,40 @@ class EmotionLayer:
             if text and score > best[0]:
                 best = (score, text)
         return best
+
+    def _aftercare_line(self, user_id: str) -> Tuple[float, str]:
+        """余韵期的一句。不在余韵期返回 `(0.0, "")`。
+
+        显著度**随时间衰减**：刚收场那会儿 0.90（该它说话，她确实还没缓过来），
+        到窗口末尾掉到 0.50（该让位给别的情绪了）。
+
+        为什么不能固定一个值：
+        * 固定 0.52 时实测它几乎总是输给态度/心境那几句——余韵等于不存在；
+        * 固定 0.9 又会在两小时里把别的情绪全压死，她只剩一种语气。
+        线性衰减两头都避开了。
+        """
+        try:
+            cfg = getattr(self._core, "config", None)
+            if not bool(getattr(cfg, "ccb", False)):
+                return 0.0, ""
+            if not bool(getattr(cfg, "ccb_scene_detail", True)):
+                return 0.0, ""
+        except Exception:
+            return 0.0, ""
+        until_raw = self._core._scope.peek_user(user_id, "ccb_aftercare_until", 0.0)
+        try:
+            until = float(until_raw or 0.0)
+        except (TypeError, ValueError):
+            return 0.0, ""
+        if until <= 0:
+            return 0.0, ""
+        window = _num(getattr(cfg, "ccb_aftercare_minutes", 120.0), 120.0) * 60.0
+        now = self._core.now_epoch()
+        text = _ccb.aftercare_note(aftercare_until=until, now=now, window=window)
+        if not text:
+            return 0.0, ""
+        ratio = _ccb.aftercare_ratio(aftercare_until=until, now=now, window=window)
+        return 0.50 + 0.40 * ratio, text
 
     def _ccb_line(
         self,
@@ -505,6 +545,12 @@ class EmotionLayer:
         idx = int.from_bytes(hashlib.blake2b(raw, digest_size=8).digest(), "big") % 2
         user_state = self._core._scope.user_state(user_id)
         _cfg = self._core.config
+        # (P3）：安全闸。人设命中未成年 / 血缘 → 整条功能不生效，
+        # 连"内心话"都不出。放在这里而不是只在 `evaluate` 里，是因为这条路径
+        # 还要推进状态、扣精力——被挡的人不该留下任何账。
+        safety = _ccb.safety_block(persona_prompt)
+        if safety:
+            return None
         coerced = ccb_coerced_within(user_state, moment)
         # 门槛从配置取。写死在这个模块里的话，用户看到「够不着」却无处可调——
         # 而这个开关默认的 affection 门槛对多数人是永远够不着的。
@@ -517,6 +563,56 @@ class EmotionLayer:
         base_affection = _num(state.get("base_affection"), 46.0)
         libido = _num(state.get("libido"), 34.0)
         base_libido = _num(state.get("base_libido"), 34.0)
+
+        # ── P1：她自己那一侧 ────────────────────────────────────────
+        # 拒绝窗与 coerced 分开：coerced 是「他越界」，refused 是「她不想要」。
+        refused = _ccb.refused_within(user_state, moment)
+        use_arousal = bool(getattr(_cfg, "ccb_use_arousal", True))
+        # 身体的唤醒：soma 一直在推它（note_chat +6 / note_message +1.5），
+        # 而 ccb 之前一次都没读过。面板关掉时按 50（=不加不减）处理。
+        arousal = 50.0
+        if use_arousal:
+            try:
+                arousal = float(self._core.soma.snapshot().get("arousal", 50.0) or 50.0)
+            except Exception:
+                arousal = 50.0
+        # 关系到哪一步：用现成的 relstage，不新造一套档位。
+        rel_index = 0
+        try:
+            from .relstage import stage_of
+
+            rel_index = int(stage_of(affection)[0])
+        except Exception:
+            rel_index = 0
+        initiative_score = _ccb.initiative(
+            libido=libido,
+            base_libido=base_libido,
+            arousal=arousal,
+            aggression=_num(state.get("aggression"), 25.0),
+            relstage_index=rel_index,
+            affection=affection,
+            affection_min=affection_min,
+            use_arousal=use_arousal,
+        )
+
+        # ── 进门判断────────────────────────────────────
+        # 模型分只在那次情绪批里更新（默认 10 条一次），所以必须判它新不新鲜：
+        # 30 分钟前的结论不能拿来决定现在进不进。过期 → -1（不知道）→ 退回兜底。
+        in_scene = float(user_state.get("ccb_stage", 0.0) or 0.0) > 0
+        raw_score = _num(user_state.get("ccb_scene_score"), -1.0)
+        score_at = _num(user_state.get("ccb_scene_at"), 0.0)
+        scene_score = raw_score if _ccb.scene_score_fresh(score_at, moment) else -1.0
+        # 兜底信号：最近 15 分钟内出现过亲密意图（用户或她自己说的）。
+        intimacy_hint = (
+            moment - _num(user_state.get("ccb_intimacy_at"), 0.0)
+        ) <= _ccb.CCB_INTIMACY_WINDOW
+        # 滞回的另一半：只有**这一场开始之后**给出的判断才有资格结束它。
+        # 拿进场前的旧结论赶人，会让她刚进来就出去。
+        if in_scene and scene_score >= 0 and scene_score <= _ccb.CCB_SCENE_EXIT:
+            if score_at > _num(user_state.get("ccb_gate_at"), 0.0):
+                _ccb.reset_scene(user_state)
+                self._core._scope.mark_dirty()
+                return None
         res = _ccb.evaluate(
             enabled=True,
             libido_min=libido_min,
@@ -525,6 +621,12 @@ class EmotionLayer:
             affection_rise=affection_rise,
             affection_deep=affection_deep,
             coerced=coerced,
+            refused=refused,
+            safety_reason=safety,
+            in_scene=in_scene,
+            scene_score=scene_score,
+            intimacy_hint=intimacy_hint,
+            initiative_score=initiative_score,
             is_group=is_group,
             persona_prompt=persona_prompt,
             affection=affection,
@@ -532,7 +634,13 @@ class EmotionLayer:
             libido=libido,
             base_libido=base_libido,
             energy=energy,
-            last_at=float(user_state.get("ccb_last_at", 0.0) or 0.0),
+            # P0-3：冷却读**自己的锚点**。原来读 `ccb_last_at`，而那个键会被
+            # `note_occurrence`（「发生过」的记录层）写——一句普通闲聊命中误记词，
+            # 就能把真正的触发推到 5 小时之后。旧数据没有 `ccb_gate_at`，
+            # 退回 `ccb_last_at` 保证升级后行为不变（只是继续受旧账影响一轮）。
+            last_at=float(
+                user_state.get("ccb_gate_at", user_state.get("ccb_last_at", 0.0)) or 0.0
+            ),
             now=float(moment),
             turns_today=float(user_state.get("ccb_turns", 0.0) or 0.0),
             index=idx,
@@ -566,13 +674,36 @@ class EmotionLayer:
         except (TypeError, ValueError):
             last_advance = 0.0
         if float(moment) - last_advance < CCB_ADVANCE_DEDUP_SECONDS:
-            return score, text
+            # 状态没推进，但状态段要按**当前**状态给（此时状态已经是最新的）。
+            return score, self._scene_text(text, user_state, moment, user_id, _cfg)
         user_state["ccb_advance_at"] = float(moment)
+        # P0-3：冷却锚点只在这里写——只有**真的进了场景**才算一次冷却。
+        user_state["ccb_gate_at"] = float(moment)
+        # (D）：进**新的一场**时清账本。判据是"之前不在场景里"——
+        # 场景中的推进不能清，否则换过的姿势全丢。
+        try:
+            was_in_scene = float(user_state.get("ccb_stage", 0.0) or 0.0) > 0
+        except (TypeError, ValueError):
+            was_in_scene = False
+        if not was_in_scene:
+            _ccb.log_clear(user_state)
+            user_state["ccb_peak_depth"] = 0.0
         user_state["ccb_stage"] = float(stage)
+        # P0-4 的收口：**同一个事件只记一次**。原来这里无条件 +1，而
+        # `note_occurrence`（用户/她的话命中词表）也 +1 —— 一次事情被记两遍。
+        # 现在两边共用 `ccb_event_dedup_at`：60 秒内谁先记谁算，后一个不重复。
+        try:
+            last_event = float(user_state.get("ccb_event_dedup_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last_event = 0.0
+        if float(moment) - last_event >= 60.0:
+            user_state["ccb_event_dedup_at"] = float(moment)
+            user_state["ccb_turns"] = float(user_state.get("ccb_turns", 0.0) or 0.0) + 1.0
+            # 一辈子的次数：社交层靠它判断「有没有和对方色色过」
+            user_state["ccb_done_count"] = (
+                float(user_state.get("ccb_done_count", 0.0) or 0.0) + 1.0
+            )
         user_state["ccb_last_at"] = float(moment)
-        user_state["ccb_turns"] = float(user_state.get("ccb_turns", 0.0) or 0.0) + 1.0
-        # 一辈子的次数：社交层靠它判断「有没有和对方色色过」
-        user_state["ccb_done_count"] = float(user_state.get("ccb_done_count", 0.0) or 0.0) + 1.0
         # 推进场景。跨天的回落和次数重算都发生在这一步里，所以只在真进场景时
         # 才付这个代价——没进场景的日子不该把状态改掉。
         if _ccb.advance_satisfy(user_state, float(moment)):
@@ -580,8 +711,88 @@ class EmotionLayer:
             self._core._scope.set_self(
                 "energy", max(0.0, float(self._core.energy.energy) - _ccb.CCB_ENERGY_COST)
             )
+            # 
+            # 记账路径还会 +2/+3 —— 等于自己给自己续火，下一次触发更近。
+            try:
+                self._core.ccb_settle(user_id, float(moment))
+            except Exception:
+                pass
+            # 。
+            # 场景态归零、姿势与位置作废；`ccb_satisfy` 保留——它是"上头"，
+            # 由按天回落处理，不是场景状态。余韵窗单开一段。
+            user_state["ccb_stage"] = 0.0
+            user_state["ccb_pose"] = float(_ccb.POSE_UNKNOWN)
+            user_state["ccb_site"] = float(_ccb.POSE_UNKNOWN)
+            window = _num(
+                getattr(getattr(self._core, "config", None), "ccb_aftercare_minutes", 120.0),
+                120.0,
+            ) * 60.0
+            user_state["ccb_aftercare_until"] = float(moment) + max(0.0, window)
+            _ccb.log_append(user_state, "peak", 0, moment)
         self._core._scope.mark_dirty()
-        return score, text
+        # 状态段放在**推进之后**算：原来放在 `evaluate` 之后、写 stage 之前，
+        # 于是进场那一轮读到的还是 stage=0（整段不出），之后每轮读到的是**上一轮**
+        # 的满足度（注入说"平台"、状态里已经是"临界"）。实测对不上，S3。
+        return score, self._scene_text(text, user_state, moment, user_id, _cfg)
+
+    def _scene_text(self, text: str, user_state: Dict[str, Any], moment: float,
+                    user_id: str, cfg: Any) -> str:
+        """状态段的唯一拼装口（两条 return 都走它，保证口径一致）。
+
+        纯增强：开关关掉、或者任何一步出错，都原样返回前面那句内心话。
+        """
+        if not bool(getattr(cfg, "ccb_scene_detail", True)):
+            return text
+        try:
+            return self._with_scene_note(text, user_state, moment, user_id)
+        except Exception:
+            return text
+
+    def _with_scene_note(self, text: str, user_state: Dict[str, Any],
+                         moment: float, user_id: str) -> str:
+        """把「姿势 / 位置 / 深度判断 / 阶段」压成一个短语挂到内心话后面。
+
+        A 的兜底：任何一项都拿不到、或整段压不出内容（`scene_note` 返回空串），
+        就原样返回——退回单行注入，不报错、不中断。
+
+        (D）：深度取**这一场到过的最深值**（单调不减），阶段回退时不会
+        出现"刚才说撑到疼、现在又说还没到底"。
+        """
+        stage = _num(user_state.get("ccb_stage"), 0.0)
+        if stage <= 0:
+            # 到顶那一轮：`ccb_stage` 已经归零，但余韵窗**刚开**——这一轮正是爆发，
+            # 什么都不给等于在最关键的一刻闭嘴。判据：余韵剩余量还接近整个窗口。
+            window = _num(
+                getattr(getattr(self._core, "config", None), "ccb_aftercare_minutes", 120.0),
+                120.0,
+            ) * 60.0
+            until = _num(user_state.get("ccb_aftercare_until"), 0.0)
+            if window > 0 and until > moment and (until - moment) >= window - 5.0:
+                phase = 4
+            else:
+                # 不在场景里就只管内心话（余韵由 `_aftercare_line` 作为普通候选处理，
+                # 不走这条直出通道）。
+                return text
+        else:
+            phase = _ccb.phase_of(
+                satisfy=_num(user_state.get("ccb_satisfy"), 0.0),
+                stage=stage,
+                aftercare_until=_num(user_state.get("ccb_aftercare_until"), 0.0),
+                now=moment,
+            )
+        body = self._core.ccb_body()
+        partner = self._core.ccb_partner(user_id)
+        depth = _ccb.depth_estimate(_num(partner.get("length_cm"), 0.0), phase)
+        # 单调化：这一场只升不降。
+        depth = _ccb.note_peak_depth(user_state, depth)
+        note = _ccb.scene_note(
+            pose=int(_num(user_state.get("ccb_pose"), _ccb.POSE_UNKNOWN)),
+            site=int(_num(user_state.get("ccb_site"), _ccb.POSE_UNKNOWN)),
+            phase=phase,
+            depth_cm=depth,
+            cap_cm=_num(body.get("depth_cap_cm"), 14.0),
+        )
+        return f"{text}（{note}）" if note else text
 
 
 def bracket(text: str) -> str:
