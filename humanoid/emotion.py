@@ -522,6 +522,27 @@ class EmotionLayer:
         ratio = _ccb.aftercare_ratio(aftercare_until=until, now=now, window=window)
         return 0.50 + 0.40 * ratio, text
 
+    def _roll_ccb_day(self, user_state: Dict[str, Any], moment: float) -> bool:
+        """按天滚动 ccb 的满足度与当日次数，返回**确实改了状态**没有。
+
+        为什么它必须在读路径上跑：`ccb.decay_satisfy` 平时只被 `advance_satisfy`
+        调，而 `advance_satisfy` 只有在「真的进场景」之后才跑；可进场景的条件里又有
+        「当日次数 < 8」。于是一旦当天打满 8 次，第二天 `evaluate` 读到的还是 8 →
+        永远进不了场景 → `decay_satisfy` 永远不跑 → `ccb_turns` 永久卡在 8、
+        ccb 再也不触发。用户看到的就是「计数不会变 + 场景再也没进行过」。
+
+        幂等：`decay_satisfy` 在 `ccb_day` 没变时直接返回，所以每轮调一次只多一次
+        整数比较；没有状态变化时不标脏，不制造额外的落盘。
+        """
+        keys = ("ccb_day", "ccb_satisfy", "ccb_turns")
+        try:
+            before = tuple(user_state.get(key) for key in keys)
+            _ccb.decay_satisfy(user_state, float(moment))
+            return tuple(user_state.get(key) for key in keys) != before
+        except Exception:
+            # 修复项本身失败不该连累这一轮的内心话（这个函数外面没有 try）。
+            return False
+
     def _ccb_line(
         self,
         user_id: str,
@@ -551,6 +572,12 @@ class EmotionLayer:
         safety = _ccb.safety_block(persona_prompt)
         if safety:
             return None
+        # P0：进 evaluate 之前先把「按天回落 + 当日次数重算」做掉。
+        # 不做的话第 8 次之后 `ccb_turns` 永久卡住、ccb 再也不触发（根因见
+        # `_roll_ccb_day`）。它只在跨天时改状态，所以平时这一行不产生写入；
+        # 放在安全闸之后，是为了被挡的人设连一根计数键都不留下。
+        if self._roll_ccb_day(user_state, moment):
+            self._core._scope.mark_dirty()
         coerced = ccb_coerced_within(user_state, moment)
         # 门槛从配置取。写死在这个模块里的话，用户看到「够不着」却无处可调——
         # 而这个开关默认的 affection 门槛对多数人是永远够不着的。

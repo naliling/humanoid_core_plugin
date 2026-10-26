@@ -35,9 +35,11 @@ CONTRACT_SCHEMA = "humanoid.contract/2"
 #: 这一版契约提供的能力。社交层按能力判断走哪条路，不靠版本号猜。
 #: 只加不改：`dreams`（她昨晚做的梦）与 `wake`（醒来状态/睡眠惯性）是 v2.28.0 新增的，
 #: `event`（刚刚发生的事够重）是 v2.29.0 新增的只读能力，API_VERSION 保持 2。
+#: v2.28.9 再补 `identity`（她是谁：参照名/人设标签）与 `outfit`（她此刻穿着）——
+#: 社交层主动开口时终于能「以她的身份、说她当下的事」说话。
 CONTRACT_CAPABILITIES = (
     "body", "feelings", "form", "activity", "day", "ongoing", "routine",
-    "dreams", "wake", "event",
+    "dreams", "wake", "event", "identity", "outfit",
 )
 
 # 社交层写回的信号文件：超过这个秒数就不采信。
@@ -170,6 +172,13 @@ def build_contract(core: Any) -> dict[str, Any]:
         "wake": _wake_block(core),
         # 日程是按哪个 AstrBot 人设排的：社交层靠它确认两边用的是同一个人。
         "persona": str(core.schedule.status().get("persona", "") or ""),
+        # 她是谁（v2.28.9，只加不改）：社交层主动开口前要知道「用哪个名字/哪副人设说话」。
+        # 两句短字符串，拿不到就是空串——绝不编名字，绝不因为人设没预热好让契约生成失败。
+        "identity": _identity_block(core),
+        # 她此刻穿着（v2.28.9，只加不改）：{"enabled","text","source"}。
+        # 社交层拿它说「今天穿得少」这类真实细节，而不是每一轮都只有天气。
+        # 拿不到（旧 Core / 穿搭关 / 判不出物种）→ 空 dict，社交层按「不知道」处理。
+        "outfit": _outfit_block(core),
         # 作息：社交层靠它知道她睡够没睡够，诊断靠它提示两套时间不一致。
         "routine": _routine_block(core, cfg, slots),
         # 天气只递真天气：没配 Key 时那句「为什么没有」是给她主人看的，社交层拿到只会照着说。
@@ -181,6 +190,7 @@ def build_contract(core: Any) -> dict[str, Any]:
         "paths": {
             "user_affection": "roles.<bid>.users.<uid>.mood.affection",
             "user_nickname": "roles.<bid>.users.<uid>.nickname",
+            "user_display_name": "roles.<bid>.users.<uid>.display_name",
             "user_last_interaction": "roles.<bid>.users.<uid>.last_interaction",
             "user_said": "roles.<bid>.users.<uid>.said",
         },
@@ -219,6 +229,55 @@ def _event_block(core: Any) -> dict[str, Any]:
     if not phrase:
         return {}
     return {"phrase": phrase}
+
+
+def _identity_block(core: Any) -> dict[str, Any]:
+    """她是谁：`char_name`（参照名称）+ `persona_label`（今天这份日程按哪个人设排的）。
+
+    v2.28.9 新增（只加不改）：社交层主动开口时，语气与自称要跟聊天侧同一个人。
+    这里只出两个短字符串：
+
+    * 拿不到（旧 Core / 人设还没预热 / 内部异常）→ 空串，**绝不拿 role_id 或「她」顶上**：
+      role_id 是内部标识，社交层拿它叫人或自称会把「bot1」念出来；
+    * 整个块永远存在（两个键都在），取值可以是空串——社交层按能力判断即可，
+      不需要再猜「这个键是没有还是坏了」。
+
+    只读：`char_name()` 在极端情况下会自愈一次自动补名（写一个内部 memo），那是
+    Core 自己的既有行为，不会因为导出契约而多出用户级数据。
+    """
+    try:
+        char_name = str(core.char_name() or "").strip()
+    except Exception:
+        char_name = ""
+    try:
+        persona_label = str(core.persona_label() or "").strip()
+    except Exception:
+        persona_label = ""
+    return {"char_name": char_name, "persona_label": persona_label}
+
+
+def _outfit_block(core: Any) -> dict[str, Any]:
+    """她此刻穿着：只导出 `{"enabled","text","source"}` 三个短字段（v2.28.9）。
+
+    `core.outfit_info()` 还带 `kind`（物种识别结果），那是面板用的内部细节；
+    跨插件接口只给社交层真正要用的三样，形状固定、体积小。
+    拿不到（旧 Core / 没这个方法 / 抛异常 / 返回非 dict）→ `{}`，
+    社交层按「不知道她穿什么」处理，不因为这一块让整份契约生成失败。
+    """
+    try:
+        info = core.outfit_info()
+    except Exception:
+        return {}
+    if not isinstance(info, dict) or not info:
+        return {}
+    try:
+        return {
+            "enabled": bool(info.get("enabled")),
+            "text": str(info.get("text") or "").strip(),
+            "source": str(info.get("source") or "").strip(),
+        }
+    except Exception:
+        return {}
 
 
 def _fields_hash(contract: dict[str, Any]) -> str:

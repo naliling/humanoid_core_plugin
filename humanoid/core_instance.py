@@ -30,6 +30,19 @@ from .slots import is_sleep_event
 
 LOG_PREFIX = "[humanoid_core]"
 
+# 状态页的标签列宽（`/你的状态` 与 `/亲密状态` 共用一套排版：列对齐比 emoji 好读）。
+STATUS_LABEL_WIDTH = 12
+
+
+def _status_row(label: str, value: str, note: str = "") -> str:
+    """状态面板的一行：标签左对齐 + 值 + 可选中文备注。
+
+    做成模块级是为了让 `/亲密状态` 与 `/你的状态` 的「亲密」段**共用同一套排版**
+    ——两处各写一份 `ljust` 的话，改一次列宽就会有一处对不齐。
+    """
+    base = f"  {label.ljust(STATUS_LABEL_WIDTH)}{value}"
+    return f"{base}  {note}" if note else base
+
 # 过期用户数据清理的扫描间隔。只需每小时一次：retention 以天为单位，扫得更勤没有收益。
 MAINTENANCE_INTERVAL_SECONDS = 3600.0
 
@@ -866,7 +879,10 @@ class HumanoidCoreInstance:
         # 指令不当成打断（发个 /查看日程 不是「有人来找你说话」）。
         if not is_command:
             try:
-                self.schedule.note_interruption(is_group=is_group)
+                # 把正文一起递下去：私聊里那句「在吗/你在干嘛/陪我」是「明确叫住她」，
+                # 可以不必熬过安静间隔就算一次来访（`schedule_interrupt_on_call`）。
+                # 不传 text 时 service 的行为与以前完全一致，所以这是一个纯增量参数。
+                self.schedule.note_interruption(is_group=is_group, text=text)
             except Exception:
                 pass
             # 别人刚说的话够重，让日程也有机会因此停下或改主意。
@@ -1161,6 +1177,11 @@ class HumanoidCoreInstance:
             "body", "feelings", "form", "activity",
             "ongoing", "wants", "day", "persona", "routine", "weather", "holiday",
             "event",
+            # v2.28.9 新增的两个跨插件块：`identity`（她叫什么）/ `outfit`（穿着）。
+            # 漏掉它们的话，旧 state 里只有旧契约时其余键都没变 → 直接 return previous，
+            # 新块要等身体/天气顺带变化才可能落盘——升级后社交层可能几小时读不到名字。
+            # `/拟人 设置 穿搭` 单独改 outfit 也同理：必须让它触发一次重写。
+            "identity", "outfit",
         )
         try:
             if isinstance(previous, dict) and all(previous.get(key) == contract.get(key) for key in keys):
@@ -1376,6 +1397,21 @@ class HumanoidCoreInstance:
         self._scope.mark_dirty()
         return profile
 
+    def _ccb_persona_prompt(self) -> str:
+        """当前生效人设的正文（人设源缓存里的那份）。拿不到就是空串。
+
+        安全闸和「判不判得出女角色」都要它：两处各取一遍，一旦有一处取到的是
+        上一次的人设，就会出现「安全闸说没问题、性别判成男」这种自相矛盾的结论。
+        """
+        try:
+            source = getattr(self, "persona_source", None)
+            if source is None:
+                return ""
+            snap = source.cached_persona(self.role_id)
+            return str(getattr(snap, "prompt", "") or "")
+        except Exception:
+            return ""
+
     def ccb_safety(self) -> str:
         """人设安全闸的判定结果（缓存按人设正文，避免每轮重跑正则）。
 
@@ -1386,14 +1422,7 @@ class HumanoidCoreInstance:
         等于没生效，而用户只会觉得"功能怪怪的"。所以第一次遇到空人设就记一条
         warning——排查时至少能在日志里看到它，而不是靠猜。
         """
-        prompt = ""
-        try:
-            source = getattr(self, "persona_source", None)
-            if source is not None:
-                snap = source.cached_persona(self.role_id)
-                prompt = str(getattr(snap, "prompt", "") or "")
-        except Exception:
-            prompt = ""
+        prompt = self._ccb_persona_prompt()
         cached = getattr(self, "_ccb_safety_cache", None)
         if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == prompt:
             return cached[1]
@@ -1431,6 +1460,231 @@ class HumanoidCoreInstance:
             except Exception as exc:
                 if self._log:
                     self._log.debug(f"{LOG_PREFIX} 欲望回落失败: {exc}")
+
+    def _cfg_num(self, name: str, default: float) -> float:
+        """读一个数值配置；缺失 / None / 坏值退回默认值。
+
+        **0 是合法值**，所以不能用 `value or default`——面板上把
+        `ccb_libido_rise` 调成 0 是「关掉涨幅这一道闸」，被 `or` 吞掉就变成
+        "用默认的 4"了（`services/mood.py` 的 `_num_or` 已经为同一件事留过注释）。
+        """
+        try:
+            raw = getattr(self.config, name, default)
+            if raw is None:
+                return float(default)
+            return float(raw)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def intimacy_status(self, user_id: str) -> dict:
+        """她对某个人的亲密状态：**只读快照**（状态页 / `/亲密状态` / 门面共用）。
+
+        「只读」在这里有两条具体含义，少一条都会变成线上事故：
+
+        1. **不建壳**：档案与计数一律走 `peek_user`，看完就走。`mood.profile()`
+           会给没档案的人现建一份——门面是每轮都可能被问一句的入口，用它等于
+           给每个问过的人都留一条永久空壳（`RoleScope.peek_user` 的注释里已经
+           为这件事踩过一轮）。
+        2. **不推进场景**：不写 `ccb_stage` / `ccb_satisfy` / `ccb_turns`，
+           看状态不等于"又做了一次"。
+
+        唯一的写动作是 `roll_day()` 的按天结账：跨天之后「当天次数」必须归零，
+        否则昨天打满 8 次的人今天永远读回 8，`evaluate()` 永远 return None，
+        场景再也不进行——用户看到的「计数不会变 + ccb 再也不触发」就是这条链。
+        它每天最多触发一次，且只在真正跨天时 `mark_dirty()`。
+
+        返回 `{}` 表示拿不到（没有 user_id / 内部异常），调用方按「不知道」处理。
+        """
+        uid = str(user_id or "").strip()
+        if not uid:
+            return {}
+        cfg = self.config
+        try:
+            now = float(self.now_epoch())
+        except Exception:
+            now = time.time()
+
+        # 有没有这个用户的条目：只用 peek 判断，判断本身不能把人建出来。
+        # 一个条目里只要出现过任何一笔 ccb 账，就说明它是真实存在的老条目，
+        # 可以安全地拿 `user_state()` 引用（它只 `setdefault`，不会新建）；
+        # 否则用空 dict 现算——与「没有任何 ccb 记录」等价。这里要扫全部
+        # `STATE_KEYS`：只扫几个"主键"的话，一个只有 `ccb_scene_score` /
+        # `ccb_intimacy_at` 的条目会被当成不存在，刚拿到的模型分就被丢掉了。
+        exists = any(
+            self._scope.peek_user(uid, key) is not None for key in _ccb.STATE_KEYS
+        )
+        state = self._scope.user_state(uid) if exists else {}
+        if exists and _ccb.roll_day(state, now):
+            self._scope.mark_dirty()
+
+        mood = self._scope.peek_user(uid, "mood", None)
+        mood = mood if isinstance(mood, dict) else {}
+
+        def mood_num(key: str, default: float) -> float:
+            raw = mood.get(key)
+            if raw is None:
+                return float(default)
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return float(default)
+            return value if value == value else float(default)  # NaN
+
+        initial_libido = self._cfg_num("mood_initial_libido", 34.0)
+        initial_affection = self._cfg_num("mood_initial_affection", 46.0)
+        libido = mood_num("libido", initial_libido)
+        base_libido = mood_num("base_libido", libido)
+        affection = mood_num("affection", initial_affection)
+        base_affection = mood_num("base_affection", affection)
+        try:
+            energy = float(self.energy.energy)
+        except Exception:
+            energy = 100.0
+
+        # 进门判断的两项输入与 `emotion._ccb_line` 同口径：模型分过期当"不知道"，
+        # 兜底信号看 15 分钟内有没有亲密意图。只读快照里不新鲜的分等于没有。
+        raw = _ccb.read_state(state) if state else {}
+        scene_at = raw.get("ccb_scene_at", 0.0)
+        scene_score = raw.get("ccb_scene_score", -1.0)
+        if not _ccb.scene_score_fresh(scene_at, now):
+            scene_score = -1.0
+        intimacy_hint = (now - raw.get("ccb_intimacy_at", 0.0)) <= _ccb.CCB_INTIMACY_WINDOW
+
+        # 她刚被强迫过：写侧把 `ccb_coerced_at` 放在 mood 子字典里，判定要和
+        # `emotion.ccb_coerced_within` 用同一份逻辑，不然面板说"能进"、实际进不去。
+        coerced = False
+        try:
+            from .emotion import ccb_coerced_within
+
+            coerced = bool(ccb_coerced_within(state, now))
+        except Exception:
+            coerced = False
+
+        snap = _ccb.scene_status(
+            state,
+            now,
+            libido=libido,
+            base_libido=base_libido,
+            affection=affection,
+            base_affection=base_affection,
+            energy=energy,
+            persona_prompt=self._ccb_persona_prompt(),
+            safety_reason=self.ccb_safety(),
+            coerced=coerced,
+            scene_score=scene_score,
+            intimacy_hint=intimacy_hint,
+            libido_min=self._cfg_num("ccb_libido_min", _ccb.CCB_LIBIDO_MIN),
+            libido_rise=self._cfg_num("ccb_libido_rise", _ccb.CCB_LIBIDO_RISE),
+            affection_min=self._cfg_num("ccb_affection_min", _ccb.CCB_AFFECTION_MIN),
+            affection_rise=self._cfg_num("ccb_affection_rise", _ccb.CCB_AFFECTION_RISE),
+            affection_deep=self._cfg_num("ccb_affection_deep", _ccb.CCB_AFFECTION_DEEP),
+            # 每日封顶没有配置项（`CCB_DAILY_MAX` 是常量），但状态页要说「今日 n/8」，
+            # 所以照样走同一个参数，值来自模块常量。
+            daily_max=_ccb.CCB_DAILY_MAX,
+        )
+        enabled = bool(getattr(cfg, "ccb", False))
+        snap["enabled"] = enabled
+        if not enabled:
+            # 开关关着时整条功能不生效：历史数字照给（那是真的发生过），但
+            # 「能不能进」一律给不能——说"能"就是骗人，而用户会照着它去试。
+            snap["in_scene"] = False
+            snap["stage_name"] = ""
+            snap["cooldown_left"] = 0.0
+            snap["aftercare_left"] = 0.0
+            snap["can_enter"] = False
+            snap["blockers"] = ["亲密场景未开启（ccb=false）"]
+        return snap
+
+    def intimacy_rows(self, user_id: str) -> list[str]:
+        """「亲密」段的每一行（`/你的状态` 与 `/亲密状态` 共用同一份数据与排版）。
+
+        只装数字与中文说明，不装标题：两个入口的抬头不一样（状态页有自己的小标题，
+        指令那边是「亲密 · uid」）。`cfg.ccb` 关着时返回空列表——那一段整个不出现。
+        """
+        if not user_id or not bool(getattr(self.config, "ccb", False)):
+            return []
+        snap = self.intimacy_status(user_id)
+        if not snap:
+            return []
+        rows: list[str] = []
+
+        lib = float(snap.get("libido") or 0.0)
+        base = float(snap.get("base_libido") or 0.0)
+        lo = float(snap.get("libido_min") or 0.0)
+        need = float(snap.get("libido_rise_need") or 0.0)
+        rows.append(_status_row(
+            "亲近欲", f"{lib:.0f}/50",
+            f"基线 {base:.0f}，{_ccb.delta_text(lib - base)}"
+            f" · 门槛 {lo:.0f}/Δ{need:.0f} → {_ccb.threshold_text(lib, base, lo, need)}",
+        ))
+        # 好感那一行只提门槛：具体数值在上面「关系」段已经有了，重复一遍反而
+        # 让「哪一行才是主数据」变模糊。
+        aff = float(snap.get("affection") or 0.0)
+        base_aff = float(snap.get("base_affection") or 0.0)
+        aff_lo = float(snap.get("affection_min") or 0.0)
+        aff_need = float(snap.get("affection_rise_need") or 0.0)
+        rows.append(_status_row(
+            "好感门槛", f"{aff:.0f}/100",
+            f"门槛 {aff_lo:.0f}/Δ{aff_need:.0f}"
+            f" → {_ccb.threshold_text(aff, base_aff, aff_lo, aff_need)}"
+            f"（深入档 {float(snap.get('affection_deep') or 0):.0f}）",
+        ))
+
+        turns = int(snap.get("turns_today") or 0)
+        daily_max = int(snap.get("daily_max") or 0)
+        if snap.get("expired"):
+            rows.append(_status_row(
+                "场景", "已闲置过期",
+                f"上次 {_ccb.duration_text(snap.get('last_ago'))}前，"
+                f"她下一句话就会清掉 · 今日 {turns}/{daily_max}",
+            ))
+        elif snap.get("in_scene"):
+            rows.append(_status_row(
+                "场景", f"进行中 · {snap.get('stage_name') or '（阶段未知）'}",
+                f"满足 {float(snap.get('satisfy') or 0):.0f}/100 · 今日 {turns}/{daily_max}",
+            ))
+        else:
+            # 余韵不算「在场景里」（那时 ccb_stage 已经归零），由下面单独的余韵行说。
+            rows.append(_status_row("场景", "未开始", f"今日 {turns}/{daily_max}"))
+
+        aftercare = float(snap.get("aftercare_left") or 0.0)
+        if aftercare > 0:
+            rows.append(_status_row(
+                "余韵", f"还剩 {_ccb.duration_text(aftercare)}", "刚收场，说话还软"
+            ))
+        cooldown = float(snap.get("cooldown_left") or 0.0)
+        if cooldown > 0:
+            rows.append(_status_row(
+                "冷却", f"还要 {_ccb.duration_text(cooldown)}", "进新的一场要等这么久"
+            ))
+
+        done = int(snap.get("done_count") or 0)
+        rows.append(_status_row("一辈子", f"{done} 次"))
+        last_ago = float(snap.get("last_ago") or 0.0)
+        if last_ago > 0:
+            rows.append(_status_row("上次", f"{_ccb.duration_text(last_ago)}前"))
+
+        blockers = [str(item) for item in (snap.get("blockers") or []) if str(item)]
+        if snap.get("in_scene"):
+            rows.append(_status_row("能进入", "（场景中，不适用）", "续场不受冷却/封顶限制"))
+        elif snap.get("can_enter"):
+            rows.append(_status_row("能进入", "能", "条件都够了"))
+        else:
+            rows.append(_status_row("能进入", "不能", "；".join(blockers) or "原因未知"))
+        return rows
+
+    def intimacy_text(self, user_id: str) -> str:
+        """`/亲密状态` 的正文：与状态页同一份数据，只是带个头。
+
+        排版交给 `intimacy_rows()`，两个入口共用——各拼一套的话，改了一处之后
+        指令与面板说的就是两件事。
+        """
+        if not bool(getattr(self.config, "ccb", False)):
+            return "亲密场景未开启（ccb=false）。"
+        rows = self.intimacy_rows(user_id)
+        if not rows:
+            return "亲密场景未开启，或没有可显示的数据。"
+        return "\n".join([f"亲密 · {user_id}", *rows])
 
     def _ccb_note_intimacy(self, user_id: str, text: str, now: float) -> None:
         """记一次"这句话有亲密意图"的时刻。
@@ -1704,19 +1958,21 @@ class HumanoidCoreInstance:
         }.get(str(state.get("state")), "- 自主拟人社交：状态未知"))
         return lines
 
-    def status_lines(self, user_id: str) -> list[str]:
+    def status_lines(self, user_id: str, is_group: bool = False) -> list[str]:
         """`/你的状态`：分组的体检单。
 
         排版按「先看什么」来：一眼能看到时间/身体，下面再是关系与环境。不用 emoji
         ——emoji 堆多了反而看不清哪行是哪行，列对齐就够了。
+
+        `is_group` 只影响「亲密」段：ccb 在群里是硬闸（`evaluate` 直接 None），
+        群里当然也不该有「她这会儿在不在亲密场景里」这一屏——那正是用户要的
+        「群里一句话都不许露」。
         """
         s = self.snapshot(user_id)
         now = self.clock.now()
-        width = 12
 
-        def row(label: str, value: str, note: str = "") -> str:
-            base = f"  {label.ljust(width)}{value}"
-            return f"{base}  {note}" if note else base
+        # 排版与 `/亲密状态` 共用（`_status_row`）：两处各写一份迟早对不齐。
+        row = _status_row
 
         out: list[str] = [f"Humanoid Core · {self.role_id}"]
         out.append(f"{now.strftime('%Y-%m-%d %H:%M')} 星期{s['weekday']}  ·  {s['city']}")
@@ -1777,13 +2033,28 @@ class HumanoidCoreInstance:
                     for k in ("care", "focus", "spare")
                 ).replace("care", "在意").replace("focus", "上心").replace("spare", "余量")))
 
+        # 亲密：只在 ccb 开着、私聊、有 user_id 时算一次。算在这里而不是等
+        # 「有没有情绪档案」——用户的原话是「看不到性欲状态，完全不知道 bot
+        # 有没有进入状态」，所以只要开关开着就该有一屏，档案没建也一样。
+        intimate: list[str] = []
+        if user_id and not is_group:
+            try:
+                intimate = self.intimacy_rows(user_id)
+            except Exception as exc:
+                intimate = []
+                if self._log:
+                    self._log.debug(f"{LOG_PREFIX} 状态页亲密段失败: {exc}")
+
         if user_id and "mood" in s:
             out.append("")
             out.append(f"关系 · {user_id}")
             out.append(row("好感度", f"{s['mood']['affection']:.1f}/100", str(s['mood']['label'])))
             mood_raw = self.scope.user_state(user_id).get("mood") or {}
             if mood_raw:
-                out.append(row("亲近欲", f"{float(mood_raw.get('libido', 0)):.0f}/50"))
+                # ccb 开着时亲近欲由下面「亲密」段给（带基线/涨幅/门槛）。同一屏出现
+                # 两个「亲近欲」而数字口径不同时，用户只会当成又一个 bug。
+                if not intimate:
+                    out.append(row("亲近欲", f"{float(mood_raw.get('libido', 0)):.0f}/50"))
                 out.append(row("攻击性", f"{float(mood_raw.get('aggression', 0)):.0f}/50"))
             try:
                 first_met = self.mood.first_met(user_id)
@@ -1801,6 +2072,14 @@ class HumanoidCoreInstance:
             if recent:
                 out.append(row("情绪事件", f"最近 {len(recent)} 条",
                                 str(recent[-1].get("event", ""))))
+
+        # 亲密：只要 ccb 开着、是私聊、有 user_id 就露一段——不再等「有没有情绪档案」。
+        # 用户的原话是「看不到性欲状态，完全不知道 bot 有没有进入状态」：这一段就是
+        # 把状态机内部那套数字摊开给他看，包含「被哪道闸挡着」。
+        if intimate:
+            out.append("")
+            out.append("亲密")
+            out.extend(intimate)
 
         out.append("")
         out.append("环境")

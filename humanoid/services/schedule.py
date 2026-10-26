@@ -101,6 +101,99 @@ INTERRUPT_TTL_SECONDS = 3600.0
 EVENT_TTL_SECONDS = 1800.0
 EVENT_COOLDOWN_SECONDS = 300.0
 
+# ─────────────────────────────────────────────────────────────
+# 可配的「保鲜期 / 打断 / 续做」（v2.28.9）
+#
+# 用户原话：「日程生成还是有限制，所谓的保鲜期，就不是可以中途打断换一个，
+# 或在当前日程接下去的。我需要加，加逻辑与功能」。
+#
+# 上面那三道比例尺与事件保鲜期原来全是写死的秒数，面板上改不了——用户说的
+# 「保鲜期限制了打断与继续」就是这里。现在每一项都有配置键，常量只留作默认值
+# 来源（旧测试与旧行为都引用它们）。读取一律走 `getattr`：旧配置、坏值、
+# 只实现了部分字段的 cfg 对象都退回默认值，绝不因为缺一个键就抛。
+# ─────────────────────────────────────────────────────────────
+
+# 私聊里这些是「明确在叫住她」的话：即使还没熬过安静间隔，也算一次来访。
+# 仍要过冷却（两次打断之间的最小间隔）；群聊永远不算。
+_INTERRUPT_CALL_PHRASES: tuple[str, ...] = (
+    "在吗",
+    "你在干嘛",
+    "干嘛呢",
+    "过来",
+    "陪我",
+    "别弄了",
+    "停一下",
+    "理我",
+    "别写了",
+    "别忙了",
+)
+
+
+def _cfg_number(cfg: Any, name: str, default: float, low: float = 0.0) -> float:
+    """读一个数值型配置：坏值/缺键退回默认值，并夹到低限。"""
+    try:
+        value = float(getattr(cfg, name, default))
+    except (TypeError, ValueError):
+        value = float(default)
+    if value != value:  # NaN
+        value = float(default)
+    return max(float(low), value)
+
+
+def _interrupt_ttl_seconds(cfg: Any) -> float:
+    """来访保鲜期（秒）：有人来找过她这件事，超过这么久没被用上就作废。"""
+    return _cfg_number(
+        cfg, "schedule_interrupt_ttl_minutes", INTERRUPT_TTL_SECONDS / 60.0
+    ) * 60.0
+
+
+def _event_ttl_seconds(cfg: Any) -> float:
+    """事件保鲜期（秒）：隔了这么久，「刚刚」就不再是刚刚。"""
+    return _cfg_number(cfg, "schedule_event_ttl_minutes", EVENT_TTL_SECONDS / 60.0) * 60.0
+
+
+def _interrupt_quiet_seconds(cfg: Any) -> float:
+    """安静间隔（秒）：0 = 不要求安静，任何一条私聊都算来访。"""
+    return _cfg_number(
+        cfg, "schedule_interrupt_quiet_minutes", INTERRUPT_QUIET_GAP_SECONDS / 60.0
+    ) * 60.0
+
+
+def _interrupt_cooldown_seconds(cfg: Any) -> float:
+    """两次「算作来访」之间最小间隔（秒）；0 = 不冷却。"""
+    return _cfg_number(
+        cfg, "schedule_interrupt_cooldown_minutes", INTERRUPT_COOLDOWN_SECONDS / 60.0
+    ) * 60.0
+
+
+def _continue_minutes(cfg: Any) -> int:
+    """`/拟人 日程继续` 一次把当前段延长多少分钟。"""
+    return max(1, int(_cfg_number(cfg, "schedule_continue_minutes", 45.0)))
+
+
+def _pause_ttl_minutes(cfg: Any) -> int:
+    """被打断的那件事保留多久（分钟），期间可以回去接着做。"""
+    return max(1, int(_cfg_number(cfg, "schedule_pause_ttl_minutes", 180.0)))
+
+
+def _on_call_enabled(cfg: Any) -> bool:
+    """「叫住她就打断」开关：缺键/坏值按默认开。"""
+    value = getattr(cfg, "schedule_interrupt_on_call", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "n", "off", "否", "关", "")
+    return bool(value)
+
+
+def _is_call_out(text: Any, cfg: Any) -> bool:
+    """这句话是不是「明确在叫住她」（在吗/你在干嘛/陪我/别弄了…）。"""
+    if not _on_call_enabled(cfg):
+        return False
+    content = str(text or "")
+    if not content:
+        return False
+    return any(phrase in content for phrase in _INTERRUPT_CALL_PHRASES)
+
+
 # 事件的措辞。kind 来自 mood 层的账本（_event_kind），那边负责判定轻重，
 # 这边只负责把它说成「她刚刚经历了什么」。同一个 kind 备几套说法，
 # 由 (角色, 事件, 日期) 抽签——同一天不会把同一句话说两遍。
@@ -529,6 +622,11 @@ def segment_prompt(
     day_frame: str = "",
     seed: list[Any] | None = None,
     want_day_frame: bool = False,
+    # 被打断之前她在做的那件事（挂起快照）：给模型一个「回去接着做」的选项。
+    # 默认 None：旧调用一个字都不变。
+    suspended: Slot | dict | None = None,
+    # 这次必须换一件事（`/拟人 日程打断`）：不许 continue 原地接着做。
+    force_switch: bool = False,
 ) -> str:
     """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
 
@@ -540,8 +638,16 @@ def segment_prompt(
     if prev_event:
         prev_line = (
             f"她这一段从 {(prev or {}).get('start', '')} 开始在做「{prev_event}」"
-            f"（{(prev or {}).get('location', '')}），到现在已经 {int(elapsed_minutes)} 分钟。\n"
+            f"（{(prev or {}).get('location', '')}），到现在已经 {int(elapsed_minutes)} 分钟。"
         )
+        # 这一段预计什么时候结束、还剩多久：要判断「接着做还是换一件」，得先知道
+        # 手上这件事还剩多少时间。旧 prompt 只说了已经做了多久。
+        _start_minute = parse_time((prev or {}).get("start"))
+        _end_minute = parse_time((prev or {}).get("end"))
+        if _start_minute is not None and _end_minute is not None:
+            _remaining = max(0, _end_minute - (_start_minute + int(elapsed_minutes)))
+            prev_line += f"这一段预计到 {format_time(_end_minute)}（还剩 {_remaining} 分钟）。"
+        prev_line += "\n"
     else:
         prev_line = "这是今天的第一次决定，手上还没有正在做的事。\n"
 
@@ -582,6 +688,41 @@ def segment_prompt(
         "这件事可能让她想放下手上正在做的，也可能让她更有劲头做完，"
         "也可能她压根没往心里去——看她是谁，也看这件事的分量。\n\n"
         if event_phrase else ""
+    )
+    # `suspended`：被打断之前她在做的那件事。以前中断之后原来在做的事没有任何
+    # 记录，回不去——用户原话「所谓的保鲜期，就不是可以中途打断换一个，或在
+    # 当前日程接下去的」。这里只把那段事实递进去，回不回去由她按人设决定。
+    _susp = suspended if isinstance(suspended, Mapping) else {}
+    _susp_event = str((_susp or {}).get("event") or "").strip()
+    suspended_block = ""
+    if _susp_event:
+        try:
+            _susp_left = max(0, int(float((_susp or {}).get("remaining_minutes", 0) or 0)))
+        except (TypeError, ValueError):
+            _susp_left = 0
+        _susp_lines = [f"【被打断之前她在做「{_susp_event}」（还剩 {_susp_left} 分钟）】"]
+        _susp_location = str((_susp or {}).get("location") or "").strip()
+        _susp_emotion = str((_susp or {}).get("emotion") or "").strip()
+        _susp_ongoing = str((_susp or {}).get("ongoing") or "").strip()
+        if _susp_location:
+            _susp_lines.append(f"当时在：{_susp_location}")
+        if _susp_emotion:
+            _susp_lines.append(f"当时的心情：{_susp_emotion}")
+        if _susp_ongoing:
+            _susp_lines.append(f"当时的进度：{_susp_ongoing}")
+        _susp_lines.append(
+            "如果她这会儿想回去接着做这件事，输出 {\"resume\": true} 就行，"
+            "不用再写 event/location/emotion（minutes 按剩下的时间算）；"
+            "不想回去就正常给一件新的事。"
+        )
+        suspended_block = "\n".join(_susp_lines) + "\n\n"
+    # `/拟人 日程打断`：这次是**换一件事**，不是「接着做」。这句话必须写死在
+    # prompt 里——不靠模型自己从「插曲」那段读出「也可以继续」。
+    switch_block = (
+        "【这次是换一件事】刚才有人明确叫停了她手上的事：这一段必须是**另一件**事，"
+        "不能 continue=true 接着做手上这件。\n"
+        "   就算你觉得她本该继续，也要给出一个具体的新事件（event/location）。\n\n"
+        if force_switch else ""
     )
     # 「还没做完的事」——她要能有一件跨天的事，今天接着昨天做。
     _ongoing = [str(x).strip() for x in (ongoing or []) if str(x or "").strip()][:3]
@@ -661,6 +802,8 @@ def segment_prompt(
         + night_line
         + interrupt_line
         + event_line
+        + switch_block
+        + suspended_block
         + "【怎么决定】\n"
         "1. 身体读数是决策输入：饿到不行就去吃，困到不行就去睡——怎么权衡由你决定。\n"
         "2. 一件事做到一半接着做很正常（continue=true）；做很久了、或身体不允许时就换。\n"
@@ -714,7 +857,12 @@ def segment_prompt(
         "   其它事要是一件说得出口的事（做了什么、去了哪），不是姿势或状态。\n"
         "3. continue：true = 接着做手上这件事（event/location/emotion 留空，速率沿用）；"
         "false = 换一件事。\n"
-        f"4. minutes：这一段做多久。最短 {SEGMENT_MIN_MINUTES} 分钟，一般的事最长 "
+        + ("   这次**不能** continue=true：必须给出一件新的事。\n" if force_switch else "")
+        + (
+            "   如果上面给了【被打断之前】那一段，想回去接着做时输出 {\"resume\": true}。\n"
+            if _susp_event else ""
+        )
+        + f"4. minutes：这一段做多久。最短 {SEGMENT_MIN_MINUTES} 分钟，一般的事最长 "
         f"{SEGMENT_MAX_MINUTES} 分钟；睡觉可以睡一整夜（最长 {SEGMENT_SLEEP_MAX_MINUTES // 60} 小时，"
         "跨过半夜也没关系）。这个是**上下限，不是目标值**——"
         "多数日常小事落在 20~60 分钟，真正要花时间的事才写长。\n"
@@ -760,6 +908,45 @@ def _pick_from_array(raw: Any, now_minute: int) -> Mapping[str, Any] | None:
     return upcoming or last
 
 
+def _truthy_flag(value: Any) -> bool:
+    """模型返回的布尔标记：真布尔与 "true"/"1"/"是"/"继续" 这类字符串都认。"""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "y", "是", "继续", "回去")
+    return bool(value)
+
+
+def _force_switch_raw(raw: Any, prev: Slot | None) -> Mapping[str, Any] | None:
+    """`/拟人 日程打断` 的解析：只接受「另一件事」。
+
+    - `continue=true`：忽略原意，改成「它明确给出的那件新事」；没给新事件
+      （或给的就是手上这件）就跳过——这次不算换事。
+    - `resume=true`：允许（回去接着做被打断之前那件事），交给 `parse_segment`。
+    - 普通回复：event 必须与手上这件不同。
+    全都不满足返回 None：调用方按失败处理（不能原地续）。
+    """
+    previous_event = str((prev or {}).get("event") or "").strip()
+    items = raw if isinstance(raw, list) else [raw]
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        candidate = dict(item)
+        if _truthy_flag(candidate.get("resume")):
+            return candidate
+        event = str(candidate.get("event") or "").strip()
+        if _truthy_flag(candidate.get("continue")):
+            if not event or event == previous_event:
+                continue
+            # 改判：模型说了 continue，但它给了一件新的事——按新事件排。
+            candidate["continue"] = False
+            return candidate
+        if not event:
+            continue
+        if previous_event and event == previous_event:
+            continue
+        return candidate
+    return None
+
+
 def _segment_minutes(raw: Mapping[str, Any], now_minute: int, sleeping: bool) -> int:
     """这一段做多久：minutes 与 end 两种写法都认，睡觉的 end 可以写在明天。"""
     minutes: int | None = None
@@ -790,18 +977,58 @@ def parse_segment(
     now_minute: int,
     step: int = 1,
     prev: Slot | None = None,
+    suspended: Slot | dict | None = None,
 ) -> Slot | None:
     """把模型返回的这一段规范化成一个 slot。
 
     `continue=true` 时沿用上一件事的名字与地点，只往前延长——这是「她决定再做
     一会儿」，不是插件替她改主意。睡觉可以跨过午夜：今天这半截截到 24:00，
     剩下的写进 `carry_end`，由 `_append_segment` 结转到明天。
+
+    `resume=true`（优先级高于 continue）时用 `suspended` 里那件被打断的事重建
+    这一段的开头：start = 现在，minutes = 剩余分钟数（下限 15），地点/心情/进度
+    沿用。没有 `suspended` 时 resume 不生效，按普通回复解析。
     """
     if isinstance(raw, list):
         raw = _pick_from_array(raw, now_minute)
     if not isinstance(raw, Mapping):
         return None
     prev = prev or {}
+    # 回去接着做被打断之前那件事：continue 与 resume 同时出现时以 resume 优先。
+    susp = suspended if isinstance(suspended, Mapping) else {}
+    suspended_event = str((susp or {}).get("event") or "").strip()[:24]
+    want_resume = _truthy_flag(raw.get("resume")) and bool(suspended_event)
+    if want_resume:
+        sleeping = is_sleep_event(suspended_event)
+        try:
+            remaining = int(float((susp or {}).get("remaining_minutes", 0) or 0))
+        except (TypeError, ValueError):
+            remaining = SEGMENT_DEFAULT_MINUTES
+        cap = SEGMENT_SLEEP_MAX_MINUTES if sleeping else SEGMENT_MAX_MINUTES
+        minutes = max(SEGMENT_MIN_MINUTES, min(cap, remaining))
+        start = segment_start(now_minute, step)
+        end = start + minutes
+        slot: Slot = {
+            "start": format_time(start),
+            "end": format_time(min(DAY_MINUTES, end)),
+            "event": suspended_event,
+            "location": str((susp or {}).get("location") or "").strip()[:16] or "家中",
+            "emotion": str((susp or {}).get("emotion") or "").strip()[:12] or "平常",
+            "energy_rate": clamp_rate(raw.get("energy_rate", 0.0)),
+        }
+        ongoing = str((susp or {}).get("ongoing") or "").strip()[:40]
+        if ongoing:
+            slot["ongoing"] = ongoing
+        if (susp or {}).get("wants"):
+            slot["wants"] = True
+        if sleeping:
+            raw_dreams = raw.get("dreams")
+            if raw_dreams is None:
+                raw_dreams = (susp or {}).get("dreams")
+            slot["dreams"] = _clean_dreams(raw_dreams)
+        if end > DAY_MINUTES:
+            slot["carry_end"] = format_time(end - DAY_MINUTES)
+        return slot
     want_continue = raw.get("continue")
     if isinstance(want_continue, str):
         want_continue = want_continue.strip().lower() in ("true", "1", "yes", "是", "继续")
@@ -1055,6 +1282,9 @@ class ScheduleService:
         self._event_at = 0.0
         self._event_phrase = ""
         self._last_event_at: float | None = None
+        # 刚装上的一段是不是「回去接着做被打断之前那件事」（resume）：`_append_segment`
+        # 要据此清掉挂起、并且不把这次被截断的段再挂起来。
+        self._resumed_event = ""
 
         self.resolver = None
         self.gateway = None
@@ -1127,6 +1357,12 @@ class ScheduleService:
     ONGOING_KEY = "ongoing_tasks"
     ONGOING_MAX = 3
     ONGOING_TTL_DAYS = 4
+    # 被打断之前她在做的那件事（只存一件）：中断之后原来在做的事要有个记录，
+    # 下一次安排时可以选「回去接着做」。结构：
+    # `{"event", "location", "emotion", "ongoing", "wants",
+    #   "remaining_minutes", "at", "ttl_minutes"}`
+    # 新的覆盖旧的；`schedule_pause_ttl_minutes` 之后过期作废（读取时顺手清）。
+    SUSPENDED_KEY = "schedule_suspended"
     # 昨天那份日程存哪儿：跨天时 `daily_schedule` 被今天的第一段覆盖，昨天做了什么
     # 就没了着落。留一份尾部给 `_history_for_prompt` 当「昨天的收尾」。
     PREV_DAY_KEY = "prev_day_schedule"
@@ -1438,12 +1674,23 @@ class ScheduleService:
             return True
         return gate.check(PURPOSE).allowed
 
-    def note_interruption(self, *, is_group: bool = False, now: float | None = None) -> None:
+    def note_interruption(
+        self,
+        *,
+        is_group: bool = False,
+        now: float | None = None,
+        text: str = "",
+    ) -> None:
         """一条私聊消息来了——满足条件时记一次「有人打破安静来找她」。
 
-        两道比例尺：距上一条私聊至少隔 `INTERRUPT_QUIET_GAP_SECONDS`（否则算
-        「消息还热着」，很多人同时聊时这个口子就自然不再触发），且距上次
-        算作来访至少隔 `INTERRUPT_COOLDOWN_SECONDS`。群消息不算「来找她」。
+        两道比例尺（都可配）：距上一条私聊至少隔 `schedule_interrupt_quiet_minutes`
+        （否则算「消息还热着」，很多人同时聊时这个口子就自然不再触发；0 = 不要求
+        安静，任何一条私聊都算来访），且距上次算作来访至少隔
+        `schedule_interrupt_cooldown_minutes`（0 = 不冷却）。群消息不算「来找她」。
+
+        `text`：消息正文。私聊里出现「在吗/你在干嘛/陪我/别弄了…」这类**明确叫住
+        她**的话时，即使没熬过安静间隔也算一次来访（`schedule_interrupt_on_call`，
+        仍受冷却；群聊永远不算）。旧调用不传 text 时行为与以前完全一致。
 
         只设不排：真正的决定在下一次 refresh_due 里做（还要过闸门/频率/预算）。
         冷却基准 `_last_interrupt_at` 与待处理的标记分开：消费掉标记不能
@@ -1451,14 +1698,21 @@ class ScheduleService:
         """
         if is_group:
             return
+        cfg = self.config
         t = float(self._monotonic() if now is None else now)
         previous = self._last_message_at
         self._last_message_at = t
-        if previous is not None and t - previous < INTERRUPT_QUIET_GAP_SECONDS:
+        quiet_seconds = _interrupt_quiet_seconds(cfg)
+        # 安静间隔没熬过时，只有「明确在叫住她」的话能破例；冷却照旧。
+        if (
+            previous is not None
+            and t - previous < quiet_seconds
+            and not _is_call_out(text, cfg)
+        ):
             return
         if (
             self._last_interrupt_at is not None
-            and t - self._last_interrupt_at < INTERRUPT_COOLDOWN_SECONDS
+            and t - self._last_interrupt_at < _interrupt_cooldown_seconds(cfg)
         ):
             return
         self._last_interrupt_at = t
@@ -1506,10 +1760,14 @@ class ScheduleService:
         return True
 
     def _fresh_event(self, *, clear: bool = True) -> str:
-        """待处理的事件措辞；没有或过期了返回空串。"""
+        """待处理的事件措辞；没有或过期了返回空串。
+
+        保鲜期读 `schedule_event_ttl_minutes`（默认 30 分钟，原写死
+        `EVENT_TTL_SECONDS`）：隔了两小时，「刚刚」就不再是刚刚。
+        """
         if not self._event_phrase or self._event_at <= 0:
             return ""
-        if self._monotonic() - self._event_at > EVENT_TTL_SECONDS:
+        if self._monotonic() - self._event_at > _event_ttl_seconds(self.config):
             if clear:
                 self._event_at = 0.0
                 self._event_phrase = ""
@@ -1541,7 +1799,7 @@ class ScheduleService:
         return {
             "phrase": phrase,
             "age_seconds": max(0.0, self._monotonic() - self._event_at),
-            "ttl": EVENT_TTL_SECONDS,
+            "ttl": _event_ttl_seconds(self.config),
         }
 
     def _fresh_interruption(self, *, clear: bool = True) -> bool:
@@ -1549,12 +1807,15 @@ class ScheduleService:
 
         不设保鲜期时，标记可以一睡几个小时（睡着时不被消费）或卡在闸门后面，
         等到下一次重排才被取用——那时提示词里那句「刚刚有人来找她」就是假话。
+        保鲜期读 `schedule_interrupt_ttl_minutes`（默认 60 分钟，原写死
+        `INTERRUPT_TTL_SECONDS`）。
 
-        `clear=False` 供只读路径（`_due_peek`）用：连「把过期标记置 0」这个写操作都不做。
+        `clear=False` 供只读路径（`_due_peek` / `status`）用：连「把过期标记置 0」
+        这个写操作都不做。
         """
         if self._interrupt_at <= 0:
             return False
-        if self._monotonic() - self._interrupt_at > INTERRUPT_TTL_SECONDS:
+        if self._monotonic() - self._interrupt_at > _interrupt_ttl_seconds(self.config):
             if clear:
                 self._interrupt_at = 0.0
             return False
@@ -1571,6 +1832,127 @@ class ScheduleService:
         ts = self._interrupt_at
         self._interrupt_at = 0.0
         return ts
+
+    # ------------------------------------------------------------------
+    # 被打断之前她在做的那件事：挂起、读取、回来接着做
+    # ------------------------------------------------------------------
+
+    def _clear_suspended(self) -> None:
+        """清掉挂起的那件事（走 scope 写路径，会 mark_dirty）。"""
+        if self._scope.get_self(self.SUSPENDED_KEY):
+            self._scope.set_self(self.SUSPENDED_KEY, None)
+
+    def _suspended_slot(self) -> dict[str, Any]:
+        """被打断那件事的规范化快照；没有/过期返回 {}。
+
+        过期（`schedule_pause_ttl_minutes`）顺手清掉——旧的挂起不该在一天后
+        还冒出来说「她打断之前在做……」。
+        """
+        raw = self._scope.get_self(self.SUSPENDED_KEY)
+        if not isinstance(raw, dict) or not raw:
+            return {}
+        event = str(raw.get("event") or "").strip()
+        if not event:
+            return {}
+        try:
+            at = float(raw.get("at") or 0.0)
+        except (TypeError, ValueError):
+            at = 0.0
+        try:
+            ttl_minutes = int(float(raw.get("ttl_minutes") or 0))
+        except (TypeError, ValueError):
+            ttl_minutes = 0
+        if ttl_minutes <= 0:
+            ttl_minutes = _pause_ttl_minutes(self.config)
+        if at > 0 and self._wall_clock() - at > ttl_minutes * 60.0:
+            self._clear_suspended()
+            return {}
+        try:
+            remaining = max(0, int(float(raw.get("remaining_minutes") or 0)))
+        except (TypeError, ValueError):
+            remaining = 0
+        return {
+            "event": event[:24],
+            "location": str(raw.get("location") or "").strip()[:16],
+            "emotion": str(raw.get("emotion") or "").strip()[:12],
+            "ongoing": str(raw.get("ongoing") or "").strip()[:40],
+            "wants": bool(raw.get("wants")),
+            "remaining_minutes": min(remaining, DAY_MINUTES),
+            "at": at,
+            "ttl_minutes": ttl_minutes,
+        }
+
+    def suspended_info(self) -> dict[str, Any]:
+        """被打断之前她在做的那件事（只读快照）；没有返回 {}。
+
+        给状态页/诊断用：`/查看日程` 与 `/拟人 诊断` 要能看出「她被打断后还
+        记着哪件事、还剩多少分钟、还能回去多久」。快照里额外补两个算出来的
+        只读字段（`age_minutes` / `ttl_left_minutes`），不改存下来的数据。
+        """
+        try:
+            slot = self._suspended_slot()
+        except Exception:
+            return {}
+        if not slot:
+            return {}
+        out = dict(slot)
+        try:
+            age = max(0.0, self._wall_clock() - float(slot.get("at") or 0.0))
+            out["age_minutes"] = int(age // 60.0)
+            out["ttl_left_minutes"] = max(
+                0, int(float(slot.get("ttl_minutes") or 0) - age / 60.0)
+            )
+        except (TypeError, ValueError):
+            out["age_minutes"] = 0
+            out["ttl_left_minutes"] = 0
+        return out
+
+    def _interrupt_status(self) -> dict[str, Any]:
+        """打断闸门的只读快照（给 `status()` 用）：还剩多少保鲜期/冷却/安静。
+
+        全部只读：不改标记、不掷骰子。任何异常都退化成「什么都不剩」——
+        状态页不能因为一个坏配置把 /查看日程 整条带崩。
+        """
+        try:
+            cfg = self.config
+            now = self._monotonic()
+            ttl = _interrupt_ttl_seconds(cfg)
+            quiet = _interrupt_quiet_seconds(cfg)
+            cooldown = _interrupt_cooldown_seconds(cfg)
+            pending = self._fresh_interruption(clear=False)
+            ttl_left = (
+                max(0.0, ttl - (now - self._interrupt_at))
+                if pending and self._interrupt_at > 0
+                else 0.0
+            )
+            cooldown_left = (
+                max(0.0, cooldown - (now - self._last_interrupt_at))
+                if self._last_interrupt_at is not None
+                else 0.0
+            )
+            quiet_left = (
+                max(0.0, quiet - (now - self._last_message_at))
+                if self._last_message_at is not None
+                else 0.0
+            )
+            return {
+                "pending": bool(pending),
+                "ttl_left": round(ttl_left, 1),
+                "cooldown_left": round(cooldown_left, 1),
+                "quiet_left": round(quiet_left, 1),
+                "ttl_minutes": int(ttl // 60),
+                "cooldown_minutes": int(cooldown // 60),
+                "quiet_minutes": int(quiet // 60),
+                "on_call": _on_call_enabled(cfg),
+                "event_pending": bool(self._fresh_event(clear=False)),
+            }
+        except Exception:
+            return {
+                "pending": False,
+                "ttl_left": 0.0,
+                "cooldown_left": 0.0,
+                "quiet_left": 0.0,
+            }
 
     def refresh_due(self) -> bool:
         """该不该决定下一段：没段/这一段过完了/身体打架/刚被打断/还没排上大模型/掷中骰子。
@@ -1677,6 +2059,111 @@ class ScheduleService:
         return True
 
     # ------------------------------------------------------------------
+    # 打断与续做：`/拟人 日程打断` 与 `/拟人 日程继续`
+    # ------------------------------------------------------------------
+
+    def continue_now(self) -> bool:
+        """让她把当前这一段接着做下去：不调模型，直接把这一段的 end 往后延。
+
+        延长量读 `schedule_continue_minutes`（默认 45 分钟）。规则：
+
+        - 覆盖此刻的那一段不存在 → False（她手上没有正在做的事）；
+        - 已经到 24:00 / 延长会跨过午夜 → False（跨午夜是睡眠结转的事）；
+        - 后面已经有下一段 → 最多延长到它的 start，不重叠、不吞掉后面的安排；
+        - 延长后 `segments()` / `active_segment()` / `current_activity()` /
+          契约与 `status()` 立刻反映新的 end（它们都从同一份 `daily_schedule` 读）。
+
+        能量速率**沿用**这一段原值：这是「接着做」，不是重新决定这件事。
+        """
+        try:
+            cfg = self.config
+            extend = _continue_minutes(cfg)
+            now = self._clock.now()
+            minutes_now = now.hour * 60 + now.minute
+            active = self.active_segment(minutes_now)
+            if active is None:
+                return False
+            lo = parse_time(active.get("start"))
+            hi = parse_time(active.get("end"))
+            if lo is None or hi is None or hi <= lo:
+                return False
+            if hi >= DAY_MINUTES:
+                return False
+            desired = hi + extend
+            if desired > DAY_MINUTES:
+                # 超过 24:00 不延长：跨午夜那半截是睡眠结转（carry）的活。
+                return False
+            stored = self._stored_slots()
+            # 不越过后面已经排好的段：有后续段时最多延长到它的 start。
+            for item in stored:
+                if item is active:
+                    continue
+                next_lo = parse_time(item.get("start"))
+                if next_lo is not None and next_lo >= hi and next_lo < desired:
+                    desired = next_lo
+            if desired <= hi:
+                return False
+            updated: list[Slot] = []
+            replaced = False
+            for item in stored:
+                if item is active:
+                    slot = dict(item)
+                    slot["end"] = format_time(desired)
+                    # energy_rate 显式沿用这一段自己的值（不是新段、不重算）。
+                    slot["energy_rate"] = active.get("energy_rate", slot.get("energy_rate", 0.0))
+                    updated.append(slot)
+                    replaced = True
+                else:
+                    updated.append(dict(item))
+            if not replaced:
+                return False
+            self._scope.update_self(daily_schedule=updated)
+            # 本窗的骰子不该因为这次延长立刻把刚延长的段又截掉。
+            self._roll_hit = False
+            if self._log and cfg.debug_mode:
+                self._log.debug(
+                    f"[humanoid_core] 日程继续：{active.get('event')} "
+                    f"{format_time(hi)} → {format_time(desired)}"
+                )
+            return True
+        except Exception as exc:
+            if self._log:
+                self._log.warning(f"[humanoid_core] 日程继续失败: {exc}")
+            return False
+
+    def interrupt_now(self) -> bool:
+        """立刻让她放下手上的事、换成另一件事（`/拟人 日程打断`）。
+
+        与 `/拟人 重置日程` 同样的力度：`force=True, ignore_cooldown=True`
+        ——不看该不该重排、不看冷却/退避，但照样受单飞闸约束。区别只在生成时
+        明确要求「换一件事」：`force_switch=True` 会让提示词写死不许 continue，
+        解析时 `continue=true` 也会被改判/判失败（不允许原地续）。
+
+        返回是否成功排入后台任务：已经有一轮生成在跑时返回 False（不排队重复）。
+        没有正在进行的段时也能用——那就直接决定下一段。
+        """
+        if self._task and not self._task.done():
+            return False
+        if self._generating:
+            return False
+        coro = self.ensure_fresh(force=True, ignore_cooldown=True, force_switch=True)
+        name = f"humanoid-schedule-interrupt-{self._scope.role_id}"
+        try:
+            task = self._spawn(coro, name) if self._spawn else asyncio.create_task(coro, name=name)
+        except Exception as exc:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            if self._log:
+                self._log.warning(f"[humanoid_core] 日程打断投递失败: {exc}")
+            return False
+        if task is None:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return False
+        self._task = task
+        return True
+
+    # ------------------------------------------------------------------
     # 生成
     # ------------------------------------------------------------------
 
@@ -1696,11 +2183,19 @@ class ScheduleService:
             self._task = asyncio.create_task(coro, name=name)
         return True
 
-    async def ensure_fresh(self, force: bool = False, ignore_cooldown: bool = False) -> bool:
+    async def ensure_fresh(
+        self,
+        force: bool = False,
+        ignore_cooldown: bool = False,
+        force_switch: bool = False,
+    ) -> bool:
         """决定（并装上）下一段。
 
         模型不可用、未配置或还在退避期时：手上没有能接着做的段就按身体现算一段
         （不留白）；有段就先做着手上的事，等退避过去再让模型接手。
+
+        `force_switch=True`（`/拟人 日程打断` 用）：这次必须换成另一件事——提示词
+        写死「不能 continue」，解析时 continue=true 会被改判/判失败。
 
         **模型调用在锁外**：它带超时与重试（多 provider 链最坏 ≈ 超时 × 尝试次数 ×
         provider 数），持锁期间任何并发 `ensure_fresh` 都得排队，一条 `/日程` 强制刷新
@@ -1752,6 +2247,7 @@ class ScheduleService:
                 slot = await self._generate_segment(
                     cfg, now, minutes, prev, elapsed, ignore_cooldown,
                     interrupted_ts=interrupted_ts, event_phrase=event_phrase,
+                    force_switch=force_switch,
                 )
             async with self._lock:
                 if slot is None and (active is None or force or not cfg.use_llm_schedule):
@@ -1782,8 +2278,10 @@ class ScheduleService:
         ignore_cooldown: bool,
         interrupted_ts: float = 0.0,
         event_phrase: str = "",
+        force_switch: bool = False,
     ) -> Slot | None:
         interrupted = interrupted_ts > 0.0
+        self._resumed_event = ""
         if self.gateway is None:
             self.last_error = "LLM Gateway 未初始化"
             return None
@@ -1793,6 +2291,8 @@ class ScheduleService:
         history, history_note = self._history_for_prompt()
         world = self._world_snapshot()
         body = self._body_snapshot()
+        # 被打断之前她在做的那件事（没有 → {}）：递进 prompt，允许它输出 resume。
+        suspended = self._suspended_slot()
         # 困意越线与「上一段是不是睡眠」都是这一刻的处境：现取一次，和本地兜底走
         # 同一条阈值（CHANGE_TRIGGER_SLEEP_PRESSURE），不让 prompt 与兜底各说各的。
         try:
@@ -1821,6 +2321,8 @@ class ScheduleService:
             day_frame=frame,
             seed=self._seed(),
             want_day_frame=not frame,
+            suspended=suspended or None,
+            force_switch=force_switch,
         )
         if self._log and cfg.debug_mode:
             self._log.debug(
@@ -1875,8 +2377,22 @@ class ScheduleService:
         raw = extract_json_object(result.text)
         if raw is None:
             raw = extract_json_array(result.text)
+        if force_switch:
+            # `/拟人 日程打断`：必须换成另一件事。continue=true 一律改判/丢弃
+            # （模型必须给出 event），拿不到新事件就失败返回——不能原地续。
+            raw = _force_switch_raw(raw, prev)
+            if raw is None:
+                self.last_error = "这次要求换一件事，但模型只说了继续、没给出新事件"
+                self._fail_backoff(cfg)
+                if self._log and cfg.debug_mode:
+                    self._log.debug(f"[humanoid_core] 日程打断失败: {self.last_error}")
+                return None
         slot = parse_segment(
-            raw, now_minute=minutes, step=cfg.granularity_minutes, prev=prev
+            raw,
+            now_minute=minutes,
+            step=cfg.granularity_minutes,
+            prev=prev,
+            suspended=suspended or None,
         )
         if slot is None:
             # 解析失败同样进退避：不挡的话每个后台周期都会再砸一次模型。
@@ -1885,6 +2401,21 @@ class ScheduleService:
             if self._log and cfg.debug_mode:
                 self._log.debug(f"[humanoid_core] 下一段解析失败: {self.last_error}")
             return None
+        if (
+            force_switch
+            and prev is not None
+            and str(slot.get("event") or "") == str(prev.get("event") or "")
+        ):
+            # 换事失败：它把原来那件事又排了一遍。按失败处理（不能假装换过）。
+            self.last_error = "这次要求换一件事，但模型又排回了同一件事"
+            self._fail_backoff(cfg)
+            if self._log and cfg.debug_mode:
+                self._log.debug(f"[humanoid_core] 日程打断失败: {self.last_error}")
+            return None
+        if suspended and str(slot.get("event") or "") == str(suspended.get("event") or ""):
+            # resume 成功（或模型自己又排了同一件事）：挂起结束。
+            self._clear_suspended()
+            self._resumed_event = str(slot.get("event") or "").strip()
 
         self.last_error = ""
         self._retry_after = 0.0
@@ -1931,6 +2462,11 @@ class ScheduleService:
 
         carry_end = str(slot.pop("carry_end", "") or "")
         new_start = parse_time(slot.get("start"))
+        # 旧的挂起（如果有）：装完这一段后，如果她回去接着做原来那件事，挂起结束。
+        suspended_before = self._suspended_slot()
+        suspended_event_before = str(suspended_before.get("event") or "").strip()
+        truncated: Slot | None = None
+        truncated_remaining = 0
         if segs and new_start is not None:
             last = dict(segs[target])
             hi = parse_time(last.get("end"))
@@ -1939,6 +2475,9 @@ class ScheduleService:
                 if hi > new_start:
                     # 她提前结束去做别的：收到新段起点，不留重叠。
                     if new_start > lo:
+                        # 这一件事被从中间截断了：记下它（新段换了事才挂起，见下）。
+                        truncated = last
+                        truncated_remaining = max(0, hi - new_start)
                         last["end"] = format_time(new_start)
                         segs[target] = last
                     else:
@@ -1974,6 +2513,35 @@ class ScheduleService:
             segs.append(slot)
         if installed:
             self._note_ongoing(installed)
+
+        # 被从中间截断的那件事：新段换了事才挂起（同一件事只是把 end 接上，不算
+        # 被打断）。只存这一件，新的覆盖旧的；`schedule_pause_ttl_minutes` 之后
+        # 过期作废（读取时由 `_suspended_slot` 顺手清）。
+        suspended_update: dict[str, Any] | None = None
+        if (
+            truncated is not None
+            and str(installed.get("event") or "") != str(truncated.get("event") or "")
+        ):
+            truncated_event = str(truncated.get("event") or "").strip()[:24]
+            if truncated_event:
+                suspended_update = {
+                    "event": truncated_event,
+                    "location": str(truncated.get("location") or "").strip()[:16],
+                    "emotion": str(truncated.get("emotion") or "").strip()[:12],
+                    "ongoing": str(truncated.get("ongoing") or "").strip()[:40],
+                    "wants": bool(truncated.get("wants")),
+                    "remaining_minutes": int(truncated_remaining),
+                    "at": float(self._wall_clock()),
+                    "ttl_minutes": _pause_ttl_minutes(self.config),
+                }
+        # 她回去接着做原来那件事了（resume，或模型自己又排了同一件事）：挂起结束。
+        # 两种来源都要认：`_generate_segment` 已经清掉 state 时，`_resumed_event` 记着
+        # 这次装上的就是原来那件事；直接调 `_append_segment` 的旧路径则按 state 判。
+        installed_event = str(installed.get("event") or "").strip()
+        resumed_previous = bool(
+            (suspended_event_before and installed_event == suspended_event_before)
+            or (self._resumed_event and installed_event == self._resumed_event)
+        )
         cap = max(6, min(SEGMENTS_DAY_CAP, int(self.config.schedule_max_slots)))
         if len(segs) > cap:
             segs = segs[-cap:]
@@ -1997,7 +2565,15 @@ class ScheduleService:
         elif str(self._scope.get_self(CARRY_KEY, "") or ""):
             # 新的一段不是跨夜睡眠：旧的结转不该再留着
             updates[CARRY_KEY] = None
+        if resumed_previous:
+            # 回去接着做了：被挂起的那件事已经结束，不再保留。
+            updates[self.SUSPENDED_KEY] = None
+        elif suspended_update is not None:
+            # 刚被从中间截断的那件事：记下来，下一次安排时可以选回去接着做。
+            updates[self.SUSPENDED_KEY] = suspended_update
         self._scope.update_self(**updates)
+        # 一次 resume 只影响刚装上的这一段。
+        self._resumed_event = ""
 
         # 本窗的骰子已经用掉了：刚装上的这一段，本窗内不再重掷。
         self._roll_hit = False
@@ -2046,6 +2622,12 @@ class ScheduleService:
         today = self._clock.today_str()
         segs = self.segments()
         active = self.active_segment()
+        # 「被打断之前她在做的那件事」与打断闸门的只读快照。任何一边坏了都不能
+        # 把 /查看日程 整条带崩：分别兜底成 {} / 空闸门。
+        try:
+            suspended = self.suspended_info()
+        except Exception:
+            suspended = {}
         return {
             "date": today,
             "stored_date": self._scope.get_self("today_date", ""),
@@ -2070,6 +2652,10 @@ class ScheduleService:
             "retry_after": self.retry_after,
             "due": self._due_peek(),
             "pending_today": str(self._scope.get_self("today_date", "") or "") != today,
+            # 被打断之前她在做的那件事（没有 → {}）；`/拟人 诊断` 与状态页用。
+            "suspended": suspended,
+            # 打断闸门：pending/ttl_left/cooldown_left/quiet_left 等只读字段。
+            "interrupt": self._interrupt_status(),
         }
 
     async def aclose(self):

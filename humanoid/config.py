@@ -337,6 +337,9 @@ class HumanoidConfig:
     # (B 表现层）：场景内要不要多给那段姿势/位置/深度/阶段。
     # 关掉就退回纯单行注入，与 2.28.6 完全一致。
     ccb_scene_detail: bool = True
+    # 每轮都把「她欲望在什么位置 / 在不在亲密场景里 / 余韵还剩多久」写进上下文。
+    # 关掉就回到旧版：只有真的触发时才有那一句（模型看不到"有点想但还没到"）。
+    ccb_presence: bool = True
     # (D）：到顶之后的余韵窗（分钟）。0 = 到顶就什么都不剩。
     ccb_aftercare_minutes: int = 120
     # 
@@ -449,6 +452,29 @@ class HumanoidConfig:
 
     # v2.14.2：让「她几点起」只由夜间窗口一处决定
     schedule_follow_night_window: bool = False
+
+    # ── v2.28.9：日程的「保鲜期 / 打断 / 续做」 ──────────────────────
+    #
+    # 用户原话：「日程生成还是有限制，所谓的保鲜期，就不是可以中途打断换一个，
+    # 或在当前日程接下去的。我需要加，加逻辑与功能」。
+    # 这几道闸原来全是 schedule.py 里写死的秒数（INTERRUPT_TTL_SECONDS 等），
+    # 面板上改不了；现在每一项都可配，常量只留作默认值来源。
+    #
+    # - 来访保鲜期：有人来找过她这件事，超过这么久没被用上就不算数；
+    # - 事件保鲜期：被夸/被骂这类「刚刚的事」，隔久了就不该再影响这一段；
+    # - 日程继续：`/拟人 日程继续` 一次把当前段延长多少分钟；
+    # - 挂起保鲜期：被打断的那件事保留多久，期间可以回去接着做；
+    # - 安静间隔：两条私聊之间至少隔这么久才算「打破安静」；0 = 任何一条都算；
+    # - 打断冷却：两次「算作来访」之间至少隔这么久；
+    # - 叫住她就打断：私聊里出现「在吗/你在干嘛/陪我」这类明确叫住她的话时，
+    #   即使没熬过安静间隔也算一次来访（仍受冷却；群聊永远不算）。
+    schedule_interrupt_ttl_minutes: int = 60
+    schedule_event_ttl_minutes: int = 30
+    schedule_continue_minutes: int = 45
+    schedule_pause_ttl_minutes: int = 180
+    schedule_interrupt_quiet_minutes: int = 45
+    schedule_interrupt_cooldown_minutes: int = 60
+    schedule_interrupt_on_call: bool = True
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any] | None) -> HumanoidConfig:
@@ -566,6 +592,7 @@ class HumanoidConfig:
             ccb_body_sensitivity=i("ccb_body_sensitivity", 0, 100),
             ccb_partner_length_cm=f("ccb_partner_length_cm", 0.0, 30.0),
             ccb_scene_detail=b("ccb_scene_detail"),
+            ccb_presence=b("ccb_presence"),
             ccb_aftercare_minutes=i("ccb_aftercare_minutes", 0, 720),
             ccb_scene_log_debug=b("ccb_scene_log_debug"),
             ccb_refractory_libido=f("ccb_refractory_libido", 0.0, 30.0),
@@ -630,6 +657,14 @@ class HumanoidConfig:
             weather_affects_body=b("weather_affects_body"),
             contract_enabled=b("contract_enabled"),
             schedule_follow_night_window=b("schedule_follow_night_window"),
+            # v2.28.9：日程保鲜期/打断/续做（区间与 schema 的 minimum/maximum 一致）。
+            schedule_interrupt_ttl_minutes=i("schedule_interrupt_ttl_minutes", 10, 720),
+            schedule_event_ttl_minutes=i("schedule_event_ttl_minutes", 5, 360),
+            schedule_continue_minutes=i("schedule_continue_minutes", 10, 240),
+            schedule_pause_ttl_minutes=i("schedule_pause_ttl_minutes", 15, 720),
+            schedule_interrupt_quiet_minutes=i("schedule_interrupt_quiet_minutes", 0, 720),
+            schedule_interrupt_cooldown_minutes=i("schedule_interrupt_cooldown_minutes", 0, 720),
+            schedule_interrupt_on_call=b("schedule_interrupt_on_call"),
         )
         if cfg.night_mode_enabled and cfg.night_start_hour == cfg.night_end_hour:
             # 起止相同 = 窗口长度 0 = **没有夜里**（不是「全天算夜里」）：睡眠债不再累积、

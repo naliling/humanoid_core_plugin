@@ -42,6 +42,7 @@ HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 查状态的指令**直接打，不带前缀**：
 
 /你的状态 - 精力、身体轴（困意/睡眠债/饥饿/不适）、生理、天气、日程、关系、注意力
+/亲密状态 - 她对你的亲密状态：亲近欲/门槛/场景阶段/余韵/冷却/能不能进（私聊）
 /查看日程 - 她今天过出来的日程（动态现排，不预排未来）
 /时间 城市 - 查看指定城市当前时间
 /好感度 - 情绪档案总览（管理员加「排行榜」看所有人的排名）
@@ -60,6 +61,8 @@ HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 
 管理员：动数据
 /拟人 重置日程 - 立即重新决定她当前这一段
+/拟人 日程打断 - 让她立刻放下手上的事，重新决定现在做什么（换一件事）
+/拟人 日程继续 - 让她把手上的事接着做下去（把当前这一段往后延长）
 /拟人 重置状态 - 重置精力、社交能量与生理周期
 /拟人 重置情绪 - 把**你自己**的情绪重置到初始值
 /拟人 设置好感度 数值 - 手动设置自己的好感度（0-100）
@@ -596,9 +599,9 @@ class HumanoidCore(Star):
         """人形化伴侣 · 管理指令（全部需要管理员）
 
         改配置：参照名称 / 诊断 / 设置 / 重载
-        动数据：重置日程 / 重置状态 / 重置情绪 / 设置好感度 / 批量好感度 / 查看昵称
+        动数据：重置日程 / 日程打断 / 日程继续 / 重置状态 / 重置情绪 / 设置好感度 / 批量好感度 / 查看昵称
 
-        查状态的指令不带前缀，直接用：/你的状态 /好感度 /情绪详情 /情绪日志
+        查状态的指令不带前缀，直接用：/你的状态 /亲密状态 /好感度 /情绪详情 /情绪日志
         /查看日程 /时间 /叫我 /拟人帮助
         """
 
@@ -606,7 +609,27 @@ class HumanoidCore(Star):
     async def cmd_status(self, event: AstrMessageEvent):
         """查看当前角色的完整状态（精力、身体轴、生理、天气、日程、过程、社交能量等）。"""
         core = self._core(event)
-        yield event.plain_result("\n".join(core.status_lines(self._sender(event))))
+        # 群聊里 `status_lines` 会自己隐掉「亲密」段：ccb 在群里是硬闸，
+        # 面板也不该有那一屏（用户明确要求群里一句话都不许露）。
+        yield event.plain_result("\n".join(
+            core.status_lines(self._sender(event), is_group=not _is_private_chat(event))
+        ))
+
+    @filter.command("亲密状态")
+    async def cmd_intimacy_status(self, event: AstrMessageEvent):
+        """查看她对你的亲密状态：亲近欲离门槛多远、在不在场景里、余韵/冷却、能不能进。
+
+        只在私聊里回答：这是「她这会儿想不想」的明细，群里说出来既冒犯也没意义
+        （ccb 本身在群里就是硬闸）。
+        """
+        if not _is_private_chat(event):
+            yield event.plain_result("亲密状态只在私聊里看。")
+            return
+        core = self._core(event)
+        if not bool(getattr(self._config, "ccb", False)):
+            yield event.plain_result("亲密场景未开启（ccb=false）。")
+            return
+        yield event.plain_result(core.intimacy_text(self._sender(event)))
 
     @filter.command("好感度")
     async def cmd_mood(self, event: AstrMessageEvent):
@@ -993,6 +1016,53 @@ class HumanoidCore(Star):
             yield event.plain_result(
                 f"❌ 生成失败：{core.schedule.last_error}（可用 /拟人 诊断 查看模型配置）"
             )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @humanoid_group.command("日程打断")
+    async def cmd_schedule_interrupt(self, event: AstrMessageEvent):
+        """让她立刻放下手上的事，重新决定现在做什么（换一件，不是继续）。"""
+        if not self._is_admin(event):
+            yield event.plain_result(NO_PERMISSION)
+            return
+        if not self._config.use_llm_schedule:
+            yield event.plain_result("⚠️ 未启用大模型日程，无法「打断换一件」。")
+            return
+        core = self._core(event)
+        try:
+            queued = bool(core.schedule.interrupt_now())
+        except Exception as exc:
+            logger.warning(f"{LOG_PREFIX} 日程打断失败: {exc}")
+            yield event.plain_result(f"❌ 打断失败：{exc}")
+            return
+        if queued:
+            yield event.plain_result("✅ 已让她停下手上的事，正在决定换成什么（稍等几秒再 /查看日程）。")
+        else:
+            yield event.plain_result(
+                "⏳ 这会儿已经有一轮日程生成在跑了，等它落定再看 /查看日程。"
+            )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @humanoid_group.command("日程继续")
+    async def cmd_schedule_continue(self, event: AstrMessageEvent):
+        """让她把手上的事接着做下去（把当前这一段往后延长，不另外生成）。"""
+        if not self._is_admin(event):
+            yield event.plain_result(NO_PERMISSION)
+            return
+        core = self._core(event)
+        try:
+            extended = core.schedule.continue_now()
+        except Exception as exc:
+            logger.warning(f"{LOG_PREFIX} 日程继续失败: {exc}")
+            yield event.plain_result(f"❌ 继续失败：{exc}")
+            return
+        if not extended:
+            yield event.plain_result("❌ 这会儿没有正在做的事可以接着做（或已到当日上限）。")
+            return
+        activity = core.schedule.current_activity()
+        what = activity.get("name", "")
+        until = activity.get("expected_end", "")
+        detail = f"：{what}（到 {until}）" if what else ""
+        yield event.plain_result(f"✅ 让她接着做下去了{detail}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("重置状态")
@@ -1434,6 +1504,16 @@ class HumanoidCore(Star):
             # 用户 /叫我 设过的更碰不到。纯图片消息也带名字，所以放在正文判空之前。
             if self._config.auto_nickname:
                 core.mood.auto_nickname(user_id, _sender_name(event))
+            # 跨插件联动要知道「TA 叫什么」：`auto_nickname` 是**认定称呼**，名字里
+            # 带数字/emoji/装饰的名片过不了校验，于是 Core 什么都留不下，主动消息
+            # 那边就永远不知道怎么叫人。这里另存一份「名片名」，只用于称呼参考，
+            # 不参与身份认定、也不进聊天注入。
+            sender_name = _sender_name(event)
+            if sender_name:
+                try:
+                    core.mood.note_display_name(user_id, sender_name)
+                except Exception:
+                    pass
             text = (getattr(event, "message_str", "") or "").strip()
             if not text:
                 return

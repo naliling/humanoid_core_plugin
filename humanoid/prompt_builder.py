@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+from . import ccb as _ccb
 from . import life_log
 from . import relstage
 import math
@@ -309,6 +310,19 @@ def _core_epoch(core) -> float:
         return time.time()
 
 
+def _as_number(value: Any, default: float) -> float:
+    """取一个**有限**的 float；坏值（None/字符串/NaN/±inf）一律退回默认值。
+
+    注入层的取值原则是「读不到就少说一句」，但 NaN 不能放行：它不会抛错，
+    只会把「亲近欲 nan/50」这种废字符写进上下文——模型会当成真实读数。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
 # 记忆插件交回来的是一段「给人看的注入文本」：可能带小标题、项目符号、换行。
 # 事实块里只收一句和别的事实并列的话——照搬会把「标题 + 正文」的形状带进来，
 # 那正是最容易让模型照着念的形状（`_sentence` 说的同一件事）。
@@ -416,6 +430,8 @@ class PromptBuilder:
                 (self._sentence(self._scene_lines(is_group)), 10.0),
                 (self._sentence(relation), 8.0),
                 (self._emotion_line(user_id, interest, agency, is_group), 8.5),
+                # ccb 常驻状态：不参与上一行的"每轮一条"竞争，显著度单独给高。
+                (self._ccb_presence_line(user_id, is_group), 9.5),
                 (self._sentence(self._feelings_lines(max_items=1, threshold=0.7)), 7.0),
                 (self._sentence(self._memory_lines(user_id, detailed=False)), 6.0),
                 (self._sentence(self._open_lines(user_id, is_group)), 6.0),
@@ -588,22 +604,180 @@ class PromptBuilder:
             return ""
         # ccb 需要知道「这是不是群」和「她是谁」——两条都是它的硬闸，
         # 拿不到就走安全侧（不出）。
-        persona_prompt = ""
-        try:
-            source = getattr(self._core, "persona_source", None)
-            if source is not None:
-                snap = source.cached_persona(self._core.role_id)
-                persona_prompt = str(getattr(snap, "prompt", "") or "")
-        except Exception:
-            persona_prompt = ""
         try:
             _score, text = self._emotion.candidate(
                 user_id, interest=interest or {}, agency=agency or {},
-                is_group=bool(is_group), persona_prompt=persona_prompt,
+                is_group=bool(is_group), persona_prompt=self._persona_prompt_text(),
             )
         except Exception:
             return ""
         return bracket(text)
+
+    def _persona_prompt_text(self) -> str:
+        """她的人设正文（缓存快照）。ccb 的两道硬闸（性别 / 安全）都看它。
+
+        拿不到就返回空串：`ccb.safety_block("")` 与 `ccb.looks_female("")` 都按
+        「不拦、当女角色」处理——这是既有的兜底口径，不在这里另立一套。
+        """
+        try:
+            source = getattr(self._core, "persona_source", None)
+            if source is None:
+                return ""
+            snap = source.cached_persona(self._core.role_id)
+            return str(getattr(snap, "prompt", "") or "")
+        except Exception:
+            return ""
+
+    # ── ccb 常驻事实句 ────────────────────────────────────────────────
+    # 「刚换过姿势」的判定窗口（秒）。姿势是场景内的事件，十分钟内换的还叫"刚换过"，
+    # 半小时前换的再写"刚"就是假话。
+    CCB_POSE_RECENT_SECONDS = 600.0
+
+    def _ccb_presence_line(self, user_id: str, is_group: bool = False) -> str:
+        """她此刻的欲望在什么位置、在不在亲密场景里——每轮一句**常驻**事实。
+
+        为什么需要它：`_emotion_line` 是多候选竞争、每轮只出一条，ccb 那句更只在
+        条件全中、真的推进场景时才出。于是绝大多数轮里模型**完全看不到**她离
+        「忍不住」还差多少，也不知道她此刻在不在场景里——用户原话是「在操对方时
+        完全不知道 bot 有没有进入状态」。这一句不走竞争，作为高显著度事实直接拼进块。
+
+        措辞纪律（与 `emotion.py` 同一套）：只说她此刻处在什么位置，不写器官、
+        不写情节、不示范排版、不下指令——它是一句状态，怎么回应由模型自己判断。
+
+        群里返回空串：群里整条 ccb 都是硬闸（收不了场），这里连状态都不给。
+        ccb 关闭 / 开关关掉 / 人设安全闸 / 男角色也返回空串——前两种是"用户不要"，
+        后两种是"这条功能本来就不生效"。
+
+        任何一步拿不到或抛异常都返回空串：少一句事实远好过整块注入消失。
+        """
+        try:
+            cfg = self.config
+            if not bool(getattr(cfg, "ccb", False)):
+                return ""
+            if is_group:
+                return ""
+            if not bool(getattr(cfg, "ccb_presence", True)):
+                return ""
+            return self._ccb_presence_text(user_id, cfg)
+        except Exception:
+            return ""
+
+    def _ccb_presence_text(self, user_id: str, cfg: HumanoidConfig) -> str:
+        """`_ccb_presence_line` 的实现：先判硬闸与数据，再按三种状态分派。"""
+        scope = getattr(self._core, "_scope", None)
+        if scope is None:
+            return ""
+        # **只读**：不因为"看一眼欲望"就给这个人建情绪档案（那等于白涨 state）。
+        profile = scope.peek_user(user_id, "mood")
+        if not isinstance(profile, dict) or not profile:
+            return ""
+        persona_prompt = self._persona_prompt_text()
+        # 安全闸（未成年 / 血缘）与性别闸都跟 `ccb.evaluate` 同一口径：
+        # 功能不生效的人设，不该在上下文里出现「她的欲望」。
+        if _ccb.safety_block(persona_prompt) or not _ccb.looks_female(persona_prompt):
+            return ""
+        now = _core_epoch(self._core)
+        stage = _as_number(scope.peek_user(user_id, "ccb_stage", 0.0), 0.0)
+        satisfy = _as_number(scope.peek_user(user_id, "ccb_satisfy", 0.0), 0.0)
+        aftercare_until = _as_number(
+            scope.peek_user(user_id, "ccb_aftercare_until", 0.0), 0.0
+        )
+        if stage > 0:
+            return self._ccb_scene_presence(user_id, cfg, stage, satisfy, now)
+        if aftercare_until > now:
+            left = max(1, int(math.ceil((aftercare_until - now) / 60.0)))
+            # 与 `_aftercare_line`（情绪候选）分工不同：那边给的是"还软着/还没缓过来"
+            # 的感受，这边给的是"还剩多久"的事实。措辞上不再重复"刚结束"那三个字，
+            # 免得同一块里出现两句几乎一样的话。
+            return f"她还在余韵里（刚结束），还剩 {left} 分钟"
+        libido = _as_number(profile.get("libido"), 34.0)
+        base_libido = _as_number(profile.get("base_libido"), libido)
+        return self._ccb_desire_presence(cfg, libido, base_libido)
+
+    def _ccb_scene_presence(
+        self,
+        user_id: str,
+        cfg: HumanoidConfig,
+        stage: float,
+        satisfy: float,
+        now: float,
+    ) -> str:
+        """在场景里那半句：正在亲密里 + 满足度 + 今日第几次 + 刚换过姿势。
+
+        阶段名不在这里重复说：`ccb_scene_detail` 开着时，`_ccb_line` 的 scene note
+        已经在**同一块事实**里写了阶段（`_with_scene_note`），再说一遍就成了
+        「两句同一状态」。scene note 关掉时才把阶段名补在这里，否则模型就彻底
+        看不到阶段了。
+        """
+        phase = _ccb.phase_of(
+            satisfy=satisfy, stage=stage, aftercare_until=0.0, now=now
+        )
+        name = (
+            _ccb.PHASE_NAMES[phase]
+            if 0 <= phase < len(_ccb.PHASE_NAMES)
+            else ""
+        )
+        bits: List[str] = []
+        if name and not bool(getattr(cfg, "ccb_scene_detail", True)):
+            bits.append(f"{name}，满足 {satisfy:.0f}/100")
+        else:
+            bits.append(f"满足 {satisfy:.0f}/100")
+        turns = int(_as_number(self._core._scope.peek_user(user_id, "ccb_turns", 0.0), 0.0))
+        if turns > 0:
+            bits.append(f"今日第 {turns} 次")
+        if self._ccb_pose_just_changed(user_id, now):
+            bits.append("刚换过姿势")
+        return "她正在亲密里（" + "，".join(bits) + "）"
+
+    def _ccb_desire_presence(
+        self, cfg: HumanoidConfig, libido: float, base_libido: float
+    ) -> str:
+        """不在场景里那半句：亲近欲在什么位置、离"忍不住"还差多少。
+
+        用户要能判断"到没到"，所以必须给**数字**和**相对基线的方向**（只给一个
+        41/50 的话，模型不知道 41 算高还是低）。阈值与涨幅门槛都从配置读，
+        与 `ccb.evaluate` 同一套数——面板上调完这里跟着变，不会出现"注入说有戏、
+        实际进不去"的分叉。
+        """
+        libido = max(0.0, min(50.0, libido))
+        threshold = _as_number(
+            getattr(cfg, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN), _ccb.CCB_LIBIDO_MIN
+        )
+        rise = _as_number(
+            getattr(cfg, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE), _ccb.CCB_LIBIDO_RISE
+        )
+        diff = libido - base_libido
+        if diff >= 1.0:
+            rel = f"比平常高 {diff:.0f}"
+        elif diff <= -1.0:
+            rel = f"比平常低 {abs(diff):.0f}"
+        else:
+            rel = "和平常差不多"
+        if diff <= -1.0 and libido < threshold:
+            # 低于基线、又没过门槛：她这会儿确实没那个心思。给一句正面结论，
+            # 比让模型自己从数字里推更不容易读错。
+            return f"她此刻没有那个心思（亲近欲 {libido:.0f}/50，{rel}）"
+        gap = max(0.0, threshold - libido)
+        rise_gap = max(0.0, rise - diff)
+        if gap <= 0 and rise_gap <= 0:
+            tail = "已经到了会忍不住的那条线"
+        elif gap <= 0:
+            tail = f"只差没比平常高出 {rise_gap:.0f}，还差一点才到忍不住"
+        else:
+            tail = f"还差 {gap:.0f} 才到忍不住"
+        return f"她此刻的欲望：亲近欲 {libido:.0f}/50（{rel}），{tail}"
+
+    def _ccb_pose_just_changed(self, user_id: str, now: float) -> bool:
+        """这一场里刚换过姿势吗（看 `ccb_log` 的 pose 账本）。
+
+        拿不到账本就当没换过——"刚"是会过期的事实，宁可少说一句也不要说错。
+        """
+        try:
+            rows = self._core._scope.peek_user(user_id, "ccb_log", None)
+            last = _ccb.log_last({"ccb_log": rows}, "pose")
+        except Exception:
+            return False
+        return last > 0 and 0.0 <= now - last <= self.CCB_POSE_RECENT_SECONDS
 
     def _relation_lines(
         self,
@@ -1212,6 +1386,9 @@ class PromptBuilder:
         if sleep_state:
             sents.append((self._sentence(sleep_state), 9.5))
         sents.append((self._emotion_line(user_id, interest, agency, is_group), 8.5))
+        # 睡着时也要知道她的欲望/场景位置：ccb 的进门条件里没有"睡着"这一条，
+        # 她可以人在睡而状态在推进，模型不知道就会把两种事实读成互斥。
+        sents.append((self._ccb_presence_line(user_id, is_group), 9.5))
         situ = self._behavior_lines(
             user_id, events, agency,
             with_previous=self.config.last_interaction_mode == "with_last_msg",
@@ -1289,6 +1466,10 @@ class PromptBuilder:
         if relation:
             sents.append((self._sentence(relation), 8.0))
         sents.append((self._emotion_line(user_id, interest, agency, is_group), 8.5))
+
+        # 每轮都写：她欲望在什么位置、在不在场景里/余韵里（显著度高于别的句子，
+        # 且与上一行的"一条"竞争无关——那条可能就是非 ccb 的情绪）。
+        sents.append((self._ccb_presence_line(user_id, is_group), 9.5))
 
         situ = self._behavior_lines(
             user_id, events, agency,
@@ -1369,6 +1550,8 @@ class PromptBuilder:
         if relation:
             sents.append((self._sentence(relation), 8.0))
         sents.append((self._emotion_line(user_id, interest, agency, is_group), 8.5))
+        # 与 medium 档同一句：每轮都让模型看见她欲望的位置/在不在场景里。
+        sents.append((self._ccb_presence_line(user_id, is_group), 9.5))
         situ = self._behavior_lines(
             user_id, events, agency,
             with_previous=self.config.last_interaction_mode == "with_last_msg",

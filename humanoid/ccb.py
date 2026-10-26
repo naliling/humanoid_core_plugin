@@ -27,8 +27,9 @@ v2.24.1 改了两件事，都是因为原来那套「达标就一直这样」不
 from __future__ import annotations
 
 import datetime
+import math
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .persona import PERSONA_PROMPT_MAX
 
@@ -536,6 +537,49 @@ def decay_satisfy(user_state: Dict[str, Any], now: float) -> None:
     # 跨天时次数重新算——不然「一天最多 8 次」会变成「一辈子 8 次」。
     if int(user_state.get("ccb_turns", 0.0) or 0.0) > 0:
         user_state["ccb_turns"] = 0.0
+
+
+def pending_days(user_state: Dict[str, Any], now: float) -> int:
+    """从上次记账那天算起，跨了几个自然日（没跨天返回 0）。
+
+    与 `decay_satisfy()` 读同一根 `ccb_day`，但**不改状态**——只读入口（状态页、
+    门面、`/好感度`）要靠它把昨天那笔账折算成今天的，否则用户看到的永远是昨天
+    的数字：这正是「以前留下的计数不会变」的来源。
+    """
+    if not isinstance(user_state, dict):
+        return 0
+    try:
+        today = _day_index(now)
+    except (OverflowError, OSError, ValueError):
+        return 0
+    try:
+        last = float(user_state.get("ccb_day", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0
+    if last <= 0:
+        return 0
+    return max(0, int(today - last))
+
+
+def roll_day(user_state: Dict[str, Any], now: float) -> bool:
+    """按天滚动一次：跨天就回落满足度、清零当日次数。返回是否真的滚动了。
+
+    **为什么非要在读路径上调用它**：这些账原来只在 `advance_satisfy()` 里结，
+    而它只有「真的进了场景」之后才跑；可「能不能进场景」又先看 `ccb_turns`。
+    于是第 8 次之后：`turns_today=8` → `evaluate()` 直接 None → 不进场景 →
+    不结账 → 第二天仍然读到 8。死循环，用户看到的就是「计数永远卡住、场景再也
+    不进行」。所以任何要读 `ccb_turns` 的地方（注入层、状态页、门面）都得先
+    在这里按天结一次账。`decay_satisfy()` 幂等，同一天重复调用不会多扣。
+
+    只改内存里的 user_state，**不写盘**——落盘由调用方 `mark_dirty()` 决定：
+    只读入口（`intimacy_summary`）用它做投影时不该顺手把 state.json 标脏。
+    """
+    if not isinstance(user_state, dict):
+        return False
+    if pending_days(user_state, now) <= 0:
+        return False
+    decay_satisfy(user_state, now)
+    return True
 
 
 def advance_satisfy(user_state: Dict[str, Any], now: float) -> bool:
@@ -1062,6 +1106,252 @@ def scene_idle_expired(*, last_at: float, now: float) -> bool:
     if last <= 0:
         return False
     return (moment - last) > CCB_SCENE_IDLE_SECONDS
+
+
+# ─── 状态快照（只读）────────────────────────────────────────────────
+#
+# 为什么单独拉一个纯函数：`evaluate()` 只回答「进不进」，而且只输出一句内心话；
+# 「她此刻到底在什么位置」这件事（亲近欲离门槛多远、今天第几次、在场景哪一段、
+# 余韵还剩多久、被哪道闸挡着）从来没有一个地方算过。状态页、指令、门面各写一套
+# 就会三处各说各话——用户实测到的「展示出来的东西会被误导」正是这么来的。
+#
+# 这里只读：不改 user_state、不写盘、不推进场景。按天折算用 `pending_days()`
+# 做**投影**，真正的写回由调用方先调 `roll_day()`——只读入口不该因为看一眼就
+# 把 state.json 标脏。
+
+def _fs(value: Any, default: float = 0.0) -> float:
+    """取一个有限浮点：拿不到 / NaN / ±Inf 一律退回默认值。
+
+    NaN 必须挡在这里：`f"{nan:.0f}"` 会原样打出 "nan"，而比较运算全是假——
+    面板上就是一行 `亲近欲 nan/50`，既不报错也查不出是哪一步坏的。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def duration_text(seconds: Any) -> str:
+    """把一段秒数说成人话（面板/指令用）。坏值按 0 处理，不抛。"""
+    try:
+        total = int(max(0.0, float(seconds)))
+    except (TypeError, ValueError):
+        return "不到 1 分钟"
+    if total < 60:
+        return "不到 1 分钟"
+    minutes = total // 60
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours, rest = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} 小时" + (f" {rest} 分" if rest else "")
+    days, rest_hours = divmod(hours, 24)
+    return f"{days} 天" + (f" {rest_hours} 小时" if rest_hours else "")
+
+
+def delta_text(value: Any) -> str:
+    """「涨了 13 / 跌了 7 / 没动」——面板上读得懂的是方向，不是裸数字。"""
+    num = _fs(value)
+    if num > 0.5:
+        return f"涨了 {num:.0f}"
+    if num < -0.5:
+        return f"跌了 {abs(num):.0f}"
+    return "没动"
+
+
+def threshold_text(value: Any, base: Any, minimum: Any, rise: Any) -> str:
+    """离门槛还差多少（一句人话）。「够」是唯一的正面结论，其余都说清差在哪。
+
+    绝对值和涨幅是**与**的关系，两条各自可能不满足，所以分开说——只报一条的话，
+    用户按面板调完另一条，还是进不去。
+    """
+    val = _fs(value)
+    bas = _fs(base)
+    low = _fs(minimum)
+    need = _fs(rise)
+    if val < low:
+        return f"不够，差 {low - val:.0f} 到 {low:.0f}"
+    if (val - bas) < need:
+        return f"涨得不够，还差 {need - (val - bas):.1f}"
+    return "够"
+
+
+def scene_status(
+    user_state: Optional[Dict[str, Any]],
+    now: float,
+    *,
+    libido: float = 0.0,
+    base_libido: float = 0.0,
+    affection: float = 0.0,
+    base_affection: float = 0.0,
+    energy: float = 100.0,
+    is_group: bool = False,
+    persona_prompt: str = "",
+    safety_reason: str = "",
+    coerced: bool = False,
+    scene_score: float = -1.0,
+    intimacy_hint: bool = True,
+    libido_min: float = CCB_LIBIDO_MIN,
+    libido_rise: float = CCB_LIBIDO_RISE,
+    affection_min: float = CCB_AFFECTION_MIN,
+    affection_rise: float = CCB_AFFECTION_RISE,
+    affection_deep: float = CCB_AFFECTION_DEEP,
+    daily_max: int = CCB_DAILY_MAX,
+) -> Dict[str, Any]:
+    """她此刻的亲密状态——**纯函数**：只读、不改状态、不写盘。
+
+    返回的每一格都对着一个用户看得见的问题：在不在场景里、到哪一段了、今天几次、
+    余韵还是冷却、离门槛差多少、被哪道闸挡着。`blockers` 的顺序照着
+    `evaluate()` 的判定顺序排，排查时从上往下看就行，不会出现「面板说能进、
+    实际进不去」这种对不上的情况。
+
+    跨天折算在这里是**投影**（`satisfy` 按天回落、`turns_today` 归零），
+    不写回 user_state；需要落盘的调用方先调 `roll_day()`——这样 `/好感度`
+    这类只读入口读到的是今天的数字，同时不会把 state.json 标脏。
+    """
+    state = user_state if isinstance(user_state, dict) else {}
+    moment = _fs(now)
+    days = pending_days(state, moment)
+
+    stage = int(_fs(state.get("ccb_stage"), 0.0))
+    satisfy = max(
+        0.0,
+        min(
+            CCB_SATISFY_FULL,
+            _fs(state.get("ccb_satisfy"), 0.0)
+            - CCB_SATISFY_DECAY_PER_DAY * days,
+        ),
+    )
+    turns_today = 0 if days > 0 else int(_fs(state.get("ccb_turns"), 0.0))
+    done_count = int(_fs(state.get("ccb_done_count"), 0.0))
+    last_at = _fs(state.get("ccb_last_at"), 0.0)
+    last_ago = max(0.0, moment - last_at) if last_at > 0 else 0.0
+    aftercare_until = _fs(state.get("ccb_aftercare_until"), 0.0)
+    aftercare_left = max(0.0, aftercare_until - moment)
+    peak_depth = max(0.0, _fs(state.get("ccb_peak_depth"), 0.0))
+    pose = int(_fs(state.get("ccb_pose"), float(POSE_UNKNOWN)))
+    site = int(_fs(state.get("ccb_site"), float(POSE_UNKNOWN)))
+    pose_name = POSE_NAMES[pose] if 0 <= pose < len(POSE_NAMES) else ""
+    site_name = SITE_NAMES[site] if 0 <= site < len(SITE_NAMES) else ""
+
+    lib = _fs(libido)
+    base_lib = _fs(base_libido)
+    aff = _fs(affection)
+    base_aff = _fs(base_affection)
+    eng = _fs(energy, 0.0)
+    low = _fs(libido_min, CCB_LIBIDO_MIN)
+    need_lib = _fs(libido_rise, CCB_LIBIDO_RISE)
+    aff_low = _fs(affection_min, CCB_AFFECTION_MIN)
+    need_aff = _fs(affection_rise, CCB_AFFECTION_RISE)
+    aff_deep = _fs(affection_deep, CCB_AFFECTION_DEEP)
+
+    # 场景闲置过期：`ccb_stage` 会因为「没人说话」而挂在那里过夜，
+    # 照实显示"进行中"就是骗人——6 小时没人碰过的那一场早就过去了。
+    expired = stage > 0 and scene_idle_expired(last_at=last_at, now=moment)
+    in_scene = stage > 0 and not expired
+    phase = phase_of(
+        satisfy=satisfy,
+        stage=float(stage) if in_scene else 0.0,
+        aftercare_until=aftercare_until,
+        now=moment,
+    )
+    stage_name = PHASE_NAMES[stage] if in_scene and 0 <= stage < len(PHASE_NAMES) else ""
+    phase_name = PHASE_NAMES[phase] if 0 <= phase < len(PHASE_NAMES) else ""
+
+    # 冷却只挡**开新的一场**，场景里不适用——这时候给个「还要等 3 小时」是误导。
+    cooldown_left = 0.0
+    if not in_scene:
+        gate_at = _fs(state.get("ccb_gate_at"), 0.0) or last_at
+        if gate_at > 0 and (moment - gate_at) < CCB_COOLDOWN_SECONDS:
+            # 夹在窗口内：时钟被回拨过时 `gate_at` 可能在未来，不夹就会报出
+            # 「还要 3 天」这种比配置本身还大的倒计时。
+            cooldown_left = max(
+                0.0, min(CCB_COOLDOWN_SECONDS, CCB_COOLDOWN_SECONDS - (moment - gate_at))
+            )
+
+    refused_at = _fs(state.get("ccb_refused_at"), 0.0)
+    refused_left = 0.0
+    if refused_at > 0:
+        refused_left = max(
+            0.0,
+            min(CCB_REFUSE_COOLDOWN_SECONDS, CCB_REFUSE_COOLDOWN_SECONDS - (moment - refused_at)),
+        )
+
+    blockers: List[str] = []
+    if not in_scene:
+        # 顺序照 `evaluate()`：安全闸 → 拒绝 → 强迫 → 群聊 → 性别 → 数值门槛
+        # → 精力 → 冷却 → 进门判断 → 当日封顶。
+        if safety_reason:
+            blockers.append(f"人设安全闸：{safety_reason}")
+        if refused_left > 0:
+            blockers.append(f"她刚拒绝过（{duration_text(refused_left)}内不提）")
+        if coerced:
+            blockers.append("他刚越界过，这一会儿不算")
+        if is_group:
+            blockers.append("群聊里不会进场景")
+        if not looks_female(persona_prompt):
+            blockers.append("人设判成男角色（只对女角色开）")
+        if aff < aff_low:
+            blockers.append(f"好感不够（{aff:.0f}/100，差 {aff_low - aff:.0f}）")
+        elif (aff - base_aff) < need_aff:
+            blockers.append(
+                f"好感涨得不够（{delta_text(aff - base_aff)}，还差 {need_aff - (aff - base_aff):.1f}）"
+            )
+        if lib < low:
+            blockers.append(f"亲近欲不够（{lib:.0f}/50，差 {low - lib:.0f}）")
+        elif (lib - base_lib) < need_lib:
+            blockers.append(
+                f"亲近欲涨得不够（{delta_text(lib - base_lib)}，还差 {need_lib - (lib - base_lib):.1f}）"
+            )
+        if eng < CCB_ENERGY_MIN:
+            blockers.append(f"精力不足（{eng:.0f} < {CCB_ENERGY_MIN:.0f}）")
+        if cooldown_left > 0:
+            blockers.append(f"冷却中（还要 {duration_text(cooldown_left)}）")
+        score = _fs(scene_score, -1.0)
+        if score >= 0.0:
+            if score < CCB_SCENE_ENTER:
+                blockers.append(f"场景分未达标（{score:.2f} < {CCB_SCENE_ENTER:.2f}）")
+        elif not intimacy_hint:
+            blockers.append("暂无模型判断且无亲密信号")
+        if turns_today >= int(daily_max):
+            blockers.append(f"当日已封顶（{turns_today}/{int(daily_max)}）")
+
+    return {
+        "in_scene": in_scene,
+        "expired": bool(expired),
+        "stage": stage,
+        "stage_name": stage_name,
+        "satisfy": round(satisfy, 1),
+        "satisfy_phase": phase,
+        "satisfy_phase_name": phase_name,
+        "turns_today": turns_today,
+        "daily_max": int(daily_max),
+        "done_count": done_count,
+        "last_at": round(last_at, 1),
+        "last_ago": round(last_ago, 1),
+        "cooldown_left": round(cooldown_left, 1),
+        "aftercare_left": round(aftercare_left, 1),
+        "peak_depth": round(peak_depth, 1),
+        "pose": pose if pose_name else POSE_UNKNOWN,
+        "pose_name": pose_name,
+        "site": site if site_name else POSE_UNKNOWN,
+        "site_name": site_name,
+        "libido": round(lib, 1),
+        "base_libido": round(base_lib, 1),
+        "libido_rise": round(lib - base_lib, 1),
+        "affection": round(aff, 1),
+        "base_affection": round(base_aff, 1),
+        "affection_rise": round(aff - base_aff, 1),
+        "energy": round(eng, 1),
+        "can_enter": not blockers,
+        "blockers": blockers,
+        "libido_min": round(low, 1),
+        "libido_rise_need": round(need_lib, 1),
+        "affection_min": round(aff_low, 1),
+        "affection_rise_need": round(need_aff, 1),
+        "affection_deep": round(aff_deep, 1),
+    }
 
 
 def evaluate(

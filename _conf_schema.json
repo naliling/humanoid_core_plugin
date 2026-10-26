@@ -43,6 +43,90 @@
       "step": 2
     }
   },
+  "schedule_interrupt_ttl_minutes": {
+    "description": "【进阶】来访保鲜期(分)",
+    "hint": "有人来找过她这件事，超过这么久还没被用上就不算数——「刚刚」不能对着几小时前的事说",
+    "type": "int",
+    "default": 60,
+    "minimum": 10,
+    "maximum": 720,
+    "slider": {
+      "min": 10,
+      "max": 720,
+      "step": 10
+    }
+  },
+  "schedule_event_ttl_minutes": {
+    "description": "【进阶】事件保鲜期(分)",
+    "hint": "被夸/被骂这类「刚刚的事」，超过这么久就不该再影响她这一段在做什么",
+    "type": "int",
+    "default": 30,
+    "minimum": 5,
+    "maximum": 360,
+    "slider": {
+      "min": 5,
+      "max": 360,
+      "step": 5
+    }
+  },
+  "schedule_continue_minutes": {
+    "description": "【进阶】日程继续延长(分)",
+    "hint": "/拟人 日程继续 一次把当前这一段往后延长多少分钟（不调模型；不越过后面已有的段、不跨午夜）",
+    "type": "int",
+    "default": 45,
+    "minimum": 10,
+    "maximum": 240,
+    "slider": {
+      "min": 10,
+      "max": 240,
+      "step": 5
+    }
+  },
+  "schedule_pause_ttl_minutes": {
+    "description": "【进阶】被打断的事保留(分)",
+    "hint": "被打断的那件事保留多久：期间下一次安排时可以选「回去接着做」（resume），过期就作废",
+    "type": "int",
+    "default": 180,
+    "minimum": 15,
+    "maximum": 720,
+    "slider": {
+      "min": 15,
+      "max": 720,
+      "step": 15
+    }
+  },
+  "schedule_interrupt_quiet_minutes": {
+    "description": "【进阶】打断安静间隔(分)",
+    "hint": "两条私聊至少隔这么久，才算「打破一段安静、有人来访」。0 = 不要求安静，任何一条私聊都算来访（仍受冷却）",
+    "type": "int",
+    "default": 45,
+    "minimum": 0,
+    "maximum": 720,
+    "slider": {
+      "min": 0,
+      "max": 720,
+      "step": 15
+    }
+  },
+  "schedule_interrupt_cooldown_minutes": {
+    "description": "【进阶】打断冷却(分)",
+    "hint": "两次「算作来访」之间至少隔这么久（多用户部署里消息不断时，它防止日程被反复重排）。0 = 不冷却",
+    "type": "int",
+    "default": 60,
+    "minimum": 0,
+    "maximum": 720,
+    "slider": {
+      "min": 0,
+      "max": 720,
+      "step": 15
+    }
+  },
+  "schedule_interrupt_on_call": {
+    "description": "【进阶】叫住她就打断",
+    "hint": "私聊里出现「在吗/你在干嘛/干嘛呢/过来/陪我/别弄了/停一下/理我/别写了/别忙了」这类明确叫住她的话时，即使没熬过安静间隔也算一次来访；仍受冷却，群聊永远不算",
+    "type": "bool",
+    "default": true
+  },
   "schedule_prompt_extra": {
     "description": "日程补充偏好",
     "hint": "以「仅供参考」递给模型，与人设、身体状态一起权衡，不是必须执行的指令",
@@ -1184,6 +1268,12 @@
     "default": true,
     "description": "场景进行中额外给出一句姿势 / 位置 / 深度 / 阶段。",
     "hint": "关掉后退回纯单行，与上一版行为一致。"
+  },
+  "ccb_presence": {
+    "type": "bool",
+    "default": true,
+    "description": "每轮把她的欲望 / 是否在亲密场景里写进上下文。",
+    "hint": "关掉就回到旧版：只在真的触发时才有那一句，看不到「有点想但还没到」。"
   },
   "ccb_aftercare_minutes": {
     "type": "int",

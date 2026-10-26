@@ -15,6 +15,7 @@ from typing import Any, List, Optional, Tuple
 from astrbot.api import logger
 
 from ..config import HumanoidConfig
+from .. import ccb as _ccb
 from ..data.mood_map import generate_mood_tag, get_mood_label
 from ..jsonx import extract_json_object
 from ..llm import PURPOSE_MOOD, LLMGateway
@@ -314,6 +315,13 @@ EMOTION_MEMORY_KEY = "emotion_memory"
 # 怎么称呼自己（或是自动认定后不再改口的依据），丢了会当场改变说话方式；last_interaction
 # 也保留，它是下次判定过期的依据。first_met 同样保留（prune 时从 mood 里搬上来），
 # 否则会出现「你管TA叫小明，你们刚认识上」。
+#
+# `display_name` / `display_name_at`（v2.28.9）与 nickname 同理保留：那是**消息自带的
+# 名片名**，社交层主动开口叫人的唯一凭据。mood 被清回初始值之后，只要这个人还叫得出
+# 名字，跨插件那边就不该突然「不知道怎么称呼 TA」——所以它不进 `RETENTION_DROPPED_FIELDS`，
+# 而且必须在 `_STALE_SHELL_FIELDS` 里（否则只剩名字的条目会被当成「有没有可清理字段」
+# 判不出来）。语义与 nickname 严格分开：nickname 是「她认定的称呼」，display_name 是
+# 「名片原样」，前者不因换名片而改口，后者跟着名片走。
 # attention 也在清理范围内：它是 `behavior.care()` 算在意度时写的，那条路径必然经过
 # mood.profile，所以它是「有真实互动」的标记；而 `/拟人 诊断` 为了量 token 会拿一个
 # status-probe 的假用户去跑 build_injection，留下一个清不掉的空壳。
@@ -335,7 +343,10 @@ RETENTION_DROPPED_FIELDS = (
 # 长期不活跃（D4）：只剩这些字段的用户条目**没有任何可清理的内容**——字段清理对它
 # 无效，原来的 `prune_expired` 直接 `continue`，于是它们永久留在 state.json 里。
 # 名单之外还有别的键（亲密计数、情绪记忆…）就保留：「有好感/有记忆的用户」不删。
-_STALE_SHELL_FIELDS = ("nickname", "nickname_src", "first_met", "last_interaction")
+_STALE_SHELL_FIELDS = (
+    "nickname", "nickname_src", "first_met", "last_interaction",
+    "display_name", "display_name_at",
+)
 # 整条删除的静默期（天）的**兜底值**。真正的取值来自配置项
 # `stale_user_retention_days`（v2.27.38 起可配；之前这里是唯一来源、写死 90 天）。
 STALE_USER_RETENTION_DAYS = 90
@@ -387,6 +398,95 @@ def validate_auto_nickname(candidate: str) -> str:
     if "--" in name or ".." in name:
         return ""
     return name
+
+
+# ── 名片名（display_name）：消息自带的名字，只用于「怎么叫 TA」 ────────
+#
+# 与 `auto_nickname` 的分工必须说清，否则两套名字迟早互相覆盖：
+#
+# * `nickname`（她认定的称呼）—— 用户 `/叫我` 设的、或自动认定一次之后**永不改口**。
+#   它是「她怎么叫 TA」的关系事实，换群名片、改 QQ 昵称都不该动它。
+# * `display_name`（名片名）—— 消息发送者**此刻的原样名字**，跟着名片走、只做参考。
+#   跨插件社交层主动开口时，`nickname` 为空是常态（很多人从没被 `/叫我` 过，名片也
+#   过不了自动认定的高门槛），没有这一份它就永远不知道怎么叫人——用户的原话就是
+#   「主动消息从 core 那拿不到名称，以至于根本不会叫人」。
+#
+# 名字来源是**对方随时能改的东西**，所以只做「存起来、可读」两件事：不写进人设、
+# 不参与身份认定、不覆盖 nickname。清洗也只做必要的（控制字符/过长/纯符号/QQ 号）。
+DISPLAY_NAME_MAX_CHARS = 24
+# 空白（含换行/制表）与不可见控制字符一律先折成一个空格，再压缩连续空白：
+# 群名片里真的有人写「小\n雨」「小\t雨」，原样存下去读的那边会拿到断行。
+_DISPLAY_NAME_BLANK = re.compile(
+    r"[\s\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u2060\ufeff]+"
+)
+
+
+def clean_display_name(candidate: str, user_id: str = "") -> str:
+    """把消息自带的名字洗成能存的样子；洗不出名字就返回空串（宁可不存）。
+
+    规则（v2.28.9 验收口径）：
+
+    * strip；换行/制表/控制字符换成空格，连续空白压成一个；
+    * 超过 24 字截断（名片可以很长，但存一份能叫的短名就够了）；
+    * 空串、纯符号（标点/emoji/装饰符），以及**纯数字且等于 user_id**
+      （没设昵称时 QQ 号会被当作名字递进来）一律不认；
+    * 其余**原样保留**（`★小鱼★`、`阿哲 2 号` 这类是名片原样，社交层要用它叫人的
+      那次判断交给它自己做——Core 这里只负责不让坏字符进 state）。
+
+    和 `validate_auto_nickname` 是两套规则：那个是「认定称呼」的高门槛，这个是
+    「名片原样」的脏字符清洗。两者绝不互相写入。
+    """
+    body = _DISPLAY_NAME_BLANK.sub(" ", str(candidate or "")).strip()
+    if len(body) > DISPLAY_NAME_MAX_CHARS:
+        body = body[:DISPLAY_NAME_MAX_CHARS].strip()
+    if not body:
+        return ""
+    # 没有任何字母/数字（中文按下表算 Letter）：纯符号、纯 emoji、纯装饰符不是名字。
+    if not any(ch.isalnum() for ch in body):
+        return ""
+    uid = str(user_id or "").strip()
+    if body.isdigit() and uid and body == uid:
+        return ""
+    return body
+
+
+def pick_display_name(
+    current: str, current_at: float, candidate: str, candidate_at: float
+) -> str:
+    """两份名片记录合并时选一个（`note_display_name` 与未来可能的用户合并共用）。
+
+    「取最长/最新」的具体口径：
+
+    1. 一边为空就取另一边——**绝不让空串覆盖已有的名字**（群聊/私聊各记一份时
+       最容易出现的就是这个：一边没名字把另一边抹掉）；
+    2. 两边时间戳都可信时取**较新**的那份（名片改了就该用新的）；
+    3. 时间戳不可信（老数据没有时间戳、都是 0）或同刻时取**较长**的那份——
+       长的那份信息更全，短的那份多半是昵称缩写；
+    4. 完全分不出来时取 candidate（刚看到的那份）。
+    """
+    current = str(current or "").strip()
+    candidate = str(candidate or "").strip()
+    if not candidate:
+        return current
+    if not current:
+        return candidate
+    if candidate == current:
+        return current
+
+    def _at(value: Any) -> float:
+        try:
+            out = float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return out if out == out else 0.0  # NaN
+
+    cur_at = _at(current_at)
+    new_at = _at(candidate_at)
+    if new_at > 0 and (cur_at <= 0 or new_at > cur_at):
+        return candidate
+    if cur_at > 0 and cur_at > new_at:
+        return current
+    return candidate if len(candidate) >= len(current) else current
 
 
 @dataclass(frozen=True, slots=True)
@@ -995,6 +1095,98 @@ class MoodService:
                 result[uid] = (name, self.nickname_source(uid))
         return result
 
+    # ── 名片名 / 开口称呼（v2.28.9）────────────────────────────
+    #
+    # 为什么单开一组，而不是复用 nickname：
+    # `nickname` 是「她认定的称呼」（/叫我 或自动认定一次，之后永不改口），
+    # `display_name` 是「消息自带的原样名片」。两者语义分开，绝不互相覆盖：
+    # 换群名片时 display_name 跟着变，nickname 不动；用户 `/叫我` 之后，
+    # nickname 仍是开口首选，display_name 退成参考。
+    # 跨插件社交层要的是**能立刻拿来叫人**的那个：`call_name()`。
+
+    def display_name(self, user_id: str) -> str:
+        """消息自带的名片名（原样、已清洗）。纯查询，不建条目、不抛。"""
+        value = self._scope.peek_user(user_id, "display_name", "")
+        # 只认字符串：state.json 里可能被手改/旧版本写成对象或数字，那不是「名字」，
+        # 返回空串让调用方按「没有名字」处理，别把 `{'坏': 1}` 念出来。
+        if not isinstance(value, str):
+            return ""
+        return value.strip()[:DISPLAY_NAME_MAX_CHARS]
+
+    def display_name_at(self, user_id: str) -> float:
+        """名片名最后一次更新的 epoch；没有/坏值返回 0.0。"""
+        try:
+            return float(self._scope.peek_user(user_id, "display_name_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def note_display_name(self, user_id: str, name: str) -> str:
+        """记下消息自带的发送者名字（群名片 / QQ 昵称）。返回**当前生效**的名片名。
+
+        只加一份「怎么叫 TA」的原料，**绝不碰 nickname**：那个是用户亲自要的称呼
+        （或自动认定后的唯一一次），被名片覆盖就会变成「群里谁换名片她跟着改口」。
+
+        写盘纪律（门面/消息路径都可能在热路径上调用）：
+
+        * 洗不出名字（空、纯符号、QQ 号）、或与现值相同时**不写、不 mark_dirty**；
+        * 群聊/私聊两份记录可能各写一次：用 `pick_display_name` 合并，
+          空串永远覆盖不掉已有的名字，时间戳新的优先（见该函数的规则）；
+        * 只写 user 级的 `display_name` + `display_name_at` 两个键，一次标脏。
+        """
+        uid = str(user_id or "").strip()
+        current = self.display_name(uid)
+        if not uid:
+            return ""
+        cleaned = clean_display_name(name, uid)
+        if not cleaned:
+            return current
+        if cleaned == current:
+            return current
+        now = float(self._time())
+        chosen = pick_display_name(
+            current, self.display_name_at(uid), cleaned, now
+        )
+        if chosen == current:
+            return current
+        try:
+            self._scope.update_user(uid, display_name=chosen, display_name_at=now)
+        except Exception:
+            # 落盘失败不该让一条消息的处理路径炸掉：下次名片还会再来。
+            try:
+                self._scope.set_user(uid, "display_name", chosen)
+                self._scope.set_user(uid, "display_name_at", now)
+            except Exception:
+                pass
+        return chosen
+
+    def call_name(self, user_id: str) -> str:
+        """她开口时该怎么叫这个人：**昵称优先，其次名片名，都没有就是空串**。
+
+        这是社交层直接拿去叫人的那一个值。返回空串 = 数据里真没有名字，
+        调用方应当说「TA」/不提称呼——**绝不编一个名字出来**。
+        """
+        nickname = self.nickname(user_id)
+        if nickname:
+            return nickname
+        return self.display_name(user_id)
+
+    def name_source(self, user_id: str) -> str:
+        """`call_name()` 的来源："nickname" / "display_name" / ""（没有名字）。"""
+        if self.nickname(user_id):
+            return "nickname"
+        if self.display_name(user_id):
+            return "display_name"
+        return ""
+
+    def all_display_names(self) -> dict[str, str]:
+        """所有存过名片名的用户：uid -> 名片名（诊断/导出用，纯查询）。"""
+        result = {}
+        for uid in self._scope.all_user_ids():
+            name = self.display_name(uid)
+            if name:
+                result[uid] = name
+        return result
+
     def _decayable(self, user_state: dict) -> Optional[dict]:
         """取出可以衰减的 mood 记录；坏数据在这里就地修好或清掉。
 
@@ -1049,9 +1241,13 @@ class MoodService:
         没有可判定时间戳的记录一律跳过，宁可不清也不误删。
 
         v2.28.9（D4）：**没有可清理字段**的条目（只剩 `nickname` / `nickname_src` /
-        `first_met` 这类被刻意保留的东西）原来被直接跳过，于是永久留存。现在它们
-        不活跃超过 `STALE_USER_RETENTION_DAYS` 就**整条删除**；名单之外还有别的键
+        `first_met` / `display_name` 这类被刻意保留的东西）原来被直接跳过，于是永久留存。
+        现在它们不活跃超过 `STALE_USER_RETENTION_DAYS` 就**整条删除**；名单之外还有别的键
         （亲密计数、情绪记忆…）的一律保留。
+
+        v2.28.9：`display_name` / `display_name_at` 加进保留名单（同 `nickname`）：
+        情绪档案 7 天不活跃会被清回初始值，但「怎么叫 TA」不该跟着丢——否则跨插件那边
+        会突然又不知道名字，主动消息重新变成「不知道怎么叫人」。
         """
         cfg = self.config
         try:
@@ -2492,8 +2688,25 @@ class MoodService:
             lines.append(f"好感度：{data['affection']:.1f}/100（基线 {data['base_affection']:.1f}）")
         else:
             lines.append(f"好感度：{data['affection']:.1f}/100")
+        # 亲近欲不能只给一个裸数字：她「比平常高多少」才是这个人能不能进亲密场景的
+        # 主门槛，而用户原来看到 41/50 根本不知道自己离 38/Δ4 还差哪一条。
+        libido = _num_or(data.get("libido"), _num_or(getattr(self.config, "mood_initial_libido", 34.0), 34.0))
+        base_libido = _num_or(data.get("base_libido"), libido)
+        libido_note = f"基线 {base_libido:.1f}，{_ccb.delta_text(libido - base_libido)}"
+        try:
+            if bool(getattr(self.config, "ccb", False)):
+                lo = _num_or(getattr(self.config, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN),
+                             _ccb.CCB_LIBIDO_MIN)
+                need = _num_or(getattr(self.config, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE),
+                               _ccb.CCB_LIBIDO_RISE)
+                libido_note += (
+                    f" · 门槛 {lo:.0f}/Δ{need:.0f}"
+                    f" → {_ccb.threshold_text(libido, base_libido, lo, need)}"
+                )
+        except Exception:
+            pass
         lines += [
-            f"亲近欲：{data['libido']:.1f}/50（基线 {data['base_libido']:.1f}）",
+            f"亲近欲：{libido:.1f}/50（{libido_note}）",
             f"攻击性：{data['aggression']:.1f}/50（基线 {data['base_aggression']:.1f}）",
             f"当前标签：{self.label(user_id)}",
         ]
@@ -2513,25 +2726,92 @@ class MoodService:
         return "\n".join(lines)
 
     def intimacy_summary(self, user_id: str) -> str:
-        """给 `/好感度` 用的一句「亲密档案」：做过几次、上一次多久前、上头到哪。
+        """`/好感度` 的「亲密档案」一句：在不在场景里、今天几次、余韵还是冷却、
+        离门槛差多少，最后才是「一共几次 / 上次多久前」。
 
-        **无副作用**。性欲（亲近欲）本来就写在档案里；这句补的是「欲望有没有变成事」
-        ——以前只看得到一条亲近欲数字，看不出她到底想不想要、有没有过。
+        **无副作用**：全部走 `peek_user`，一个字节都不写。跨天之后这里用
+        `ccb.scene_status()` 的**投影**（它自己按天折算昨天那笔账），而不是去
+        `roll_day()` 改状态——看一眼好感度就把 state.json 标脏是另一类事故；
+        真正的结账发生在下一轮注入（`emotion._ccb_line`）或状态页读路径上。
         """
-        # 只读：三个键各自 peek，不因为看一眼亲密档案就建条目。
+        cfg = self.config
         try:
-            done = float(self._scope.peek_user(user_id, "ccb_done_count", 0.0) or 0.0)
-            satisfy = float(self._scope.peek_user(user_id, "ccb_satisfy", 0.0) or 0.0)
-            last = float(self._scope.peek_user(user_id, "ccb_last_at", 0.0) or 0.0)
-        except (TypeError, ValueError):
+            state = {
+                key: self._scope.peek_user(user_id, key) for key in _ccb.STATE_KEYS
+            }
+            state = {key: value for key, value in state.items() if value is not None}
+            mood = self._scope.peek_user(user_id, "mood", None)
+        except Exception:
             return ""
-        if done <= 0 and last <= 0:
-            return "亲密：还没有过"
-        ago = ""
-        if last > 0:
-            try:
-                hours = max(0.0, (self._time() - last) / 3600.0)
-                ago = (f"，上次 {hours:.0f} 小时前" if hours < 48 else f"，上次 {hours / 24:.0f} 天前")
-            except Exception:
-                ago = ""
-        return f"亲密：{int(done)} 次{ago}，上头 {satisfy:.0f}/100"
+        mood = mood if isinstance(mood, dict) else {}
+
+        def pick(key: str, default: float) -> float:
+            raw = mood.get(key)
+            if raw is None:
+                return float(default)
+            value = _num_or(raw, default)
+            return value if value == value else float(default)  # NaN
+
+        initial_libido = _num_or(getattr(cfg, "mood_initial_libido", 34.0), 34.0)
+        initial_affection = _num_or(getattr(cfg, "mood_initial_affection", 46.0), 46.0)
+        libido = pick("libido", initial_libido)
+        base_libido = pick("base_libido", libido)
+        affection = pick("affection", initial_affection)
+        base_affection = pick("base_affection", affection)
+        try:
+            now = float(self._time())
+        except Exception:
+            return ""
+        snap = _ccb.scene_status(
+            state,
+            now,
+            libido=libido,
+            base_libido=base_libido,
+            affection=affection,
+            base_affection=base_affection,
+            libido_min=_num_or(getattr(cfg, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN),
+                               _ccb.CCB_LIBIDO_MIN),
+            libido_rise=_num_or(getattr(cfg, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE),
+                                _ccb.CCB_LIBIDO_RISE),
+            affection_min=_num_or(getattr(cfg, "ccb_affection_min", _ccb.CCB_AFFECTION_MIN),
+                                  _ccb.CCB_AFFECTION_MIN),
+            affection_rise=_num_or(getattr(cfg, "ccb_affection_rise", _ccb.CCB_AFFECTION_RISE),
+                                   _ccb.CCB_AFFECTION_RISE),
+            affection_deep=_num_or(getattr(cfg, "ccb_affection_deep", _ccb.CCB_AFFECTION_DEEP),
+                                   _ccb.CCB_AFFECTION_DEEP),
+        )
+
+        bits: List[str] = []
+        done = int(snap.get("done_count") or 0)
+        bits.append(f"{done} 次" if done > 0 else "还没有过")
+        turns = int(snap.get("turns_today") or 0)
+        daily_max = int(snap.get("daily_max") or 0)
+        if snap.get("in_scene"):
+            bits.append(
+                f"在场景里（{snap.get('stage_name') or '进行中'}·"
+                f"满足 {float(snap.get('satisfy') or 0):.0f}/100·今日 {turns}/{daily_max}）"
+            )
+        elif snap.get("expired"):
+            bits.append("上次那场已经闲置过期")
+        else:
+            bits.append(f"今日 {turns}/{daily_max} 次")
+        aftercare = float(snap.get("aftercare_left") or 0.0)
+        cooldown = float(snap.get("cooldown_left") or 0.0)
+        if aftercare > 0:
+            bits.append(f"余韵还剩 {_ccb.duration_text(aftercare)}")
+        elif cooldown > 0:
+            bits.append(f"冷却还要 {_ccb.duration_text(cooldown)}")
+        last_ago = float(snap.get("last_ago") or 0.0)
+        if last_ago > 0:
+            bits.append(f"上次 {_ccb.duration_text(last_ago)}前")
+        gap = _ccb.threshold_text(
+            snap.get("libido"), snap.get("base_libido"),
+            snap.get("libido_min"), snap.get("libido_rise_need"),
+        )
+        bits.append(
+            f"亲近欲 {float(snap.get('libido') or 0):.0f}/50"
+            f"（基线 {float(snap.get('base_libido') or 0):.0f}"
+            f"，门槛 {float(snap.get('libido_min') or 0):.0f}"
+            f"/Δ{float(snap.get('libido_rise_need') or 0):.0f} → {gap}）"
+        )
+        return "亲密：" + "，".join(bits)
