@@ -55,6 +55,36 @@ CCB_LIBIDO_MIN = 38.0
 #   · 基线被运营设成 40   → 要涨到 44。初始值高的人不会天天碰到——
 #     这条挡的是「从一开始就高」，不是「涨了一点就够」。
 CCB_LIBIDO_RISE = 4.0
+# 情绪层一天最多能给亲近欲加多少（与 `services.mood.DAILY_LIBIDO_GAIN_CAP` 同源）。
+# 见 `reachable_libido_min`：绝对门槛高于「基线 + 这个量」时，那条线**一辈子够不着**，
+# 这个开关就永远不会打开。线上实测（2026-10-26）8562 个用户条目里没有一个人进过场景。
+LIBIDO_DAILY_REACH = 4.5
+# 亲近欲量程上限（与 `services.mood.LIBIDO_RANGE` 的右端一致）。只用于判断
+# 「已经顶到量程、不可能再涨」这一种饱和态。
+LIBIDO_MAX = 50.0
+
+
+def reachable_libido_min(libido_min: float, base_libido: float) -> float:
+    """把绝对门槛夹到「她这具身体真能到的高度」。
+
+    设计里 38/50 配的是默认基线 34：34 + 每日可涨 4.5 = 38.5，所以「今天涨到头」
+    那一刻刚好够到。但面板允许把初始亲近欲调低（例如 30）——那时 30 + 4.5 = 34.5，
+    38 永远够不着，功能看起来就是坏的（不报错、只是从来不动）。
+
+    这里只**夹低**、不抬高：配置本来就被设得比可达上限低时原样保留；只有设得
+    够不着时才按可达上限算，并在 `scene_status`（/亲密状态）里如实显示这个数。
+    与 `libido_rise` 配合：夹完等于「基线 + 4.5」，涨 4 的要求同样只有到顶才满足，
+    仍然是「真的到了今天这一档」才进，不是随便开。
+    """
+    try:
+        low = float(libido_min)
+        base = float(base_libido)
+    except (TypeError, ValueError):
+        return float(libido_min) if libido_min is not None else CCB_LIBIDO_MIN
+    if not (math.isfinite(low) and math.isfinite(base)):
+        return low
+    reach = base + LIBIDO_DAILY_REACH
+    return low if reach >= low else reach
 # E1 三档（v2.27.8）：<50 拒绝/岔开；50~74 擦边暧昧；≥75 深入。
 # 原来 78/12 对多数人是永远够不着的静默开关。
 CCB_AFFECTION_MIN = 50.0
@@ -353,6 +383,26 @@ _INITIATIVE_WORDS = (
     "想再要一次",
     "抱紧一点别松",
 )
+# 主动档：主语是**她**的念头（不是「想让你…」这种等对方动的句式）。
+# 纪律不变：行为层级，不写器官、不写情节、不长于一句。
+_ACTIVE_WORDS = (
+    "想自己来",
+    "不想再等了",
+    "今天想主动一点",
+    "想把你按住",
+)
+# 主导度到这条线以上，auto 模式就按「她主动」选措辞。
+CCB_DOMINANCE_ACTIVE = 0.62
+# 动作词：只收「动到对方 / 自己动」的强动词，避免「按手机」「推门」误计。
+_ACTION_WORDS = (
+    "按住", "按在", "压住", "压在", "推倒", "骑上", "骑在", "跨坐", "坐上",
+    "抱紧", "抱住", "搂住", "亲上", "吻上", "亲住", "咬住", "含住", "舔",
+    "摸上", "抚摸", "抓住", "拉住", "扯开", "脱掉", "褪下", "套上", "顶进",
+    "撞进", "蹭", "贴紧", "缠住", "勾住", "自己来", "主动", "主导", "跨上",
+)
+# 主导 / 顺从的人设词（只在人设正文里数次数，不参与别的判断）。
+_DOM_WORDS = ("女王", "强势", "主导", "支配", "霸道", "掌控", "命令", "攻", "主动", "高冷")
+_SUB_WORDS = ("顺从", "害羞", "被动", "乖巧", "听话", "温顺", "怯", "软")
 
 # ccb_done_count：一辈子的次数（不分天）。社交层拿它判断「有没有和对方色色过」，
 # 从而决定要不要主动问一句——它不是当天次数（那是 ccb_turns）。
@@ -374,6 +424,8 @@ STATE_KEYS = (
     "ccb_peak_depth",
     # 
     "ccb_scene_score", "ccb_scene_at", "ccb_intimacy_at",
+    # v2.28.11：这一场谁在动（她 / 他）与最近一次是谁。
+    "ccb_her_acts", "ccb_his_acts", "ccb_last_actor",
 )
 
 # 满足：场景里累积，到顶算「收场」。
@@ -513,6 +565,10 @@ def reset_scene(user_state: Dict[str, Any]) -> None:
     # 不跨场保留——跨场保留会变成第二份 state.json 体积来源。
     user_state["ccb_peak_depth"] = 0.0
     user_state[LOG_KEY] = []
+    # 谁在动属于**这一场**，不跨场保留。
+    user_state["ccb_her_acts"] = 0.0
+    user_state["ccb_his_acts"] = 0.0
+    user_state["ccb_last_actor"] = 0.0
 
 
 def decay_satisfy(user_state: Dict[str, Any], now: float) -> None:
@@ -616,20 +672,38 @@ def _values_hold(
     libido_rise: float = CCB_LIBIDO_RISE,
     affection_min: float = CCB_AFFECTION_MIN,
     affection_rise: float = CCB_AFFECTION_RISE,
+    affection_deep: float = CCB_AFFECTION_DEEP,
 ) -> bool:
     """只有**数值门槛**这一组——冷却/当日封顶/精力/群聊都不在这里。
 
     拆出来是给 `_qualifies`（能不能进）与 `scene_lapsed`（结没结束）共用，
     门槛只此一处定义，改阈值不会两边走歪。
+
+    两条「涨上来」的要求各有一个**饱和例外**：亲近欲已经顶到量程（50）时不可能再涨，
+    但那一刻本来就是「她一直很想要」，按涨不上去判她不想是反的；好感已经进了「深入」
+    档（默认 75）时同理——关系已经很深，不需要再靠一次涨幅证明。没有这两个例外，
+    最亲密的那批人反而永远进不了场景（线上实测：libido 50/base 50、好感 100/100 的
+    用户被「涨得不够」挡在门外）。
     """
-    if libido < float(libido_min):
+    low = reachable_libido_min(libido_min, base_libido)
+    if libido < low:
         return False
     if (libido - base_libido) < float(libido_rise):
-        return False
+        try:
+            pinned = float(libido) >= LIBIDO_MAX - 1.0
+        except (TypeError, ValueError):
+            pinned = False
+        if not pinned:
+            return False
     if affection < float(affection_min):
         return False
     if (affection - base_affection) < float(affection_rise):
-        return False
+        try:
+            deep = float(affection) >= float(affection_deep)
+        except (TypeError, ValueError):
+            deep = False
+        if not deep:
+            return False
     return True
 
 
@@ -645,6 +719,7 @@ def _qualifies(
     libido_rise: float = CCB_LIBIDO_RISE,
     affection_min: float = CCB_AFFECTION_MIN,
     affection_rise: float = CCB_AFFECTION_RISE,
+    affection_deep: float = CCB_AFFECTION_DEEP,
     coerced: bool = False,
 ) -> bool:
     """「该不该进入场景」的门槛——上下文闸 + 数值门槛，冷却/当日封顶/精力**不在**。"""
@@ -661,6 +736,7 @@ def _qualifies(
         libido_rise=libido_rise,
         affection_min=affection_min,
         affection_rise=affection_rise,
+        affection_deep=affection_deep,
     )
 
 
@@ -676,6 +752,7 @@ def scene_lapsed(
     libido_rise: float = CCB_LIBIDO_RISE,
     affection_min: float = CCB_AFFECTION_MIN,
     affection_rise: float = CCB_AFFECTION_RISE,
+    affection_deep: float = CCB_AFFECTION_DEEP,
     coerced: bool = False,
 ) -> bool:
     """场景是否**真的结束**（色欲/好感掉下数值门槛）。
@@ -696,6 +773,7 @@ def scene_lapsed(
         libido_rise=libido_rise,
         affection_min=affection_min,
         affection_rise=affection_rise,
+        affection_deep=affection_deep,
     )
 
 
@@ -769,6 +847,67 @@ def initiative(
         return _clamp01(raw)
     gate = _clamp01((aff - floor * 0.5) / max(1.0, floor * 0.5))
     return _clamp01(raw * (0.35 + 0.65 * gate))
+
+
+def detect_action(text: str) -> int:
+    """这句话里有几个「她在动 / 他在动」的强动作词（否定句不算）。
+
+    只用于记「这一场谁在动」，不参与任何门槛判断——判错最多是多一句状态，
+    不会影响进不进场景。
+    """
+    s = str(text or "")
+    if not s.strip():
+        return 0
+    count = 0
+    for word in _ACTION_WORDS:
+        start = 0
+        while True:
+            idx = s.find(word, start)
+            if idx < 0:
+                break
+            if not _negated(s, idx):
+                count += 1
+                break
+            start = idx + len(word)
+    return count
+
+
+def dominance(
+    *,
+    persona_prompt: str = "",
+    aggression: float = 25.0,
+    relstage_index: int = 0,
+    affection: float = 0.0,
+    her_acts: float = 0.0,
+    his_acts: float = 0.0,
+) -> float:
+    """她这一场有多想主导（0~1）。纯函数、不写状态、不落盘。
+
+    四路信息，权重刻意不等：人设词 > 实际动作比例 > 心气 > 关系档。
+    人设是「她本来是什么样的人」，动作比例是「这一场实际发生了什么」——
+    后者更重要，但人设不会被几个动作完全扭转。
+    """
+    base = 0.5
+    text = str(persona_prompt or "")[:2000]
+    dom = sum(text.count(w) for w in _DOM_WORDS)
+    sub = sum(text.count(w) for w in _SUB_WORDS)
+    if dom + sub > 0:
+        base += 0.18 * (dom - sub) / max(1, dom + sub)
+    try:
+        base += (max(0.0, min(50.0, float(aggression))) / 50.0 - 0.5) * 0.16
+    except (TypeError, ValueError):
+        pass
+    try:
+        total = max(0.0, float(her_acts)) + max(0.0, float(his_acts))
+        if total > 0:
+            base += (max(0.0, float(her_acts)) / total - 0.5) * 0.26
+    except (TypeError, ValueError):
+        pass
+    try:
+        base += (max(0.0, min(3.0, float(relstage_index))) / 3.0 - 0.5) * 0.10
+    except (TypeError, ValueError):
+        pass
+    return _clamp01(base)
 
 
 def refused_within(user_state: Dict[str, Any], moment: float,
@@ -1240,7 +1379,10 @@ def scene_status(
     aff = _fs(affection)
     base_aff = _fs(base_affection)
     eng = _fs(energy, 0.0)
-    low = _fs(libido_min, CCB_LIBIDO_MIN)
+    low_cfg = _fs(libido_min, CCB_LIBIDO_MIN)
+    # 与 `evaluate` 同一个数：配置门槛够不着时按「基线 + 每日可达涨幅」算，
+    # /亲密状态 显示的就是真正生效的那个门槛（不然面板说差 8 点，其实永远到不了）。
+    low = reachable_libido_min(low_cfg, base_lib)
     need_lib = _fs(libido_rise, CCB_LIBIDO_RISE)
     aff_low = _fs(affection_min, CCB_AFFECTION_MIN)
     need_aff = _fs(affection_rise, CCB_AFFECTION_RISE)
@@ -1294,15 +1436,22 @@ def scene_status(
             blockers.append("人设判成男角色（只对女角色开）")
         if aff < aff_low:
             blockers.append(f"好感不够（{aff:.0f}/100，差 {aff_low - aff:.0f}）")
-        elif (aff - base_aff) < need_aff:
+        elif (aff - base_aff) < need_aff and aff < aff_deep:
+            # 深入档（默认 75）算「关系已经够深」，不再要求这一阵子涨过 8 分。
             blockers.append(
-                f"好感涨得不够（{delta_text(aff - base_aff)}，还差 {need_aff - (aff - base_aff):.1f}）"
+                f"好感涨得不够（{delta_text(aff - base_aff)}，还差 {need_aff - (aff - base_aff):.1f}，"
+                f"或把好感养到深入档 {aff_deep:.0f}）"
             )
         if lib < low:
-            blockers.append(f"亲近欲不够（{lib:.0f}/50，差 {low - lib:.0f}）")
-        elif (lib - base_lib) < need_lib:
+            hint = ""
+            if low < low_cfg - 1e-6:
+                hint = f"（配置 {low_cfg:.0f} 超出她这具身体一天能涨到的上限，已按可达值算）"
+            blockers.append(f"亲近欲不够（{lib:.0f}/50，差 {low - lib:.0f}）{hint}")
+        elif (lib - base_lib) < need_lib and lib < LIBIDO_MAX - 1.0:
+            # 已经顶到量程（50）算「她一直很想要」，不再要求还能再涨。
             blockers.append(
-                f"亲近欲涨得不够（{delta_text(lib - base_lib)}，还差 {need_lib - (lib - base_lib):.1f}）"
+                f"亲近欲涨得不够（{delta_text(lib - base_lib)}，还差 {need_lib - (lib - base_lib):.1f}，"
+                f"或顶到 {LIBIDO_MAX:.0f} 满格）"
             )
         if eng < CCB_ENERGY_MIN:
             blockers.append(f"精力不足（{eng:.0f} < {CCB_ENERGY_MIN:.0f}）")
@@ -1347,6 +1496,8 @@ def scene_status(
         "can_enter": not blockers,
         "blockers": blockers,
         "libido_min": round(low, 1),
+        # 面板上配的那个数：与 `libido_min` 不同时说明「配置够不着，已按可达值算」。
+        "libido_min_config": round(low_cfg, 1),
         "libido_rise_need": round(need_lib, 1),
         "affection_min": round(aff_low, 1),
         "affection_rise_need": round(need_aff, 1),
@@ -1375,6 +1526,8 @@ def evaluate(
     coerced: bool = False,
     index: int = 0,
     initiative_score: float = 0.0,
+    lead: str = "auto",
+    dominance_score: float = 0.5,
     refused: bool = False,
     safety_reason: str = "",
     in_scene: bool = False,
@@ -1396,6 +1549,10 @@ def evaluate(
     # （所以它不进 `scene_lapsed`，见那个函数的说明）。
     if refused:
         return None
+    # 绝对门槛先夹到「她真能到的高度」（见 `reachable_libido_min`）。夹在这里而不是
+    # 让每个调用方自己算：`_qualifies` 与下面的档位（`_band_for` / `bands`）必须用
+    # 同一个数，否则会出现「门槛过了、档位却找不到」→ 静默 return None 的老毛病。
+    eff_min = reachable_libido_min(libido_min, base_libido)
     # E4/E6：刚被强迫过（无视拒绝/胁迫）→ 不进入，谈不上「享受」
     if not _qualifies(
         coerced=coerced,
@@ -1405,10 +1562,11 @@ def evaluate(
         base_affection=base_affection,
         libido=libido,
         base_libido=base_libido,
-        libido_min=libido_min,
+        libido_min=eff_min,
         libido_rise=libido_rise,
         affection_min=affection_min,
         affection_rise=affection_rise,
+        affection_deep=affection_deep,
     ):
         return None
     if energy < CCB_ENERGY_MIN:
@@ -1431,12 +1589,12 @@ def evaluate(
     if turns_today >= CCB_DAILY_MAX:
         return None
 
-    band = _band_for(libido, float(libido_min))
+    band = _band_for(libido, eff_min)
     if not band:
         return None
     score, words = band
     # 阶段跟着档位走，同样从阈值推导——写死 43/48 的话阈值一改就又出缝。
-    ladder = bands(float(libido_min))
+    ladder = bands(eff_min)
     stage = 1 + sum(1 for floor, _s, _w in ladder[1:] if libido >= floor)
     # E1：好感没到「深入」那一档时，只给最浅一档（擦边暧昧），不往深走。
     if affection < float(affection_deep):
@@ -1456,6 +1614,14 @@ def evaluate(
     ):
         stage = len(ladder) + 1
         words = _INITIATIVE_WORDS
+    # v2.28.11：她自己主导时，措辞换成「主语是她」的那一套。
+    # 仍然是念头（想自己来 / 不想再等了），不是指令，也不写动作。
+    _lead = str(lead or "auto")
+    active = _lead == "her" or (
+        _lead == "auto" and float(dominance_score) >= CCB_DOMINANCE_ACTIVE
+    )
+    if active and stage >= 2:
+        words = _ACTIVE_WORDS
     return score, words[index % len(words)], stage
 
 # ─── 「这件事到底发生过没有」：独立于状态机 ────────────────────────

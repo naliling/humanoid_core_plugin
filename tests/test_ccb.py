@@ -62,7 +62,11 @@ class Gate(unittest.TestCase):
         # E1 三档：<50 拒绝/岔开；50~74 擦边；≥75 深入。
         self.assertIsNone(ccb.evaluate(**_ok(affection=45.0, base_affection=40.0)))
         self.assertIsNotNone(ccb.evaluate(**_ok(affection=70.0, base_affection=46.0)))
-        self.assertIsNone(ccb.evaluate(**_ok(affection=92.0, base_affection=90.0)))
+        # 涨得不够、又没到深入档 → 不进
+        self.assertIsNone(ccb.evaluate(**_ok(affection=60.0, base_affection=56.0)))
+        # 深入档（≥75）算「关系已经够深」，不再要求这一阵涨过 8 分——
+        # 不然最亲密的那批人（好感 100/100、亲近欲 50/50）永远卡在「涨得不够」上。
+        self.assertIsNotNone(ccb.evaluate(**_ok(affection=92.0, base_affection=90.0)))
 
     def test_deep_affection_unlocks_deeper_stage(self):
         # 好感没到「深入」档时只给最浅一档（擦边）。
@@ -443,13 +447,15 @@ class ThresholdsAreConfigurable(unittest.TestCase):
 
     def test_stage_follows_the_bands_not_hardcoded_numbers(self):
         from humanoid import ccb
+        # 门槛取「基线 + 每日可达涨幅」以内，别让可达性夹取参与进来——
+        # 这条测的是「档位跟着门槛走」，不是可达性（那个由 test_v22812_ccb_reach 盯）。
         base = dict(enabled=True, is_group=False, persona_prompt=FEMALE,
                     base_affection=40.0, base_libido=20.0, energy=80.0,
                     last_at=0.0, now=1.0, affection=90.0)
-        # 门槛 30 时：30/35/40 三档，stage 依次 1/2/3
+        # 门槛 24 时：24/29/34 三档，stage 依次 1/2/3
         stages = []
-        for lib in (31.0, 36.0, 41.0):
-            res = ccb.evaluate(libido=lib, libido_min=30.0, libido_rise=0.0,
+        for lib in (25.0, 30.0, 35.0):
+            res = ccb.evaluate(libido=lib, libido_min=24.0, libido_rise=0.0,
                                affection_min=50.0, affection_rise=0.0, **base)
             stages.append(res[2] if res else None)
         self.assertEqual(stages, [1, 2, 3], "阶段写死 43/48 的话，门槛一改就错位")

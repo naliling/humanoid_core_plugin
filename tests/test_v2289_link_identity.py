@@ -325,7 +325,8 @@ class ContractIdentityOutfitTest(unittest.TestCase):
     def test_identity_block(self):
         self.assertEqual(
             self.contract["identity"],
-            {"char_name": "小满", "persona_label": "温柔的夜猫子"},
+            {"char_name": "小满", "persona_label": "温柔的夜猫子",
+             "species": "", "body_traits": []},
         )
 
     def test_outfit_block_shape(self):
@@ -384,13 +385,16 @@ class ContractIdentityOutfitTest(unittest.TestCase):
         core.persona_label = boom
         core.outfit_info = boom
         contract = build_contract(core)
-        self.assertEqual(contract["identity"], {"char_name": "", "persona_label": ""})
+        self.assertEqual(contract["identity"],
+                         {"char_name": "", "persona_label": "",
+                          "species": "", "body_traits": []})
         self.assertEqual(contract["outfit"], {})
         self.assertEqual(contract["v"], 2)
 
     def test_block_helpers_degrade(self):
         self.assertEqual(_identity_block(SimpleNamespace()),
-                         {"char_name": "", "persona_label": ""})
+                         {"char_name": "", "persona_label": "",
+                          "species": "", "body_traits": []})
         self.assertEqual(_outfit_block(SimpleNamespace()), {})
         self.assertEqual(
             _outfit_block(SimpleNamespace(

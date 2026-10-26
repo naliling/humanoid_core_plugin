@@ -1275,6 +1275,19 @@
     "description": "每轮把她的欲望 / 是否在亲密场景里写进上下文。",
     "hint": "关掉就回到旧版：只在真的触发时才有那一句，看不到「有点想但还没到」。"
   },
+  "ccb_lead": {
+    "type": "string",
+    "description": "这一场谁主导（auto / her / him）",
+    "hint": "auto = 按人设与这一场的动作自动判断；her = 注入「她想自己来」的主动措辞；him = 被动措辞。只改注入，不强制模型行为。",
+    "options": ["auto", "her", "him"],
+    "default": "auto"
+  },
+  "ccb_species": {
+    "type": "string",
+    "description": "她的物种 / 身体结构（留空自动识别）",
+    "hint": "留空 = 按人设自动识别（小马宝莉 / 半人马 / 人鱼 / 龙 / 魅魔 / 触手系等）。人设没写清楚时再手动填，例如「小马宝莉」「半人马+触手」。只描述结构，不写器官。",
+    "default": ""
+  },
   "ccb_aftercare_minutes": {
     "type": "int",
     "default": 120,

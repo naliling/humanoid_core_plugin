@@ -237,7 +237,9 @@ class ReadmeCommandsMatchCode(unittest.TestCase):
     def test_readme_does_not_promise_removed_prefixes(self):
         """不能出现 `/拟人 状态` 这种已经拆掉的写法（历史说明那一行除外）。"""
         readme = (SCHEMA_PATH.parent / "README.md").read_text(encoding="utf-8")
-        bad = re.findall(r"`/拟人 (状态|日程|时间|好感度|情绪详情|情绪日志|叫我|帮助)`", readme)
+        # 「时间」不在列表里：v2.28.11 起 `/拟人 时间 城市` 是**真的**管理指令
+        # （设置她的城市）；`/时间 城市` 仍然是所有人都能用的查询。
+        bad = re.findall(r"`/拟人 (状态|日程|好感度|情绪详情|情绪日志|叫我|帮助)`", readme)
         self.assertEqual(bad, [], f"README 仍写着已拆掉的旧指令：{bad}")
 
 

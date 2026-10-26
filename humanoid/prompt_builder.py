@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 from . import ccb as _ccb
+from . import species as _species
 from . import life_log
 from . import relstage
 import math
@@ -383,12 +384,19 @@ def _strip_heading_spans(text: str) -> str:
 class PromptBuilder:
     # 天气重复注入的最短间隔（秒）。见 `_weather_worth_saying`。
     WEATHER_REPEAT_SECONDS = 4 * 3600.0
+    # 同一句内心话的最短重复间隔（秒）。见 `_emotion_repeated`。
+    EMOTION_REPEAT_SECONDS = 10 * 60.0
+    # 内存里最多记多少人的「上次注入的内心话」——只用于去重，不落盘。
+    EMOTION_SEEN_LIMIT = 512
 
     def __init__(self, core_instance: "HumanoidCoreInstance") -> None:
         self._core = core_instance
         self._emotion = EmotionLayer(core_instance)
         # 上次写进注入的天气：(文本, 时刻)。None = 还没写过。
         self._weather_seen: Optional[tuple] = None
+        # 每个人上次注入的内心话：uid -> (文本, 时刻)。只放内存：
+        # 重启后重新记一次没有代价，而落盘会让读路径变成写路径。
+        self._emotion_seen: Dict[str, tuple] = {}
 
     @property
     def config(self) -> HumanoidConfig:
@@ -605,13 +613,47 @@ class PromptBuilder:
         # ccb 需要知道「这是不是群」和「她是谁」——两条都是它的硬闸，
         # 拿不到就走安全侧（不出）。
         try:
-            _score, text = self._emotion.candidate(
+            _score, text, kind = self._emotion.candidate_with_kind(
                 user_id, interest=interest or {}, agency=agency or {},
                 is_group=bool(is_group), persona_prompt=self._persona_prompt_text(),
             )
         except Exception:
             return ""
+        text = str(text or "").strip()
+        if not text:
+            return ""
+        # ccb 那句是场景里的实时状态（还带姿势/满足度），不能按「重复」压掉；
+        # 只有普通情绪句才做逐字去重。
+        if kind != "ccb" and self._emotion_repeated(user_id, text):
+            return ""
         return bracket(text)
+
+    def _emotion_repeated(self, user_id: str, text: str) -> bool:
+        """这一句内心话是不是刚注入过？是就这一轮不再注入。
+
+        实测（2026-10-26，线上私聊 1420609667）：她当天被同一件事硌着，
+        `_attitude` 每轮都以同样的显著度胜出，注入里逐轮出现一模一样的一句
+        「她内心：上回那句话到现在都还窝火」。模型于是每一句回复都把
+        「心里窝火」照抄进括号里——连续 8 条一字不差的模板。
+
+        根因不在词，在**重复**：同一件事说一遍是状态，说到第八遍就是台词，
+        模型会照着念。这里按「同一句 + 10 分钟窗口」去重：窗口内不再重复注入，
+        模型从它自己刚说过的话里已经知道她这会儿什么心情。情绪换了（文本变了）
+        立刻放行——去重只针对逐字重复，不做时间上的稀释。
+        """
+        now = _core_epoch(self._core)
+        seen = self._emotion_seen.get(user_id)
+        if isinstance(seen, tuple) and len(seen) == 2 and seen[0] == text:
+            try:
+                if 0.0 <= now - float(seen[1]) < self.EMOTION_REPEAT_SECONDS:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        # 只记最近这些人：长跑之后内存不该被几万个 uid 慢慢吃掉。
+        if len(self._emotion_seen) >= self.EMOTION_SEEN_LIMIT:
+            self._emotion_seen.clear()
+        self._emotion_seen[user_id] = (text, now)
+        return False
 
     def _persona_prompt_text(self) -> str:
         """她的人设正文（缓存快照）。ccb 的两道硬闸（性别 / 安全）都看它。
@@ -619,6 +661,17 @@ class PromptBuilder:
         拿不到就返回空串：`ccb.safety_block("")` 与 `ccb.looks_female("")` 都按
         「不拦、当女角色」处理——这是既有的兜底口径，不在这里另立一套。
         """
+        # v2.28.13：优先走 Core 的 `ccb_persona_text()`——它会沿用「上次取到的那份」
+        # 人设。注入层与安全闸必须读同一份：人设源暂时取不到时，注入按缓存判物种、
+        # 安全闸却按空串放行，就是两套结论。
+        try:
+            getter = getattr(self._core, "ccb_persona_text", None)
+            if callable(getter):
+                text = str(getter() or "")
+                if text.strip():
+                    return text
+        except Exception:
+            pass
         try:
             source = getattr(self._core, "persona_source", None)
             if source is None:
@@ -727,7 +780,31 @@ class PromptBuilder:
             bits.append(f"今日第 {turns} 次")
         if self._ccb_pose_just_changed(user_id, now):
             bits.append("刚换过姿势")
-        return "她正在亲密里（" + "，".join(bits) + "）"
+        text = "她正在亲密里（" + "，".join(bits) + "）"
+        # 谁在动 / 谁来主导：一句短事实，和身体结构共用同一句，控制 token。
+        try:
+            lead = str(getattr(cfg, "ccb_lead", "auto") or "auto")
+            her_acts = int(_as_number(
+                self._core._scope.peek_user(user_id, "ccb_her_acts", 0.0), 0.0))
+            his_acts = int(_as_number(
+                self._core._scope.peek_user(user_id, "ccb_his_acts", 0.0), 0.0))
+        except Exception:
+            lead, her_acts, his_acts = "auto", 0, 0
+        if lead == "her":
+            text += "；这一场她想自己来"
+        elif lead == "him":
+            text += "；这一场她更想被带着走"
+        elif her_acts > his_acts and her_acts >= 2:
+            text += "；这一场她更主动"
+        # 身体结构（物种）只在这一句里带，且只在场景内带：
+        # 每轮都加会让 token 白涨；场景里不加，模型就只会按人类写。
+        try:
+            body = _species.body_line(self._core.species_profile())
+        except Exception:
+            body = ""
+        if body:
+            text += "；她的身体：" + body
+        return text
 
     def _ccb_desire_presence(
         self, cfg: HumanoidConfig, libido: float, base_libido: float
@@ -743,6 +820,9 @@ class PromptBuilder:
         threshold = _as_number(
             getattr(cfg, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN), _ccb.CCB_LIBIDO_MIN
         )
+        # 注入里说的门槛必须与 `ccb.evaluate` 用的同一个数：配置门槛高于「基线 +
+        # 每日可达涨幅」时按可达值算（否则会说「还差 8 才到忍不住」，而其实永远不到）。
+        threshold = _ccb.reachable_libido_min(threshold, base_libido)
         rise = _as_number(
             getattr(cfg, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE), _ccb.CCB_LIBIDO_RISE
         )

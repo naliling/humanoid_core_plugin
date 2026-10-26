@@ -21,8 +21,9 @@ class PhrasingRotatesAcrossDays(unittest.TestCase):
         import inspect
         import textwrap
         from humanoid.emotion import EmotionLayer
+        # 抽签逻辑在 candidate_with_kind 里（candidate 只是薄包装，v2.28.12）。
         code = _ast.unparse(_ast.parse(
-            textwrap.dedent(inspect.getsource(EmotionLayer.candidate))))
+            textwrap.dedent(inspect.getsource(EmotionLayer.candidate_with_kind))))
         self.assertIn("today", code, "抽签种子里没有日期 → 措辞一辈子不变")
 
     def test_same_day_stable_across_restarts(self):

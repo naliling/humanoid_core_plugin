@@ -420,12 +420,34 @@ class EmotionLayer:
         persona_prompt: str = "",
     ) -> Tuple[float, str]:
         """五个维度竞争，返回显著度最高的那一条。`(0.0, "")` = 此刻没什么特别情绪。"""
+        score, text, _kind = self.candidate_with_kind(
+            user_id, interest=interest, agency=agency,
+            is_group=is_group, persona_prompt=persona_prompt,
+        )
+        return score, text
+
+    def candidate_with_kind(
+        self,
+        user_id: str,
+        *,
+        interest: Dict[str, Any],
+        agency: Dict[str, Any],
+        is_group: bool = False,
+        persona_prompt: str = "",
+    ) -> Tuple[float, str, str]:
+        """同 `candidate`，多返回一个来源标记：`"emotion"` / `"ccb"` / 空串。
+
+        `prompt_builder._emotion_line` 要对「逐轮重复的同一句」去重（线上实测：
+        同一句情绪话连续 8 轮被照抄成「心里窝火」模板）。但 ccb 那句不能去重——
+        它本来就是场景里的实时状态（姿势/满足度还会拼在后面），隔一轮不给等于场景里
+        突然没声音了。来源标记就是给这一处判断用的。
+        """
         try:
             profile = self._core.mood.profile(user_id) or {}
         except Exception:
-            return 0.0, ""
+            return 0.0, "", ""
         if not profile:
-            return 0.0, ""
+            return 0.0, "", ""
         # 抽签种子必须「**一天内稳定、跨天轮换**」——这正是 `wording.pick` 那条规矩。
         #
         # 两版都错过：
@@ -471,7 +493,7 @@ class EmotionLayer:
         # 冷静期优先于一切：她正在气头上，别的情绪都让位。
         cool = self._cooling_line(user_id, index)
         if cool is not None:
-            return cool
+            return cool[0], cool[1], "emotion"
 
         # ccb：一个默认关的独立开关。条件全中时它**直接返回**，不参与竞争——
         # 门槛已经很高（亲近欲 45/50 且是涨上来的），到了就是这一刻，
@@ -480,13 +502,13 @@ class EmotionLayer:
             user_id, profile, is_group=is_group, persona_prompt=persona_prompt, now=None
         )
         if got is not None:
-            return got
+            return got[0], got[1], "ccb"
 
         best = (0.0, "")
         for score, text in pools:
             if text and score > best[0]:
                 best = (score, text)
-        return best
+        return best[0], best[1], "emotion"
 
     def _aftercare_line(self, user_id: str) -> Tuple[float, str]:
         """余韵期的一句。不在余韵期返回 `(0.0, "")`。
@@ -640,6 +662,15 @@ class EmotionLayer:
                 _ccb.reset_scene(user_state)
                 self._core._scope.mark_dirty()
                 return None
+        lead_mode = str(getattr(_cfg, "ccb_lead", "auto") or "auto")
+        dominance_score = _ccb.dominance(
+            persona_prompt=persona_prompt,
+            aggression=_num(state.get("aggression"), 25.0),
+            relstage_index=rel_index,
+            affection=affection,
+            her_acts=_num(user_state.get("ccb_her_acts"), 0.0),
+            his_acts=_num(user_state.get("ccb_his_acts"), 0.0),
+        )
         res = _ccb.evaluate(
             enabled=True,
             libido_min=libido_min,
@@ -654,6 +685,8 @@ class EmotionLayer:
             scene_score=scene_score,
             intimacy_hint=intimacy_hint,
             initiative_score=initiative_score,
+            lead=lead_mode,
+            dominance_score=dominance_score,
             is_group=is_group,
             persona_prompt=persona_prompt,
             affection=affection,
@@ -688,6 +721,7 @@ class EmotionLayer:
                 libido_rise=libido_rise,
                 affection_min=affection_min,
                 affection_rise=affection_rise,
+                affection_deep=affection_deep,
                 coerced=coerced,
             ):
                 _ccb.reset_scene(user_state)

@@ -35,6 +35,7 @@ INT_SETTING_RANGES: dict[str, tuple[int, int]] = {
 
 INJECT_MODES = ("medium", "full", "mood_only")
 ENVIRONMENT_MODES = ("both", "private", "group")
+CCB_LEAD_MODES = ("auto", "her", "him")
 CYCLE_STYLES = ("default", "simple")
 LAST_INTERACTION_MODES = ("simple", "with_last_msg")
 
@@ -148,7 +149,7 @@ def _as_float_tuple(value: Any, default: tuple[float, ...]) -> tuple[float, ...]
 def _phase_multipliers(value: Any, default: tuple[float, ...]) -> tuple[float, ...]:
     """周期恢复倍率：长度不等于阶段数（8）时按默认值走。
 
-    老版本是 6 段，。
+    老版本是 6 段（v2.14 之前），阶段数已改成 8 段。
     旧列表留着会**静默错位**：面板显示 8 段顺序，代码却按旧顺序取值，
     中间几段的恢复倍率对不上。长度对不上就整体用新默认（6 个数本来就写不出 8 段）。
     """
@@ -158,7 +159,7 @@ def _phase_multipliers(value: Any, default: tuple[float, ...]) -> tuple[float, .
         # 退回让用户以为自己的 6 个倍率还在生效。面板不拦、代码丢，只能在这里喊。
         logger.warning(
             "energy_recovery_phase_multipliers 需要恰好 %d 个数，收到 %d 个："
-            "已整表退回默认值（旧版是 6 段，",
+            "已整表退回默认值（旧版是 6 段，写不出现在的 8 个阶段）",
             len(default),
             len(out),
         )
@@ -340,6 +341,12 @@ class HumanoidConfig:
     # 每轮都把「她欲望在什么位置 / 在不在亲密场景里 / 余韵还剩多久」写进上下文。
     # 关掉就回到旧版：只有真的触发时才有那一句（模型看不到"有点想但还没到"）。
     ccb_presence: bool = True
+    # 面板手动指定物种/身体结构（如「小马宝莉」「半人马+触手」）。
+    # 空 = 自动按人设识别；人设没写清楚时才需要填。
+    ccb_species: str = ""
+    # 这一场她想不想主导：auto（按人设+动作比例）/ her（强制主动措辞）/ him（被动）。
+    # 只改注入措辞，不强制模型行为——写清楚，免得用户以为拨了就一定主动。
+    ccb_lead: str = "auto"
     # (D）：到顶之后的余韵窗（分钟）。0 = 到顶就什么都不剩。
     ccb_aftercare_minutes: int = 120
     # 
@@ -593,6 +600,8 @@ class HumanoidConfig:
             ccb_partner_length_cm=f("ccb_partner_length_cm", 0.0, 30.0),
             ccb_scene_detail=b("ccb_scene_detail"),
             ccb_presence=b("ccb_presence"),
+            ccb_species=s_opt("ccb_species"),
+            ccb_lead=c("ccb_lead", CCB_LEAD_MODES),
             ccb_aftercare_minutes=i("ccb_aftercare_minutes", 0, 720),
             ccb_scene_log_debug=b("ccb_scene_log_debug"),
             ccb_refractory_libido=f("ccb_refractory_libido", 0.0, 30.0),

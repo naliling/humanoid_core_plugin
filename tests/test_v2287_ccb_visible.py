@@ -244,8 +244,12 @@ class Snapshot(unittest.TestCase):
                 )
 
     def test_blockers_include_the_numbers(self):
-        """光说「不够」没用：面板要能看出还差多少。"""
-        snap = _snap(libido=35.0, base_libido=30.0, energy=12.0)
+        """光说「不够」没用：面板要能看出还差多少。
+
+        基线 30 时绝对门槛按「可达上限」算成 34.5（见 test_v22812_ccb_reach），
+        所以这里取 31.5 才能看到「差 3」——旧版 35 已经过得了可达门槛了。
+        """
+        snap = _snap(libido=31.5, base_libido=30.0, energy=12.0)
         text = "；".join(snap["blockers"])
         self.assertIn("差 3", text, f"亲近欲离门槛还差多少没给出：{text}")
         self.assertIn("30", text, f"精力门槛数字没给出：{text}")

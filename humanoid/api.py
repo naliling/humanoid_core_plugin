@@ -302,11 +302,52 @@ class CoreFacade:
         except Exception:
             proactive = False
         fields = self._status_fields(snap)
+        # v2.28.11：她这会儿有多想主导/主动（0~1）。社交层用它决定「她主动开口」
+        # 还是「她等着」。纯读、不写状态。
+        initiative_score = 0.0
+        try:
+            from . import ccb as _ccb
+            from .relstage import stage_of
+            # **只读**：mood.profile() 取不到会新建条目（门面读一眼不该留空壳），
+            # 与 prompt_builder 同一个只读口径。
+            prof = core._scope.peek_user(uid, "mood") or {}
+            lib = float(prof.get("libido", snap.get("libido", 0.0)) or 0.0)
+            raw_base = prof.get("base_libido", snap.get("base_libido", lib))
+            base_lib = lib if raw_base in (None, "") else float(raw_base)
+            agg = float(prof.get("aggression", 25.0) or 25.0)
+            aff = float(prof.get("affection", 0.0) or 0.0)
+            try:
+                arousal = float(core.soma.snapshot().get("arousal", 50.0) or 50.0)
+            except Exception:
+                arousal = 50.0
+            try:
+                rel_index = int(stage_of(aff)[0])
+            except Exception:
+                rel_index = 0
+            cfg = getattr(core, "config", None)
+            initiative_score = _ccb.initiative(
+                libido=lib,
+                base_libido=base_lib,
+                arousal=arousal,
+                aggression=agg,
+                relstage_index=rel_index,
+                affection=aff,
+                affection_min=float(getattr(cfg, "ccb_affection_min", 50.0) or 50.0),
+                use_arousal=bool(getattr(cfg, "ccb_use_arousal", True)),
+            )
+        except Exception:
+            initiative_score = 0.0
+        initiative_label = (
+            "想主动" if initiative_score >= 0.65
+            else ("一般" if initiative_score >= 0.35 else "不想")
+        )
         if done <= 0 and last_at <= 0 and stage <= 0:
             # 一条记录都没有：不是「拿不到」，是「确实还没有」。给调用方一个能
             # 判断的确定答案，而不是让它去区分空 dict 的两种含义。
             return {"stage": 0, "satisfy": 0.0, "done_count": 0.0,
-                    "last_at": 0.0, "want_line": "", **fields}
+                    "last_at": 0.0, "want_line": "",
+                    "initiative": round(initiative_score, 2),
+                    "initiative_label": initiative_label, **fields}
         return {
             "stage": stage,
             "satisfy": round(satisfy, 1),
@@ -315,6 +356,8 @@ class CoreFacade:
             "want_line": (
                 self._intimacy_want(core, uid, stage, satisfy) if proactive else ""
             ),
+            "initiative": round(initiative_score, 2),
+            "initiative_label": initiative_label,
             **fields,
         }
 
@@ -398,7 +441,32 @@ class CoreFacade:
                 label = _s(core.persona_label())
             except Exception:
                 label = ""
-        return {"char_name": name, "persona_label": label}
+        sp_label = _s(identity.get("species"))
+        raw_traits = identity.get("body_traits")
+        sp_traits = [
+            _s(t) for t in (raw_traits if isinstance(raw_traits, list) else []) if _s(t)
+        ][:4]
+        if not sp_label:
+            try:
+                prof = core.species_profile()
+            except Exception:
+                prof = {}
+            if isinstance(prof, dict):
+                try:
+                    conf = float(prof.get("confidence") or 0.0)
+                except (TypeError, ValueError):
+                    conf = 0.0
+                if conf >= 0.65:
+                    sp_label = _s(prof.get("label"))
+                    sp_traits = [
+                        _s(t) for t in (prof.get("traits") or []) if _s(t)
+                    ][:4]
+        return {
+            "char_name": name,
+            "persona_label": label,
+            "species": sp_label,
+            "body_traits": sp_traits,
+        }
 
     def _outfit(self, core: Any, contract: Dict[str, Any]) -> Dict[str, Any]:
         """她此刻穿着：`{"enabled","text","source"}`。

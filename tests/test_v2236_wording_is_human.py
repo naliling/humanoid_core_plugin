@@ -99,7 +99,8 @@ class SeedIsStable(unittest.TestCase):
         import ast as _ast
         # 去掉 docstring 和注释再扫——否则「原来写的是 hash(str(user_id))」这句说明
         # 自己就会把断言触发（这个坑我自己踩了一次）。
-        tree = _ast.parse(textwrap.dedent(inspect.getsource(EmotionLayer.candidate)))
+        # 抽签逻辑在 candidate_with_kind 里（candidate 只是它的薄包装，v2.28.12）。
+        tree = _ast.parse(textwrap.dedent(inspect.getsource(EmotionLayer.candidate_with_kind)))
         fn = tree.body[0]
         head = fn.body[0] if fn.body else None
         if isinstance(head, _ast.Expr) and isinstance(getattr(head, "value", None), _ast.Constant):
@@ -134,7 +135,8 @@ class SeedIsStable(unittest.TestCase):
         import textwrap
         import inspect
         from humanoid.emotion import EmotionLayer
-        tree = _ast.parse(textwrap.dedent(inspect.getsource(EmotionLayer.candidate)))
+        # 抽签逻辑在 candidate_with_kind 里（candidate 只是薄包装，v2.28.12）。
+        tree = _ast.parse(textwrap.dedent(inspect.getsource(EmotionLayer.candidate_with_kind)))
         code = _ast.unparse(tree)
         self.assertIn("today", code, "抽签种子里没有日期 → 措辞一辈子不变")
 

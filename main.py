@@ -54,7 +54,8 @@ HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 下面这些是管理员指令，挂在「拟人」组下，要打 /拟人 前缀：
 
 管理员：改配置
-/拟人 设置 - 看常用项；写成「/拟人 设置 城市 大阪」就改一项，立即生效
+/拟人 时间 - 设置她所在的城市（时区）：/拟人 时间 大阪
+/拟人 设置 - 看常用项；写成「/拟人 设置 间隔 30」就改一项，立即生效
 /拟人 参照名称 名字 - 设定注入里代表她的名字（默认跟人设里的名字）
 /拟人 诊断 - 排查模型选择、时区是否生效、上下文多大、状态文件多大
 /拟人 重载 - 重载插件配置
@@ -71,8 +72,6 @@ HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 
 NO_PERMISSION = "❌ 权限不足，该指令仅管理员可用。"
 
-# 多消息合并：防抖胜出的那条把同一批里更早的几条原话挂在事件上，交给 on_llm_request
-# 前置进 prompt。走事件自带的 extra、不走全局字典，合并数据随事件走，跨事件不会串。
 LOG_PREFIX = "[humanoid_core] "
 
 # -------------------- 跨插件门面（契约 v2 主路径） --------------------
@@ -186,9 +185,13 @@ def _sender_name(event: AstrMessageEvent) -> str:
 # 正确判据与框架的 CommandFilter 一致：剪掉唤醒前缀后的文本（message_str）
 # 是否**等于或空格接续**某个已注册指令名。`/今天好累` → 不匹配 → 当聊天；
 # `/查看日程` → 「查看日程」→ 命中 → 当指令。
+#
+# **这份名单必须与真实注册一一对应**：漏掉一条，那条指令就会被当成聊天记账
+# （涨好感、算进「TA 说过的话」、扣精力与社交能量、还可能触发情绪分析调用）。
+# `tests/test_v2290_command_audit.py` 直接从 main.py 的装饰器解析注册名来钉住它。
 COMMAND_NAMES = (
-    "你的状态", "好感度", "情绪详情", "情绪日志", "查看日程", "时间", "叫我", "拟人帮助",
-    "拟人",
+    "你的状态", "亲密状态", "好感度", "情绪详情", "情绪日志", "查看日程", "时间", "叫我",
+    "拟人帮助", "拟人",
 )
 
 
@@ -827,6 +830,40 @@ class HumanoidCore(Star):
     }
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @humanoid_group.command("时间")
+    async def cmd_set_city(self, event: AstrMessageEvent):
+        """`/拟人 时间 大阪`：设置她所在的城市（时区），只改当前这个机器人。
+
+        与 `/时间 城市` 分工：那条谁都能用、只是**查**别处的时间；
+        这条是管理员**改**她的城市（决定作息、天气、季节）。
+        """
+        if not self._is_admin(event):
+            yield event.plain_result(NO_PERMISSION)
+            return
+        value = _arg_after(event.message_str or "", "拟人 时间", "拟人时间").strip()
+        core = self._core(event)
+        if not value:
+            effective = core.clock.city or "（未定）"
+            override = str(core.scope.get_self("tz_city_override", "") or "")
+            tag = "当前 bot 单独设" if override else "跟随全局"
+            yield event.plain_result(
+                f"她所在的城市：{effective}（{tag}）\n"
+                "用法：/拟人 时间 大阪（只改当前这个机器人）；"
+                "写「/拟人 时间 默认」可取消单独设置、回到跟随全局。"
+            )
+            return
+        effective = core.set_city_override(value)
+        follow = str(core.scope.get_self("tz_city_override", "") or "")
+        if follow:
+            yield event.plain_result(
+                f"✅ 当前机器人的城市已单独设为 {effective!r}（只影响这个 bot，其他机器人不变）。"
+            )
+        else:
+            yield event.plain_result(
+                f"✅ 已取消当前机器人的单独城市，回到跟随全局配置（{effective!r}）。"
+            )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("设置")
     async def cmd_settings(self, event: AstrMessageEvent):
         """`/拟人 设置` 看常用项；`/拟人 设置 城市 大阪` 改一项，改完立即生效。"""
@@ -939,9 +976,9 @@ class HumanoidCore(Star):
             override = str(core.scope.get_self("tz_city_override", "") or "")
             effective = core.clock.city or "（未定）"
             tag = "当前 bot 单独设" if override else f"跟随全局 {cfg.timezone_city or '（未定）'}"
-            lines.append(f"- 城市：{effective}（{tag}）　→ /拟人 设置 城市 大阪")
+            lines.append(f"- 城市：{effective}（{tag}）　→ /拟人 时间 大阪")
         else:
-            lines.append(f"- 城市（全局默认）：{cfg.timezone_city or '（未定）'}　→ /拟人 设置 城市 大阪")
+            lines.append(f"- 城市（全局默认）：{cfg.timezone_city or '（未定）'}　→ /拟人 时间 大阪")
         lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人 设置 人设 开")
         lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（每 {cfg.schedule_refresh_minutes} 分钟决定一次要不要排下一段，变动概率 {cfg.schedule_change_chance}%）")
         _lo = cfg.schedule_min_interval_minutes
@@ -1292,8 +1329,8 @@ class HumanoidCore(Star):
             core = self.role_manager.get_or_create(self._self_id(event))
             user_id = self._sender(event)
             text = (getattr(event, "message_str", "") or "").strip()
-            # 兄弟 bot 的发言不该被回复：合并层那道只是不合并，不拦的话另一台 bot
-            # 在群里 @ 一下，本台照样会正经回它一条（多 bot 串台）。
+            # 兄弟 bot 的发言不该被回复：另一台 bot 在群里 @ 一下，本台会正经
+            # 回它一条（多 bot 串台）。
             # 必须 stop_event 才能真的挡下本轮 LLM，光 return 挡不住。
             if user_id and user_id in self._known_role_ids(exclude=self._self_id(event)):
                 stopper = getattr(event, "stop_event", None)
@@ -1454,14 +1491,15 @@ class HumanoidCore(Star):
         except Exception as e:
             logger.debug(f"{LOG_PREFIX} 发送前记录她的发言失败: {e}")
 
-    # -------------------- 多消息合并（消息防抖） --------------------
+    # -------------------- 兄弟 bot 识别（多 bot 同进程部署） --------------------
 
     def _known_role_ids(self, exclude: str = "") -> set:
         """本插件状态里已经见过的其它角色 id（多 bot 同进程部署时的「兄弟」）。
 
         它们发出来的消息在事件层看起来就是普通用户——另一台 bot 的自发消息、
         被平台回灌过来时，sender 是那台 bot 的 id，不等于本台，所以「跳过自己发的」
-        那道闸挡不住。叠进合并 buffer 就会变成「她分不清自己在回谁」。
+        那道闸挡不住。不认出来的话，本台会把兄弟 bot 当成一个陌生用户去回话，
+        情绪与身体账上也多出一个人（多 bot 串台）。
         只认状态里出现过的 id；跨进程的 bot 认不出，README 里写清了边界。
         """
         out: set = set()

@@ -12,6 +12,7 @@ from . import __version__
 from . import life_log
 from . import ccb as _ccb
 from . import outfit
+from . import species
 from .clock import Clock, format_state_timestamp
 from .config import HumanoidConfig
 from .link import SocialSignals, build_contract
@@ -1177,6 +1178,10 @@ class HumanoidCoreInstance:
             "body", "feelings", "form", "activity",
             "ongoing", "wants", "day", "persona", "routine", "weather", "holiday",
             "event",
+            # `wake` 与 `event` 同一个道理：醒来状态（睡着没有 / 惯性还剩几分钟）
+            # 是 v2.28.0 才进契约的块，漏在这里的话，旧 state 里那份没有 wake 的契约
+            # 会一直命中「其余键都没变 → return previous」，新块永远写不进去。
+            "wake",
             # v2.28.9 新增的两个跨插件块：`identity`（她叫什么）/ `outfit`（穿着）。
             # 漏掉它们的话，旧 state 里只有旧契约时其余键都没变 → 直接 return previous，
             # 新块要等身体/天气顺带变化才可能落盘——升级后社交层可能几小时读不到名字。
@@ -1398,29 +1403,100 @@ class HumanoidCoreInstance:
         return profile
 
     def _ccb_persona_prompt(self) -> str:
-        """当前生效人设的正文（人设源缓存里的那份）。拿不到就是空串。
+        """当前生效人设的正文（人设源缓存里的那份）。拿不到就用上次取到的那份。
 
         安全闸和「判不判得出女角色」都要它：两处各取一遍，一旦有一处取到的是
         上一次的人设，就会出现「安全闸说没问题、性别判成男」这种自相矛盾的结论。
+
+        v2.28.13：人设源偶尔会**暂时**取不到（还没加载完 / 加载失败 / 这一轮缓存
+        没命中），原来会直接返回空串 —— 安全闸随之静默失效（线上日志里那行
+        「拿不到人设正文，安全闸本轮不生效」）。现在把**最后一次取到的正文**记住，
+        临时取不到时沿用它：人设没变过，沿用是安全侧；真的人设被清空/换掉时，
+        下一次成功取到就会覆盖它。
         """
         try:
             source = getattr(self, "persona_source", None)
-            if source is None:
-                return ""
-            snap = source.cached_persona(self.role_id)
-            return str(getattr(snap, "prompt", "") or "")
+            snap = source.cached_persona(self.role_id) if source is not None else None
+            prompt = str(getattr(snap, "prompt", "") or "")
         except Exception:
-            return ""
+            prompt = ""
+        if prompt.strip():
+            self._ccb_persona_last = prompt
+            return prompt
+        return str(getattr(self, "_ccb_persona_last", "") or "")
+
+    def ccb_persona_text(self) -> str:
+        """安全闸/性别判定/物种识别共用的人设正文（带「上次取到的那份」兜底）。
+
+        与 `_ccb_persona_prompt` 同一个来源，独立成公开方法是给
+        `prompt_builder._persona_prompt_text` 用的——注入层和状态层必须读同一份，
+        否则会出现「注入里按小马写、安全闸按人类判」。
+        """
+        return self._ccb_persona_prompt()
+
+    def species_profile(self) -> dict[str, Any]:
+        """物种/身体结构档案（缓存按人设正文 + 面板覆盖）。
+
+        只读、判不出给空档；CCB 场景注入与契约导出共用这一份，避免两处各判一次
+        出现「提示词说是小马、契约说是人类」。
+        """
+        try:
+            prompt = self._ccb_persona_prompt() or self._persona_text()
+        except Exception:
+            prompt = ""
+        try:
+            override = str(getattr(self.config, "ccb_species", "") or "")
+        except Exception:
+            override = ""
+        scope = getattr(self, "_scope", None)
+        # **识别一次就固定**：认准了就写进角色状态，之后不再随人设文本抖动。
+        # 只有面板覆盖值变了才重算（那是用户明确改的）；人设改了想重认，
+        # 把 ccb_species 填一个值再清空即可。
+        stored = None
+        if scope is not None:
+            try:
+                stored = scope.get_self("species")
+            except Exception:
+                stored = None
+        if (
+            isinstance(stored, dict)
+            and str(stored.get("_override") or "") == override
+            and str(stored.get("label") or "").strip()
+        ):
+            return stored
+
+        key = (prompt, override)
+        cached = getattr(self, "_species_cache", None)
+        if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == key:
+            return cached[1]
+        try:
+            profile = species.detect(prompt, override=override)
+        except Exception:
+            profile = {"kind": "human", "label": "", "traits": [],
+                       "confidence": 0.0, "terms": [], "source": ""}
+        profile["_override"] = override
+        # 只在「真的认出来了」或「用户手填了」时才固化；人设还没加载时不写死成人类。
+        try:
+            if scope is not None and (
+                override or float(profile.get("confidence") or 0.0) >= species.INJECT_MIN
+            ):
+                scope.set_self("species", profile)
+        except Exception:
+            pass
+        self._species_cache = (key, profile)
+        return profile
 
     def ccb_safety(self) -> str:
         """人设安全闸的判定结果（缓存按人设正文，避免每轮重跑正则）。
 
-        返回拒绝理由，空串表示允许。拿不到人设时放行——与 `looks_female`
-        的「判不出按女」同向：拿不到不等于有风险；真正兜底的是总开关默认关闭。
+        返回拒绝理由，空串表示允许。**从来没取到过人设**时放行——与
+        `looks_female` 的「判不出按女」同向：拿不到不等于有风险；真正兜底的是
+        总开关默认关闭。v2.28.13 起临时取不到会沿用上一次的正文（见
+        `_ccb_persona_prompt`），只有"一次都没拿到过"才真的空着。
 
-        **S7：放行但不能静默。** 人设取不到（还没加载 / 加载失败）时这道闸实际
-        等于没生效，而用户只会觉得"功能怪怪的"。所以第一次遇到空人设就记一条
-        warning——排查时至少能在日志里看到它，而不是靠猜。
+        **S7：放行但不能静默。** 一次都没取到人设时这道闸实际等于没生效，而用户
+        只会觉得"功能怪怪的"。所以第一次遇到空人设就记一条 warning——排查时至少
+        能在日志里看到它，而不是靠猜。
         """
         prompt = self._ccb_persona_prompt()
         cached = getattr(self, "_ccb_safety_cache", None)
@@ -1611,11 +1687,18 @@ class HumanoidCoreInstance:
         lib = float(snap.get("libido") or 0.0)
         base = float(snap.get("base_libido") or 0.0)
         lo = float(snap.get("libido_min") or 0.0)
+        lo_cfg = float(snap.get("libido_min_config") or lo)
         need = float(snap.get("libido_rise_need") or 0.0)
+        # 面板上配的门槛高于「基线 + 每天能涨的量」时按可达值算——这里把两个数
+        # 都写出来，否则用户会以为是 bug（面板说他差 8 点，实际永远差不到）。
+        reach_note = ""
+        if lo_cfg - lo > 1e-6:
+            reach_note = f"（面板 {lo_cfg:.0f} 超出可达上限，按可达值算）"
         rows.append(_status_row(
             "亲近欲", f"{lib:.0f}/50",
             f"基线 {base:.0f}，{_ccb.delta_text(lib - base)}"
-            f" · 门槛 {lo:.0f}/Δ{need:.0f} → {_ccb.threshold_text(lib, base, lo, need)}",
+            f" · 门槛 {lo:.0f}/Δ{need:.0f} → {_ccb.threshold_text(lib, base, lo, need)}"
+            f"{reach_note}",
         ))
         # 好感那一行只提门槛：具体数值在上面「关系」段已经有了，重复一遍反而
         # 让「哪一行才是主数据」变模糊。
@@ -1646,6 +1729,19 @@ class HumanoidCoreInstance:
         else:
             # 余韵不算「在场景里」（那时 ccb_stage 已经归零），由下面单独的余韵行说。
             rows.append(_status_row("场景", "未开始", f"今日 {turns}/{daily_max}"))
+
+        # v2.28.11：这一场谁在动（只统计到场景里，不额外花 token）。
+        if snap.get("in_scene"):
+            try:
+                her = int(float(self._scope.peek_user(user_id, "ccb_her_acts", 0.0) or 0.0))
+                his = int(float(self._scope.peek_user(user_id, "ccb_his_acts", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                her = his = 0
+            if her + his > 0:
+                rows.append(_status_row(
+                    "谁在动", f"她 {her} · 他 {his}",
+                    "这一场累计动作次数（只是记账，不参与判定）",
+                ))
 
         aftercare = float(snap.get("aftercare_left") or 0.0)
         if aftercare > 0:
@@ -1755,6 +1851,18 @@ class HumanoidCoreInstance:
                     state["ccb_site"] = float(site)
                     _ccb.log_append(state, "site", site, now)
                     changed = True
+            # v2.28.11：这一场谁在动。source 已经告诉我们是谁说的——
+            # 她说的正文里的动作是她在动，用户那句里的动作是他在动。
+            acts = int(_ccb.detect_action(text))
+            if acts > 0:
+                key = "ccb_her_acts" if source == "her" else "ccb_his_acts"
+                try:
+                    prev = int(float(state.get(key, 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    prev = 0
+                state[key] = float(prev + acts)
+                state["ccb_last_actor"] = 1.0 if source == "her" else 2.0
+                changed = True
             if changed:
                 self._scope.mark_dirty()
         except Exception:

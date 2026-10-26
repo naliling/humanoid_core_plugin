@@ -253,7 +253,32 @@ def _identity_block(core: Any) -> dict[str, Any]:
         persona_label = str(core.persona_label() or "").strip()
     except Exception:
         persona_label = ""
-    return {"char_name": char_name, "persona_label": persona_label}
+    try:
+        sp = core.species_profile()
+    except Exception:
+        sp = {}
+    if not isinstance(sp, dict):
+        sp = {}
+    try:
+        sp_conf = float(sp.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        sp_conf = 0.0
+    # 只有**真认出来**的才导出：人类不给 "species":"人类" 这种噪音。
+    if sp_conf >= 0.65:
+        sp_label = str(sp.get("label") or "").strip()
+        sp_traits = [
+            str(t) for t in (sp.get("traits") or []) if str(t).strip()
+        ][:4]
+    else:
+        sp_label, sp_traits = "", []
+    return {
+        "char_name": char_name,
+        "persona_label": persona_label,
+        # 物种 / 身体结构（v2.28.11，只加不改）：社交层主动消息也能提一句
+        # 「她是小马」；判不出就是空串/空列表，调用方按「不知道」处理。
+        "species": sp_label,
+        "body_traits": sp_traits,
+    }
 
 
 def _outfit_block(core: Any) -> dict[str, Any]:
