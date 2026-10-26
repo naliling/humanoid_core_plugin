@@ -207,6 +207,16 @@ DIMENSIONS = (
     ("aggression", "base_aggression", AGGRESSION_RANGE),
 )
 
+# ── 旧档案的基线自愈（v2.28.14）──
+#
+# 老版本把「当时的轴值」原样搬进 base_*（有的档案里 base_libido 就是 42、50，
+# base_aggression 是 38）。而 base_* 的定义是「面板里的初始值」，于是这些人
+# 攻击性的地板钉在 38 掉不下来、亲近欲只比基线高一两点——ccb_libido_rise
+# 那条「涨 4 分」一辈子过不去，表现就是「每次就差一点」。
+# 没有打过标记的档案按当前面板值重锚一次；好感那条基线不动（它是棘轮抬过的
+# 关系下限，不是初始值）。
+BASE_SYNC_VERSION = 1
+
 # 关系标签的滞回阈值：三条轴里任意一条相对「上次定档时」漂过这么多分，才承认新档位。
 # 12.5 分一档，所以 6 分是「半个档」——单条消息最多动 2 分，要连着聊三四条才可能跨过去。
 LABEL_ANCHOR_DRIFT = 6.0
@@ -250,7 +260,10 @@ LLM_SKIPPABLE_AFFECTION = -1.5
 # 12~14 天到「关系明显变好」。
 POSITIVE_MESSAGE_CAP = 2.4
 # 亲近欲的同款上限（甜话不但在刷好感，也在刷亲近欲，ccb 门槛全靠它）。
-LIBIDO_MESSAGE_CAP = 1.2
+# v2.28.14：1.2 → 1.5。反馈「亲近欲加得难」——它一天只有 4.5 点额度时，
+# 基线 30 的人要攒四天才能碰一次 ccb 涨幅门槛；单句给到 1.5、日额度 6 之后，
+# 一次认真聊就能把欲望推过门槛。
+LIBIDO_MESSAGE_CAP = 1.5
 # 甜话压脾气也要慢：单句最多压 0.3 分，否则几十句甜话就把攻击性打到 0。
 AGGRESSION_DOWN_CAP = 0.3
 # 每日净增封顶（按她城市的自然日计）。封顶值与时衰半衰期是**配套**的：
@@ -262,7 +275,7 @@ AGGRESSION_DOWN_CAP = 0.3
 # 「ledger≈33」反推出来的日净增。注意 3.1 的均衡是 68 —— **70 在 3.1 下不可达**，
 # 别再照抄旧注释里的「到 70」。
 DAILY_NET_GAIN_CAP = 3.1
-DAILY_LIBIDO_GAIN_CAP = 4.5
+DAILY_LIBIDO_GAIN_CAP = 6.0
 # 同类话递减系数：同一天里第 1/2/3/4+ 次只有对应比例生效。
 # 「新话题不受限」——它只打在反复刷的同类话上（本地词典命中类别）。
 REPEAT_DECAY = (1.0, 0.6, 0.35, 0.2)
@@ -753,6 +766,8 @@ class MoodService:
             "last_decay": self._time(),
             "turn_count": 0,
             "messages_since_llm": 0,
+            # 新建档案的 base 就是面板初始值，不用再等 _repair 重锚一次。
+            "base_sync_v": BASE_SYNC_VERSION,
         }
         user_state["mood"] = record
         self._scope.mark_dirty()
@@ -809,6 +824,17 @@ class MoodService:
             logger.warning(
                 "情绪轴值不可用（%s），已按面板初始值补齐", "、".join(reset)
             )
+        # ── 旧档案的基线自愈（v2.28.14，见文件头 BASE_SYNC_VERSION）──
+        # 只重锚 libido / aggression：这两条的 base 从头到尾就是「面板初始值」；
+        # 老档案把它写成了当时的轴值，于是地板被钉死。好感不动。
+        if record.get("base_sync_v") != BASE_SYNC_VERSION:
+            for key, base_key, bounds in DIMENSIONS[1:]:
+                target = max(bounds[0], min(bounds[1], defaults[key]))
+                if abs(_num_or(record.get(base_key, target), target) - target) > 1e-6:
+                    record[base_key] = target
+                    changed = True
+            record["base_sync_v"] = BASE_SYNC_VERSION
+            changed = True
         for field in ("last_decay", "messages_since_llm", "turn_count"):
             if field not in record:
                 record[field] = 0 if field == "turn_count" else self._time()
@@ -1711,11 +1737,11 @@ class MoodService:
                            warm_key: str = "") -> Delta:
         """把「她还能被暖到多少」的三道闸依次施加到一条正向上。
 
-        1. **单句封顶**：好感最多 +2.4、亲近欲最多 +1.2、脾气最多压 -0.3。
+        1. **单句封顶**：好感最多 +2.4、亲近欲最多 +1.5、脾气最多压 -0.3。
            原来是 2.0（面板 cap）且无递减、无封顶——单句太厚，十句话就能感到关系变了。
         2. **同类递减**：同一天里同类话第 2 次 ×0.6、第 3 次 ×0.35、第 4 次起 ×0.2。
            刷一百句「喜欢你」和说一句「喜欢你」没有区别。
-        3. **每日净增封顶**：按她城市的自然日，正向上的净增封顶 3.1 / 4.5
+        3. **每日净增封顶**：按她城市的自然日，正向上的净增封顶 3.1 / 6.0
            （好感是 `DAILY_NET_GAIN_CAP`，v2.28.9 的 D2 从 6.5 收到 3.1）。
            刷屏一天也不会比认真聊一天额外收获多少。
         只削正向；负向（骂人/冷淡）不动——那个该疼就疼。
