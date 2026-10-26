@@ -8,7 +8,6 @@
 .hc-grid b{color:#1d4ed8}
 .hc-note{background:#eff6ff;border-left:3px solid #60a5fa;border-radius:8px;padding:10px 14px;font-size:14px;color:#1e3a8a;line-height:1.9}
 .hc-chip{display:inline-block;background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.38);border-radius:999px;padding:4px 13px;margin-right:8px;font-size:12px;letter-spacing:1px}
-.hc-tag{display:inline-block;background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;border-radius:999px;padding:5px 13px;margin:6px 8px 0 0;font-size:12px;font-weight:600}
 </style>
 
 <div class="hc-hero" style="background:linear-gradient(135deg,#1d4ed8 0%,#2563eb 55%,#60a5fa 100%);border-radius:20px;padding:30px 28px;color:#fff;box-shadow:0 12px 32px rgba(37,99,235,.28)">
@@ -18,7 +17,7 @@
   <div style="margin-top:16px;font-size:12px;opacity:.9"><span class="hc-chip">身体</span><span class="hc-chip">日程</span><span class="hc-chip">情绪</span></div>
 </div>
 
-<div style="margin:14px 0 6px"><span class="hc-tag">身体</span><span class="hc-tag">日程</span><span class="hc-tag">情绪</span><span class="hc-tag">好感度</span><span class="hc-tag">亲密状态</span><span class="hc-tag">生理模拟</span><span class="hc-tag">生理周期</span><span class="hc-tag">睡眠</span><span class="hc-tag">天气</span><span class="hc-tag">时间</span><span class="hc-tag">位置地区</span><span class="hc-tag">输入状态</span><span class="hc-tag">多角色</span><span class="hc-tag">长期记忆</span></div>
+![身体](https://img.shields.io/badge/-%E8%BA%AB%E4%BD%93-2563eb?style=flat-square) ![日程](https://img.shields.io/badge/-%E6%97%A5%E7%A8%8B-2563eb?style=flat-square) ![情绪](https://img.shields.io/badge/-%E6%83%85%E7%BB%AA-2563eb?style=flat-square) ![好感度](https://img.shields.io/badge/-%E5%A5%BD%E6%84%9F%E5%BA%A6-2563eb?style=flat-square) ![亲密状态](https://img.shields.io/badge/-%E4%BA%B2%E5%AF%86%E7%8A%B6%E6%80%81-2563eb?style=flat-square) ![生理模拟](https://img.shields.io/badge/-%E7%94%9F%E7%90%86%E6%A8%A1%E6%8B%9F-2563eb?style=flat-square) ![生理周期](https://img.shields.io/badge/-%E7%94%9F%E7%90%86%E5%91%A8%E6%9C%9F-2563eb?style=flat-square) ![睡眠](https://img.shields.io/badge/-%E7%9D%A1%E7%9C%A0-2563eb?style=flat-square) ![天气](https://img.shields.io/badge/-%E5%A4%A9%E6%B0%94-2563eb?style=flat-square) ![时间](https://img.shields.io/badge/-%E6%97%B6%E9%97%B4-2563eb?style=flat-square) ![位置地区](https://img.shields.io/badge/-%E4%BD%8D%E7%BD%AE%E5%9C%B0%E5%8C%BA-2563eb?style=flat-square) ![输入状态](https://img.shields.io/badge/-%E8%BE%93%E5%85%A5%E7%8A%B6%E6%80%81-2563eb?style=flat-square) ![多角色](https://img.shields.io/badge/-%E5%A4%9A%E8%A7%92%E8%89%B2-2563eb?style=flat-square) ![长期记忆](https://img.shields.io/badge/-%E9%95%BF%E6%9C%9F%E8%AE%B0%E5%BF%86-2563eb?style=flat-square)
 
 > 插件负责她的身体、日程、情绪和关系背景；具体怎么说话，仍然由大模型按人设自己决定。
 
