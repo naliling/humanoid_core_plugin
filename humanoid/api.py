@@ -855,6 +855,10 @@ class CoreFacade:
             "base_affection": _num(profile.get("base_affection")),
             "nickname": _s(user_state.get("nickname")),
             "last_interaction": _num(user_state.get("last_interaction")),
+            # 对话轮数与相识时间：主动层判断「这段关系够不够近」时不用再自己数消息，
+            # 也不会把「好感被 override 钉成 100、涨幅为 0」的人误判成生人。
+            "turns": int(_num(profile.get("turn_count"), 0.0) or 0),
+            "first_met": _num(user_state.get("first_met")),
             "intimacy_done_count": done,
             "intimacy_satisfy": round(satisfy, 1),
             "intimacy_last_at": last_at,

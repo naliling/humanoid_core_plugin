@@ -524,6 +524,14 @@ class FacadeUserBlockTest(unittest.TestCase):
         self.assertEqual(brief["relationship"]["last_interaction"],
                          brief["user"]["last_interaction"])
 
+    def test_relationship_carries_turns_and_first_met(self):
+        """v2.28.17：主动层判断「关系够近」用的对话轮数/相识时间也在关系快照里。"""
+        brief = self.facade.brief("bot1", "10001", task="status")
+        rel = brief["relationship"]
+        self.assertIn("turns", rel)
+        self.assertIsInstance(rel["turns"], int)
+        self.assertAlmostEqual(rel["first_met"], brief["user"]["first_met"], places=1)
+
     def test_call_name_falls_back_to_display_name(self):
         # 有名片名、但还没有「认定称呼」的人：这正是大多数用户的样子。
         self.core.mood.note_display_name("20002", "阿哲")

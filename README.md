@@ -8,7 +8,7 @@
 > 不是一句人设，是一整天的生活。
 > 插件负责她的身体、日程、情绪和关系背景；怎么说话，仍然由大模型按人设自己决定。
 
-![version](https://img.shields.io/badge/version-v2.28.16-2563eb?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.28.17-2563eb?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20%E4%BB%BB%E6%84%8F%20AstrBot%20%E5%B9%B3%E5%8F%B0-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
