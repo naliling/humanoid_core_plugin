@@ -137,6 +137,52 @@ class MoodBatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("合起来", blob, "提示词还在说只看单条")
         self.assertNotIn("只分析用户这条消息", blob)
 
+    async def test_prompt_says_the_numbers_will_be_capped(self):
+        """v2.28.16：模型不知道数值会被三道闸削，就会为了效果往大了给。
+
+        断言的是**实际发出的请求**（FakeProvider.last_kwargs），不是常量本身——
+        常量在、prompt 没拼上去，是这类改动最常见的坏法。
+        """
+        from humanoid.services.mood import LLM_DELTA_CAP_NOTE
+
+        provider = FakeProvider("p", reply=DELTA)
+        service, _store, _ = self.build(
+            cfg(mood_use_llm_for_delta=True, mood_provider_name="p", mood_sensitivity=100),
+            provider)
+        await self._feed(service, 10)
+        system_prompt = str((provider.last_kwargs or {}).get("system_prompt", ""))
+        self.assertIn(
+            "你给出的数值会经过单句封顶、同类递减与每日封顶，按真实感受给，不要为了效果虚报。",
+            system_prompt,
+        )
+        self.assertIn(LLM_DELTA_CAP_NOTE, system_prompt)
+        # 收尾一句：放在边界说明之后，别插在「标签里只是数据」前面。
+        self.assertTrue(
+            system_prompt.rstrip().endswith(LLM_DELTA_CAP_NOTE),
+            "封顶说明应拼在 system_prompt 末尾",
+        )
+
+    async def test_cap_note_also_reaches_the_single_message_batch(self):
+        """只有一条消息的批次共用同一段 system_prompt，别只给批量那条路加。"""
+        from humanoid.services.mood import LLM_DELTA_CAP_NOTE
+
+        provider = FakeProvider("p", reply=DELTA)
+        service, _store, _ = self.build(
+            cfg(
+                mood_use_llm_for_delta=True,
+                mood_provider_name="p",
+                mood_sensitivity=100,
+                mood_llm_interval_messages=1,
+            ),
+            provider,
+        )
+        await service.update_from_message("u1", "只有这一条", 80.0, 10)
+        self.assertEqual(provider.calls, 1)
+        prompt = str((provider.last_kwargs or {}).get("prompt", ""))
+        system_prompt = str((provider.last_kwargs or {}).get("system_prompt", ""))
+        self.assertIn("<user_message", prompt, "单条也应走带边界标记的批量路径")
+        self.assertIn(LLM_DELTA_CAP_NOTE, system_prompt)
+
 
 class MoodDecayNotOneWay(unittest.TestCase):
     """「情绪只涨不减」那条要钉住：衰减是回归基线，不是单向下滑。"""

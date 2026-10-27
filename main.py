@@ -33,6 +33,7 @@ from .humanoid.role_manager import RoleManager
 from .humanoid.state import StateStore
 from .humanoid.clock import Clock
 from .humanoid.input_state import InputStateNotifier
+from .humanoid.sibling_chat import SiblingChatGuard
 from .humanoid import memory_link
 
 DATA_SUBDIR = ("plugin_data", "humanoid_core")
@@ -73,6 +74,11 @@ HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
 NO_PERMISSION = "❌ 权限不足，该指令仅管理员可用。"
 
 LOG_PREFIX = "[humanoid_core] "
+
+# 兄弟 bot 互聊判断在同一个 event 上只做一次。`on_llm_request` 在工具循环/重试里会对
+# 同一条消息再触发，每触发一次就 allow() 一次会把 3 次额度在**一条**消息上吃光
+# （第 2 轮就被自己挡下）。结果按 event 缓存，复用框架的 extra 通道。
+_SIBLING_DECISION_KEY = "_hcore_sibling_chat_allowed"
 
 # -------------------- 跨插件门面（契约 v2 主路径） --------------------
 #
@@ -438,6 +444,9 @@ class HumanoidCore(Star):
         # 进程内内存即可——重启后第一次只记账不写（见 `_write_finished_process`）。
         self._last_written_process: dict[str, str] = {}
         self._life_write_stamps: dict[str, list[float]] = {}
+        # 兄弟 bot 互聊护栏：同平台另一个 bot 可以聊，但同一对角色在窗口内最多连续
+        # 放行 3 次；真人一开口清零（见 `humanoid/sibling_chat.py`）。
+        self._sibling_guard = SiblingChatGuard()
 
         state_path = data_dir / "state.json"
         self._state_store = StateStore(state_path, lambda: self._config.state_flush_interval_seconds, logger)
@@ -1326,17 +1335,29 @@ class HumanoidCore(Star):
             is_group = not _is_private_chat(event)
             if not self.engine.environment_allows(not is_group):
                 return
-            core = self.role_manager.get_or_create(self._self_id(event))
+            role_id = self._self_id(event)
+            core = self.role_manager.get_or_create(role_id)
             user_id = self._sender(event)
             text = (getattr(event, "message_str", "") or "").strip()
-            # 兄弟 bot 的发言不该被回复：另一台 bot 在群里 @ 一下，本台会正经
-            # 回它一条（多 bot 串台）。
-            # 必须 stop_event 才能真的挡下本轮 LLM，光 return 挡不住。
-            if user_id and user_id in self._known_role_ids(exclude=self._self_id(event)):
-                stopper = getattr(event, "stop_event", None)
-                if callable(stopper):
-                    stopper()
-                return
+            # 兄弟 bot 的发言：**可以聊，但防互刷**。
+            #
+            # 以前这里无条件 stop_event，同机另一台 bot 永远得不到回复（看起来像装死）；
+            # 完全放开又会两台机器你一句我一句刷到天亮。所以按
+            # `SiblingChatGuard` 的额度判：放行 → 不 stop，让主链路正常回它；
+            # 额度用完 → stop_event 挡下本轮 LLM（光 return 挡不住）。
+            #
+            # **只在真正会触发回复的这个钩子里判**（另一个 on_llm_request 是输入状态，
+            # 不碰它），并按 event 缓存结论，同一条消息被工具循环重放时不重复吃额度。
+            if user_id and user_id in self._known_role_ids(exclude=role_id):
+                if not self._sibling_chat_allowed(role_id, user_id, event):
+                    stopper = getattr(event, "stop_event", None)
+                    if callable(stopper):
+                        stopper()
+                    logger.debug(
+                        f"{LOG_PREFIX} 兄弟 bot {user_id} 互聊额度用完，挡下这一轮"
+                    )
+                    return
+                logger.debug(f"{LOG_PREFIX} 兄弟 bot {user_id} 互聊放行")
             said = text
             # 对话对方的名字：开关开着才用真名（默认关=写「TA」）。取的是**这条消息的
             # 发送者名**——群聊是群名片、私聊是 QQ 昵称，不依赖 AstrBot 的任何配置开关。
@@ -1513,6 +1534,34 @@ class HumanoidCore(Star):
             pass
         return out
 
+    def _sibling_chat_allowed(
+        self, role_id: str, peer_id: str, event: AstrMessageEvent
+    ) -> bool:
+        """这条兄弟 bot 的发言放不放行；同一个 event 只判一次（结论缓存在 extra 上）。
+
+        为什么缓存：`on_llm_request` 在工具循环/重试里会对同一条消息反复触发。每触发
+        一次就 `allow()` 一次的话，3 次额度会被**一条**消息吃光（第 2 轮就被自己挡下），
+        而实际只发生了一轮对话，额度就白扣了。
+
+        读缓存。取不到 / 框架没有 extra 通道时退回现算——宁可多判一次，也不能不判。
+        """
+        reader = getattr(event, "get_extra", None)
+        if callable(reader):
+            try:
+                cached = reader(_SIBLING_DECISION_KEY)
+            except Exception:
+                cached = None
+            if cached is not None:
+                return bool(cached)
+        allowed = self._sibling_guard.allow(role_id, peer_id, time.time())
+        writer = getattr(event, "set_extra", None)
+        if callable(writer):
+            try:
+                writer(_SIBLING_DECISION_KEY, allowed)
+            except Exception:
+                pass
+        return allowed
+
 
     # -------------------- 消息事件监听 --------------------
 
@@ -1526,11 +1575,18 @@ class HumanoidCore(Star):
             user_id = self._sender(event)
             if user_id == role_id:
                 return
-            # 兄弟 bot 的消息不是「用户说了什么」：不记账、也不该触发回复。
+            # 兄弟 bot 的消息不是「用户说了什么」：不记账、也不该改她的情绪/身体。
             # 多台 bot 同进程部署时，另一台 bot 的群发言在事件层就是普通成员，
             # sender 不等于本台，前面那道「跳过自己」挡不住。只认状态里见过的角色 id。
+            #
+            # 注意分工：**回复与否**由 `inject_context` 里的 `_sibling_chat_allowed`
+            # 决定（放行时主链路照常回它）；这里只做记账隔离，不让 bot 的发言进
+            # 情绪/身体账本——她会因为另一个 bot 的话改心情，那才是真串台。
             if user_id and user_id in self._known_role_ids(exclude=role_id):
                 return
+            # 真人一开口，机器对机器那条链就该结束：清掉本角色名下所有 peer 的互聊额度。
+            # 放在空文本/指令早退之前：一条「嗯」或一条指令也是人回来了。
+            self._sibling_guard.note_human(role_id)
             # 任何一条真实用户消息都算「有人在用」：松开空闲静默，让日程重新跟上。
             # 放在后续所有早退之前，否则「被过滤的环境」会把静默一直吊着。
             self.call_gate.note_interaction()

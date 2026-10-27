@@ -13,7 +13,7 @@ desc: |
   长期记忆不归她管：装了「我会牢牢记住你」时，她按你这句话去读，也把自己生活里的事写回去。
 
   配置不复杂，真正要改的就那几项，额外的都标着【进阶】。
-version: 2.28.14
+version: 2.28.16
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.0.0"

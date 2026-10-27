@@ -8,7 +8,7 @@
 > 不是一句人设，是一整天的生活。
 > 插件负责她的身体、日程、情绪和关系背景；怎么说话，仍然由大模型按人设自己决定。
 
-![version](https://img.shields.io/badge/version-v2.28.14-2563eb?style=flat-square)
+![version](https://img.shields.io/badge/version-v2.28.16-2563eb?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20%E4%BB%BB%E6%84%8F%20AstrBot%20%E5%B9%B3%E5%8F%B0-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -56,7 +56,7 @@
 
 - **时间时区** —— 按她的城市过，作息跟着走；
 - **天气** —— 她那边什么天，要不要带伞她自己知道；
-- **节日季节** —— 知道今天是什么日子。
+- **节日季节** —— 知道今天是什么日子，含农历节日与二十四节气；
 
 ### 互动细节
 
@@ -64,7 +64,8 @@
 - **多角色** —— 每个角色各自生活，互不覆盖；
 - **长期记忆** —— 装了记忆插件就按你这句话去读，没装照常跑；
 - **未完事项** —— 记着手上还开着的事，最多三条、最多放三天；
-- **对话间隔** —— 知道你多久没来，但不逼她问「你去哪了」。
+- **对话间隔** —— 知道你多久没来，但不逼她问「你去哪了」；
+- **同机 bot** —— 可以聊；同一对 bot 十分钟最多三轮，真人一开口就清零。
 
 ---
 

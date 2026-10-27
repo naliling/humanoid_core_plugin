@@ -444,7 +444,9 @@ class SwitchEffectsTest(unittest.TestCase):
         self.assertEqual(resolve_holiday(moment, cfg.holidays), "我们的纪念日")
         clock = Clock(lambda: cfg)
         self.assertEqual(clock.holiday(moment), "我们的纪念日")
-        self.assertEqual(resolve_holiday(moment, []), "")
+        # 没有自定义节日时**不再是空串**：v2.28.16 起 2026-09-25 在农历表里是中秋节。
+        # 这条断言同步改成新口径，否则「自定义盖住农历」这件事反而测不出来。
+        self.assertEqual(resolve_holiday(moment, []), "中秋节")
 
 
 class NicknameGateTest(unittest.TestCase):
