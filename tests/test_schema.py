@@ -81,8 +81,36 @@ class SchemaTest(unittest.TestCase):
             "schedule_provider_cooldown_minutes",
             "mood_provider_name",
             "state_flush_interval_seconds",
+            "input_state_min_interval_seconds",
+            "input_state_max_frames",
         ):
             self.assertIn(key, self.schema)
+
+    def test_field_count_is_pinned(self):
+        """字段数变化必须同步改这里（v3.0.0 = 134：新增「正在输入」节流两项）。
+
+        面板项数在 README / main.py 的帮助文案里也被引用，字段增删时一并对齐，
+        否则用户看到的「共 N 项」与面板实际数量对不上。
+        """
+        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 134)
+        self.assertEqual(len(self.schema), 134)
+
+    def test_input_state_throttle_keys_are_consistent(self):
+        """v3.0.0 新增的两个「正在输入」节流项：类型/区间/默认值三处一致。"""
+        interval = self.schema["input_state_min_interval_seconds"]
+        self.assertEqual(interval["type"], "float")
+        self.assertEqual(interval["default"], 0.3)
+        self.assertEqual((interval["minimum"], interval["maximum"]), (0.1, 10.0))
+        frames = self.schema["input_state_max_frames"]
+        self.assertEqual(frames["type"], "int")
+        self.assertEqual(frames["default"], 60)
+        self.assertEqual((frames["minimum"], frames["maximum"]), (5, 500))
+        built = HumanoidConfig.from_raw({
+            "input_state_min_interval_seconds": 0.3,
+            "input_state_max_frames": 60,
+        })
+        self.assertEqual(built.input_state_min_interval_seconds, 0.3)
+        self.assertEqual(built.input_state_max_frames, 60)
 
 
 class SliderKeyTest(unittest.TestCase):

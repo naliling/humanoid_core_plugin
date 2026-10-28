@@ -46,14 +46,14 @@ LEGACY_STATE = {
     "_cached_weather_obj": {"weather": "晴 🌡️ 31°C", "env": "当前城市 [Heyuan,CN] 天气：晴"},
     "_last_weather_fetch": "2026-08-20 20:00:00",
     "_cached_location": "Heyuan,CN",
-    "nicknames": {"3881756548": "娜莉灵", "10086": "小十"},
-    "user_last_seen": {"3881756548": 1_780_000_000.0, "10086": 1_779_000_000.0},
+    "nicknames": {"100000003": "娜莉灵", "10086": "小十"},
+    "user_last_seen": {"100000003": 1_780_000_000.0, "10086": 1_779_000_000.0},
     "last_message": {
-        "3881756548": {"text": "那我先睡了", "timestamp": 1_780_000_000.0}
+        "100000003": {"text": "那我先睡了", "timestamp": 1_780_000_000.0}
     },
     "_energy_noise_date": "2026-08-20",
     "moods": {
-        "3881756548": {
+        "100000003": {
             "affection": 78.5,
             "libido": 41.2,
             "aggression": 6.0,
@@ -66,7 +66,7 @@ LEGACY_STATE = {
     },
     "_mood_decay_last_run": 1_780_000_100.0,
     "mood_logs": {
-        "3881756548": [
+        "100000003": [
             {
                 "time": "2026-08-20 19:02:11",
                 "event": "好感度上升至 78.5",
@@ -77,7 +77,7 @@ LEGACY_STATE = {
         ]
     },
     "social_energy": 44.0,
-    "mood_tags": {"3881756548": "状态平稳，开心，亲切"},
+    "mood_tags": {"100000003": "状态平稳，开心，亲切"},
     "_last_social_energy_reset_date": "2026-08-20",
 }
 
@@ -95,20 +95,20 @@ class LegacyStateTest(unittest.TestCase):
         role = self.load().data["roles"]["default"]
         self_state = role["self"]
         users = role["users"]
-        self.assertEqual(users["3881756548"]["nickname"], LEGACY_STATE["nicknames"]["3881756548"])
+        self.assertEqual(users["100000003"]["nickname"], LEGACY_STATE["nicknames"]["100000003"])
         self.assertEqual(users["10086"]["nickname"], LEGACY_STATE["nicknames"]["10086"])
-        self.assertEqual(users["3881756548"]["mood"], LEGACY_STATE["moods"]["3881756548"])
-        self.assertEqual(users["3881756548"]["mood_logs"], LEGACY_STATE["mood_logs"]["3881756548"])
+        self.assertEqual(users["100000003"]["mood"], LEGACY_STATE["moods"]["100000003"])
+        self.assertEqual(users["100000003"]["mood_logs"], LEGACY_STATE["mood_logs"]["100000003"])
         self.assertEqual(
-            users["3881756548"]["mood_tag"], LEGACY_STATE["mood_tags"]["3881756548"]
+            users["100000003"]["mood_tag"], LEGACY_STATE["mood_tags"]["100000003"]
         )
         self.assertEqual(
-            users["3881756548"]["last_interaction"],
-            LEGACY_STATE["user_last_seen"]["3881756548"],
+            users["100000003"]["last_interaction"],
+            LEGACY_STATE["user_last_seen"]["100000003"],
         )
         self.assertEqual(
-            users["3881756548"]["last_message"]["text"],
-            LEGACY_STATE["last_message"]["3881756548"]["text"],
+            users["100000003"]["last_message"]["text"],
+            LEGACY_STATE["last_message"]["100000003"]["text"],
         )
         self.assertEqual(self_state["energy"], 63.4)
         self.assertEqual(self_state["social_energy"], 44.0)
@@ -165,20 +165,20 @@ class LegacyEngineTest(unittest.IsolatedAsyncioTestCase):
         await roles.start()
         core = roles.get_or_create("default")
         try:
-            self.assertEqual(core.mood.nickname("3881756548"), "娜莉灵")
-            profile = core.mood.profile("3881756548")
+            self.assertEqual(core.mood.nickname("100000003"), "娜莉灵")
+            profile = core.mood.profile("100000003")
             self.assertEqual(profile["turn_count"], 142)
             self.assertAlmostEqual(profile["base_affection"], 60.0)
             self.assertIn("last_decay", profile, "老档案缺的字段应被补齐")
-            self.assertEqual(core.mood.tag("3881756548"), "状态平稳，开心，亲切")
+            self.assertEqual(core.mood.tag("100000003"), "状态平稳，开心，亲切")
 
             core.schedule.seed_first_segment()
-            snap = core.snapshot("3881756548")
+            snap = core.snapshot("100000003")
             self.assertTrue(snap["today"])
             self.assertTrue(snap["schedule"]["slots"], "老档案启动后也要有当下这一段")
             self.assertLessEqual(snap["energy"]["value"], snap["energy"]["max"])
-            self.assertIn("default", "\n".join(core.status_lines("3881756548")))
-            self.assertIn("好感度上升至 78.5", core.mood.logs_text("3881756548"))
+            self.assertIn("default", "\n".join(core.status_lines("100000003")))
+            self.assertIn("好感度上升至 78.5", core.mood.logs_text("100000003"))
         finally:
             await roles.stop()
             await store.stop()  # 必须显式落盘，否则文件里还是迁移前的旧结构
@@ -186,7 +186,7 @@ class LegacyEngineTest(unittest.IsolatedAsyncioTestCase):
         saved = json.loads((datadir / "state.json").read_text(encoding="utf-8"))
         users = saved["roles"]["default"]["users"]
         self.assertEqual(users["10086"]["nickname"], "小十")
-        self.assertEqual(users["3881756548"]["nickname"], "娜莉灵")
+        self.assertEqual(users["100000003"]["nickname"], "娜莉灵")
         self.assertEqual(saved["_state_version"], STATE_VERSION)
 
 

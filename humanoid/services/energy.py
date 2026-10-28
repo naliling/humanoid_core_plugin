@@ -158,20 +158,18 @@ class EnergyService:
             return self.energy
 
         energy = self.energy
-        if last.date() < now.date():
-            # 跨天：先落到新一天的起点，再从 00:00 结算到现在。
-            #
-            # 旧写法在这里直接 `return self._reset_for_new_day(...)`，00:00→now 那一段
-            # 一分未计——实测 `last_update=05-31 23:59`、`now=06-01 08:00`、日程
-            # `00:00–24:00 rate=-0.15` 时返回 79.61，八小时的消耗凭空消失。
-            #
-            # 新起点本身已经代表「睡醒后的状态」（`_reset_for_new_day`），所以这一截
-            # 只结算**消耗**，不再叠加恢复：否则同一夜的休息会被算两遍（起点一次、
-            # 午夜后一次），凌晨三点就能把精力顶到上限。
-            energy = self._new_day_baseline(cfg)
-            energy = self._settle(energy, _day_start(now), now, cfg, recovery=False)
-        else:
-            energy = self._settle(energy, last, now, cfg)
+        # **跨天不再给无条件的新一天基线**（v3.0.0，审核 P1-3）。
+        #
+        # 旧写法：只要 `last.date() < now.date()` 就把精力重置到 ~80（`_new_day_baseline`），
+        # 再从 00:00 结算消耗。触发条件是**日历跨天**而不是「睡醒」——夜猫子 23:59 还
+        # 醒着、日程写着「做事」，00:01 却凭空回血（实测 30.00 → 83.30，+53.30）。
+        # 熬夜越累、午夜回血越多，"累"这个轴失去意义。
+        #
+        # 新口径：**从 last_update 起连续结算**，跨天也一样。睡眠恢复由日程里的睡眠段
+        # 与自然恢复积分给出（它们本来就是按分钟计的），不再需要「新一天起点」这个
+        # 魔法数字。跨多天时 `_settle_span` 按本地午夜切段，避免把次日凌晨的日程段
+        # 错配到前一天。
+        energy = self._settle_span(energy, last, now, cfg)
         energy = self._apply_body_ceiling(energy, cfg)
         data["energy"] = round(energy, 1)
         data["last_update"] = format_state_timestamp(now)
@@ -189,14 +187,6 @@ class EnergyService:
             return energy
         return min(energy, max(0.0, ceiling))
 
-    def _new_day_baseline(self, cfg: HumanoidConfig) -> float:
-        """新一天的起点不是固定 80：欠着睡眠债的时候，起床也不会「满血」。"""
-        body = self._body_axis()
-        penalty = body.sleep_debt_penalty() if body is not None else 1.0
-        return self._clamp(
-            DAY_START_ENERGY * random.uniform(0.95, 1.05) * penalty, cfg, floor=5.0
-        )
-
     def _body_axis(self) -> Any:
         if self._body is None:
             return None
@@ -204,6 +194,36 @@ class EnergyService:
             return self._body()
         except Exception:
             return None
+
+    def _settle_span(
+        self,
+        energy: float,
+        start: datetime,
+        end: datetime,
+        cfg: HumanoidConfig,
+    ) -> float:
+        """把 start→end 按**本地自然日**切段结算，跨多天也正确。
+
+        日程时段是「某天的第几分钟」，而 `_compute_delta` 拿 `anchor`（段起点）的
+        日期去还原时段。跨天时如果整段用同一个 anchor，次日 00:00–08:00 的睡眠段会
+        被算到前一天（时间戳落在窗口之外）→ 那一夜等于没睡，又会退回「午夜凭空回血」
+        的另一头。这里在每段本地午夜切开：每段都用自己那天的 anchor。
+        """
+        cursor = start
+        # 防御：时区/DST 极端场景下日期推进异常时不至于死循环（正常最多跨几天）。
+        for _ in range(64):
+            if cursor >= end:
+                break
+            day_start = _day_start(cursor)
+            next_midnight = datetime.combine(
+                day_start.date() + timedelta(days=1), time(0, 0), tzinfo=cursor.tzinfo
+            )
+            segment_end = min(end, next_midnight)
+            if segment_end <= cursor:
+                break
+            energy = self._settle(energy, cursor, segment_end, cfg)
+            cursor = segment_end
+        return energy
 
     def _settle(
         self,
@@ -246,15 +266,23 @@ class EnergyService:
         body = self._body_axis()
         discomfort_factor = body.discomfort_factor() if body is not None else 1.0
 
-        phase_idx = cfg.cycle_phase_index(self.cycle_day)
-        consumption_factor = (
-            CONSUMPTION_PHASE_FACTORS[phase_idx]
-            if phase_idx < len(CONSUMPTION_PHASE_FACTORS)
-            else 1.0
-        )
+        # 周期调制只在 `enable_cycle` 打开时生效（v3.0.0，审核 P2-14）：
+        # 用户把面板上的生理周期关掉，情绪/精力就不该还按 ×1.3~1.5 摆动。
+        # 关闭时用标准 28 天轴的第 5 段（系数 1.0）作为中性档。
+        if cfg.enable_cycle:
+            phase_idx = cfg.cycle_phase_index(self.cycle_day)
+            consumption_factor = (
+                CONSUMPTION_PHASE_FACTORS[phase_idx]
+                if phase_idx < len(CONSUMPTION_PHASE_FACTORS)
+                else 1.0
+            )
+            recovery_factor = cfg.phase_recovery_multiplier(self.cycle_day)
+        else:
+            phase_idx = 4  # 中性档：CONSUMPTION_PHASE_FACTORS[4] == 1.0
+            consumption_factor = 1.0
+            recovery_factor = 1.0
         recovery_per_min = max(0.0, float(cfg.energy_natural_recovery_per_minute))
         recovery_step = max(1, int(cfg.energy_natural_recovery_interval_minutes))
-        recovery_factor = cfg.phase_recovery_multiplier(self.cycle_day)
 
         total = 0.0
         covered: list[tuple[float, float]] = []
@@ -312,12 +340,8 @@ class EnergyService:
         credited = (int(max(0.0, minutes)) // step) * step
         if credited <= 0:
             return 0.0
-        return (
-            per_min
-            * cfg.phase_recovery_multiplier(self.cycle_day)
-            * max(0.0, float(cfg.energy_decay_rate))
-            * credited
-        )
+        recovery_factor = cfg.phase_recovery_multiplier(self.cycle_day) if cfg.enable_cycle else 1.0
+        return per_min * recovery_factor * max(0.0, float(cfg.energy_decay_rate)) * credited
 
     def consume_for_message(self) -> float:
         cfg = self.config

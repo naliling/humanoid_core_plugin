@@ -290,6 +290,11 @@ class HumanoidConfig:
     input_state_enabled: bool = True
     input_state_interval_seconds: float = 0.5
     input_state_timeout_seconds: float = 120.0
+    # 「正在输入」上报节流（v3.0.0，P2-12）：单条 20 秒回复按 0.1 秒上报就是 200 次
+    # call_action，NapCat/QQ 侧有风控风险。最小间隔管「两次上报之间至少隔多久」，
+    # 最大帧数管「一条回复最多报多少帧」——两个闸都只减少上报，不影响视觉连续。
+    input_state_min_interval_seconds: float = 0.3
+    input_state_max_frames: int = 60
 
     inject_activity_context: str = "medium"
     # 注入的 Token 硬预算：超了按显著度从低到高丢句，必需品（时间/称呼/场景）永不丢。
@@ -399,7 +404,12 @@ class HumanoidConfig:
     # 整条用户记录的静默期（天）：只剩称呼/初遇时间这种「没有可清理内容」的条目，
     # 不活跃超过这么久就**整条删掉**。原来写死 90 天（`mood.STALE_USER_RETENTION_DAYS`，
     # 代码注释里就写着「配置项由主会话另行添加」）——一个 bot 攒到 7000+ 用户、
-    # state.json 2.5 MB，就是这个数字撑出来的。0 = 永不整条删除（不推荐）。
+    # state.json 2.5 MB，就是这个数字撑出来的。
+    #
+    # v3.0.0 语义修正（P2-09）：**0 = 永不按静默期删除整条用户记录**（以前 0 会退回
+    # 常量 90 天，用户设 0 反而更早丢称呼/初遇，与注释完全相反）。>0 时只删「仅剩
+    # 称呼/初遇这类没有可清理字段」的条目；纯空壳 `{}` 条目不承载任何用户数据，
+    # 仍会被清掉（这是 0 的唯一例外，属存储清理，见 mood.py 的实现注释）。
     stale_user_retention_days: int = 30
     # 自动认定称呼：用户还没设过称呼时，从消息带的名字（群聊优先群名片）认一次怎么叫 TA。
     # 只填空白、门槛很严、认过之后永不改动——用户 /叫我 设的更不会被它碰。
@@ -567,6 +577,8 @@ class HumanoidConfig:
             input_state_enabled=b("input_state_enabled"),
             input_state_interval_seconds=f("input_state_interval_seconds", 0.1, 10.0),
             input_state_timeout_seconds=f("input_state_timeout_seconds", 10.0, 600.0),
+            input_state_min_interval_seconds=f("input_state_min_interval_seconds", 0.1, 10.0),
+            input_state_max_frames=i("input_state_max_frames", 5, 500),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
             # 这一项曾经是 113 个字段里唯一不走 i()/f() 的（直接 int(src.get(...))），
             # 面板里填个 'abc' 或 '3000.0' 就会抛 ValueError 一路冒到 initialize()，
@@ -842,50 +854,142 @@ DEFAULTS = HumanoidConfig()
 # 但 AstrBot 更新配置只补缺不覆盖，老用户会永远停在 Heyuan,CN 上——于是「她在北京」
 # 但「她那边天气是河源」。
 LEGACY_WEATHER_LOCATION = "Heyuan,CN"
-# v2.16.7 之前的日程默认：时段数 16、旧偏好文案。只迁移仍停在旧默认值的用户。
+# v2.16.7 之前的日程默认：时段数 16、旧偏好文案。
 LEGACY_SCHEDULE_MAX_SLOTS = 16
 LEGACY_SCHEDULE_PROMPT_EXTRA = "休闲日常，愉快的生活。"
 # v2.27.2 之前的初始好感默认值。46 起步偏亲（叠加当时的单句 2 分收益，“几个指令”就能起两度）；
-# 改成中性起点 35，只动仍停在 46 的配置——自己改过的一律不碰。
+# 改成中性起点 35。
 LEGACY_MOOD_INITIAL_AFFECTION = 46
+# v2.14 之前的周期恢复倍率是 6 段；现在按 8 个阶段取值，6 段会被 `_phase_multipliers`
+# 整表退回默认并**每次启动刷一条 WARN**（现网 6 个日志合计 114 次），用户自定义的 6 个
+# 倍率永久失效。长度=6 与现在的语义严格冲突（6 个数写不出 8 段），可以判定为旧格式
+# 安全迁移，并写回配置让面板与真实行为一致（P2-31）。
+LEGACY_PHASE_MULTIPLIER_COUNT = 6
+
+# 「旧默认值本身就是一个合法的用户选择」的项（P2-10）。无法与「从没动过的旧默认」
+# 区分：AstrBot 在插件初始化**之前**就构造 AstrBotConfig 并调用 check_config_integrity，
+# 把 schema 里的全部默认值补进配置再 save_config()——所以 `raw_config` 永远包含全部键，
+# 「键存在」不能证明用户写过。这些项不再按「等于旧默认」静默改掉，只记一条 INFO；
+# 调用方只有拿到 `explicit_keys`（能证明用户显式设置过）时才可能安全迁移。
+_USER_CHOICE_LEGACY_DEFAULTS: dict[str, Any] = {
+    "mood_initial_affection": LEGACY_MOOD_INITIAL_AFFECTION,
+    "schedule_max_slots": LEGACY_SCHEDULE_MAX_SLOTS,
+    "schedule_prompt_extra": LEGACY_SCHEDULE_PROMPT_EXTRA,
+    "inject_activity_context": "low",
+}
 
 
-def plan_default_migrations(raw: Mapping[str, Any] | None) -> dict[str, Any]:
-    """算出需要一次性提升的旧默认值。
+def _phase_multiplier_count(value: Any) -> int:
+    """周期恢复倍率列表里到底有几个数；不是列表（或坏值）返回 -1。"""
+    if isinstance(value, (str, bytes, Mapping)) or not isinstance(value, Iterable):
+        return -1
+    try:
+        return len(list(value))
+    except TypeError:
+        return -1
+
+
+def _looks_like_legacy_default(current: Any, legacy: Any) -> bool:
+    """当前值是否**恰好**还是某个旧默认值（只用于「要不要提醒」，不再据此改配置）。"""
+    if isinstance(legacy, str):
+        return isinstance(current, str) and current.strip() == legacy.strip()
+    if isinstance(legacy, bool):
+        return current is legacy
+    if isinstance(legacy, (int, float)) and not isinstance(current, bool):
+        try:
+            return float(current) == float(legacy)
+        except (TypeError, ValueError):
+            return False
+    return current == legacy
+
+
+def _notify_user_choice_not_migrated(key: str, legacy: Any, new_value: Any) -> None:
+    """用户显式合法选择 = 旧默认值时：保留现值，只 INFO 说明为什么不动（P2-10）。"""
+    logger.info(
+        "配置项 %s 仍是旧默认值 %r：这个值本身就是合法的手动选择，无法与「从没改过的"
+        "旧默认」区分，为避免覆盖你的显式设置本次不自动迁移（新默认 %r）。如需使用新默认，"
+        "请在面板里手动修改。",
+        key,
+        legacy,
+        new_value,
+    )
+
+
+def plan_default_migrations(
+    raw: Mapping[str, Any] | None,
+    *,
+    applied: Iterable[str] | None = None,
+    explicit_keys: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """算出需要一次性提升的旧默认值（**只含能确定是旧默认值的项**）。
 
     AstrBot 的 `check_config_integrity` 只在键缺失时插默认值，已有值一律保留，所以调
-    默认值对老用户完全无效。这里只处理「当前值仍等于旧版本默认值」的项：用户自己改过
-    的值一律不碰。
+    默认值对老用户完全无效。但「当前值 == 旧默认值」**不能**证明用户没动过它：
+    AstrBot 在插件初始化前就把 schema 默认值全部补进配置并落盘（见
+    astrbot/core/config/astrbot_config.py 的 check_config_integrity），初始部署那一刻
+    配置文件里就已经是一份完整的旧默认值。
+
+    因此这里分两类处理（P2-10）：
+
+    1. **可判定**：`weather_location` 与 `timezone_city` 的组合、6 段的周期恢复倍率
+       （结构上已经不是现在能用的格式）→ 自动迁移；
+    2. **用户合法选择**：初始好感 46、时段数 16、旧偏好文案、注入档位 low、作息
+       窗口 23/6 且跟随开着 → **不自动改**，只 INFO 说明。这些值无法与「没动过的旧
+       默认」区分，以前的实现会静默覆盖用户的显式选择。
+
+    `applied` / `explicit_keys` 是调用方可选传入的：前者来自 `.defaults-migrated`
+    标记（已应用过的键），后者是能证明用户显式设置过的键；命中的键一律跳过。
     """
     src: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
+    skip = {str(key) for key in (applied or ())} | {
+        str(key) for key in (explicit_keys or ())
+    }
     changes: dict[str, Any] = {}
+
+    # ── 可判定类：自动迁移 ──────────────────────────────────────────
     weather = str(src.get("weather_location") or "").strip()
     city = str(src.get("timezone_city") or "").strip()
-    if weather == LEGACY_WEATHER_LOCATION and city and city != DEFAULT_CITY_PLACEHOLDER:
+    if (
+        "weather_location" not in skip
+        and weather == LEGACY_WEATHER_LOCATION
+        and city
+        and city != DEFAULT_CITY_PLACEHOLDER
+    ):
         # 她改了所在城市却没改天气城市（也改不了，以前没人提示这两处要对上）：
         # 清空天气城市，让它跟着所在城市走。
         changes["weather_location"] = ""
-    # v2.16.4：作息由人设决定，身体跟着她的日程走。只动「从没碰过作息设置」的人
-    # （窗口还是出厂那对 23/6 且对齐开着）——真去改过夜间窗口的人大概正是要锁作息，不碰。
     if (
-        src.get("schedule_follow_night_window") is True
-        and src.get("night_start_hour") == 23
-        and src.get("night_end_hour") == 6
+        "energy_recovery_phase_multipliers" not in skip
+        and _phase_multiplier_count(src.get("energy_recovery_phase_multipliers"))
+        == LEGACY_PHASE_MULTIPLIER_COUNT
     ):
-        changes["schedule_follow_night_window"] = False
-    # v2.16.7：日程改为 15 分钟粒度、模型填表覆盖全天的默认。只动仍停在旧默认的项。
-    if src.get("schedule_max_slots") == LEGACY_SCHEDULE_MAX_SLOTS:
-        changes["schedule_max_slots"] = 96
-    if str(src.get("schedule_prompt_extra") or "").strip() == LEGACY_SCHEDULE_PROMPT_EXTRA:
-        changes["schedule_prompt_extra"] = DEFAULTS.schedule_prompt_extra
-    # v2.18.2：注入档位 low 升格为 medium（插件已不是轻量级）。只动仍停在旧默认的项，
-    # 用户自己改成 full/mood_only 的不碰。
-    if str(src.get("inject_activity_context") or "").strip() == "low":
-        changes["inject_activity_context"] = "medium"
-    # v2.27.2：初始好感默认 46 → 35。只动仍停在 46 的项——手动设过 46 以外值的不碰。
-    # **用户现有的好感数据（state.json）一律不动**，这条只影响新档案的起点。
-    if src.get("mood_initial_affection") == LEGACY_MOOD_INITIAL_AFFECTION:
-        changes["mood_initial_affection"] = DEFAULTS.mood_initial_affection
+        # P2-31：6 段旧值写不出 8 个阶段，代码侧每次启动都会整表退回默认并 WARN。
+        # 这里主动写回 8 段新默认，让配置与真实行为一致、告警消失。
+        changes["energy_recovery_phase_multipliers"] = list(
+            DEFAULTS.energy_recovery_phase_multipliers
+        )
+        logger.info(
+            "energy_recovery_phase_multipliers 仍是旧版 6 段格式：已迁移为 8 段默认值 %r",
+            changes["energy_recovery_phase_multipliers"],
+        )
+
+    # ── 用户合法选择类：保留现值，只提醒 ────────────────────────────
+    for key, legacy in _USER_CHOICE_LEGACY_DEFAULTS.items():
+        if key in skip:
+            continue
+        if _looks_like_legacy_default(src.get(key), legacy):
+            _notify_user_choice_not_migrated(key, legacy, getattr(DEFAULTS, key, None))
+    if (
+        "schedule_follow_night_window" not in skip
+        and src.get("schedule_follow_night_window") is True
+        and _looks_like_legacy_default(src.get("night_start_hour"), 23)
+        and _looks_like_legacy_default(src.get("night_end_hour"), 6)
+    ):
+        # 真去改过夜间窗口的人大概正是要锁作息；而「跟随开着 + 出厂 23/6」也可能是
+        # 用户显式选的手动值，同样无法区分。保留现值，由用户自己在面板里决定。
+        _notify_user_choice_not_migrated(
+            "schedule_follow_night_window", True, False
+        )
     return changes
 
 

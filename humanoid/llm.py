@@ -11,7 +11,10 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
+
+from .clock import resolve_zone
 
 OUTCOME_OK = "ok"
 OUTCOME_NOT_FOUND = "not_found"
@@ -25,10 +28,15 @@ OUTCOME_NO_CANDIDATE = "no_candidate"
 PURPOSE_SCHEDULE = "日程生成"
 PURPOSE_MOOD = "情绪分析"
 
-# 一次 `generate()` 的**总**时间上限（跨候选、跨重试）。
-# 单个候选的超时由调用方给，但候选数 × 重试数 × 超时会相乘：3 候选 × 2 次 × 60s
-# 最坏就是 6 分钟，而日程生成期间 `_generating` 全程为真，用户看到的是「一直在决定
-# 下一段」。这里给一个总闸；下限是单次 timeout，所以单独一次尝试永远拿得到完整时间。
+# 一次 `generate()` 的**总**时间上限（跨候选、跨重试）——这是**硬上限**，不随
+# 面板的 timeout 放大。
+#
+# 旧写法是 `deadline = now + max(timeout, 150)`：面板把单次 timeout 调到 300 时，
+# 总闸跟着变成 300s（外加一次尝试本身 300s），日程生成期间 `_generating` 全程为真，
+# 用户看到「一直在决定下一段」，`/重置日程` 也被单飞闸挡回——「上限」实际是「下限」
+# （审核 P2-18）。现在总时长不会超过本常量；单次尝试最多拿
+# `min(timeout, 剩余总预算)`，所以面板 timeout > 150 时单次会被总闸截断。
+# 默认 timeout=60（config.schedule_llm_timeout_seconds）时行为与旧版完全一致。
 MAX_TOTAL_CALL_SECONDS = 150.0
 
 # 重试只对「再试一次可能就好了」的错误有意义。鉴权失败、请求体非法、内容审核拒绝、
@@ -346,6 +354,7 @@ class CallGate:
     """
 
     __slots__ = (
+        "_city_provider",
         "_config",
         "_day",
         "_last_call",
@@ -366,11 +375,15 @@ class CallGate:
         logger: Any = None,
         wall_clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
+        city_provider: Callable[[], str] | None = None,
     ) -> None:
         self._config = config_provider
         self._log = logger
         self._wall = wall_clock
         self._mono = monotonic
+        # 角色级城市覆盖（v3.0.0，审核 P2-17）：多角色各自设了城市时由 core 传入
+        # （通常就是 `clock.city`）。不传则回退全局配置 `timezone_city`。
+        self._city_provider = city_provider
         # None 而不是 0：0 既像「从没互动过」，又是墙钟上一个完全合法的取值，
         # 拿它当哨兵会让「到底有没有人说过话」这件事在某些时刻判错。
         self._last_interaction: float | None = None
@@ -462,8 +475,45 @@ class CallGate:
         except OSError:
             pass
 
+    def _character_city(self) -> str:
+        """预算按哪个城市的自然日切：角色级覆盖优先，其次全局配置。"""
+        if self._city_provider is not None:
+            try:
+                override = str(self._city_provider() or "").strip()
+            except Exception:
+                override = ""
+            if override:
+                return override
+        try:
+            return str(getattr(self._config(), "timezone_city", "") or "").strip()
+        except Exception:
+            return ""
+
+    def _local_day(self, wall: float) -> str:
+        """这个墙钟时刻在她所在城市是几号（`YYYY-MM-DD`）。
+
+        v3.0.0（审核 P2-17）：日预算原来按**宿主机**本地时区切（`time.localtime`），
+        而角色是按自己城市过日子的（mood 的日闸也走角色时区）。服务器 UTC、她在东京
+        时预算 08:00 才重置；`/拟人 诊断` 的「今日已用 N/200」和她的一天对不上。
+        这里复用 clock 的城市→时区解析（`resolve_zone`），认不出城市/缺 tzdata 时
+        退回宿主机时区（与旧行为一致，不让一个坏城市名卡死预算）。
+        """
+        city = self._character_city()
+        tz = None
+        if city:
+            try:
+                tz = resolve_zone(city)[0]
+            except Exception:
+                tz = None
+        if tz is not None:
+            try:
+                return datetime.fromtimestamp(float(wall), tz).strftime("%Y-%m-%d")
+            except (OverflowError, OSError, ValueError, TypeError):
+                pass
+        return time.strftime("%Y-%m-%d", time.localtime(float(wall)))
+
     def _roll_day(self) -> None:
-        today = time.strftime("%Y-%m-%d", time.localtime(self._wall()))
+        today = self._local_day(self._wall())
         if today != self._day:
             self._day = today
             self._used_today = 0
@@ -718,9 +768,18 @@ class LLMGateway:
 
         cfg = self._config()
         # 总时间闸：候选数 × 重试数 × timeout 会相乘（最坏好几分钟），而日程生成期间
-        # `_generating` 全程为真，用户看到的是「一直在决定下一段」。下限取单次 timeout，
-        # 保证单独一次尝试永远拿得到完整时间。
-        deadline = self._monotonic() + max(float(timeout), MAX_TOTAL_CALL_SECONDS)
+        # `_generating` 全程为真，用户看到的是「一直在决定下一段」。
+        #
+        # **这是硬上限**（v3.0.0，审核 P2-18）：不再 `max(timeout, 150)`——那样面板
+        # timeout=300 会把总闸放大成 300s，「上限」变成下限。单次尝试拿
+        # `min(timeout, 剩余预算)`（见 `_call_with_retries`），总耗时不会超过本常量。
+        try:
+            total_cap = float(MAX_TOTAL_CALL_SECONDS)
+        except (TypeError, ValueError):
+            total_cap = 150.0
+        if not (total_cap > 0) or total_cap != total_cap:
+            total_cap = 150.0
+        deadline = self._monotonic() + total_cap
         if self._log and cfg.debug_mode:
             self._log.debug(f"[humanoid_core] LLM 请求 (purpose={purpose}) 提示词前200字: {prompt[:200]}...")
 
@@ -877,18 +936,22 @@ class LLMGateway:
     ) -> tuple[str, str, float, str]:
         outcome, detail, elapsed = OUTCOME_ERROR, "", 0.0
         for attempt_no in range(1, attempts_per_provider + 1):
-            if self._monotonic() >= deadline:
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
                 outcome, detail = OUTCOME_TIMEOUT, "整体调用已超时，未再重试"
                 break
+            # 单次尝试只能拿「配置 timeout」与「总闸剩余」的较小值：否则 timeout=300
+            # 时一次尝试就能越过总闸（审核 P2-18：「总上限」必须真的兜得住）。
+            attempt_timeout = min(float(timeout), max(0.1, remaining))
             started = self._monotonic()
             try:
-                response, note = await self._invoke(provider, prompt, call_kwargs, timeout)
+                response, note = await self._invoke(provider, prompt, call_kwargs, attempt_timeout)
                 self._note_system_prompt(actual_id, note, label)
             except asyncio.CancelledError:
                 raise
             except (asyncio.TimeoutError, TimeoutError):
                 elapsed = self._monotonic() - started
-                outcome, detail = OUTCOME_TIMEOUT, f"超过 {timeout:.0f}s（第 {attempt_no} 次）"
+                outcome, detail = OUTCOME_TIMEOUT, f"超过 {attempt_timeout:.0f}s（第 {attempt_no} 次）"
             except Exception as exc:
                 elapsed = self._monotonic() - started
                 outcome, detail = OUTCOME_ERROR, f"{type(exc).__name__}: {exc}"

@@ -222,6 +222,14 @@ class SomaService:
     # ------------------------------------------------------------------
 
     def slot_at(self, moment: datetime) -> dict:
+        """这一刻落在日程的哪一段；没有/坏段返回空 dict。
+
+        **零长段（start == end）按 0 长度处理，不是「到 24:00」**：旧写法
+        `if e <= s: e = 1440` 把 `08:00-08:00` 解释成 08:00–24:00，于是她会被
+        判定「从 08:00 起一直在睡/在吃」最长 16 小时，睡眠压力、饥饿、久坐、
+        精力结算全部连锁跑偏。倒序段（end < start）同样是坏数据，一并跳过。
+        口径与 `slots.sleep_window_minutes`（同形状直接丢弃）一致。
+        """
         minutes = moment.hour * 60 + moment.minute
         for slot in self._slots():
             start = slot.get("start")
@@ -230,7 +238,14 @@ class SomaService:
                 continue
             s = self._to_minutes(start)
             e = self._to_minutes(end)
-            if e <= s:
+            if e == s:
+                # **零长段按 0 长度处理**（v3.0.0，审核 P2-20）：旧写法 `e <= s → e = 1440`
+                # 把 `08:00-08:00` 解释成 08:00–24:00，她会被判「从 08:00 起一直在睡/在吃」
+                # 最长 16 小时，睡眠压力、饥饿、久坐、精力结算全部连锁跑偏。
+                continue
+            if e < s:
+                # 跨午夜写法（`{'start': '22:00', 'end': '07:00'}`）：当天只覆盖到 24:00；
+                # 次日凌晨那一段由日程结转出的 `00:00-07:00` 段承担（生产里的两段拼法）。
                 e = 1440
             if s <= minutes < e:
                 return slot

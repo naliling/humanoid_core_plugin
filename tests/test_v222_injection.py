@@ -294,7 +294,7 @@ class InjectionLayerTest(unittest.TestCase):
         """
         core = self.core()
         self.assertEqual(core.config.mood_initial_affection, 35)
-        for uid in ("555", "777", "3881756548", "1423008208"):
+        for uid in ("555", "777", "100000003", "100000004"):
             core.scope.user_state(uid)["mood"] = {
                 "affection": 35.0, "libido": 34.0, "aggression": 28.0,
                 "base_affection": 35.0, "base_libido": 34.0, "base_aggression": 28.0,

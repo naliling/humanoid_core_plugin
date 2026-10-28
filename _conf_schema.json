@@ -165,6 +165,32 @@
       "step": 5.0
     }
   },
+  "input_state_min_interval_seconds": {
+    "description": "【进阶】输入状态最小上报间隔（秒）",
+    "hint": "两次「正在输入」上报之间至少隔这么久。默认 0.3 秒：太密会触发 NapCat/QQ 风控（单条 20 秒回复按 0.1 秒上报就是 200 次调用）",
+    "type": "float",
+    "default": 0.3,
+    "minimum": 0.1,
+    "maximum": 10.0,
+    "slider": {
+      "min": 0.1,
+      "max": 10.0,
+      "step": 0.1
+    }
+  },
+  "input_state_max_frames": {
+    "description": "【进阶】单条回复最多上报多少帧「正在输入」",
+    "hint": "一条长回复最多报这么多帧就停，防止刷爆 call_action。默认 60 帧",
+    "type": "int",
+    "default": 60,
+    "minimum": 5,
+    "maximum": 500,
+    "slider": {
+      "min": 5,
+      "max": 500,
+      "step": 5
+    }
+  },
   "inject_activity_context": {
     "description": "上下文给多少事实",
     "hint": "注入多少生活细节",
@@ -545,7 +571,7 @@
   },
   "mood_affection_override": {
     "description": "【进阶】指定某人好感",
-    "hint": "每个条目写一条 QQ:数值（如 3881756548:100）；钉死后不随聊天变化",
+    "hint": "每个条目写一条 QQ:数值（如 100000003:100）；钉死后不随聊天变化",
     "type": "list",
     "default": []
   },
@@ -775,7 +801,7 @@
   },
   "stale_user_retention_days": {
     "description": "【进阶】整条用户记录保留(天)",
-    "hint": "只剩称呼/初遇时间、没有可清理内容的用户，不活跃超过这么多天就整条删掉。原来写死 90 天，是 state.json 涨到几 MB 的主因",
+    "hint": "只剩称呼/初遇时间、没有可清理内容的用户，不活跃超过这么多天就整条删掉；0 = 永不按静默期整条删除（纯空壳条目仍会清掉，它不承载任何用户数据）。原来写死 90 天，是 state.json 涨到几 MB 的主因",
     "type": "int",
     "default": 30,
     "minimum": 0,
@@ -999,7 +1025,7 @@
   },
   "energy_recovery_phase_multipliers": {
     "description": "【进阶】周期各段恢复倍率",
-    "hint": "8 个数按顺序对应：月经期、卵泡早期、卵泡中期、卵泡晚期、排卵期、黄体早期、黄体中期、黄体晚期",
+    "hint": "8 个数按顺序对应：月经期、卵泡早期、卵泡中期、卵泡晚期、排卵期、黄体早期、黄体中期、黄体晚期。旧版的 6 段配置会在升级时自动迁移为这 8 段默认值",
     "type": "list",
     "default": [
       0.5,
@@ -1050,7 +1076,7 @@
   },
   "soma_enabled": {
     "description": "多轴身体",
-    "hint": "要不要维护身体状态（精力/饥饿/困意）",
+    "hint": "要不要维护身体状态（精力/饥饿/困意）。v3.0.0 起关闭身体轴不再连带停发跨插件契约：identity/日程/天气/节日等非身体块照常导出，身体块给中性表示",
     "type": "bool",
     "default": true
   },
@@ -1133,7 +1159,7 @@
   },
   "contract_enabled": {
     "description": "【进阶】导出契约给社交层",
-    "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度",
+    "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度。总开关：false 时整份跨插件契约（含 identity/日程/天气/节日等非身体块）都不导出，自主拟人社交会退回旧字段；只关身体请用 soma_enabled",
     "type": "bool",
     "default": true
   },

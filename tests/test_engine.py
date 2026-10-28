@@ -271,12 +271,20 @@ class StateFileSafetyTest(unittest.TestCase):
         self.assertEqual(len(list(self.dir.glob("*.corrupt-*.json"))), 2)
 
     def test_encoding_is_tried_before_declaring_corruption(self):
-        """GBK 手改过的文件是**编码不对**，不是损坏：不许备份走、更不许重建。"""
-        self.path.write_bytes('{"roles": {}, "备注": "手改"}'.encode("gbk"))
+        """GBK 手改过的文件是**编码不对**，不是损坏：不许备份走、更不许重建。
+
+        v3.0.0（P2-05）：顶层只允许 `_state_version`/`roles`，未知键（原用例里的
+        顶层「备注」）会被迁移层清理，所以中文解码验证挪进 roles 里的真实字段；
+        同时断言未知键确实被删掉。
+        """
+        self.path.write_bytes(
+            '{"roles": {"default": {"self": {"last_update": "手改"}}}, "备注": "手改"}'.encode("gbk")
+        )
         store = self._store()
         store.load("2026-01-01")
         self.assertEqual(list(self.dir.glob("*.corrupt-*.json")), [])
-        self.assertEqual(store.get("备注"), "手改")
+        self.assertEqual(store.data["roles"]["default"]["self"]["last_update"], "手改")
+        self.assertNotIn("备注", store.data)
 
     def test_newer_state_version_refuses_to_write_back(self):
         from humanoid.state import STATE_VERSION

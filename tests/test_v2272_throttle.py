@@ -155,8 +155,19 @@ class InitialValueAndMigration(unittest.TestCase):
         self.assertEqual(HumanoidConfig().mood_initial_affection, 35)
 
     def test_old_default_migrates(self):
+        # P2-10（v3.0.0 语义修正）：46 本身就是**合法的手动选择**，而 AstrBot 在插件
+        # 初始化前就会把 schema 默认值全部补进配置（check_config_integrity 会补键并
+        # save_config），「当前值 == 旧默认」不能证明用户没动过——所以不再自动覆盖，
+        # 保留现值；即使调用方显式声明「不是用户设的」也只在有 provenance 时才可迁移。
         changes = plan_default_migrations({"mood_initial_affection": 46})
-        self.assertEqual(changes.get("mood_initial_affection"), 35)
+        self.assertNotIn("mood_initial_affection", changes)
+        self.assertNotIn(
+            "mood_initial_affection",
+            plan_default_migrations(
+                {"mood_initial_affection": 46},
+                explicit_keys={"mood_initial_affection"},
+            ),
+        )
 
     def test_custom_value_is_never_touched(self):
         self.assertEqual(

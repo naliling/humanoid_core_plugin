@@ -30,6 +30,7 @@ from . import relstage
 import math
 import re
 import time
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from astrbot.api import logger
@@ -396,7 +397,11 @@ class PromptBuilder:
         self._weather_seen: Optional[tuple] = None
         # 每个人上次注入的内心话：uid -> (文本, 时刻)。只放内存：
         # 重启后重新记一次没有代价，而落盘会让读路径变成写路径。
-        self._emotion_seen: Dict[str, tuple] = {}
+        #
+        # v3.0.0：**OrderedDict 做 LRU，满了淘汰最旧的一个**。旧写法 `clear()` 整表清空，
+        # 大部署（>512 个发过言的人）每次表满就忘掉所有人的去重记录，紧接着下一轮
+        # 所有人都会再看到同一句内心话——v2.28.12 修的「同一句不复读」在大号上周期复发。
+        self._emotion_seen: "OrderedDict[str, tuple]" = OrderedDict()
 
     @property
     def config(self) -> HumanoidConfig:
@@ -646,13 +651,27 @@ class PromptBuilder:
         if isinstance(seen, tuple) and len(seen) == 2 and seen[0] == text:
             try:
                 if 0.0 <= now - float(seen[1]) < self.EMOTION_REPEAT_SECONDS:
+                    self._emotion_seen.move_to_end(user_id)
                     return True
             except (TypeError, ValueError):
                 pass
         # 只记最近这些人：长跑之后内存不该被几万个 uid 慢慢吃掉。
-        if len(self._emotion_seen) >= self.EMOTION_SEEN_LIMIT:
-            self._emotion_seen.clear()
+        #
+        # 淘汰顺序：**先丢已过期的**（它们对去重已经没有意义），再从最旧的开始丢；
+        # 绝不整表清空——那等于让所有人同时失去去重保护（审核 P2-15）。
+        while self._emotion_seen:
+            oldest_uid, oldest = next(iter(self._emotion_seen.items()))
+            try:
+                fresh = 0.0 <= now - float(oldest[1]) < self.EMOTION_REPEAT_SECONDS
+            except (TypeError, ValueError):
+                fresh = False
+            if fresh:
+                break
+            self._emotion_seen.popitem(last=False)
+        while len(self._emotion_seen) >= self.EMOTION_SEEN_LIMIT:
+            self._emotion_seen.popitem(last=False)
         self._emotion_seen[user_id] = (text, now)
+        self._emotion_seen.move_to_end(user_id)
         return False
 
     def _persona_prompt_text(self) -> str:
@@ -1682,7 +1701,7 @@ class PromptBuilder:
         # 抬头只留版本号，不再写 `uid=`。
         #
         # 那个 `uid={_uid_tag(role_id)}` 打的是**角色 id**（机器人自己），不是用户的，
-        # 而且只取末 8 位——所有人看到的都是同一串 `uid=32823490`，模型则把它当成
+        # 而且只取末 8 位——所有人看到的都是同一串 `uid=12345678`，模型则把它当成
         # 一个真实存在的编号。它不是任何东西的 id，只是给模型的一条假事实；
         # 真正需要它的地方（区分不同角色的块）由 `MARK_PREFIX` 本身就够了。
         header = f"{MARK_PREFIX} {MARK_VERSION}〕"

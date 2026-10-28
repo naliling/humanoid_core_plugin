@@ -6,6 +6,7 @@ from typing import Any
 
 from astrbot.api import logger
 
+from . import memory_link
 from .config import HumanoidConfig
 from .clock import DEFAULT_CITY_PLACEHOLDER, weekday_cn, format_offset
 from .slots import parse_time
@@ -92,6 +93,33 @@ def _signals_line(signals: dict) -> str:
     if state == "not_installed":
         return "- 社交层信号：没装「自主拟人社交」插件。这不是故障——本插件单独也能跑。"
     return f"- 社交层信号：读不到（拿不到 data 目录）{tail}"
+
+
+def _memory_link_line() -> str:
+    """长期记忆桥接的状态行（v3.0.0，P2-24）。
+
+    `memory_link.last_error()` 以前定义了却全仓无消费方：桥接解析失败/超时/对面关了
+    开关，用户在 /拟人 诊断 里一个字都看不到，只能去翻日志。这里把它摊开说，并给
+    出「该去查什么」的方向（没装 / 接口不匹配 / 卡住 / 开关关着）。
+    """
+    try:
+        error = str(memory_link.last_error() or "").strip()
+    except Exception:
+        error = ""
+    if not error:
+        return (
+            "- 长期记忆联动（memory_companion）：没有失败记录"
+            "（没装 / 对面关了桥接时是静默降级，不报错）"
+        )
+    kind = error.split(":", 1)[0].strip()
+    hint = {
+        "missing": "对面没装 / 未激活 / 宿主没有注册表 API",
+        "signature": "找到对面了但接口对不上（双方版本不匹配）",
+        "exception": "调用对面时抛了异常",
+        "timeout": "对面在限定时间内没返回——已按超时降级，不会卡住回复",
+        "disabled": "对面装了但桥接开关关着（配置页「记忆插件协同 → 启用桥接 API」）",
+    }.get(kind, "未知类别")
+    return f"- 长期记忆联动（memory_companion）：最近一次失败 = {error}（{hint}）"
 
 
 def _hhmm(hour_of_day: float) -> str:
@@ -427,8 +455,25 @@ def _build_report_body(
         )
 
     lines += ["", "【身体与联动】"]
+    body_status = body_status or {}
     if not cfg.soma_enabled:
         lines.append("- 生理层已关闭：只剩精力标量，不会困、不会饿、也不会攒出想说话的心思")
+        # v3.0.0（P1-C/P2-26）：契约不再连带停发，这里必须说清当前契约与社交信号的状态，
+        # 否则用户以为「关身体 = 断联动」的现象还在（社交层那边也会误诊成旧版 Core）。
+        contract = body_status.get("contract")
+        if isinstance(contract, dict) and contract:
+            lines.append(
+                f"- 联动契约：v{contract.get('v')} 已导出（身体块给中性表示，其余块照常）；"
+                "写在她自己的 state.json 里"
+            )
+        elif not cfg.contract_enabled:
+            lines.append("- 联动契约：配置里关着（contract_enabled=false），不会导出")
+        else:
+            lines.append(
+                "- 联动契约：已开启；生理层关闭也照常导出（身体块中性表示），"
+                "启动后等一轮再看"
+            )
+        lines.append(_signals_line(body_status.get("signals") or {}))
     elif body_status:
         snap = body_status.get("soma") or {}
         lines.append(
@@ -449,8 +494,8 @@ def _build_report_body(
             )
         elif not cfg.contract_enabled:
             lines.append("- 联动契约：配置里关着（contract_enabled=false），不会导出")
-        elif not cfg.soma_enabled:
-            lines.append("- 联动契约：生理层关着时不导出（轴全是初始值，社交层读到会误判）")
+        # v3.0.0（P1-C/P2-26）：soma_enabled 不再切断契约，旧的「生理层关着时不导出」
+        # 分支已不存在（上面 if not cfg.soma_enabled 分支单独说明）。
         else:
             lines.append(
                 f"- 联动契约：还没写出（身体 tick 每 {cfg.body_tick_seconds}s 一次，"
@@ -459,13 +504,19 @@ def _build_report_body(
         lines.append(_signals_line(signals))
     else:
         lines.append("- 生理层已开启，但还没有角色实例")
+    # v3.0.0（P2-24）：长期记忆桥接的失败原因不能只躺在 last_error() 里没人读。
+    lines.append(_memory_link_line())
 
     lines += ["", "【Token 预算】"]
     if inject_estimate:
         parts = "，".join(f"{mode} ≈ {tok}" for mode, tok in inject_estimate.items())
         lines.append(f"- 聊天时追加的上下文：{parts} token")
-    for note in state_size_lines or []:
-        lines.append(f"- {note}")
+    if state_size_lines:
+        # v3.0.0（P2-32）：状态落盘本身的可观测性单独成节——Windows 上 state.json
+        # 被占用时落盘会连续失败，以前只有日志里一条 WARN，用户在诊断页看不到。
+        lines += ["", "【状态落盘】"]
+        for note in state_size_lines:
+            lines.append(f"- {note}")
     lines.append(
         f"- 日程生成：滚动分段，一次只决定下一段（输入约 240 + 输出一个小 JSON）；"
         f"决策窗 {cfg.schedule_refresh_minutes} 分钟，变动概率 {cfg.schedule_change_chance}%，"
@@ -575,6 +626,61 @@ def state_size_lines(core) -> list[str]:
             if size_kb > 512:
                 hint = "（已经偏大：写盘是默认每 60 秒整份重写，可调小「情绪数据保留」）"
             out.append(f"状态文件：{size_kb:.0f} KB{hint}")
+    except Exception:
+        pass
+    try:
+        store = getattr(core, "_state_store", None)
+
+        def _store_attr(name: str):
+            """读 StateStore 暴露的诊断属性（A 在 P2-32 加的）；拿不到就是 None。"""
+            try:
+                return getattr(store, name, None)
+            except Exception:
+                return None
+
+        interval = _store_attr("effective_flush_interval")
+        serial_ms = _store_attr("last_serialize_ms")
+        payload_bytes = _store_attr("last_payload_bytes")
+        consec = _store_attr("consecutive_write_failures")
+        failures = _store_attr("flush_failures")
+        error = _store_attr("last_write_error")
+        extra: list[str] = []
+        try:
+            if interval is not None:
+                extra.append(f"生效落盘间隔：{float(interval):g} 秒")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if serial_ms is not None:
+                extra.append(f"上次序列化耗时：{float(serial_ms):.1f} ms")
+        except (TypeError, ValueError):
+            pass
+        try:
+            if payload_bytes is not None:
+                extra.append(f"上次写入体积：{float(payload_bytes) / 1024.0:.0f} KB")
+        except (TypeError, ValueError):
+            pass
+        if extra:
+            out.append("；".join(extra))
+        try:
+            consec_n = int(consec or 0)
+        except (TypeError, ValueError):
+            consec_n = 0
+        try:
+            failures_n = int(failures or 0)
+        except (TypeError, ValueError):
+            failures_n = 0
+        error_text = str(error or "").strip()
+        reason_text = error_text or "原因未知"
+        if consec_n > 0:
+            out.append(
+                f"{WARN_MARK} 状态落盘连续失败 {consec_n} 次：{reason_text}。"
+                "文件可能被杀软 / 同步盘（OneDrive 等）占用；状态仍在内存里，恢复后会自动补写。"
+                "（Windows 上可把 data 目录加入排除项，或关掉同步盘对该目录的实时同步。）"
+            )
+        elif failures_n > 0:
+            tail = f"：{error_text}" if error_text else ""
+            out.append(f"累计落盘失败 {failures_n} 次（最近一次已恢复）{tail}")
     except Exception:
         pass
     try:

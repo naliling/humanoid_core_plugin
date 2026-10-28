@@ -80,7 +80,12 @@ class SocialOutgoingSignalTest(unittest.TestCase):
         self.assertAlmostEqual(float(rows[-1]["at"]), at, places=3)
         self.assertTrue(rows[-1]["pending"], "主动发出去、对方还没回，应当是 pending")
 
-    def test_last_interaction_advances_to_the_send_time(self) -> None:
+    def test_her_said_at_advances_to_the_send_time(self) -> None:
+        """v3.0.0（联动 P2-3）：她主动开口推进 her_said_at。
+
+        last_interaction 保持兼容语义 = 「TA 上次说话」，不能被她的主动消息推进；
+        否则社交层会把「她刚发过消息」误当成「对方刚说过话」，掩盖真实沉默时长。
+        """
         root = Path(tempfile.mkdtemp())
         core = make_core(root)
         at = time.time() - 30.0
@@ -88,20 +93,25 @@ class SocialOutgoingSignalTest(unittest.TestCase):
         write_signals(root, last_proactive_at=at, last_target_uid="u9",
                       last_proactive_text="在吗")
         core._apply_social_signals()
-        stamp = float(core.scope.get_user("u9", "last_interaction", 0) or 0)
-        self.assertAlmostEqual(stamp, at, places=3)
+        her = float(core.scope.get_user("u9", "her_said_at", 0) or 0)
+        self.assertAlmostEqual(her, at, places=3)
+        peer = float(core.scope.get_user("u9", "last_interaction", 0) or 0)
+        self.assertAlmostEqual(
+            peer, at - 3600.0, places=3,
+            msg="last_interaction 是 TA 上次说话，不能被她的主动消息推进",
+        )
 
-    def test_it_does_not_rewind_a_newer_user_message(self) -> None:
-        """信号可能晚一轮才被取到：不能把用户后来发言的时间戳推回去。"""
+    def test_it_does_not_rewind_a_newer_her_said_at(self) -> None:
+        """信号可能晚一轮才被取到：不能把更新的「她说话」时间戳推回去。"""
         root = Path(tempfile.mkdtemp())
         core = make_core(root)
         at = time.time() - 600.0
         newer = at + 300.0
-        core.scope.set_user("u9", "last_interaction", newer)
+        core.scope.set_user("u9", "her_said_at", newer)
         write_signals(root, last_proactive_at=at, last_target_uid="u9",
                       last_proactive_text="在吗")
         core._apply_social_signals()
-        stamp = float(core.scope.get_user("u9", "last_interaction", 0) or 0)
+        stamp = float(core.scope.get_user("u9", "her_said_at", 0) or 0)
         self.assertAlmostEqual(stamp, newer, places=3)
 
     def test_same_signal_is_not_recorded_twice(self) -> None:

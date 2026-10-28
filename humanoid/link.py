@@ -22,6 +22,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Optional
 
+from . import __version__
 from .life_log import parse_open
 from .services.schedule import (
     day_phrases,
@@ -30,11 +31,14 @@ from .services.schedule import (
 )
 
 CONTRACT_VERSION = 2
-#: 结构标识。社交层拿它和 `fields_hash` 一起做一致性校验（只告警 + 降级，不抛错）。
+#: 结构标识。**现状要说实**：截至 autonomous_social v1.28.17，社交层并不校验它、也不读
+#: `fields_hash`（它的 core_bridge.py 自认没有校验方）——这三键目前是 Core 侧导出的死数据，
+#: 保留是为了「只加不改」：以后对方接上校验时不必再动 Core。
 CONTRACT_SCHEMA = "humanoid.contract/2"
 #: 这一版契约提供的能力。社交层按能力判断走哪条路，不靠版本号猜。
-#: 只加不改：`dreams`（她昨晚做的梦）与 `wake`（醒来状态/睡眠惯性）是 v2.28.0 新增的，
-#: `event`（刚刚发生的事够重）是 v2.29.0 新增的只读能力，API_VERSION 保持 2。
+#: 只加不改：`dreams`（她昨晚做的梦）与 `wake`（醒来状态/睡眠惯性）是 v2.28.0 新增的；
+#: `event`（刚刚发生的事够重）**v2.28.5 起就有**（旧注释误写成 v2.29.0——那是个从未发布
+#: 过的版本号，联动 P2-28），3.0.0 起继续提供只读能力。API_VERSION 保持 2。
 #: v2.28.9 再补 `identity`（她是谁：参照名/人设标签）与 `outfit`（她此刻穿着）——
 #: 社交层主动开口时终于能「以她的身份、说她当下的事」说话。
 CONTRACT_CAPABILITIES = (
@@ -97,7 +101,9 @@ def build_contract(core: Any) -> dict[str, Any]:
     zone = getattr(now.tzinfo, "key", "") or ""
     contract = {
         "v": CONTRACT_VERSION,
-        "core_version": getattr(core, "version", "") or "",
+        # 版本自述只认真实包版本（humanoid.__version__）：拿不到实例属性时退回导入值，
+        # 绝不写死字符串（联动 P2-28：旧代码在注释里写过不存在的 v2.29.0）。
+        "core_version": str(getattr(core, "version", "") or __version__),
         "generated_at": round(now.timestamp(), 1),
         "time": {
             "local": now.strftime("%Y-%m-%d %H:%M"),
@@ -119,21 +125,7 @@ def build_contract(core: Any) -> dict[str, Any]:
             # 生效的 IANA 名；空串意味着她其实没拿到真时区（缺 tzdata 或城市认不出）。
             "tz": zone,
         },
-        "body": {
-            "energy": round(float(snap["energy"]["value"]), 1),
-            "energy_text": snap["energy"]["text"],
-            "sleep_pressure": soma.get("sleep_pressure"),
-            "sleep_debt": soma.get("sleep_debt"),
-            "hunger": soma.get("hunger"),
-            "discomfort": soma.get("discomfort"),
-            "arousal": soma.get("arousal"),
-            "asleep": bool(soma.get("asleep")),
-            "last_sleep_hours": soma.get("last_sleep_hours"),
-            "social_energy": round(float(snap["social_energy"]["value"]), 1),
-            "social_desire": soma.get("social_desire"),
-            "cycle_day": int(core.energy.cycle_day),
-            "cycle_phase": (snap.get("cycle") or "").strip(),
-        },
+        "body": _body_block(core, cfg, snap, soma),
         "feelings": feelings,
         "form": {
             "max_chars": int(form.get("max_chars", 120)),
@@ -187,18 +179,51 @@ def build_contract(core: Any) -> dict[str, Any]:
         # 节日是可预测的客观事实，不该让模型现编。
         "holiday": _contract_holiday(core),
         # 契约里没有按用户的数据（1000 人时会把文件撑大）；这些路径是稳定承诺。
+        #
+        # v3.0.0（联动 P2-25）：原来只有 5 条，而社交层实际按结构读的用户级键有 20+ 个
+        # （ccb_*、attention、mood_tag、turn_count、base_* 等）。补齐后**注释要说实**：
+        # 截至 autonomous_social v1.28.17，社交层并不读取/校验 `paths` 本身
+        # （core_bridge.py 自认没有校验方），真正的消费点是它直接按结构读 state.json。
+        # 保留并补齐是为了「只加不改」：哪天 social 接上校验，Core 这边不用再改。
         "paths": {
+            # 旧承诺（保持不动）。
             "user_affection": "roles.<bid>.users.<uid>.mood.affection",
             "user_nickname": "roles.<bid>.users.<uid>.nickname",
             "user_display_name": "roles.<bid>.users.<uid>.display_name",
             "user_last_interaction": "roles.<bid>.users.<uid>.last_interaction",
             "user_said": "roles.<bid>.users.<uid>.said",
+            # v3.0.0 补齐：social/core_bridge.py 实际读取的用户级键（只加不改）。
+            "user_base_affection": "roles.<bid>.users.<uid>.base_affection",
+            "user_name": "roles.<bid>.users.<uid>.name",
+            "user_nickname_src": "roles.<bid>.users.<uid>.nickname_src",
+            "user_mood_tag": "roles.<bid>.users.<uid>.mood_tag",
+            "user_mood": "roles.<bid>.users.<uid>.mood",
+            "user_mood_libido": "roles.<bid>.users.<uid>.mood.libido",
+            "user_mood_base_libido": "roles.<bid>.users.<uid>.mood.base_libido",
+            "user_mood_turn_count": "roles.<bid>.users.<uid>.mood.turn_count",
+            "user_attention": "roles.<bid>.users.<uid>.attention",
+            "user_last_message": "roles.<bid>.users.<uid>.last_message",
+            "user_first_met": "roles.<bid>.users.<uid>.first_met",
+            # v3.0.0（联动 P2-3）：TA 说话 / 她说话分开记（只加不改）。
+            "user_peer_said_at": "roles.<bid>.users.<uid>.peer_said_at",
+            "user_her_said_at": "roles.<bid>.users.<uid>.her_said_at",
+            "user_ccb_done_count": "roles.<bid>.users.<uid>.ccb_done_count",
+            "user_ccb_last_at": "roles.<bid>.users.<uid>.ccb_last_at",
+            "user_ccb_satisfy": "roles.<bid>.users.<uid>.ccb_satisfy",
+            "user_ccb_stage": "roles.<bid>.users.<uid>.ccb_stage",
+            "user_ccb_turns": "roles.<bid>.users.<uid>.ccb_turns",
+            "user_ccb_aftercare_until": "roles.<bid>.users.<uid>.ccb_aftercare_until",
         },
     }
     # ─── 握手三键（契约 v2）：只加不改 ───────────────────
     #
-    # 社交层以前只能靠 `v >= 1` 猜「对面是不是新版本」，字段对不上时静默拿到 None。
-    # 这三键把「猜」变成「校验」：结构不一致能留一条能搜到的日志，而不是行为悄悄变了。
+    # 设计意图：社交层以前只能靠 `v >= 1` 猜「对面是不是新版本」，字段对不上时静默
+    # 拿到 None；这三键本想把「猜」变成「校验」。
+    #
+    # **现状（v3.0.0 如实注释）**：截至 autonomous_social v1.28.17，社交层全仓 0 命中，
+    # 既不读 `schema` 也不校验 `fields_hash`——core 侧导出即死数据（联动 P2-25/P2-4）。
+    # 保留而非删除的原因是「只加不改」：对方将来接上校验时，Core 侧不用再动。
+    # 维护者看契约时不要误以为已经有人在用它们做兼容性检查。
     #
     # `fields_hash` 只覆盖**结构**（键名），不含取值——取值随时在变，那是 `generated_at`
     # 的活。所以它稳定、可缓存，只有真的增删字段时才会变。
@@ -206,6 +231,52 @@ def build_contract(core: Any) -> dict[str, Any]:
     contract["capabilities"] = list(CONTRACT_CAPABILITIES)
     contract["fields_hash"] = _fields_hash(contract)
     return contract
+
+
+def _body_block(core: Any, cfg: Any, snap: dict[str, Any], soma: dict[str, Any]) -> dict[str, Any]:
+    """身体块：13 个键一个不改（社交层按这些键读），但**关掉身体轴时不再让整份契约消失**。
+
+    v3.0.0 之前 `refresh_contract` 只要 `soma_enabled=false` 就整份停发，连带停掉
+    identity/日程/天气/节日/事件/作息这些**与身体无关**的块；社交层把「没读到契约」
+    误诊成「旧版 Core，升级到 v2.14+」（联动 P1-C/P2-26）。现在契约照发，只有这一块
+    给**中性表示**：
+
+    * 精力 / 社交能量 / 周期这三项与身体轴开关无关，照给真实值；
+    * 六个身体轴与「睡着」给中性值（不困、不饿、不难受、唤醒度居中、不想说话、醒着），
+      意思不是「她一点也不困」，而是「这一项没在跑」——社交层据此最多少一条由头，
+      不会拿到一个假的「她刚聊完不想说话」。
+    """
+    if cfg.soma_enabled and soma:
+        return {
+            "energy": round(float(snap["energy"]["value"]), 1),
+            "energy_text": snap["energy"]["text"],
+            "sleep_pressure": soma.get("sleep_pressure"),
+            "sleep_debt": soma.get("sleep_debt"),
+            "hunger": soma.get("hunger"),
+            "discomfort": soma.get("discomfort"),
+            "arousal": soma.get("arousal"),
+            "asleep": bool(soma.get("asleep")),
+            "last_sleep_hours": soma.get("last_sleep_hours"),
+            "social_energy": round(float(snap["social_energy"]["value"]), 1),
+            "social_desire": soma.get("social_desire"),
+            "cycle_day": int(core.energy.cycle_day),
+            "cycle_phase": (snap.get("cycle") or "").strip(),
+        }
+    return {
+        "energy": round(float(snap["energy"]["value"]), 1),
+        "energy_text": snap["energy"]["text"],
+        "sleep_pressure": 0.0,
+        "sleep_debt": 0.0,
+        "hunger": 0.0,
+        "discomfort": 0.0,
+        "arousal": 50.0,
+        "asleep": False,
+        "last_sleep_hours": 0.0,
+        "social_energy": round(float(snap["social_energy"]["value"]), 1),
+        "social_desire": 50.0,
+        "cycle_day": int(core.energy.cycle_day),
+        "cycle_phase": (snap.get("cycle") or "").strip(),
+    }
 
 
 def _event_block(core: Any) -> dict[str, Any]:
@@ -547,10 +618,15 @@ class SocialSignals:
         """
         if role_id:
             by_bid = payload.get("by_bid")
-            if isinstance(by_bid, dict):
+            if isinstance(by_bid, dict) and by_bid:
+                # v3.0.0（联动 P2-7/P2-27）：**分片存在时绝不回落顶层**。
+                # 顶层是多 Bot 时跨角色共用的部分（或单 Bot 的整份），回落过去等于把
+                # 别人的数据读成本角色的：第二角色会读到第一角色的「刚主动找过谁 /
+                # 被冷落几次」，错误泄 social_desire、错误扣好感；open_items 更糟——
+                # 顶层恒为 [] 时会把本角色的未完事项账本整体清空。
+                # 本角色分片缺失 = 「不知道」，返回空 dict 让调用方降级。
                 row = by_bid.get(str(role_id))
-                if isinstance(row, dict):
-                    return row
+                return row if isinstance(row, dict) else {}
         return payload
 
     def last_proactive(self, role_id: str = "") -> tuple[str, float]:
@@ -569,7 +645,8 @@ class SocialSignals:
         为什么需要它：主动消息走 `context.send_message` → `platform.send_by_session`，
         不经过 respond 阶段、不产生消息事件，Core 收不到任何事件。
         社交层把原话写进信号文件，Core 在下一轮取信号时就能把这句话补记进
-        `mood.spoke_log`，并推进这个人的 `last_interaction`。
+        `mood.spoke_log`，并推进这个人的 `her_said_at`（v3.0.0 起；**不再**推进
+        `last_interaction`——那个键的兼容语义是「TA 上次说话」，联动 P2-3）。
 
         旧版社交插件没有这个字段：缺键 / 坏值一律返回空串，调用方按「只知道她开过口、
         不知道说了什么」降级——不会因为字段缺失把整条信号读坏。
@@ -657,7 +734,9 @@ class SocialSignals:
 
         返回值有**三种**，调用方必须分得开（见 `life_log.merge_open`）：
 
-        * `None` → 文件不存在 / 过期 / 读不到 / 写方根本没写这个键。表示「**不知道**」，
+        * `None` → 文件不存在 / 过期 / 读不到 / 写方根本没写这个键 / **多 Bot 时本角色
+          分片缺失**（v3.0.0，联动 P2-27：分片存在就不回落顶层，缺失按「不知道」处理，
+          绝不能被顶层的 `[]` 误当成「全结了」把账本清空）。表示「**不知道**」，
           不能据此清掉已有账本；
         * `[]` → 文件新鲜，写方明确写了一个空表。表示「**确实没有了**」；
         * 非空 → 就是还开着的那几条。
@@ -693,10 +772,11 @@ class SocialSignals:
         if isinstance(data, dict):
             if role_id:
                 by_bid = data.get("by_bid")
-                if isinstance(by_bid, dict):
+                if isinstance(by_bid, dict) and by_bid:
+                    # v3.0.0（联动 P2-27）：分片存在时不再回落顶层——顶层在多 Bot 时是
+                    # 跨角色数据，回落等于把别人的「被冷落几次」读成本角色的。
                     role = by_bid.get(str(role_id))
-                    if isinstance(role, dict):
-                        return [role]
+                    return [role] if isinstance(role, dict) else []
             return [data]
         return []
 

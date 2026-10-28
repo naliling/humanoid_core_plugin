@@ -386,6 +386,7 @@ _STALE_SHELL_FIELDS = (
 )
 # 整条删除的静默期（天）的**兜底值**。真正的取值来自配置项
 # `stale_user_retention_days`（v2.27.38 起可配；之前这里是唯一来源、写死 90 天）。
+# v3.0.0 起配置项的 0 = **永不整条删除**（不再退回这个常量），见 `prune_expired`。
 STALE_USER_RETENTION_DAYS = 90
 
 # 自动认定称呼的硬性门槛：来源是消息带的名字（群聊是群名片、私聊是 QQ 昵称），
@@ -812,8 +813,11 @@ class MoodService:
                 return stored
         return self._time()
 
-    def _repair(self, record: dict, user_state: dict) -> dict:
+    def _repair(self, record: dict, user_state: dict, *, persist: bool = True) -> dict:
         """把坏掉的轴值就地修好。
+
+        `persist=False`（v3.0.0，P2-21）：只修传入的 `record`（调用方给的拷贝），
+        不回写 `user_state`、不 `mark_dirty`。只读快照走这条路径，读接口不会写盘。
 
         坏值（`null` / 坏字符串 / NaN）**不能**按 `bounds[0]` 补齐：`_serialize` 会把
         内存里的 NaN 写成 `null`，于是「算术里混进过一次 NaN」的档案下次启动就变成
@@ -867,9 +871,39 @@ class MoodService:
         if "first_met" not in record:
             record["first_met"] = record.get("last_interaction", self._time())
             changed = True
-        if changed:
+        if changed and persist:
             user_state["mood"] = record
             self._scope.mark_dirty()
+        return record
+
+    def peek_profile(self, user_id: str) -> dict[str, Any]:
+        """**只读**情绪档案快照：不建条目、不写 user_state、不 mark_dirty。
+
+        v3.0.0（审核 P2-21）：门面（api.py）的读路径原来调 `profile()`——没有档案时
+        会给用户现建一份空壳并 mark_dirty，「只读门面」于是成了 state.json 的写源，
+        与 CHANGELOG v2.28.9 的「全部只读、不建条目、不写盘」矛盾。本方法给只读
+        调用方一个替代：
+
+        * **有档案**：返回 `_repair` 后的**浅拷贝**。修复只作用于副本（坏值按面板
+          初始值补齐），调用方读到的数字与写路径同口径，但原 record 不动；
+        * **无档案**：返回 `{}`（**不**是 None：门面按 dict 取值，少一层判空），
+          绝不因为「看一眼」就给对方留一条永久记录。
+
+        写路径（情绪分析、衰减、称呼、行为层）仍然用 `profile()`。
+        签名约定：`peek_profile(user_id: str) -> dict[str, Any]`（api.py 按此探测）。
+        """
+        try:
+            raw = self._scope.peek_user(user_id, "mood")
+        except Exception:
+            return {}
+        if not isinstance(raw, dict) or not raw:
+            return {}
+        record = dict(raw)
+        try:
+            # persist=False：只修副本；user_state 传空 dict 也证明这条路不依赖它。
+            self._repair(record, {}, persist=False)
+        except Exception:
+            return record
         return record
 
     def label(self, user_id: str) -> str:
@@ -1298,6 +1332,12 @@ class MoodService:
         v2.28.9：`display_name` / `display_name_at` 加进保留名单（同 `nickname`）：
         情绪档案 7 天不活跃会被清回初始值，但「怎么叫 TA」不该跟着丢——否则跨插件那边
         会突然又不知道名字，主动消息重新变成「不知道怎么叫人」。
+
+        v3.0.0（P2-09）：`stale_user_retention_days <= 0` 表示**永不整条删除**
+        （与 config.py 注释和面板说明一致）。旧实现把 0 退回 90 天常量，用户设 0
+        反而更早丢掉称呼/初遇。0 时字段级清理（`mood_data_retention_days`）照旧。
+        **唯一例外**：纯空壳 `{}` 条目仍会清（它不含任何用户数据，不删只会让
+        state.json 随群规模无限涨）；这是「0=永不整条删除」的明确例外，不是语义漂移。
         """
         cfg = self.config
         try:
@@ -1310,14 +1350,17 @@ class MoodService:
         now = self._time() if now is None else float(now)
         cutoff = now - days * 86400.0
         # 整条删除的静默期可配（v2.27.38）：写死 90 天时，一个 bot 攒到 7000+ 用户、
-        # state.json 2.5 MB 也清不下来。配了非正数就退回常量（= 保持旧行为）。
+        # state.json 2.5 MB 也清不下来。
+        #
+        # **0 = 永不整条删除**（v3.0.0，审核 P2-09）：旧实现把 0/负数退回 90 天常量，
+        # 于是用户按面板说明设 0（想永久保留称呼与初遇时间）反而 90 天后被删。
+        # 0 时字段级清理照旧，只是不再有「整条删除」这一步。
         try:
             stale_days = int(getattr(cfg, "stale_user_retention_days", STALE_USER_RETENTION_DAYS))
         except (TypeError, ValueError):
             stale_days = STALE_USER_RETENTION_DAYS
-        if stale_days <= 0:
-            stale_days = STALE_USER_RETENTION_DAYS
-        stale_cutoff = now - stale_days * 86400.0
+        delete_stale = stale_days > 0
+        stale_cutoff = now - stale_days * 86400.0 if delete_stale else 0.0
         pruned = 0
         for uid in self._scope.all_user_ids():
             user_state = self._scope.user_state(uid)
@@ -1331,6 +1374,9 @@ class MoodService:
                 continue
             if not any(key in user_state for key in RETENTION_DROPPED_FIELDS):
                 # 无可清理字段：字段清理对它无效，所以只能整条删。
+                # 但配置成 0（永不整条删除）时保留——这是 P2-09 的核心语义。
+                if not delete_stale:
+                    continue
                 if not all(key in _STALE_SHELL_FIELDS for key in user_state):
                     continue
                 stale_stamp = user_state.get("last_interaction")
@@ -1387,6 +1433,9 @@ class MoodService:
         # （「时间源本身坏了（NaN/inf）：不推进也不写」）。
         if not _finite(now):
             return False
+        # 时钟回拨：先把账本时间轴平移回来（否则未来条目按满权重计入 → 好感跳涨），
+        # 再处理 last_decay。平移结果必须落盘，所以下面按「有改动」返回。
+        rebased = self._rebase_ledger(record, now)
         try:
             last = float(record.get("last_decay", now))
         except (TypeError, ValueError):
@@ -1395,7 +1444,20 @@ class MoodService:
             # 坏掉的时间戳就地修成「此刻」：不修的话每次都会算出一个 NaN 比率。
             last = now
         elapsed_hours = (now - last) / 3600.0
+        if elapsed_hours < -(self.LEDGER_CLOCK_SKEW_TOLERANCE / 3600.0):
+            # 时钟被回拨（last_decay 落在未来）。旧实现这里直接 return——回拨期间
+            # 衰减永远冻结，情绪停在回拨前的值。正确做法是把锚点修到「此刻」，
+            # 让衰减从现在起正常走；这一次不衰减（负时长没有意义），但状态要落盘。
+            record["last_decay"] = now
+            user_state["mood"] = record
+            self._scope.mark_dirty()
+            return True
         if elapsed_hours < 0.1:
+            if rebased:
+                record["last_decay"] = now
+                user_state["mood"] = record
+                self._scope.mark_dirty()
+                return True
             return False
 
         duration = max(0.5, _num_or(cfg.mood_decay_hours, 6.0))
@@ -1743,22 +1805,27 @@ class MoodService:
         energy = self._scope.get_self("energy", 80)
         delta = Delta(adjust(delta.affection), adjust(delta.libido), adjust(delta.aggression))
 
-        cycle_day = self._scope.get_self("current_cycle_day", 1)
-        phase = cfg.cycle_phase_index(cycle_day)
-        # 8 阶段索引：0 月经期（消极放大）、4 排卵期（积极放大）。
-        # 其余阶段不调制——以前给「卵泡期」一个统一口径，而它其实是三段不同状态。
-        if phase == 0:
-            delta = Delta(
-                delta.affection * (0.5 if delta.affection > 0 else 1.5),
-                delta.libido * (0.5 if delta.libido > 0 else 1.5),
-                delta.aggression * (0.5 if delta.aggression > 0 else 1.5),
-            )
-        elif phase == 4:
-            delta = Delta(
-                delta.affection * (1.4 if delta.affection > 0 else 1.0),
-                delta.libido * (1.4 if delta.libido > 0 else 1.0),
-                delta.aggression * (1.4 if delta.aggression > 0 else 1.0),
-            )
+        # 周期相位调制**只在 enable_cycle 打开时生效**（v3.0.0，审核 P2-14）。
+        # 旧写法无条件跑这一段：用户把面板上的生理周期关掉之后，描述与不适确实没了，
+        # 但月经期负面情绪照样被放大 1.5 倍、正面砍半，排卵期照样 ×1.4——
+        # 「开关关了却还在调制」是最难被发现的那类配置失效。
+        if cfg.enable_cycle:
+            cycle_day = self._scope.get_self("current_cycle_day", 1)
+            phase = cfg.cycle_phase_index(cycle_day)
+            # 8 阶段索引：0 月经期（消极放大）、4 排卵期（积极放大）。
+            # 其余阶段不调制——以前给「卵泡期」一个统一口径，而它其实是三段不同状态。
+            if phase == 0:
+                delta = Delta(
+                    delta.affection * (0.5 if delta.affection > 0 else 1.5),
+                    delta.libido * (0.5 if delta.libido > 0 else 1.5),
+                    delta.aggression * (0.5 if delta.aggression > 0 else 1.5),
+                )
+            elif phase == 4:
+                delta = Delta(
+                    delta.affection * (1.4 if delta.affection > 0 else 1.0),
+                    delta.libido * (1.4 if delta.libido > 0 else 1.0),
+                    delta.aggression * (1.4 if delta.aggression > 0 else 1.0),
+                )
 
         # 单次变化上限（面板项）。**按轴各自夹**：这一项的名字是「单次好感变化上限」，
         # 而 `Delta.capped()` 会把 libido / aggression 也一起夹到 ±cap —— 面板设成 1 时，
@@ -1987,7 +2054,10 @@ class MoodService:
                 aff = 0.0
         aff *= factor
         if aff < 0 and bool(getattr(cfg, "mood_negative_softening", True)):
-            current = float(record.get("affection", 50.0) or 50.0)
+            # 不能用 `or`：好感恰好是 0.0 时会被当成「没设」→ 按 50 结算，底部软化与
+            # 韧性整段失效，负向伤害被放大数倍（审核 P2-19）。`_num_or` 只把 None/坏值
+            # 退回默认值，合法的 0 原样保留。
+            current = _num_or(record.get("affection"), 50.0)
             # 底部减速：越靠近低分区扣得越少
             if current < 30.0:
                 aff *= max(0.3, current / 30.0)
@@ -2014,8 +2084,9 @@ class MoodService:
         cfg = self.config
         if not bool(getattr(cfg, "mood_recovery_bonus", True)):
             return delta
-        base = float(record.get("base_affection", 50.0) or 50.0)
-        current = float(record.get("affection", base) or base)
+        # 同上：base/current 都可能合法地是 0，不能用 `or` 吞掉（审核 P2-19）。
+        base = _num_or(record.get("base_affection"), 50.0)
+        current = _num_or(record.get("affection"), base)
         apology = bool(_APOLOGY_PATTERN.search(str(text or "")))
         # 连击计数：负向清零，正面/道歉 +1
         if delta.affection < 0:
@@ -2073,10 +2144,9 @@ class MoodService:
                 True,
             )
         threshold = _num_or(getattr(cfg, "ccb_affection_min", 50.0), 50.0)
-        try:
-            aff = float(record.get("affection", 50.0) or 50.0)
-        except (TypeError, ValueError):
-            aff = 50.0
+        # 0 是合法好感：`or 50.0` 会把它当成没设，好感 0 时反而越过门槛白拿亲近欲
+        # （与 P2-19 同一类陷阱；审核只列了 6 处，这是同款第 7 处）。
+        aff = _num_or(record.get("affection"), 50.0)
         if aff >= threshold:
             return (
                 Delta(float(delta.affection), float(delta.libido) + 2.0, float(delta.aggression)),
@@ -2094,10 +2164,9 @@ class MoodService:
         cfg = self.config
         if not bool(getattr(cfg, "cooling_enabled", True)):
             return
-        try:
-            aff = float(record.get("affection", 50.0) or 50.0)
-        except (TypeError, ValueError):
-            aff = 50.0
+        # 同上：好感 0 被当成 50 时，冷静期永远不会触发（已经是"最低档"的人
+        # 反而最不该被当成关系还好）。
+        aff = _num_or(record.get("affection"), 50.0)
         threshold = _num_or(getattr(cfg, "cooling_affection", 10), 10.0)
         # 单条负向的幅度在 `_throttle_negative` 里已封顶到 -NEGATIVE_MESSAGE_CAP，
         # 所以「重创」的阈值必须贴着这个上限，否则这条分支恒假（原来是 -2.5）。
@@ -2159,13 +2228,12 @@ class MoodService:
             return ""
         if not isinstance(record, dict):
             return ""
-        try:
-            aff = float(record.get("affection", 50.0) or 50.0)
-            base = float(record.get("base_affection", aff) or aff)
-            aggr = float(record.get("aggression", 28.0) or 28.0)
-            base_aggr = float(record.get("base_aggression", aggr) or aggr)
-        except (TypeError, ValueError):
-            return ""
+        # 0 是合法值：`x or default` 会把 0 当「没设」，好感 0 时这里反而按 50 算，
+        # 永远出不了「她此刻有点提不起劲」（审核 P2-19）。
+        aff = _num_or(record.get("affection"), 50.0)
+        base = _num_or(record.get("base_affection"), aff)
+        aggr = _num_or(record.get("aggression"), 28.0)
+        base_aggr = _num_or(record.get("base_aggression"), aggr)
         if aggr - base_aggr >= 7.0:
             return "她此刻心里还有点堵"
         if aff - base >= 9.0:
@@ -2186,13 +2254,11 @@ class MoodService:
             return ""
         if not isinstance(record, dict):
             return ""
-        try:
-            aff = float(record.get("affection", 50.0) or 50.0)
-            base = float(record.get("base_affection", aff) or aff)
-            aggr = float(record.get("aggression", 28.0) or 28.0)
-            base_aggr = float(record.get("base_aggression", aggr) or aggr)
-        except (TypeError, ValueError):
-            return ""
+        # 同 current_tone：0 是合法值，不能用 `or` 吞（审核 P2-19）。
+        aff = _num_or(record.get("affection"), 50.0)
+        base = _num_or(record.get("base_affection"), aff)
+        aggr = _num_or(record.get("aggression"), 28.0)
+        base_aggr = _num_or(record.get("base_aggression"), aggr)
         if aggr - base_aggr >= 7.0 or base - aff >= 7.0:
             return "这会儿话不太多"
         if aff - base >= 9.0:
@@ -2215,6 +2281,78 @@ class MoodService:
     # 注意 ledger≈33 对应的是**日净增 3.1**，与 `DAILY_NET_GAIN_CAP` 是配套的两个数，
     # 改一个必须重标另一个。
     LEDGER_HALF_LIFE_HOURS = 168.0
+    # 账本条目的「未来」容差（秒）：超过这个量说明系统时钟被回拨过（NTP 大校正/
+    # VM 快照恢复/容器迁移），要把账本时间轴整体平移，而不是按「刚刚发生」计权重。
+    LEDGER_CLOCK_SKEW_TOLERANCE = 300.0
+
+    def _rebase_ledger(self, record: dict, now: float) -> bool:
+        """时钟回拨时把账本时间轴整体平移回 now，返回是否改动。
+
+        问题（审核 P2-13）：账本只记「距今多久」，靠 `_ledger_total` 按 now 算 age。
+        系统时间倒退 30 天后，所有条目时间戳都落在未来，age 被夹成 0 → 每一笔旧账
+        都按「刚刚发生」满权重计入（实测 20 天暖聊后回拨 30 天：61.75 → 75.50，
+        好感 +13.75，没有任何事件）；`_decay_record` 也因 `elapsed_hours < 0.1` 冻结。
+
+        处置：**平移时间轴**而不是丢弃未来条目——丢弃等于让 20 天的关系凭空失忆，
+        同样是没来由的跳变。把账本连同 `last_decay`/`last_interaction` 一起减去
+        同一个偏移量 `skew`，使「时钟回拨前最后一次结算的时刻」正好落在 now：
+        每笔账的**年龄保持回拨前的值**（不是被夹成 0），所以好感一分数都不跳；
+        此后 now 继续前进，时衰从回拨前的年龄接着走（不冻结）。
+
+        参照点取 `last_interaction`/`last_decay` 里最大的那个：`_commit` 每次结算都会
+        写 `last_interaction = now`，所以它就是「回拨前这台钟最后一次说现在」的值。
+        老档案没有这两个字段时才退回「把最新一笔对齐到 now」。
+
+        只平移、不新增键：`t` 仍是「账本时间轴上的时刻」，语义不变。
+        """
+        led = record.get(LEDGER_KEY)
+        if not isinstance(led, list) or not led or not _finite(now):
+            return False
+        newest = None
+        for item in led:
+            if not isinstance(item, dict):
+                continue
+            try:
+                stamp = float(item.get("t"))
+            except (TypeError, ValueError):
+                continue
+            if _finite(stamp) and (newest is None or stamp > newest):
+                newest = stamp
+        if newest is None or newest <= float(now) + self.LEDGER_CLOCK_SKEW_TOLERANCE:
+            return False
+        reference = None
+        for key in ("last_interaction", "last_decay"):
+            try:
+                value = float(record.get(key))
+            except (TypeError, ValueError):
+                continue
+            if _finite(value) and (reference is None or value > reference):
+                reference = value
+        if reference is None or reference <= float(now) + self.LEDGER_CLOCK_SKEW_TOLERANCE:
+            reference = newest
+        skew = reference - float(now)
+        if skew <= self.LEDGER_CLOCK_SKEW_TOLERANCE:
+            return False
+        for item in led:
+            if not isinstance(item, dict):
+                continue
+            try:
+                stamp = float(item.get("t"))
+            except (TypeError, ValueError):
+                continue
+            if not _finite(stamp):
+                continue
+            item["t"] = round(stamp - skew, 1)
+        # 这两个也是「她这台钟上的时刻」，跟着同一偏移量走：否则下一次调用会看到
+        # 它们仍在未来，再次触发平移（重复平移会把账本越推越远）。
+        for key in ("last_interaction", "last_decay"):
+            try:
+                value = float(record.get(key))
+            except (TypeError, ValueError):
+                continue
+            if _finite(value):
+                record[key] = round(max(0.0, value - skew), 1)
+        return True
 
     def _ledger_append(self, record: dict, delta: Delta, now: float,
                        kind: str = "") -> None:
@@ -2279,6 +2417,12 @@ class MoodService:
             # 时间戳或权重不是有限数就整笔丢掉：`t` 是 NaN 时 `max(0.0, nan)` 变成 0.0
             # （=按「刚刚」满权重），`w` 是 NaN 时 `min(100.0, nan)` 变成 100.0（=满分）。
             if not _finite(raw_t) or not _finite(w):
+                continue
+            # 防御：正常路径在 `_commit`/`_decay_record` 里已经先 `_rebase_ledger` 把
+            # 未来时间轴平移过；若这里还看得到明显超前的条目（例如外部直接调用本函数），
+            # **整笔跳过**而不是把 age 夹成 0 —— 后者会让旧账按「刚刚发生」满权重计入，
+            # 好感凭空跳涨（审核 P2-13）。
+            if raw_t > now + self.LEDGER_CLOCK_SKEW_TOLERANCE:
                 continue
             age = max(0.0, (now - raw_t) / 3600.0)
             total += w * (0.5 ** (age / half))
@@ -2350,7 +2494,9 @@ class MoodService:
         # 就能把好感打到 0。`IGNORE_PENALTY_CAP` 仍然只管单笔，不动。
         weight = -self._charge_negative_day(record, -weight)
         if weight < 0:
-            self._ledger_append(record, Delta(weight, 0.0, 0.0), self._time(), "没被理")
+            now = self._time()
+            self._rebase_ledger(record, now)
+            self._ledger_append(record, Delta(weight, 0.0, 0.0), now, "没被理")
             _note_emotion_memory(
                 record, self._time(), "grudge", "heavy" if weight <= -3.0 else "light"
             )
@@ -2371,6 +2517,9 @@ class MoodService:
             "libido": delta.libido,
             "aggression": delta.aggression,
         }
+        # 时钟被回拨过时，先把账本时间轴平移回此刻，再记新账：否则新条目会落在
+        # 「未来旧账的过去」，时衰把它直接算没，而旧账又按满权重顶高好感（审核 P2-13）。
+        self._rebase_ledger(record, now)
         # **不是累加**，是把这一笔记进账本，然后按「base + 账本此刻的净值」重算。
         # 累加器只记得「曾经加过」，不记得「那件事已经过去了」——于是好感只涨不跌。
         self._ledger_append(record, delta, now)

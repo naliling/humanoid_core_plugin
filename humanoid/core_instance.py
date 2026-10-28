@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 import time
 from typing import Any, Optional
@@ -184,6 +185,9 @@ class HumanoidCoreInstance:
         self._fetch_json = fetch_json
         self.persona_source = persona_source
         self.last_activity: Optional[float] = None
+        # 契约重建的输入摘要与上次重建时刻（P2-06 / P2-07）：见 refresh_contract。
+        self._contract_digest: tuple | None = None
+        self._contract_built_at = 0.0
 
         self.resolver = resolver
         self.gateway = gateway
@@ -561,7 +565,7 @@ class HumanoidCoreInstance:
         """自动取名：只从人设正文里抽自称的名字。
 
         **抽不到就返回空串**，不用 role_id 顶上。role_id 是内部标识（`bot1`、
-        `3632823490` 这种），拿它当名字会让注入变成「（bot1的内心：心里有点堵）」
+        `100000001` 这种），拿它当名字会让注入变成「（bot1的内心：心里有点堵）」
         ——比不补更糟：不补的时候注入退回「她」，那是对的。
 
         这里必须走**同步的缓存读取**（`cached_persona`），不能调 async 的
@@ -861,7 +865,7 @@ class HumanoidCoreInstance:
             )
 
     def on_message(self, user_id: str, text: str, is_group: bool = False, umo: str = "",
-                   is_command: bool = False) -> None:
+                   is_command: bool = False, user_name: str = "") -> None:
         """一条真实用户消息的记账。
 
         `is_command=True` 时只推进时钟与「人在用」，**不记任何互动**：
@@ -913,7 +917,11 @@ class HumanoidCoreInstance:
                 ):
                     if _ccb.detect_occurrence(text):
                         _us = self._scope.user_state(user_id)
-                        if _ccb.note_occurrence(_us, now):
+                        # v3.0.0（审核 P2-22 / B 的实现）：纯聊天文本命中必须在真实场景
+                        # 内才入账。以前任何私聊一句「我们做爱了」就能 +1 并写档案，
+                        # 绕过 38/50 门槛、场景分与冷却；社交层又拿 ccb_done_count 判断
+                        # 「是否发生过」。场景外直接返回 False，下面结算不会执行。
+                        if _ccb.note_occurrence_in_scene(_us, now):
                             # 结算：明确拒绝 → 掉好感；到基线且不是第一次 → 多涨并降攻击。
                             # P1：拒绝有两个来源——**他**这条消息在拒绝（他不想），
                             # 或者**她**刚刚明确说过不要（她不想要）却仍然发生了。
@@ -974,7 +982,14 @@ class HumanoidCoreInstance:
                 self.behavior.add_event(user_id, event)
 
             # 当前消息成为下一次“回来时”可参考的上一条消息。
+            # v3.0.0（联动 P2-3）：`last_interaction` 保持旧语义 = **TA 上次说话**
+            #（社交层一直按这个读，只加不改）；`peer_said_at` 是同一时刻的显式别名。
+            # 她说话不再推进这里的值，而是记 `her_said_at`（见 _note_social_outgoing）。
             self._scope.set_user(user_id, "last_interaction", now)
+            self._scope.set_user(user_id, "peer_said_at", now)
+            # 联动 P2-5：social 的两条兜底分支读 user 级 name / base_affection，
+            # 这里只**加**一份副本，不改既有 nickname/display_name/mood.base_affection。
+            self._mirror_social_fallback_fields(user_id, user_name)
             if text:
                 self._scope.set_user(user_id, "last_message", {
                     "text": text[:120],
@@ -1014,6 +1029,63 @@ class HumanoidCoreInstance:
             self.soma.note_chat(now)
         if not is_command:
             self._dispatch_async(user_id, text, is_group=is_group)
+
+    # ─── 社交层兜底字段（v3.0.0，联动 P2-5）──────────────────
+
+    def _mirror_social_fallback_fields(self, user_id: str, sender_name: str = "") -> None:
+        """把社交层兜底要用的两个 **user 级**键补一份：`name` 与 `base_affection`。
+
+        social/core_bridge.py 的称呼三级回退第三级读 `user.name`、好感基线在
+        `mood.base_affection` 拿不到时读 `user.base_affection`；而 Core 一直只写
+        `display_name` 与 mood 子字典，这两条兜底分支**永远不产出**（联动 P2-5）。
+
+        只加不改：
+
+        * 既有 `nickname` / `display_name` / `mood.base_affection` 的语义与优先级
+          完全不动；这里只是同一份事实的 user 级副本；
+        * 值没变就不写（避免每条消息多一次 mark_dirty 与写盘放大）；
+        * 没有 mood 档案的用户不补 base_affection（不为陌生人建档）；
+        * 任何异常都吞掉——这是参考字段，坏掉不该影响一条消息的记账。
+        """
+        uid = str(user_id or "").strip()
+        if not uid:
+            return
+        scope = self._scope
+        cleaned = ""
+        if sender_name:
+            try:
+                from .services.mood import clean_display_name
+
+                cleaned = clean_display_name(str(sender_name), uid)
+            except Exception:
+                cleaned = ""
+        if cleaned:
+            try:
+                if cleaned != str(scope.peek_user(uid, "name", "") or ""):
+                    scope.set_user(uid, "name", cleaned)
+            except Exception:
+                pass
+        try:
+            record = scope.peek_user(uid, "mood")
+            if not isinstance(record, dict):
+                return
+            raw = record.get("base_affection")
+            if raw is None:
+                return
+            base = float(raw)
+            if base != base:  # NaN
+                return
+            current = scope.peek_user(uid, "base_affection")
+            try:
+                unchanged = current is not None and abs(float(current) - base) <= 1e-6
+            except (TypeError, ValueError):
+                unchanged = False
+            if not unchanged:
+                scope.set_user(uid, "base_affection", round(base, 2))
+        except (TypeError, ValueError):
+            return
+        except Exception:
+            return
 
     def _note_schedule_event(
         self, user_id: str, text: str, *, is_group: bool = False, now: float = 0.0
@@ -1137,17 +1209,80 @@ class HumanoidCoreInstance:
             memory_text=memory_text,
         )
 
+    #: 契约的兜底重建间隔（秒）：即使输入摘要没变，也至少每分钟刷一次 time/day 这类
+    #: 随时间走、但摘要里看不出来的字段（P2-06）。
+    CONTRACT_MAX_AGE_SECONDS = 60.0
+
+    def _contract_input_digest(self) -> tuple | None:
+        """契约输入摘要（v3.0.0，P2-06）：便宜、只取「变了就值得重算整份契约」的几项。
+
+        以前身体 tick 每轮都全量重算一遍契约（实测 3.28 ms/次/角色）；而 body_tick_seconds
+        允许配到 15 秒，契约里的 body/day 大多在这个尺度上没变。摘要没变就复用上一份，
+        变了立刻重建、最多晚 CONTRACT_MAX_AGE_SECONDS 兜底刷一次时间类字段。
+
+        取不到（旧测试替身 / 内部异常）返回 None = 不做缓存、照旧每轮重算，行为不退化。
+        这里调用的都是各服务里现成的只读快照方法，不推进身体、不写状态。
+        """
+        try:
+            cfg = self.config
+            now = self.clock.now()
+            slot = self.schedule.current_slot() or {}
+            slots = self.schedule.current_slots() or []
+            weather = self.weather.snapshot() or {}
+            parts: tuple = (
+                round(float(self.energy.energy), 1),
+                round(float(self.social.value), 1),
+                now.strftime("%Y-%m-%d"),
+                str(slot.get("start", "")),
+                str(slot.get("event", "")),
+                str(slot.get("location", "")),
+                len(slots),
+                str(slots[-1].get("event", "")) if slots else "",
+                str(weather.get("env", "")),
+                str(weather.get("notice", "")),
+                str(self.clock.holiday() or ""),
+                str(self.char_name() or ""),
+                str(self.persona_label() or ""),
+                bool(getattr(cfg, "soma_enabled", False)),
+            )
+            if bool(getattr(cfg, "soma_enabled", False)):
+                snap = self.soma.snapshot() or {}
+                parts += tuple(
+                    round(float(snap.get(key, 0.0) or 0.0), 1)
+                    for key in (
+                        "sleep_pressure", "sleep_debt", "hunger", "discomfort",
+                        "arousal", "social_desire",
+                    )
+                )
+                parts += (bool(snap.get("asleep")),)
+            try:
+                outfit_info = self.outfit_info() or {}
+                parts += (
+                    bool(outfit_info.get("enabled")),
+                    str(outfit_info.get("text", "")),
+                )
+            except Exception:
+                parts += (False, "")
+            return parts
+        except Exception:
+            return None
+
     def refresh_contract(self) -> dict | None:
         """重算并落盘导出给社交层的身体快照。
 
         只在真正有得看的变化时写：`generated_at` 每分钟都在动，拿它参与比较的话这个
         方法本身就变成常驻写盘源。时间字段会跟着一起刷新，但不单独触发写入。
 
-        身体关着时不导出：契约里的轴全是初始值，社交层读到 `social_desire=0` 会把她当成
-        「刚聊完不想说话」而长期压住主动消息。不导出，社交层就退回旧字段，行为与 v1.7.4 一致。
+        **门禁解耦（v3.0.0，联动 P1-C/P2-26）**：
+
+        * `contract_enabled=false` 才整份停发并清空（总开关，用户明确不要联动）；
+        * `soma_enabled=false` **不再**连带停发——契约里的 identity/日程/天气/节日/
+          事件/作息/time/persona 与身体无关，社交层一直在用；以前把这个「多轴身体」
+          开关的副作用当成整份契约的闸门，社交层还会把缺失误诊成「旧版 Core，升级到
+          v2.14+」。身体块改由 `link.build_contract` 给中性表示，键名一个不变。
         """
-        if not self.config.contract_enabled or not self.config.soma_enabled:
-            # 契约关闭时清空已有契约，避免社交层读到过期数据
+        if not self.config.contract_enabled:
+            # 契约总开关关闭：清空已有契约，避免社交层读到过期数据。
             previous = self._scope.get_self("contract")
             if previous is not None:
                 try:
@@ -1155,6 +1290,22 @@ class HumanoidCoreInstance:
                 except Exception:
                     pass
             return None
+        # v3.0.0（P2-06）：输入摘要没变就别重算整份契约；变了立刻重建，
+        # 另外最多 CONTRACT_MAX_AGE_SECONDS 兜底刷一次（time/day 这类随时间走的字段）。
+        digest = self._contract_input_digest()
+        if digest is not None:
+            try:
+                age = time.monotonic() - float(self._contract_built_at)
+            except (TypeError, ValueError):
+                age = None
+            if (
+                digest == self._contract_digest
+                and age is not None
+                and age < self.CONTRACT_MAX_AGE_SECONDS
+            ):
+                return self._scope.get_self("contract")
+            self._contract_digest = digest
+            self._contract_built_at = time.monotonic()
         try:
             contract = build_contract(self)
         except Exception as exc:
@@ -1257,7 +1408,9 @@ class HumanoidCoreInstance:
 
         - 只在信号时间戳**前进**时记一次（旧文件里同一个 at 不重复记）；
         - 原文缺失（旧版社交插件）就只当没发生，不拿占位文本污染 `spoke_log`；
-        - `last_interaction` 只往后推，不覆盖用户后来的发言。
+        - v3.0.0（联动 P2-3）起她说话记 `her_said_at`，**不再推进 `last_interaction`**：
+          后者是「TA 上次说话」的兼容语义，被她的主动消息推前会让社交层误判对方刚说过话、
+          掩盖真实沉默时长（它据此判冷淡/放弃/追问）。
         """
         uid = str(target or "").strip()
         try:
@@ -1293,9 +1446,11 @@ class HumanoidCoreInstance:
             return
         try:
             self.mood.note_spoke(uid, text, at)
-            current = float(self.scope.get_user(uid, "last_interaction", 0.0) or 0.0)
+            # v3.0.0（联动 P2-3）：她开口推进 her_said_at；last_interaction 只属于
+            # 「TA 上次说话」，这里不再动它（兼容语义不变 = 只加不改）。
+            current = float(self.scope.get_user(uid, "her_said_at", 0.0) or 0.0)
             if at > current:
-                self.scope.set_user(uid, "last_interaction", at)
+                self.scope.set_user(uid, "her_said_at", at)
             # P1：她主动说出口的话也进 ccb 的账（含社交层代发的主动消息）。
             self.note_her_words(uid, text, now=at)
         except Exception as exc:
@@ -1325,10 +1480,19 @@ class HumanoidCoreInstance:
         与用户那一路共用 `ccb_event_dedup_at`：一件事只记一次，谁先说都一样。
         """
         cfg = self.config
-        if not bool(getattr(cfg, "ccb", False)) or is_group:
-            return
         body = str(text or "").strip()
         if not body:
+            return
+        # 她说话的时间与 ccb 无关：社交层要区分「TA 沉默多久」和「她多久前开过口」，
+        # 所以这一笔在 ccb 闸门**之前**记（v3.0.0，联动 P2-3）。只加一个 user 级键。
+        try:
+            moment = self.now_epoch() if now is None else float(now)
+            current = float(self._scope.peek_user(user_id, "her_said_at", 0.0) or 0.0)
+            if moment > current:
+                self._scope.set_user(user_id, "her_said_at", moment)
+        except Exception:
+            pass
+        if not bool(getattr(cfg, "ccb", False)) or is_group:
             return
         try:
             if not self.mood.readable(
@@ -1340,7 +1504,6 @@ class HumanoidCoreInstance:
         except Exception:
             return
         try:
-            moment = self.now_epoch() if now is None else float(now)
             state = self._scope.user_state(user_id)
             # 
             # 放在拒绝判定之前：判姿势与拒绝互不影响，先记下来更省事。
@@ -1910,13 +2073,31 @@ class HumanoidCoreInstance:
             # 7062 个用户 = 7062 次 read，实测 1.5 秒。这段代码跑在**事件循环**上，
             # 于是每个 tick 都把整台 AstrBot 冻住一次——消息回不出去、LLM 不调用，
             # 看门狗日志里写的就是 `Event loop stalled for 30s`。
+            #
+            # v3.0.0（P2-08）：**反向遍历**信号里的 ignored_by 表，而不是每 tick 全量
+            # 扫本角色的所有用户（生产 7806 人，每分钟一次 O(n)）。ignored_by 只有
+            # 「她主动找过、没被回」的人才会出现，通常是个位数；语义完全等价——
+            # 旧代码也只对 ignored 表里 >0 的人动手。
+            #
+            # 仍然只处理本角色**已有档案**的人：不认识的 uid 不在这里建档（旧行为）。
             ignored = self.signals.ignored_by_map(self.role_id)
             if not ignored:
                 return
-            for uid in self.scope.all_user_ids():
-                per = ignored.get(uid, 0)
-                if per > 0:
-                    self.mood.note_ignored_by_peer(uid, per)
+            scope = self.scope
+            for uid, per in ignored.items():
+                try:
+                    count = int(per or 0)
+                except (TypeError, ValueError):
+                    continue
+                if count <= 0:
+                    continue
+                # 这个用户在本角色状态里存在吗（旧行为只扫已有用户）。用 peek，不建档。
+                known = scope.peek_user(uid, "mood") is not None or (
+                    scope.peek_user(uid, "last_interaction") is not None
+                )
+                if not known:
+                    continue
+                self.mood.note_ignored_by_peer(uid, count)
         except Exception as exc:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 应用按人冷落失败: {exc}")
@@ -2329,12 +2510,28 @@ class HumanoidCoreInstance:
             except asyncio.TimeoutError:
                 pass
 
+    def _body_interval(self) -> float:
+        """身体/过程循环的间隔（秒）：配置坏值退回 60，下限 15（与旧行为一致）。"""
+        try:
+            return max(15.0, float(self.config.body_tick_seconds))
+        except Exception as exc:
+            if self._log:
+                self._log.warning(
+                    f"{LOG_PREFIX} 身体推进间隔不可用（{exc!r}），本轮用默认 60 秒"
+                )
+            return 60.0
+
     async def _process_loop(self):
         """过程推进：她手上的事自己会走完、会换阶段。
 
         没有这个循环，`ProcessService` 就只是一个躺在文件里的类（此前全项目零实例化）：
         `current_process` 永远停在生成那一刻的第一阶段。单轮出错只记一条，绝不把循环带走。
         """
+        # v3.0.0（P2-07）：按 monotonic 的**下一截止时刻**调度，而不是「干完活再等 interval」
+        #（后者实际周期 = 耗时 + interval，系统性偏长，且耗时抖动会累积成漂移）。
+        # 每次加一个小 jitter（≤1s），避免多角色同相位抖动。
+        rng = random.Random()
+        next_at = time.monotonic()
         while not self._stop_event.is_set():
             try:
                 self.process.tick()
@@ -2342,13 +2539,15 @@ class HumanoidCoreInstance:
                     await self.process.update_async()
             except Exception as exc:
                 self._log.warning(f"{LOG_PREFIX} 过程推进失败: {exc}")
+            interval = self._body_interval()
+            next_at += interval
+            now = time.monotonic()
+            if next_at < now:
+                # 落后一个整周期以上（休眠/事件循环被长期占住）：不补跑，直接对齐此刻。
+                next_at = now
+            delay = max(0.0, next_at - now) + rng.uniform(0.0, min(1.0, interval * 0.05))
             try:
-                interval = max(15.0, float(self.config.body_tick_seconds))
-            except Exception as exc:
-                self._log.warning(f"{LOG_PREFIX} 过程推进间隔不可用（{exc!r}），本轮用默认 60 秒")
-                interval = 60.0
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
             except asyncio.TimeoutError:
                 pass
 
@@ -2390,16 +2589,21 @@ class HumanoidCoreInstance:
         v2.13.2 里精力、饥饿、久坐全部挂在 on_message 上：没人说话的那十几个小时里
         她不会困也不会饿。这个循环不依赖消息，同时把生理周期按天推下去。
         """
+        # v3.0.0（P2-07）：同 _process_loop，按 monotonic 下一截止时刻调度 + 小 jitter。
+        # 旧写法「等 _body_step 跑完再等 interval」让 body_tick_seconds 名义 60 秒、实际
+        # 60+耗时，多角色还会同相位抖动。
+        rng = random.Random()
+        next_at = time.monotonic()
         while not self._stop_event.is_set():
-            cfg = self.config
             await self._body_step()
+            interval = self._body_interval()
+            next_at += interval
+            now = time.monotonic()
+            if next_at < now:
+                next_at = now
+            delay = max(0.0, next_at - now) + rng.uniform(0.0, min(1.0, interval * 0.05))
             try:
-                interval = max(15.0, float(cfg.body_tick_seconds))
-            except Exception as exc:
-                self._log.warning(f"{LOG_PREFIX} 身体推进间隔不可用（{exc!r}），本轮用默认 60 秒")
-                interval = 60.0
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
+                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
             except asyncio.TimeoutError:
                 pass
 

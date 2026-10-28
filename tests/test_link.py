@@ -186,7 +186,11 @@ class ContractTest(unittest.TestCase):
         self.harness.store.flush_sync()
         changed = dict(ci.build_contract(self.core))
         changed["weather"] = "天气：小雨，气温 9℃"
-        with mock.patch.object(ci, "build_contract", return_value=changed):
+        # v3.0.0（P2-06）：refresh_contract 先比便宜输入摘要、没变就复用上一份。这里
+        # 是 mock 掉 build_contract 直接改输出，输入摘要当然不会变——把缓存闸关掉，
+        # 测的仍是原意「build 结果变了必须重写」。摘要本身的行为见 test_v300_runtime。
+        with mock.patch.object(ci, "build_contract", return_value=changed), \
+                mock.patch.object(self.core, "_contract_input_digest", return_value=None):
             again = self.core.refresh_contract()
         self.assertEqual(again["weather"], "天气：小雨，气温 9℃")
         self.assertTrue(self.harness.store.dirty, "天气变了却没重写契约")
@@ -197,13 +201,34 @@ class ContractTest(unittest.TestCase):
         self.box_off.reload()
         self.assertIsNone(self.core.refresh_contract())
 
-    def test_no_contract_when_body_is_off(self):
-        """生理层关着时不能导出契约。
+    def test_contract_still_exported_when_body_is_off(self):
+        """v3.0.0（联动 P1-C/P2-26）：生理层关着时**仍要**导出契约。
 
-        轴全是初始值，社交层读到 social_desire=0 会把她当成「刚聊完不想说话」而长期
-        压住主动消息。不导出，它就退回旧字段，行为与 v1.7.4 一致。
+        以前 soma_enabled=false 会整份停发，连带 identity/日程/天气/节日/作息这些与
+        身体无关的块一起消失，社交层还把缺失误诊成「旧版 Core」。现在契约照发，
+        身体块给中性表示（键名一个不少）。
         """
         harness = Harness({"timezone_city": "北京", "soma_enabled": False})
+        core = harness.roles.get_or_create("bot1")
+        contract = core.refresh_contract()
+        self.assertIsNotNone(contract)
+        self.assertIs(core._scope.get_self("contract"), contract)
+        # 非身体块必须都在（社交层读的就是这些）。
+        for key in ("identity", "day", "outfit", "routine", "weather", "holiday",
+                    "persona", "time", "wake", "event"):
+            self.assertIn(key, contract, key)
+        # 身体块键名不变、值为中性表示。
+        body = contract.get("body") or {}
+        for key in ("energy", "energy_text", "sleep_pressure", "sleep_debt", "hunger",
+                    "discomfort", "arousal", "asleep", "last_sleep_hours",
+                    "social_energy", "social_desire", "cycle_day", "cycle_phase"):
+            self.assertIn(key, body, key)
+        self.assertEqual(body.get("sleep_pressure"), 0.0)
+        self.assertFalse(body.get("asleep"))
+
+    def test_contract_disabled_stops_everything(self):
+        """contract_enabled=false 才是整份停发（总开关）。"""
+        harness = Harness({"timezone_city": "北京", "contract_enabled": False})
         core = harness.roles.get_or_create("bot1")
         self.assertIsNone(core.refresh_contract())
         self.assertIsNone(core._scope.get_self("contract"))
@@ -422,7 +447,7 @@ class SignalsTest(unittest.TestCase):
         """用户数不该等于 `read()` 次数。
 
         原来按 `all_user_ids()` 逐个调 `ignored_by_uid`，而那个方法每次都要走一遍
-        `read()`（路径拼装 + stat）。线上 `3632823490` 这个角色有 7062 个用户，
+        `read()`（路径拼装 + stat）。线上 `100000001` 这个角色有 7062 个用户，
         实测 1.5 秒；这段代码跑在**事件循环**上，于是每个 tick 都把整台 AstrBot
         冻住一次——消息回不出去、LLM 不调用，看门狗日志里就是
         `Event loop stalled for 30s`。这里钉住：用户再多，`read()` 也只走一次。
@@ -621,9 +646,10 @@ def test_unknown_role_does_not_see_another_roles_row():
         "by_bid": {"roleA": {"last_proactive_at": 222.0, "last_target_uid": "u9"}},
     }
     sig.read = lambda: sig._payload
-    # roleB 不在里面 —— 宁可读到顶层的 0，也别把 roleA 的动静算到自己头上
+    # v3.0.0（联动 P2-7/P2-27）：分片存在时**不回落顶层**。roleB 分片缺失 =
+    # 「不知道」，绝不能把 roleA 的动静算到自己头上（多 Bot 时顶层是跨角色数据）。
     target, at = SocialSignals.last_proactive(sig, "roleB")
-    assert at == 1.0
+    assert at == 0.0
     assert target == ""
 
 
@@ -650,8 +676,10 @@ class SignalsScopeAndTtlTest(unittest.TestCase):
         })
         signals = SocialSignals(lambda: root)
         self.assertEqual(signals.ignored_by_uid("42", "bot1"), 5, "读到了顶层的别人的数")
-        # 分片不存在时才回落顶层（单 Bot 部署就是这么写的）
-        self.assertEqual(signals.ignored_by_uid("42", "bot2"), 99)
+        # v3.0.0（联动 P2-7/P2-27）：分片存在时，缺失分片的角色读「不知道」（0），
+        # 不再回落顶层——回落到的是别的角色的被冷落计数。
+        self.assertEqual(signals.ignored_by_uid("42", "bot2"), 0)
+        # 不传角色（单 Bot 口径）时仍读顶层，这是旧行为、只加不改。
         self.assertEqual(signals.ignored_by_uid("42"), 99)
 
     def test_expiry_clears_fingerprint_and_payload(self):

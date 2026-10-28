@@ -26,7 +26,7 @@ from humanoid.services.mood import MoodService
 from .fakes import ScopeStore
 
 FEMALE = "你是小满，24岁。她说话很短，喜欢安静。"
-UID = "3881756548"
+UID = "100000003"
 
 # 线上那条真实的旧档案（灰凝）：好感被 override 钉在 100，两条 base 是旧版轴值。
 LEGACY = {

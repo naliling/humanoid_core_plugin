@@ -73,6 +73,8 @@ USER_KEYS = {
     "affection", "base_affection", "affection_delta",
     "label", "mood_tag", "aggression", "libido",
     "attention", "first_met", "known_days", "last_interaction",
+    # v3.0.0（联动 P2-3）：TA 说话 / 她说话分开记（只加不改）。
+    "peer_said_at", "her_said_at",
     "said", "intimacy",
 }
 
@@ -190,8 +192,8 @@ class DisplayNameCleanTest(unittest.TestCase):
 
     def test_qq_number_is_not_a_name(self):
         # 没设昵称时 get_sender_name 返回的就是 QQ 号：等于 user_id 的纯数字不算名字。
-        self.assertEqual(clean_display_name("3632823490", "3632823490"), "")
-        self.assertEqual(clean_display_name(" 3632823490 ", "3632823490"), "")
+        self.assertEqual(clean_display_name("100000001", "100000001"), "")
+        self.assertEqual(clean_display_name(" 100000001 ", "100000001"), "")
         # 不含字母/汉字的纯数字串即使不是 user_id 也留着（名片原样，交给社交层判断），
         # 但至少别把 QQ 号本身当名字。
         self.assertEqual(clean_display_name("2024", "10001"), "2024")
@@ -444,7 +446,11 @@ class FacadeBriefSharedBlocksTest(unittest.TestCase):
         self.assertIn("events", status)
         # status 仍保留旧字段（只加不改，老社交层还在读它）。
         self.assertIn("relationship", status)
-        self.assertNotIn("relationship", proactive)
+        # v3.0.0（联动 P2-2）：relationship **所有 task** 都带。以前只有 status 给，
+        # 而社交层只调 proactive——`turns` 对唯一消费方永远不可见，它只能自己数消息。
+        self.assertIn("relationship", proactive)
+        self.assertIn("turns", proactive["relationship"])
+        self.assertIn("relationship", chat)  # P2-2：所有 task 都带
 
     def test_her_falls_back_to_live_core(self):
         # 模拟旧 Core 落盘的契约：没有 identity 块。

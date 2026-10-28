@@ -11,6 +11,9 @@
 
 这一层是纯装饰：任何一步出错（不是 NapCat、连接断了、对方离线）都只记一条 debug 日志，
 既不影响正常回复，也不会让状态一直亮着——每个任务自己带 timeout 兜底。
+
+v3.0.0（P2-12）再加两道频率闸：上报间隔有**下限**（配置，默认 0.3s）、单条回复有
+**帧数上限**（配置，默认 60 帧），免得一条长回复把 NapCat 的 call_action 刷爆。
 """
 
 from __future__ import annotations
@@ -29,6 +32,18 @@ REPORT_TIMEOUT_SECONDS = 5.0
 # 拿它当收尾等待时间等于没有上限。
 STOP_WAIT_SECONDS = 2.0
 
+# ── 上报频率治理（v3.0.0，P2-12）────────────────────────────
+# 这一层挂在回复主链上、每条回复一个任务：间隔配到 0.1s 时，一条 20 秒的回复会打
+# 200 次 call_action，NapCat/QQ 侧会当刷接口触发风控。两道闸：
+#
+# 1. 最小上报间隔下限（由配置 input_state_min_interval_seconds 给，默认 0.3s）；
+# 2. 单条回复最多上报帧数（由配置 input_state_max_frames 给，默认 60 帧）。
+#
+# 默认值保持「视觉连续」（0.5s 一帧、60 帧 = 30 秒），但把最坏情况封在 60 次调用内。
+FRAMES_DEFAULT = 60
+# 构造/热重载时给的默认下限；0 = 不额外限制（直接实例化的测试与旧调用不受影响）。
+MIN_INTERVAL_DEFAULT = 0.0
+
 
 class InputStateNotifier:
     """按会话维护「正在输入」的上报任务。"""
@@ -38,19 +53,47 @@ class InputStateNotifier:
         logger: Any,
         interval: float = 0.5,
         timeout: float = 120.0,
+        min_interval: float = MIN_INTERVAL_DEFAULT,
+        max_frames: int = 0,
     ) -> None:
         self._log = logger
         self._tasks: Dict[str, _Entry] = {}
         self._last_active: Dict[str, float] = {}
-        self.interval = max(0.05, float(interval))
-        self.timeout = max(1.0, float(timeout))
+        self.min_interval = MIN_INTERVAL_DEFAULT
+        self.max_frames = 0
+        self.interval = 0.5
+        self.timeout = 120.0
+        self.configure(min_interval, interval, timeout, max_frames=max_frames)
 
     # ------------------------------------------------------------------
 
-    def configure(self, interval: float, timeout: float) -> None:
-        """配置热重载：改的是之后新起的任务，正在跑的按老节奏走完。"""
-        self.interval = max(0.05, float(interval))
-        self.timeout = max(1.0, float(timeout))
+    def configure(self, min_interval: float = MIN_INTERVAL_DEFAULT,
+                   interval: float = 0.5, timeout: float = 120.0,
+                   max_frames: int = 0) -> None:
+        """配置热重载：改的是之后新起的任务，正在跑的按老节奏走完。
+
+        `min_interval` 是上报间隔的**下限**（0 = 不额外限制）；`max_frames` 是单条
+        回复最多上报几帧（0 = 不限）。两者都只影响之后新起的任务。
+        """
+        try:
+            self.min_interval = max(0.0, float(min_interval))
+        except (TypeError, ValueError):
+            self.min_interval = MIN_INTERVAL_DEFAULT
+        try:
+            interval_value = float(interval)
+        except (TypeError, ValueError):
+            interval_value = 0.5
+        # 下限不是「禁止更密」的硬闸写在常量里，而是配置给的下限：0.05 是框架安全底线。
+        self.interval = max(0.05, interval_value, self.min_interval)
+        try:
+            frames = int(max_frames or 0)
+        except (TypeError, ValueError):
+            frames = 0
+        self.max_frames = max(0, frames)
+        try:
+            self.timeout = max(1.0, float(timeout))
+        except (TypeError, ValueError):
+            self.timeout = 120.0
 
     def is_supported(self, event: Any) -> Tuple[bool, str]:
         """这个事件能不能上报：只有 NapCat 的私聊才做。
@@ -170,10 +213,18 @@ class InputStateNotifier:
 
     async def _run(self, key: str, client: Any, user_id: str, stop_event: asyncio.Event) -> None:
         deadline = time.monotonic() + self.timeout
+        frames = 0
         try:
             while not stop_event.is_set():
+                # 单条回复的帧数上限（P2-12）：一条超长回复不该打上百次 call_action。
+                if self.max_frames and frames >= self.max_frames:
+                    self._log.debug(
+                        f"[humanoid_core] 输入状态已达到单条回复上限 {self.max_frames} 帧，停止上报"
+                    )
+                    return
                 self._last_active[key] = time.monotonic()
                 await self._report(client, user_id)
+                frames += 1
                 if time.monotonic() >= deadline:
                     self._log.debug(f"[humanoid_core] 输入状态上报超时（{self.timeout:.0f}s），停止")
                     return

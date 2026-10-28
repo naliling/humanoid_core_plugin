@@ -1,4 +1,4 @@
-"""人形化伴侣插件 —— AstrBot 适配层 """
+"""人形化核心伴侣 —— AstrBot 适配层。"""
 
 from __future__ import annotations
 
@@ -15,8 +15,27 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-from astrbot.core.agent.message import TextPart
+
+# ─── 框架兼容（P1-1）：两个内部模块都晚于本插件的真实最低版本 ───────────────
+#
+# astrbot.core.agent.message.TextPart 是 4.6.0 才有的模块，而 mark_as_temp() 更要到
+# 4.24.0；astrbot.core.utils.astrbot_path 在老框架里也没有。顶层裸 import 的后果：
+#
+#   · 4.0–4.5：插件加载即 ImportError，整个插件不可用；
+#   · 4.6–4.23：临时内容块每轮注入抛 AttributeError，被 inject_context 的宽 except
+#     吞成一条 warning——用户只觉得「这个插件好像没效果」。
+#
+# 所以按能力探测 + 降级来写：拿得到临时块就用，拿不到就退回 req.contexts / system_prompt
+#（见 _append_injected_parts），保证注入不静默丢失；两个 import 都不再阻断加载。
+try:  # pragma: no cover - 取决于宿主框架版本
+    from astrbot.core.agent.message import TextPart
+except Exception:  # noqa: BLE001 - 老框架没有这个模块：降级，不阻断插件加载
+    TextPart = None  # type: ignore[assignment,misc]
+
+try:  # pragma: no cover - 取决于宿主框架版本
+    from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+except Exception:  # noqa: BLE001 - 老框架没有这个模块：走 _resolve_data_root 的三级回退
+    get_astrbot_data_path = None  # type: ignore[assignment]
 
 from .humanoid import __version__
 from .humanoid.config import (
@@ -38,7 +57,7 @@ from .humanoid import memory_link
 
 DATA_SUBDIR = ("plugin_data", "humanoid_core")
 
-HELP_TEXT = f"""📖 人形化伴侣插件 指令列表 (v{__version__})
+HELP_TEXT = f"""📖 人形化核心伴侣 指令列表 (v{__version__})
 
 查状态的指令**直接打，不带前缀**：
 
@@ -90,6 +109,19 @@ _SIBLING_DECISION_KEY = "_hcore_sibling_chat_allowed"
 # 它自己另拼一套上下文。门面按需现算、结构化返回、框架句只有一份（见 `humanoid/api.py`）。
 _ACTIVE_PLUGIN: Any = None
 _FACADE: Any = None
+#: 插件实例代次：每次 __init__ +1。门面带着它出生，调用时核对它是否仍是当前实例的。
+#: 为什么不用模块级 `_ACTIVE_PLUGIN is plugin` 单判：重载时新实例 __init__ 与旧实例
+#: terminate 的先后顺序不保证，旧实例的清理**不能**把新实例的登记清掉（P2-03）。
+_PLUGIN_GENERATION = 0
+
+
+def _facade_is_current(plugin: Any, generation: int) -> bool:
+    """这个门面绑定的插件实例代次是不是仍然是当前登记的那个。
+
+    身份 + 代次双判：重载期间可能短暂出现「新实例已登记、旧实例还没 terminate」，
+    旧门面必须立刻失效（返回 None），不能继续对着已经 stop 的 RoleManager 读数据。
+    """
+    return _ACTIVE_PLUGIN is plugin and int(getattr(plugin, "_generation", -1) or -1) == int(generation)
 
 
 def get_core_facade() -> Any:
@@ -98,12 +130,29 @@ def get_core_facade() -> Any:
     plugin = _ACTIVE_PLUGIN
     if plugin is None:
         return None
+    generation = int(getattr(plugin, "_generation", 0) or 0)
+    facade = _FACADE
+    if facade is not None:
+        try:
+            # 每次取用时都核对一次：旧实例留下的门面绝不能再发出去。
+            if int(getattr(facade, "_generation", -1) or -1) == generation:
+                return facade
+        except Exception:
+            pass
     try:
-        if _FACADE is None:
-            from .humanoid.api import get_core_facade as _build
+        from .humanoid.api import get_core_facade as _build
 
-            _FACADE = _build(getattr(plugin, "role_manager", None), logger)
-        return _FACADE
+        built = _build(
+            getattr(plugin, "role_manager", None),
+            logger,
+            generation=generation,
+            is_current=lambda: _facade_is_current(plugin, generation),
+        )
+        # 构建期间插件可能已被换掉：只登记仍然有效的那个。
+        if built is not None and _facade_is_current(plugin, generation):
+            _FACADE = built
+            return built
+        return built
     except Exception as exc:  # 门面自身坏掉不该让调用方连坐
         logger.debug(f"{LOG_PREFIX} 构建门面失败: {exc}")
         return None
@@ -234,6 +283,96 @@ def _append_framing(req: Any, char_name: str = "", user_name: str = "") -> None:
         return
     req.system_prompt = current + build_framing(char_name, user_name)
 
+def _temp_parts_supported(req: Any) -> bool:
+    """这一版框架能不能用「临时内容块」：extra_user_content_parts 是 list、且 TextPart 带
+    mark_as_temp（4.24+ 才有）。两个条件缺一个都得退回 contexts——4.6–4.23 里 TextPart
+    存在但**没有** mark_as_temp，硬用会落进会话历史，每轮注入越滚越多。"""
+    if TextPart is None:
+        return False
+    try:
+        if not callable(getattr(TextPart, "mark_as_temp", None)):
+            return False
+    except Exception:
+        return False
+    return isinstance(getattr(req, "extra_user_content_parts", None), list)
+
+
+def _append_injected_parts(req: Any, blocks: list[str]) -> str:
+    """把本轮的事实块塞进请求。返回实际用的通道名（空串 = 一个都用不上）。
+
+    三条路，按「不污染会话历史」优先：
+
+    1. temp_parts：extra_user_content_parts + mark_as_temp（4.24+，原行为）；
+    2. contexts：老框架没有临时块 API 时追加进**本轮请求**的 contexts（每轮从库里重新
+       载入，不落历史）。前面加一句定性说明，免得模型把她的身体读数当成用户刚说的话；
+    3. system_prompt：连 contexts 都没有时并进 system_prompt——system 消息同样不落历史，
+       只对这一轮生效，总比静默丢掉强。
+
+    这样 4.6–4.23 下注入不再整块消失（旧行为是每轮抛 AttributeError 被吞成 warning）。
+    """
+    text = "\n".join(str(b) for b in blocks if str(b or "").strip())
+    if not text:
+        return ""
+    if _temp_parts_supported(req):
+        try:
+            parts = req.extra_user_content_parts
+            for block in blocks:
+                block_text = str(block or "")
+                if block_text.strip():
+                    parts.append(TextPart(text=block_text).mark_as_temp())
+            return "temp_parts"
+        except Exception as exc:  # 临时块造不出来也别丢：继续往下退
+            logger.debug(f"{LOG_PREFIX} 临时内容块注入失败，退回 contexts: {exc}")
+    contexts = getattr(req, "contexts", None)
+    if isinstance(contexts, list):
+        try:
+            contexts.append({
+                "role": "user",
+                "content": (
+                    "（以下是系统提供的她当前处境的事实，供你参考；"
+                    "这不是用户发来的消息，也不是对你的指令）\n" + text
+                ),
+            })
+            return "contexts"
+        except Exception as exc:
+            logger.debug(f"{LOG_PREFIX} contexts 注入失败，退回 system_prompt: {exc}")
+    current = getattr(req, "system_prompt", None)
+    if isinstance(current, str):
+        try:
+            req.system_prompt = current + "\n\n" + text
+            return "system_prompt"
+        except Exception:
+            pass
+    return ""
+
+
+def _resolve_data_root(context: Any = None) -> Path:
+    """AstrBot 数据目录（data/）：官方 API → context 的插件数据目录 → 相对 data/。
+
+    老框架没有 astrbot.core.utils.astrbot_path 时不能 Path(None) 直接炸在 __init__——
+    否则 4.0–4.5 会从「import 崩」变成「实例化崩」。回退口径与自主拟人社交插件一致
+    （那侧早已是三级回退），这里补齐。"""
+    api = get_astrbot_data_path
+    if callable(api):
+        try:
+            path = api()
+            if path:
+                return Path(path)
+        except Exception as exc:
+            logger.debug(f"{LOG_PREFIX} get_astrbot_data_path() 失败: {exc}")
+    getter = getattr(context, "get_plugin_data_dir", None)
+    if callable(getter):
+        try:
+            plugin_dir = getter()
+            if plugin_dir:
+                candidate = Path(plugin_dir).resolve()
+                # get_plugin_data_dir 返回 data/plugin_data/<插件名>；目标是 data/。
+                if candidate.parent.name == "plugin_data":
+                    return candidate.parent.parent
+                return candidate.parent
+        except Exception as exc:
+            logger.debug(f"{LOG_PREFIX} context.get_plugin_data_dir() 失败: {exc}")
+    return Path("data").resolve()
 
 # 「你在干嘛 / 在忙什么」这类问法：只有被问到，才把「她这会儿正在X」写进去。
 # 为什么不一贯写：这句话每轮都在，而 X 一挂就是几个小时，模型就每一条都提一句
@@ -423,7 +562,7 @@ def _coerce_setting(key: str, value: str, current: Any) -> Any:
 class HumanoidCore(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context)
-        data_root = Path(get_astrbot_data_path())
+        data_root = _resolve_data_root(context)
         data_dir = data_root.joinpath(*DATA_SUBDIR)
         self._migrate_defaults(config, data_dir)
         self._config_box = ConfigBox(config)
@@ -432,14 +571,22 @@ class HumanoidCore(Star):
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
         # 输入状态（正在输入）：按会话跑一个高频上报的小任务，纯装饰，出错不影响回复。
+        # P2-12：最小上报间隔下限 + 单条回复最大帧数（新配置项由 A 补；未补时用默认值兜底）。
         self._input_state = InputStateNotifier(
             logger,
-            interval=self._config.input_state_interval_seconds,
-            timeout=self._config.input_state_timeout_seconds,
+            interval=getattr(self._config, "input_state_interval_seconds", 0.5),
+            timeout=getattr(self._config, "input_state_timeout_seconds", 120.0),
+            min_interval=getattr(self._config, "input_state_min_interval_seconds", 0.3),
+            max_frames=getattr(self._config, "input_state_max_frames", 60),
         )
-        # 记忆联动的桥接对象：懒解析一次（插件加载顺序不保证，构造时对面可能还没就绪）。
+        # 记忆联动的桥接对象：短 TTL 缓存 + 失败后限时重试（P2-24）。插件加载顺序不保证，
+        # 构造时对面可能还没就绪；对面后加载/热重载之后必须能自愈，不能「解析失败一次就永久失效」。
         self._memory_bridge_obj: Any = None
+        self._memory_bridge_checked_at = 0.0
         self._memory_bridge_resolved = False
+        # 注入通道（temp_parts/contexts/system_prompt/空）：给 /拟人 诊断 与测试看。
+        self._inject_channel = ""
+        self._inject_fallback_warned = False
         # 写回侧：每个角色最近一次**已经写过**的过程名，以及最近 24 小时写了几条。
         # 进程内内存即可——重启后第一次只记账不写（见 `_write_finished_process`）。
         self._last_written_process: dict[str, str] = {}
@@ -454,6 +601,10 @@ class HumanoidCore(Star):
         clock = Clock(lambda: self._config)
         today = clock.today_str()
         self._state_store.load(today, self._config.cycle_length)
+        # P2-08：进程内维护「见过的角色 id」（兄弟 bot 识别 + 门面/门禁判断用），
+        # 从已加载的状态初始化一次；之后只在新角色实例创建时增长。
+        self._known_roles: set[str] = set()
+        self._refresh_known_roles()
 
         self.resolver = ProviderResolver(context, logger)
         # 闸门建在网关这一层：网关全局只有一份，所有 bot 共用它，
@@ -485,7 +636,11 @@ class HumanoidCore(Star):
 
         # 把活着的实例登记到模块级，供 `get_core_facade()` 取用。插件被卸载/重载时
         # `terminate()` 会清掉它，否则别的插件会拿到一个已经停掉的角色管理器。
-        global _ACTIVE_PLUGIN, _FACADE
+        # 代次自增：重载时新旧实例可能短暂共存，旧实例的 terminate 不许清掉新实例
+        # 的登记（P2-03），门面按代次校验（P1-B）。
+        global _ACTIVE_PLUGIN, _FACADE, _PLUGIN_GENERATION
+        _PLUGIN_GENERATION += 1
+        self._generation = _PLUGIN_GENERATION
         _ACTIVE_PLUGIN = self
         _FACADE = None
 
@@ -538,22 +693,66 @@ class HumanoidCore(Star):
         _write_applied_migrations(marker, applied | set(changes))
 
     async def initialize(self) -> None:
-        await self._state_store.start()
-        await self.role_manager.start()
-        for core in self.role_manager.get_all():
-            core.schedule.current_slots()
+        """插件初始化：起落盘循环与各个角色的后台循环（v3.0.0 加失败回滚，P2-02）。
+
+        以前没有回滚：`_state_store.start()` 起了 flush 任务、`_ACTIVE_PLUGIN` 也已在
+        `__init__` 登记；任一步失败后插件处于「半死」状态（后台任务泄漏、门面可用但
+        角色没起来），框架重试时还可能叠出第二个 flush 循环。现在失败就按启动逆序回滚
+        并把异常上抛，让框架看到一个明确的加载失败。
+        """
+        global _ACTIVE_PLUGIN, _FACADE
+        try:
+            await self._state_store.start()
+            await self.role_manager.start()
+            for core in self.role_manager.get_all():
+                core.schedule.current_slots()
+            self._refresh_known_roles()
+        except Exception as exc:
+            logger.warning(f"{LOG_PREFIX} 初始化失败，回滚已启动的资源: {exc}", exc_info=True)
+            try:
+                await self.role_manager.stop()
+            except Exception as stop_exc:
+                logger.warning(f"{LOG_PREFIX} 回滚角色管理器失败: {stop_exc}")
+            try:
+                await self._state_store.stop()
+            except Exception as stop_exc:
+                logger.warning(f"{LOG_PREFIX} 回滚状态落盘失败: {stop_exc}")
+            # 门面也必须失效：否则别的插件会拿到一个「上下文已按失败路径停掉」的门面。
+            if _ACTIVE_PLUGIN is self:
+                _ACTIVE_PLUGIN = None
+                _FACADE = None
+            raise
 
     async def terminate(self) -> None:
         global _ACTIVE_PLUGIN, _FACADE
         # 先摘掉门面再停：停的过程中别的插件来问，应该拿到 None 而不是半个死对象。
-        _ACTIVE_PLUGIN = None
-        _FACADE = None
-        await self._input_state.stop_all()
-        await self.role_manager.stop()
-        await self._state_store.stop()
-        session, self._session = self._session, None
-        if session is not None and not session.closed:
-            await session.close()
+        # 只摘**自己**那一份登记（P2-03）：重载时新实例可能已经登记，旧实例的
+        # terminate 绝不能把新实例清掉。
+        if _ACTIVE_PLUGIN is self:
+            _ACTIVE_PLUGIN = None
+            _FACADE = None
+        # P2-01：清理段用 try/finally 保证「状态一定落盘、session 一定关」。
+        # 以前任何一步抛错就跳过后续，卸载变成报错事件、这轮状态还可能丢。
+        try:
+            await self._input_state.stop_all()
+        except Exception as exc:
+            logger.warning(f"{LOG_PREFIX} 停止输入状态上报失败: {exc}")
+        try:
+            await self.role_manager.stop()
+        except Exception as exc:
+            logger.warning(f"{LOG_PREFIX} 停止角色管理器失败: {exc}")
+        finally:
+            try:
+                await self._state_store.stop()
+            except Exception as exc:
+                logger.warning(f"{LOG_PREFIX} 卸载时状态落盘失败（不影响使用）: {exc}")
+            finally:
+                session, self._session = self._session, None
+                if session is not None and not session.closed:
+                    try:
+                        await session.close()
+                    except Exception as exc:
+                        logger.debug(f"{LOG_PREFIX} 关闭 aiohttp session 失败: {exc}")
 
     async def cleanup(self) -> None:
         await self.terminate()
@@ -567,9 +766,22 @@ class HumanoidCore(Star):
 
     async def _fetch_json(self, url: str, timeout: float) -> dict[str, Any]:
         session = await self._ensure_session()
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-            response.raise_for_status()
-            return await response.json()
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                response.raise_for_status()
+                return await response.json()
+        except Exception as exc:
+            # aiohttp 的 ClientResponseError.__str__ 里带 real_url（含 appid=<KEY>）。
+            # 上浮前统一脱敏，避免调用方的失败日志把天气密钥写进长期日志（P1-2）。
+            # 脱敏函数在 services/weather.py（与天气侧共用一份），拿不到时宁可只留异常类型。
+            detail = type(exc).__name__
+            try:
+                from .humanoid.services.weather import redact_secrets
+
+                detail = redact_secrets(f"{type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+            raise RuntimeError(detail) from None
 
     def _sender(self, event: AstrMessageEvent) -> str:
         return str(event.get_sender_id())
@@ -588,7 +800,32 @@ class HumanoidCore(Star):
         return self.engine.is_admin(self._sender(event), astrbot_admin)
 
     def _core(self, event: AstrMessageEvent):
-        return self.role_manager.get_or_create(self._self_id(event))
+        role_id = self._self_id(event)
+        core = self.role_manager.get_or_create(role_id)
+        # 新角色可能来自一条消息（多 bot 同进程部署的常规路径）：登记进「见过的角色」。
+        try:
+            self._known_roles.add(str(core.role_id))
+        except Exception:
+            pass
+        return core
+
+    def _refresh_known_roles(self) -> None:
+        """从已加载状态重置「见过的角色 id」集合（只在加载/重载后跑一次）。
+
+        P2-08：原实现每条消息都直读 `StateStore.data["roles"]`（绕过 RoleScope 约定、
+        且多一个数据访问入口）。角色集合在运行期只增不减（删角色后状态里会残留，
+        旧实现同样会读到），所以一次性快照 + 创建时增长与旧语义一致。
+        """
+        known: set[str] = set()
+        try:
+            roles = (self._state_store.data or {}).get("roles") or {}
+            for rid in roles:
+                rid = str(rid or "")
+                if rid:
+                    known.add(rid)
+        except Exception:
+            known = set()
+        self._known_roles = known
 
     # -------------------- 用户指令 --------------------
 
@@ -608,7 +845,7 @@ class HumanoidCore(Star):
 
     @filter.command_group("拟人")
     def humanoid_group(self):
-        """人形化伴侣 · 管理指令（全部需要管理员）
+        """人形化核心伴侣 · 管理指令（全部需要管理员）
 
         改配置：参照名称 / 诊断 / 设置 / 重载
         动数据：重置日程 / 日程打断 / 日程继续 / 重置状态 / 重置情绪 / 设置好感度 / 批量好感度 / 查看昵称
@@ -1023,18 +1260,82 @@ class HumanoidCore(Star):
         lines.append("改完立即生效；进阶项用 /拟人 重载 刷新。")
         return "\n".join(lines)
 
+    def _reload_config(self) -> dict:
+        """重载配置：能读盘就从盘上读（P2-11），返回一段可自查的来源信息。
+
+        AstrBot 的插件配置对象是 AstrBotConfig（dict 子类，带 config_path）：面板保存
+        改的就是这份内存对象并同步 save_config() 到 config_path，所以正常路径下
+        内存与磁盘一致，ConfigBox.reload() 重解析内存 dict 就够了。但**用户直接手改
+        配置文件**时内存不会变，回执说「已重载」而改动不生效——这就是 P2-11。这里先从
+        config_path 读回磁盘 JSON，再**原地**更新同一个配置对象：
+
+        * 必须原地 clear/update，不能把 raw 换成普通 dict —— 换了之后 /拟人 设置 的
+          save_config() 会静默消失（回执说已保存、实际写不进文件）；
+        * 读盘失败（文件被占用/JSON 坏/没有 config_path）就退回内存重解析，并在回执里
+          说清「面板改动会同步到内存，手改文件请重启/重载插件」，不再假装成功。
+        """
+        info = {"source": "memory", "path": "", "error": "", "mtime": ""}
+        raw = self._config_box.raw
+        config_path = getattr(raw, "config_path", None) if raw is not None else None
+        if isinstance(config_path, str) and config_path:
+            info["path"] = config_path
+            try:
+                data = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
+                if not isinstance(data, dict):
+                    raise ValueError("配置文件顶层不是对象")
+                if isinstance(raw, dict):
+                    raw.clear()
+                    raw.update(data)
+                info["source"] = "disk"
+                try:
+                    info["mtime"] = time.strftime(
+                        "%Y-%m-%d %H:%M:%S",
+                        time.localtime(Path(config_path).stat().st_mtime),
+                    )
+                except Exception:
+                    info["mtime"] = ""
+            except FileNotFoundError:
+                info["error"] = "配置文件不存在"
+            except Exception as exc:
+                info["error"] = f"{type(exc).__name__}: {exc}"
+        self._config_box.reload()
+        return info
+
     @humanoid_group.command("重载")
     async def cmd_reload(self, event: AstrMessageEvent):
         """热重载插件配置，无需重启。"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
-        self._config_box.reload()
+        info = self._reload_config()
         self._input_state.configure(
-            self._config.input_state_interval_seconds,
-            self._config.input_state_timeout_seconds,
+            getattr(self._config, "input_state_min_interval_seconds", 0.0),
+            getattr(self._config, "input_state_interval_seconds", 0.5),
+            getattr(self._config, "input_state_timeout_seconds", 120.0),
+            max_frames=getattr(self._config, "input_state_max_frames", 0),
         )
-        yield event.plain_result(f"✅ 配置已重载。当前注入档位：{self._config.inject_activity_context}")
+        lines = [
+            f"✅ 配置已重载。当前注入档位：{self._config.inject_activity_context}"
+        ]
+        if info["source"] == "disk":
+            detail = f"来源：配置文件 {info['path']}"
+            if info["mtime"]:
+                detail += f"（修改时间 {info['mtime']}）"
+            lines.append(detail + "，已按磁盘内容重新解析。")
+        elif info["error"]:
+            lines.append(
+                "⚠ 读取配置文件失败，本次按内存里的配置重解析："
+                f"{info['error']}。"
+                "面板保存会同步到内存；如果你手改了磁盘文件，请重启/重载插件再试。"
+            )
+        else:
+            lines.append(
+                "（当前配置对象没有 config_path，只能按内存配置重解析：面板改动需重启/重载插件。）"
+            )
+        if self._config_box.load_error:
+            lines.append(f"⚠ 配置解析失败，已整体退回默认值：{self._config_box.load_error}")
+        lines.append("自查：/拟人 诊断 顶部会显示配置解析错误；上面一行是本次读取的配置文件。")
+        yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("重置日程")
@@ -1230,21 +1531,61 @@ class HumanoidCore(Star):
 
     # -------------------- 长期记忆联动 --------------------
 
+    # 桥接对象的缓存时长：解析成功用 5 分钟；失败/没装 60 秒后重试（P2-24）。
+    # 关键是对面**后加载或热重载**之后能自愈：以前解析失败一次就永久负缓存，
+    # 记忆联动要到下次重载本插件才可能恢复。
+    MEMORY_BRIDGE_TTL_SECONDS = 300.0
+    MEMORY_BRIDGE_RETRY_SECONDS = 60.0
+
+    def _memory_timeout(self, default: float) -> float:
+        """记忆桥接的等待上限；配置项还没加（或对象是测试替身）时用模块默认值。
+
+        跨插件等待必须有界（P1-6），所以这里不因为「读配置失败」就退回无限等待。
+        """
+        try:
+            value = getattr(self._config, "memory_bridge_timeout_seconds", default)
+            return float(value)
+        except Exception:
+            return float(default)
+
     def _memory_bridge(self):
         """拿 memory_companion 的桥接对象；没装 / 没就绪返回 None。
 
-        懒解析一次：插件加载顺序不保证，构造时对面可能还没就绪。只查宿主注册表，
-        不 importlib——没装时 `import_module` 会凭空造一个空模块（「没装却说装了」）。
+        带 TTL 的懒解析：插件加载顺序不保证，构造时对面可能还没就绪；对面之后才加载、
+        或热重载换了新的桥接实例，这里到点会重新问一次宿主注册表，能自己接上。
+        只查宿主注册表，不 importlib——没装时 `import_module` 会凭空造一个空模块
+        （「没装却说装了」）。
+
+        先解析、成功后再更新缓存时间戳：旧实现先把 resolved 置真再解析，解析中途抛异常
+        就变成「已解析且为 None」，永久失效。
         """
-        if not self._memory_bridge_resolved:
-            self._memory_bridge_resolved = True
-            try:
-                self._memory_bridge_obj = memory_link.find_memory_bridge(
-                    getattr(self, "context", None)
-                )
-            except Exception:
-                self._memory_bridge_obj = None
-        return self._memory_bridge_obj
+        now = time.monotonic()
+        cached = getattr(self, "_memory_bridge_obj", None)
+        ttl = (
+            self.MEMORY_BRIDGE_TTL_SECONDS
+            if cached is not None
+            else self.MEMORY_BRIDGE_RETRY_SECONDS
+        )
+        try:
+            checked_at = float(self._memory_bridge_checked_at)
+        except (AttributeError, TypeError, ValueError):
+            # 兼容用 __new__ 直接构造的测试替身/旧对象：第一次被问到就当刚检查过并补上时间戳。
+            checked_at = now
+            self._memory_bridge_checked_at = now
+        if getattr(self, "_memory_bridge_resolved", False) and (now - checked_at) < ttl:
+            return cached
+        bridge = None
+        try:
+            bridge = memory_link.find_memory_bridge(getattr(self, "context", None))
+        except Exception as exc:  # 注册表 API 自身坏掉时也只是「这轮没有记忆」
+            logger.debug(f"{LOG_PREFIX} 解析记忆桥接失败: {exc}")
+            bridge = None
+        self._memory_bridge_resolved = True
+        self._memory_bridge_checked_at = now
+        if bridge is not None and bridge is not self._memory_bridge_obj:
+            logger.info(f"{LOG_PREFIX} 已接上长期记忆桥接（memory_companion）")
+        self._memory_bridge_obj = bridge
+        return bridge
 
     async def _memory_note(self, umo: str, user_id: str, said: str, is_group: bool) -> str:
         """按 TA 这条消息去记忆库要几条相关长期记忆；拿不到返回空串。
@@ -1256,7 +1597,12 @@ class HumanoidCore(Star):
             return ""
         try:
             return await memory_link.fetch_memory_text(
-                bridge, umo, user_id, query=said, is_group=is_group
+                bridge,
+                umo,
+                user_id,
+                query=said,
+                is_group=is_group,
+                timeout=self._memory_timeout(memory_link.READ_TIMEOUT_SECONDS),
             )
         except Exception:
             return ""
@@ -1310,6 +1656,8 @@ class HumanoidCore(Star):
                 umo=umo,
                 # 幂等键按内容算：同一件事重放不会写两条（时刻参与的话每次都是新键）。
                 key=f"proc:{name}",
+                # 写回也限时：它被注入链路 await，对面卡住不能连带把回复挂住。
+                timeout=self._memory_timeout(memory_link.WRITE_TIMEOUT_SECONDS),
             )
         except Exception:
             return
@@ -1336,7 +1684,7 @@ class HumanoidCore(Star):
             if not self.engine.environment_allows(not is_group):
                 return
             role_id = self._self_id(event)
-            core = self.role_manager.get_or_create(role_id)
+            core = self._core(event)
             user_id = self._sender(event)
             text = (getattr(event, "message_str", "") or "").strip()
             # 兄弟 bot 的发言：**可以聊，但防互刷**。
@@ -1400,17 +1748,27 @@ class HumanoidCore(Star):
                 # 注入为空时（预算卡太小、构建抛异常）留着它，模型收下一句宣告却一条事实都
                 # 拿不到——它会自己编。所以没有事实就不要宣告。
                 _append_framing(req, char_name, user_name)
-                # 「此刻的她」与身体事实走临时内容块：只发给模型、不落历史。
+                # 「此刻的她」与身体事实优先走临时内容块：只发给模型、不落会话历史。
+                # 老框架没有这个 API 时退到 contexts/system_prompt（P1-1），不再静默丢注入。
                 state_note = _state_note(
                     core, user_id, char_name, user_name, is_group=is_group, said=said
                 )
-                parts = getattr(req, "extra_user_content_parts", None)
-                if not isinstance(parts, list):
-                    parts = []
-                    req.extra_user_content_parts = parts
-                if state_note:
-                    parts.append(TextPart(text=state_note).mark_as_temp())
-                parts.append(TextPart(text=injection).mark_as_temp())
+                channel = _append_injected_parts(
+                    req, [block for block in (state_note, injection) if block]
+                )
+                self._inject_channel = channel
+                if not channel:
+                    logger.warning(
+                        f"{LOG_PREFIX} 本轮注入没有可用通道（既无临时块也无 contexts/system_prompt），"
+                        "事实未进入上下文"
+                    )
+                elif channel != "temp_parts" and not self._inject_fallback_warned:
+                    # 只提示一次：每轮回执会刷屏，但这说明宿主的 AstrBot 版本偏低。
+                    self._inject_fallback_warned = True
+                    logger.warning(
+                        f"{LOG_PREFIX} 当前 AstrBot 不支持临时内容块（mark_as_temp），"
+                        f"注入已降级为 {channel} 通道；建议升级 AstrBot 到 4.24+"
+                    )
 
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 注入失败: {e}")
@@ -1439,7 +1797,7 @@ class HumanoidCore(Star):
             if not text:
                 return
             cfg = self._config
-            core = self.role_manager.get_or_create(self._self_id(event))
+            core = self._core(event)
             user_id = self._sender(event)
             if not core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
                                       in_group=cfg.mood_enabled_in_group):
@@ -1499,7 +1857,7 @@ class HumanoidCore(Star):
             if not self.engine.environment_allows(not is_group):
                 return
             cfg = self._config
-            core = self.role_manager.get_or_create(self._self_id(event))
+            core = self._core(event)
             user_id = self._sender(event)
             if not core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
                                       in_group=cfg.mood_enabled_in_group):
@@ -1515,24 +1873,21 @@ class HumanoidCore(Star):
     # -------------------- 兄弟 bot 识别（多 bot 同进程部署） --------------------
 
     def _known_role_ids(self, exclude: str = "") -> set:
-        """本插件状态里已经见过的其它角色 id（多 bot 同进程部署时的「兄弟」）。
+        """本进程里已经见过的其它角色 id（多 bot 同进程部署时的「兄弟」）。
 
         它们发出来的消息在事件层看起来就是普通用户——另一台 bot 的自发消息、
         被平台回灌过来时，sender 是那台 bot 的 id，不等于本台，所以「跳过自己发的」
         那道闸挡不住。不认出来的话，本台会把兄弟 bot 当成一个陌生用户去回话，
         情绪与身体账上也多出一个人（多 bot 串台）。
-        只认状态里出现过的 id；跨进程的 bot 认不出，README 里写清了边界。
+        只认本进程见过的 id；跨进程的 bot 认不出，README 里写清了边界。
+
+        v3.0.0（P2-08）：改读进程内维护的 `_known_roles` 集合，不再每条消息直读
+        `StateStore.data["roles"]`——那是绕过 RoleScope 的第二个数据访问入口，
+        生产 6 个角色每次消息都要构造一遍列表。集合在加载/重载时从状态重建、
+        新角色实例创建时增长（见 `_refresh_known_roles` / `_core`）。
         """
-        out: set = set()
-        try:
-            roles = self._state_store.data.get("roles", {}) or {}
-            for rid in roles:
-                rid = str(rid or "")
-                if rid and rid != "default" and rid != str(exclude):
-                    out.add(rid)
-        except Exception:
-            pass
-        return out
+        skip = {"default", str(exclude or "")}
+        return {rid for rid in self._known_roles if rid and rid not in skip}
 
     def _sibling_chat_allowed(
         self, role_id: str, peer_id: str, event: AstrMessageEvent
@@ -1593,7 +1948,7 @@ class HumanoidCore(Star):
             is_group = not _is_private_chat(event)
             if not self.engine.environment_allows(not is_group):
                 return
-            core = self.role_manager.get_or_create(role_id)
+            core = self._core(event)
             # 自动认定称呼：只在这个人还没有任何称呼时填一次，之后换名片也不会改口；
             # 用户 /叫我 设过的更碰不到。纯图片消息也带名字，所以放在正文判空之前。
             if self._config.auto_nickname:
@@ -1631,6 +1986,9 @@ class HumanoidCore(Star):
                         await source.persona(core.role_id)
             except Exception:
                 pass
-            core.on_message(user_id, text, is_group=is_group, umo=umo, is_command=is_command)
+            core.on_message(
+                user_id, text, is_group=is_group, umo=umo, is_command=is_command,
+                user_name=sender_name,
+            )
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 消息记账失败: {e}")

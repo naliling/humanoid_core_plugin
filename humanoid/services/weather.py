@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Callable, Awaitable
 from typing import Any
@@ -35,6 +36,29 @@ NOTICE_WORDS = ("未填", "未开启", "获取中", "没配天气", "过期", "�
 def is_notice(text: str) -> bool:
     """这句是配置说明书还是真天气。"""
     return any(word in text for word in NOTICE_WORDS)
+
+
+# 凭证参数名。日志/异常文本里出现这些键，后面的值一律打码。
+# 只匹配「键名 + =」，且键名前必须是词边界：这样 `keyword=` 这类业务参数不会被误伤，
+# 而 `appid=`/`api_key=`/`token=` 无论出现在 URL、aiohttp 异常文本还是别的 provider
+# 报错里都能命中。aiohttp 的 `ClientResponseError.__str__` 带 `real_url`（含完整 query），
+# 401/429/5xx 时它就是一条把 key 写进日志的路径（审核 P1-2）。
+_SECRET_PARAM_RE = re.compile(
+    r"(?i)\b(appid|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)=([^&'\")\s]+)"
+)
+
+
+def redact_secrets(text: str) -> str:
+    """把文本里的凭证值打码：`appid=xxx` → `appid=***`。
+
+    **可复用**：天气失败日志（本文件）、main.py 的 `_fetch_json` 异常上浮、
+    未来的诊断/异常展示都应该先过这一层。脱敏不依赖 `debug_mode`——日志是长期
+    留存物，泄漏一次就收不回来。
+    """
+    try:
+        return _SECRET_PARAM_RE.sub(lambda m: f"{m.group(1)}=***", str(text or ""))
+    except Exception:
+        return ""
 
 
 def build_url(location: str, api_key: str) -> str:
@@ -222,16 +246,18 @@ class WeatherService:
         except Exception as e:
             self._note_failure()
             if self._log:
-                self._log.warning(f"[humanoid_core] 天气刷新失败: {e}")
+                # 异常文本可能带完整 URL（aiohttp 的 real_url 含 appid=）——日志是长期
+                # 留存物，必须在这里脱敏（审核 P1-2）。不只 debug：warning 才是默认会写盘的。
+                self._log.warning(f"[humanoid_core] 天气刷新失败: {redact_secrets(str(e))}")
             return False
         finally:
             self._inflight = False
 
 
 def _redacted(url: str) -> str:
-    """debug 日志里不回显 API Key。"""
-    start = url.find("appid=")
-    if start == -1:
-        return url
-    end = url.find("&", start)
-    return url[: start + 6] + "***" + (url[end:] if end != -1 else "")
+    """debug 日志里不回显 API Key。
+
+    保留这个名字给既有调用/测试；实现统一走 `redact_secrets`（覆盖 appid= 位于末尾、
+    被引号包裹、以及 api_key=/token= 等其它凭证参数）。
+    """
+    return redact_secrets(url)

@@ -63,6 +63,9 @@ LIBIDO_DAILY_REACH = 6.0
 # 亲近欲量程上限（与 `services.mood.LIBIDO_RANGE` 的右端一致）。只用于判断
 # 「已经顶到量程、不可能再涨」这一种饱和态。
 LIBIDO_MAX = 50.0
+# 攻击性量程上限（与 `services.mood.AGGRESSION_RANGE` 的右端一致）。ccb 的结算函数
+# 以前把上限写成 100（审核 P2-23 同类问题）——写回档案后状态页会出现越界数值。
+AGGRESSION_MAX = 50.0
 
 
 def reachable_libido_min(libido_min: float, base_libido: float) -> float:
@@ -1714,6 +1717,47 @@ def note_occurrence(user_state: Dict[str, Any], moment: float) -> bool:
     except (TypeError, ValueError):
         return False
 
+
+def scene_active(user_state: Dict[str, Any], now: float) -> bool:
+    """此刻是不是真的在 ccb 场景里（与 `scene_status` 的 `in_scene` 同口径）。
+
+    判据沿用场景状态机自己那两条：`ccb_stage > 0` 且没有闲置超时
+    （`CCB_SCENE_IDLE_SECONDS`）。`ccb_stage` 会因为没人说话而挂过夜，
+    所以不能只看它非零。纯函数、只读、不改状态。
+    """
+    if not isinstance(user_state, dict):
+        return False
+    try:
+        stage = int(_fs(user_state.get("ccb_stage"), 0.0))
+    except (TypeError, ValueError):
+        return False
+    if stage <= 0:
+        return False
+    moment = _fs(now, 0.0)
+    return not scene_idle_expired(last_at=_fs(user_state.get("ccb_last_at"), 0.0), now=moment)
+
+
+def note_occurrence_in_scene(user_state: Dict[str, Any], moment: float) -> bool:
+    """纯聊天文本命中「已经发生」时用这个：**只有真的在场景里才记账**。
+
+    为什么需要它（v3.0.0，审核 P2-22）：`on_message` 原来对私聊纯文本直接调
+    `note_occurrence` + `occurrence_effects`——任何用户一句「我们做爱了」就能让
+    `ccb_done_count` +1，并直接写好感/亲近欲/攻击性，绕过 38/50 门槛、场景分与冷却。
+    `note_her_words`（她的话）本来就有 `ccb_stage > 0` 的闸，这里用同一条闸。
+
+    **场景外**：不计数、不写 `ccb_last_at`/`ccb_event_dedup_at`、不结算数值
+    （直接返回 False，调用方不会走 `occurrence_effects`）。场景内行为与
+    `note_occurrence` 完全一致——真实发生的那一次照旧入账。
+
+    取舍：状态机门槛（默认 78 好感）以下的人，事后一句「我们做过了」不再计数。
+    这是审核建议的方向（误记会污染「一辈子的次数」，而社交层拿它判断「是否发生过」）；
+    CCB 默认关闭，默认用户完全不受影响。存量被纯文本刷高的 `ccb_done_count`
+    不回溯修正。
+    """
+    if not scene_active(user_state, moment):
+        return False
+    return note_occurrence(user_state, moment)
+
 # ─── 「她是明确拒绝的」与「事后怎么结算」 ─────────────────────
 # 用户要求：明确拒绝（不是开玩笑、不是欲拒还迎）却仍然发生 → 好感掉；
 # 已经到基线且此前有过 → 好感涨得更多，亲近欲也涨，攻击性下降。
@@ -1762,26 +1806,27 @@ def occurrence_effects(
     * 亲近欲每次 +2（被满足会拉高，不是清空）。
     """
     out: Dict[str, float] = {}
-    try:
-        aff = float(profile.get("affection", 46.0) or 46.0)
-        lib = float(profile.get("libido", 34.0) or 34.0)
-        agg = float(profile.get("aggression", 0.0) or 0.0)
-        base = float(profile.get("base_affection", aff) or aff)
-        done = float(user_state.get("ccb_done_count", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return out
+    # `_fs` 而不是 `x or 默认值`：0 是合法轴值（好感恰好 0 / 亲近欲 0），用 `or`
+    # 会把它当成「没设」按中位数结算（与 mood.py 的 P2-19 同款陷阱）。
+    aff = _fs(profile.get("affection"), 46.0)
+    lib = _fs(profile.get("libido"), 34.0)
+    agg = _fs(profile.get("aggression"), 0.0)
+    base = _fs(profile.get("base_affection"), aff)
+    done = _fs(user_state.get("ccb_done_count"), 0.0)
 
     if refused:
         out["affection"] = max(0.0, aff - 4.0)
-        out["aggression"] = min(100.0, agg + 6.0)
+        out["aggression"] = min(AGGRESSION_MAX, agg + 6.0)
         out["libido"] = max(0.0, lib - 6.0)
         return out
 
     gain = 2.0
     if done > 1 and aff >= base:
         gain += 3.0
-        out["libido"] = min(100.0, lib + 3.0)
+        # **钳到量程**（审核 P2-23）：上限原来写 100，而全系统量程是 0–50；
+        # 直接写回档案会让状态页出现「亲近欲 53/50」。
+        out["libido"] = min(LIBIDO_MAX, lib + 3.0)
         out["aggression"] = max(0.0, agg - 3.0)
     out["affection"] = min(100.0, aff + gain)
-    out.setdefault("libido", min(100.0, lib + 2.0))
+    out.setdefault("libido", min(LIBIDO_MAX, lib + 2.0))
     return out

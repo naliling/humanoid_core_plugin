@@ -71,17 +71,21 @@ class EnergyTest(unittest.TestCase):
         service = EnergyService(store.scope, lambda: conf, clock, lambda: slots or WORKDAY)
         return service, store, clock
 
-    def test_new_day_reset_does_not_pin_energy_to_max(self):
-        """跨天后凌晨三点的第一条消息不应把精力顶到上限。
+    def test_cross_midnight_is_continuous_not_a_magic_reset(self):
+        """跨天不再有「新一天起点」：精力从 last_update 连续结算（v3.0.0，P1-3）。
 
-        计费起点若被写成当天 00:00，自然恢复会按三小时计入，直接冲满。
+        旧写法跨过本地零点就把精力重置到 ~80（夜猫子 23:59→00:01 实测 +53），
+        这里改成按日程（含睡眠恢复）连续积分。22:10→次日 03:00 的期望值可以手算：
+        22:10-24:00 休闲（rate=0，只有自然恢复）+ 00:00-03:00 睡眠（rate=0.15）。
         """
         service, store, clock = self.build(moment=datetime(2026, 8, 22, 3, 0, tzinfo=TZ))
         store.data["energy"] = 30.0
         store.data["last_update"] = "2026-08-21 22:10:00"
         energy = service.advance()
-        self.assertLess(energy, 90.0, "跨天重置后不应接近上限")
-        self.assertGreater(energy, 70.0)
+        # 22:10→24:00：110 分钟自然恢复 0.15 × phase 0.5 × decay 0.5 = +4.125
+        # 00:00→03:00：睡眠 rate 0.15 × decay 0.5 = +13.5，自然恢复 0.15 × 0.5 × 0.5 = +6.75
+        self.assertAlmostEqual(energy, 54.375, places=2, msg="跨天必须连续结算，不能凭空回血")
+        self.assertLess(energy, 70.0, "熬夜跨天不该反而回血")
         # 计费起点必须是「现在」，不是午夜
         self.assertEqual(store.get("last_update"), "2026-08-22 03:00:00")
 

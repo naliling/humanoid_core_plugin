@@ -198,11 +198,15 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
         main_module.get_astrbot_data_path = lambda: str(self.tmp)
         self.star = main_module.HumanoidCore(self.ctx, self.raw)
         await self.star.initialize()
-        # `_known_role_ids` 只认状态里出现过的角色 id：登记一个「兄弟 bot」。
+        # `_known_role_ids` 只认本进程见过的角色 id：登记一个「兄弟 bot」。
+        # v3.0.0（P2-08）：这个集合改成进程内维护（加载时从状态重建、角色实例创建时
+        # 增长），生产路径由兄弟 bot 自己的实例经 _core 登记；测试手工塞状态后要同步
+        # 登记一次，否则缓存里看不到它。
         self.star._state_store.data.setdefault("roles", {})[SIBLING] = {
             "self": {},
             "users": {},
         }
+        self.star._known_roles.add(SIBLING)
 
     async def asyncTearDown(self) -> None:
         await self.star.terminate()

@@ -179,15 +179,44 @@ class GroupSilence(unittest.TestCase):
         state = _state(core)
         self.assertEqual(float(state.get("ccb_done_count", 0.0) or 0.0), 0.0)
 
-    def test_private_message_still_reaches_it(self):
+    def test_private_message_still_reaches_it_inside_a_scene(self):
+        """v3.0.0（P2-22）：私聊文本入账的前提是**真的在场景里**。"""
         core = _core()
         _mood(core)
+        state = _state(core)
+        state["ccb_stage"] = 2.0
+        state["ccb_last_at"] = core.now_epoch()
 
         async def _run():
             core.on_message("u1", "我们做过了", is_group=False)
 
         asyncio.run(_run())
         self.assertGreater(float(_state(core).get("ccb_done_count", 0.0) or 0.0), 0.0)
+
+    def test_private_text_outside_a_scene_is_not_recorded(self):
+        """v3.0.0（P2-22）：纯聊天一句话不能再刷关系数值。
+
+        旧行为：私聊里任何一句「我们做过了」→ done_count+1，并直接加好感/亲近欲/
+        降攻击性，绕过 38/50 门槛、场景分与冷却；社交层又拿 ccb_done_count 判断
+        「是否发生过」。现在场景外（ccb_stage<=0 或闲置超时）一律不入账。
+        """
+        core = _core()
+        _mood(core)
+        state = _state(core)
+        before_aff = float(state["mood"].get("affection", 0.0))
+
+        async def _run():
+            core.on_message("u1", "我们做过了", is_group=False)
+
+        asyncio.run(_run())
+        state = _state(core)
+        self.assertEqual(float(state.get("ccb_done_count", 0.0) or 0.0), 0.0)
+        self.assertNotIn("ccb_last_at", state, "场景外不该写「上次发生」时间")
+        self.assertLessEqual(
+            float(state["mood"].get("affection", 0.0)),
+            before_aff + 1e-6,
+            "场景外一句纯文本把好感刷上去了",
+        )
 
     def test_command_is_not_a_conversation(self):
         core = _core()

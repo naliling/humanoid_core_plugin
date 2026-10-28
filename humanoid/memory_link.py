@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import sys
 import time
@@ -49,10 +50,20 @@ READ_CACHE_TTL_SECONDS = 60.0
 #: 缓存条目上限：超过就整体清空，比按 LRU 淘汰简单，且这里的数据全部可重建。
 READ_CACHE_MAX_ENTRIES = 256
 
-# 三类失败原因分开记：区分「对方插件没装」与「装了但坏了」，排查时一眼看得出方向。
+# 跨插件调用必须有上限（P1-6）：注入挂在 @filter.on_llm_request 上，对**每条消息**执行。
+# 对面检索一次卡住（死锁/在等网络），没有超时的 await 会把本插件所有回复一起挂住——
+# 表现是「装死」而不是报错，用户完全看不出方向。
+# 默认值取 0.5s：长期记忆是加分项，不值得为它让用户多等；写回复走 1.0s（更宽，但同样有界）。
+READ_TIMEOUT_SECONDS = 0.5
+WRITE_TIMEOUT_SECONDS = 1.0
+#: 上限：调用方即使传了更大的值也夹到这里，防止「可配」变成「无限等」。
+MAX_TIMEOUT_SECONDS = 2.0
+
+# 失败原因分开记：区分「对方插件没装」「装了但坏了」「卡住了」，排查时一眼看得出方向。
 FAIL_MISSING = "missing"      # 注册表里没有它（没装 / 未激活 / 宿主没有注册表 API）
 FAIL_SIGNATURE = "signature"  # 找到了它，但桥接工厂或所需方法不可调用（接口对不上）
 FAIL_EXCEPTION = "exception"  # 注册表、工厂或桥接方法调用时抛了异常
+FAIL_TIMEOUT = "timeout"      # 桥接方法在限定时间内没返回（对面卡住/死锁）
 # 对面装了、也激活了，但把桥接开关关了（`private_companion_bridge.enabled`）。
 # 这是**用户在配置页上做的一个选择**，不是故障——降级到「没有记忆」是预期行为。
 FAIL_DISABLED = "disabled"
@@ -128,6 +139,20 @@ def _brief(exc: BaseException, limit: int = 160) -> str:
     except Exception:  # 连 __str__ 都坏了的异常
         text = type(exc).__name__
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _clamp_timeout(timeout: Any, default: float) -> float:
+    """把调用方给的超时夹进 (0, MAX_TIMEOUT_SECONDS]；坏值退回默认。
+
+    跨插件等待不允许「配成无限」：桥接是注入链路的一部分，等太久等于把所有回复一起挂住。
+    """
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError):
+        value = float(default)
+    if not (value > 0):
+        value = float(default)
+    return min(value, MAX_TIMEOUT_SECONDS)
 
 
 def _text_of(value: Any) -> str:
@@ -282,10 +307,14 @@ async def fetch_memory_text(
     is_group: bool = False,
     max_chars: int = READ_MAX_CHARS,
     top_k: int = READ_TOP_K,
+    timeout: float = READ_TIMEOUT_SECONDS,
 ) -> str:
     """拉这个人相关的长期记忆（拼好的注入文本）；拿不到返回空串。
 
     带 60 秒缓存：同一个会话连着几条消息只查一次记忆库。
+
+    **等待有上限**（P1-6）：调用点在 @filter.on_llm_request 里、对每条消息执行，对面
+    检索卡住时这里必须放弃而不是一直等。超时按「这一轮没有记忆」降级，下一轮重试。
     """
     if bridge is None or not str(uid or "").strip():
         return ""
@@ -302,13 +331,24 @@ async def fetch_memory_text(
     if not callable(fn):
         _note_failure(FAIL_SIGNATURE, "桥接对象没有可调用的 compose_context（接口签名不符）")
         return ""
+    limit = _clamp_timeout(timeout, READ_TIMEOUT_SECONDS)
     try:
-        text = await fn(
-            query=str(query or ""),
-            session_context=_session_context(umo, uid, is_group),
-            top_k=int(top_k),
-            max_chars=int(max_chars),
+        text = await asyncio.wait_for(
+            fn(
+                query=str(query or ""),
+                session_context=_session_context(umo, uid, is_group),
+                top_k=int(top_k),
+                max_chars=int(max_chars),
+            ),
+            timeout=limit,
         )
+    except asyncio.TimeoutError:
+        # 超时不进缓存：对面下一轮可能就恢复了，负缓存会把记忆永久判死。
+        _note_failure(
+            FAIL_TIMEOUT,
+            f"compose_context() 超过 {limit:g}s 未返回，已放弃本轮记忆（对面可能卡住了）",
+        )
+        return ""
     except Exception as exc:
         _note_failure(FAIL_EXCEPTION, f"compose_context() 调用失败：{_brief(exc)}")
         return ""
@@ -342,10 +382,13 @@ async def write_life_event(
     umo: str = "",
     key: str = "",
     importance: float = 0.5,
+    timeout: float = WRITE_TIMEOUT_SECONDS,
 ) -> None:
     """把一件「她自己的、聊天里看不见的事」写进长期记忆；失败只记日志。
 
     写的是**事件**，不是她的状态数值：数值下一轮就变了，写进去只是垃圾。
+
+    写回同样有上限（P1-6）：它被注入链路 await，对面写库卡住不能连带把回复挂住。
     """
     text = _text_of(content)
     if bridge is None or not text:
@@ -357,14 +400,23 @@ async def write_life_event(
         )
         return
     payload = f"（她自己生活里的事）{text}"
+    limit = _clamp_timeout(timeout, WRITE_TIMEOUT_SECONDS)
     try:
-        await fn(
-            user_id=str(uid or ""),
-            content=payload,
-            source_plugin=SOURCE_PLUGIN,
-            idempotency_key=_idempotency_key(umo, payload, key),
-            importance=float(importance),
-            tags=["life"],
+        await asyncio.wait_for(
+            fn(
+                user_id=str(uid or ""),
+                content=payload,
+                source_plugin=SOURCE_PLUGIN,
+                idempotency_key=_idempotency_key(umo, payload, key),
+                importance=float(importance),
+                tags=["life"],
+            ),
+            timeout=limit,
+        )
+    except asyncio.TimeoutError:
+        _note_failure(
+            FAIL_TIMEOUT,
+            f"record_external_memory() 超过 {limit:g}s 未返回，已放弃本次写回",
         )
     except Exception as exc:
         _note_failure(FAIL_EXCEPTION, f"record_external_memory() 调用失败：{_brief(exc)}")

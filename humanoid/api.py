@@ -69,21 +69,53 @@ def _item_id(prefix: str, text: str) -> str:
 
 
 class CoreFacade:
-    """某个角色的只读视图。由 `main.get_core_facade()` 交给别的插件。"""
+    """某个角色的只读视图。由 `main.get_core_facade()` 交给别的插件。
 
-    def __init__(self, roles: Any, logger: Any = None) -> None:
+    **实例代次（P1-B）**：门面绑定创建它的那个插件实例代次。插件重载/卸载后，旧的
+    门面对象可能还被别的插件缓存着（社交层就缓存它）；它再被调用时必须立刻失效，
+    返回 `None`/`{}`/`[]`，不能让对方继续对着已经 `stop()` 的 RoleManager 读数据。
+    校验通过 `is_current` 回调在**每次调用**时做，不是构造时判一次。
+    """
+
+    def __init__(self, roles: Any, logger: Any = None, *, generation: int = 0,
+                 is_current: Any = None) -> None:
         self._roles = roles
         self._log = logger
+        self._generation = int(generation or 0)
+        #: 返回 bool 的回调：创建它的插件实例是否仍是当前登记的实例。
+        #: None = 不绑定（单测直接构造、老调用方），退化为旧行为。
+        self._is_current = is_current
+
+    def _alive(self) -> bool:
+        """这个门面背后的插件实例是否还是当前实例。没有绑定校验时一律视为有效。"""
+        checker = self._is_current
+        if checker is None:
+            return True
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    def is_current(self) -> bool:
+        """公开的存活探测：别的插件可以用它在缓存失效后重建门面（P1-B）。"""
+        return self._alive()
 
     # ─── 元信息 ─────────────────────────────────────────
 
-    def api_version(self) -> int:
+    def api_version(self) -> Optional[int]:
+        """协议版本。门面已失效时返回 None：让对方能看出「这个门面不能用了」。"""
+        if not self._alive():
+            return None
         return API_VERSION
 
     def capabilities(self) -> List[str]:
+        if not self._alive():
+            return []
         return list(CAPABILITIES)
 
     def role_ids(self) -> List[str]:
+        if not self._alive():
+            return []
         try:
             return [str(inst.role_id) for inst in self._roles.get_all()]
         except Exception:
@@ -96,7 +128,12 @@ class CoreFacade:
 
         门面是只读的：`RoleManager.get_or_create()` 会建角色、起后台循环、写一条日志。
         社交层拿一个错的 role_id 来问一次，不该因此在 Core 里凭空多出一个角色。
+
+        插件实例被重载/卸载后，旧门面在这里返回 None：所有依赖 `_core` 的方法
+        自动退化成 None/空 dict/空 list（P1-B）。
         """
+        if not self._alive():
+            return None
         try:
             for inst in self._roles.get_all():
                 if str(getattr(inst, "role_id", "")) == str(role_id):
@@ -218,9 +255,10 @@ class CoreFacade:
             # 只能从天气说起，还叫不出名字（用户的原话：「拿不到名称，根本不会叫人」）。
             if _s(user_id):
                 out["user"] = self._user(core, str(role_id), user_id)
-            if task == "status":
-                # 保留旧字段：老社交层读的是 `relationship`，只加不改。
-                out["relationship"] = self._relationship(core, user_id)
+            # v3.0.0（联动 P2-2）：**所有 task** 都带 `relationship`。
+            # 以前只有 status 才给，而社交层只调 proactive——`turns` 等字段永远拿不到。
+            # 保留旧字段名与形状（只加不改），只把「什么时候给」放宽。
+            out["relationship"] = self._relationship(core, user_id)
             out["fingerprint"] = self._fingerprint(core, out)
             return out
         except Exception as exc:
@@ -383,6 +421,35 @@ class CoreFacade:
             ),
         }
 
+    def _read_only_profile(self, core: Any, user_id: str) -> Dict[str, Any]:
+        """只读取情绪档案：**不建条目、不 mark_dirty、不写 state**（P2-21）。
+
+        `mood.profile()` 对没档案的人会现建一份并 mark_dirty——门面是「每轮都可能被
+        问一句」的只读入口，用它等于把读接口变成常驻写盘源，还给每个问过的人都留一条
+        永久空壳。优先级：
+
+        1. `mood.peek_profile(uid)`（v3.0.0 新增的只读快照，B/服务层提供；内部 _repair
+           只作用于副本）；
+        2. 旧版没有该方法时退回 `scope.peek_user(uid, 'mood')`——同样只读、不建壳。
+
+        没有档案时返回 `{}`：调用方按面板初始值/「不知道」处理，绝不在这里替人建档案。
+        """
+        mood = getattr(core, "mood", None)
+        for name in ("peek_profile", "profile_readonly", "snapshot_profile"):
+            reader = getattr(mood, name, None) if mood is not None else None
+            if not callable(reader):
+                continue
+            try:
+                record = reader(user_id)
+            except Exception:
+                return {}
+            return record if isinstance(record, dict) else {}
+        try:
+            record = core.scope.peek_user(user_id, "mood")
+        except Exception:
+            return {}
+        return record if isinstance(record, dict) else {}
+
     def _intimacy_want(self, core: Any, user_id: str, stage: int, satisfy: float) -> str:
         """一句「她这会儿想不想」——**只读、只描述状态，不下指令**。
 
@@ -390,9 +457,8 @@ class CoreFacade:
         社交层拿它当主动开口的由头，要不要说、怎么说由它自己定。
         拿不到就空串（不编）。
         """
-        try:
-            profile = core.mood.profile(user_id) or {}
-        except Exception:
+        profile = self._read_only_profile(core, user_id)
+        if not profile:
             return ""
         try:
             libido = float(profile.get("libido", 0.0) or 0.0)
@@ -603,6 +669,9 @@ class CoreFacade:
         last_interaction = _num(peek("last_interaction", 0.0))
         if last_interaction <= 0 and record:
             last_interaction = _num(record.get("last_interaction", 0.0))
+        # v3.0.0（联动 P2-3）：TA 说话 / 她说话分开记，社交层才分得清「对方沉默多久」。
+        peer_said_at = _num(peek("peer_said_at", last_interaction))
+        her_said_at = _num(peek("her_said_at", 0.0))
 
         raw_said = peek("said", [])
         said: List[Dict[str, Any]] = []
@@ -641,6 +710,8 @@ class CoreFacade:
             "first_met": round(first_met, 1),
             "known_days": known_days,
             "last_interaction": round(last_interaction, 1),
+            "peer_said_at": round(peer_said_at, 1),
+            "her_said_at": round(her_said_at, 1),
             "said": said,
             "intimacy": intimacy,
         }
@@ -772,7 +843,8 @@ class CoreFacade:
         """近期事件。两种来源，按时间倒序：
 
         1. **刚发生的事**（``kind="recent"``）：日程层那个事件机制——她被夸了/
-           被骂了/被敷衍了。v2.29.0 起契约里有 `event` 块，这里转成同一形状。
+           被骂了/被敷衍了。契约里 `event` 块 v2.28.5 起就有（联动 P2-28：旧注释
+           误写成从未发布过的 v2.29.0），3.0.0 起继续提供；这里转成同一形状。
         2. **还没结束的事**（``kind="open"``）：`life_log` 的未完成项。
 
         社交层拿它们当主动开口的由头。旧 Core 两个都没有 → 空列表，
@@ -817,13 +889,40 @@ class CoreFacade:
         return out[: max(0, int(limit))]
 
     def _relationship(self, core: Any, user_id: str) -> Dict[str, Any]:
-        if not user_id:
+        """给社交层的「这段关系」摘要：**所有 task 都返回**（v3.0.0，联动 P2-2）。
+
+        以前只有 `task=status` 才带 `relationship`，而社交层只调 `task=proactive`——
+        v2.28.17 招牌的 `relationship.turns` 对唯一消费方永远不可见，它只能继续自己数消息。
+
+        读路径全程只读（P2-21）：情绪档案走 `peek_profile`/`peek_user`（不建条目、不
+        mark_dirty），用户级键也走 `peek_user`（`user_state()` 会 setdefault 给陌生人留空壳）。
+        没档案时给面板初始值——那是配置里的确定事实，不是编。
+        """
+        uid = _s(user_id)
+        if not uid:
             return {}
-        try:
-            profile = core.mood.profile(user_id) or {}
-            user_state = core.scope.user_state(user_id) or {}
-        except Exception:
-            return {}
+        profile = self._read_only_profile(core, uid)
+
+        cfg = getattr(core, "config", None)
+
+        def cfg_num(name: str, default: float) -> float:
+            try:
+                return float(getattr(cfg, name, default))
+            except (TypeError, ValueError):
+                return float(default)
+
+        def peek(key: str, default: Any = None) -> Any:
+            try:
+                return core.scope.peek_user(uid, key, default)
+            except Exception:
+                return default
+
+        initial_affection = cfg_num("mood_initial_affection", 50.0)
+        if profile:
+            affection = _num(profile.get("affection"), initial_affection)
+            base_affection = _num(profile.get("base_affection"), affection)
+        else:
+            affection = base_affection = initial_affection
         # 亲密三键（P0-5）与 `intimacy()` 同源：CHANGELOG v2.27.13 声称契约导出了
         # 它们，实际没有；`status` 这条路上补一份，社交层不必多调一次门面。
         # v2.28.7 起直接读同一份 `intimacy_status()` 快照，多出来的「在不在场景里」
@@ -850,15 +949,26 @@ class CoreFacade:
             except Exception:
                 done, satisfy, last_at, stage = 0.0, 0.0, 0.0, 0
             fields = self._status_fields({})
+        last_interaction = _num(peek("last_interaction", 0.0))
+        peer_said_at = _num(peek("peer_said_at", last_interaction))
+        first_met = _num(peek("first_met", 0.0))
+        if first_met <= 0 and profile:
+            first_met = _num(profile.get("first_met", 0.0))
         return {
-            "affection": _num(profile.get("affection")),
-            "base_affection": _num(profile.get("base_affection")),
-            "nickname": _s(user_state.get("nickname")),
-            "last_interaction": _num(user_state.get("last_interaction")),
+            "affection": round(affection, 1),
+            "base_affection": round(base_affection, 1),
+            "nickname": _s(peek("nickname", "")),
+            # v3.0.0（联动 P2-3）：`last_interaction` 保持兼容语义 = **TA 上次说话**
+            #（旧版在外面还把它在「她主动开口」时往前推，社交层据此误判对方刚说过话）。
+            # 她说话的时间另记 `her_said_at`；`peer_said_at` 是同一语义的显式别名，
+            # 新社交层用它可以不依赖 last_interaction 的历史含义。
+            "last_interaction": round(last_interaction, 1),
+            "peer_said_at": round(peer_said_at, 1),
+            "her_said_at": round(_num(peek("her_said_at", 0.0)), 1),
             # 对话轮数与相识时间：主动层判断「这段关系够不够近」时不用再自己数消息，
             # 也不会把「好感被 override 钉成 100、涨幅为 0」的人误判成生人。
             "turns": int(_num(profile.get("turn_count"), 0.0) or 0),
-            "first_met": _num(user_state.get("first_met")),
+            "first_met": round(first_met, 1),
             "intimacy_done_count": done,
             "intimacy_satisfy": round(satisfy, 1),
             "intimacy_last_at": last_at,
@@ -893,11 +1003,16 @@ class CoreFacade:
             pass
 
 
-def get_core_facade(roles: Any = None, logger: Any = None) -> Optional[CoreFacade]:
+def get_core_facade(roles: Any = None, logger: Any = None, *, generation: int = 0,
+                    is_current: Any = None) -> Optional[CoreFacade]:
     """给别的插件拿门面。宿主按 `star_cls.__module__` 找过来，这里必须可调用。
 
     没有角色管理器（插件还没起来）时返回 None——对方会退回读 state.json。
+
+    `generation` / `is_current` 由 `main.get_core_facade()` 传入（P1-B）：门面绑定插件
+    实例代次，每次调用校验它是否仍是当前实例；旧门面调用一律退化成空值。
+    不传时退化为旧行为（单测/直接构造）。
     """
     if roles is None:
         return None
-    return CoreFacade(roles, logger)
+    return CoreFacade(roles, logger, generation=generation, is_current=is_current)
