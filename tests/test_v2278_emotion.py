@@ -391,7 +391,7 @@ class _EmotionCore:
 
 
 # 日上限作用在**进账本之前**的 delta 上，而账本对负向另有 ×1.2 的放大
-# （`LEDGER_NEGATIVE_AMPLIFY`）。所以实际好感的单日跌幅上限是 6.5 × 1.2 = 7.8。
+# （`LEDGER_NEGATIVE_AMPLIFY`）。所以实际好感的单日跌幅上限是 4.5 × 1.2 = 5.4。
 _LOSS_CEILING = M.DAILY_NET_LOSS_CAP * M.LEDGER_NEGATIVE_AMPLIFY
 
 
@@ -513,10 +513,10 @@ class TodayEventsPolarity(unittest.TestCase):
 
 
 class GainCapRecalibration(unittest.TestCase):
-    """D2：正向日上限收到 3.1，与注释里的「ledger≈33 / 12~14 天」口径一致。"""
+    """v3.0.1：正向日上限提到 6.0，与负向 4.5×1.2 = 5.4 对等，正常聊天能正积累。"""
 
     def test_cap_value(self):
-        self.assertAlmostEqual(M.DAILY_NET_GAIN_CAP, 3.1, places=6)
+        self.assertAlmostEqual(M.DAILY_NET_GAIN_CAP, 6.0, places=6)
 
     def test_a_day_of_spam_stays_within_the_cap(self):
         svc, clock = _svc(mood_initial_affection=35)

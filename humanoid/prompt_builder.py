@@ -730,6 +730,8 @@ class PromptBuilder:
                 return ""
             if not bool(getattr(cfg, "ccb_presence", True)):
                 return ""
+            if not _ccb.allowed_for(cfg, user_id):
+                return ""
             return self._ccb_presence_text(user_id, cfg)
         except Exception:
             return ""
@@ -764,7 +766,39 @@ class PromptBuilder:
             return f"她还在余韵里（刚结束），还剩 {left} 分钟"
         libido = _as_number(profile.get("libido"), 34.0)
         base_libido = _as_number(profile.get("base_libido"), libido)
-        return self._ccb_desire_presence(cfg, libido, base_libido)
+        affection = _as_number(profile.get("affection"), 0.0)
+        base_affection = _as_number(profile.get("base_affection"), affection)
+        # 余下的门槛也一起取：她「能不能进那一步」不只看亲近欲。以前这一句只
+        # 抄了亲近欲那一半，好感/精力/冷却全没算，于是模型会被告知「已经到了会
+        # 忍不住的那条线」，而真正拦门的 `ccb.evaluate` 因为好感不够直接返回 None。
+        try:
+            energy = _as_number(self._core.energy.energy, 100.0)
+        except Exception:
+            energy = 100.0
+        cooldown_left = 0.0
+        try:
+            gate_at = _as_number(scope.peek_user(user_id, "ccb_gate_at", 0.0), 0.0)
+            if gate_at <= 0:
+                gate_at = _as_number(scope.peek_user(user_id, "ccb_last_at", 0.0), 0.0)
+            if gate_at > 0 and (now - gate_at) < _ccb.CCB_COOLDOWN_SECONDS:
+                cooldown_left = max(
+                    0.0,
+                    min(
+                        _ccb.CCB_COOLDOWN_SECONDS,
+                        _ccb.CCB_COOLDOWN_SECONDS - (now - gate_at),
+                    ),
+                )
+        except Exception:
+            cooldown_left = 0.0
+        return self._ccb_desire_presence(
+            cfg,
+            libido,
+            base_libido,
+            affection=affection,
+            base_affection=base_affection,
+            energy=energy,
+            cooldown_left=cooldown_left,
+        )
 
     def _ccb_scene_presence(
         self,
@@ -826,25 +860,74 @@ class PromptBuilder:
         return text
 
     def _ccb_desire_presence(
-        self, cfg: HumanoidConfig, libido: float, base_libido: float
+        self,
+        cfg: HumanoidConfig,
+        libido: float,
+        base_libido: float,
+        *,
+        affection: Optional[float] = None,
+        base_affection: Optional[float] = None,
+        energy: Optional[float] = None,
+        cooldown_left: float = 0.0,
     ) -> str:
-        """不在场景里那半句：亲近欲在什么位置、离"忍不住"还差多少。
+        """不在场景里那半句：亲近欲在什么位置、离「忍不住」还差多少。
 
         用户要能判断"到没到"，所以必须给**数字**和**相对基线的方向**（只给一个
-        41/50 的话，模型不知道 41 算高还是低）。阈值与涨幅门槛都从配置读，
-        与 `ccb.evaluate` 同一套数——面板上调完这里跟着变，不会出现"注入说有戏、
-        实际进不去"的分叉。
+        41/50 的话，模型不知道 41 算高还是低）。
+
+        **门槛必须与 `ccb.evaluate` 同源**：能不能进那一步不只是亲近欲，还有好感、
+        好感涨幅、精力、冷却。以前这里只抄了亲近欲那一半，于是会写出「已经到了会
+        忍不住的那条线」，而同一时刻 `evaluate()` 因为好感不够直接返回 None——
+        模型被告知有戏、实际永远进不去，用户看到的就是「场景是个摆件」。
+        现在所有门槛走 `ccb.gate_gaps()`，说的和做的同一个数；有别的门槛没满足时
+        只写「还没到那一步，因为…」，不再宣称她已经忍不住。
         """
         libido = max(0.0, min(50.0, libido))
-        threshold = _as_number(
+        aff = _as_number(
+            affection if affection is not None else _ccb.CCB_AFFECTION_DEEP,
+            _ccb.CCB_AFFECTION_DEEP,
+        )
+        base_aff = _as_number(
+            base_affection if base_affection is not None else aff, aff
+        )
+        eng = _as_number(energy if energy is not None else 100.0, 100.0)
+        libido_min = _as_number(
             getattr(cfg, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN), _ccb.CCB_LIBIDO_MIN
         )
-        # 注入里说的门槛必须与 `ccb.evaluate` 用的同一个数：配置门槛高于「基线 +
-        # 每日可达涨幅」时按可达值算（否则会说「还差 8 才到忍不住」，而其实永远不到）。
-        threshold = _ccb.reachable_libido_min(threshold, base_libido)
-        rise = _as_number(
+        libido_rise = _as_number(
             getattr(cfg, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE), _ccb.CCB_LIBIDO_RISE
         )
+        aff_min = _as_number(
+            getattr(cfg, "ccb_affection_min", _ccb.CCB_AFFECTION_MIN),
+            _ccb.CCB_AFFECTION_MIN,
+        )
+        aff_rise = _as_number(
+            getattr(cfg, "ccb_affection_rise", _ccb.CCB_AFFECTION_RISE),
+            _ccb.CCB_AFFECTION_RISE,
+        )
+        aff_deep = _as_number(
+            getattr(cfg, "ccb_affection_deep", _ccb.CCB_AFFECTION_DEEP),
+            _ccb.CCB_AFFECTION_DEEP,
+        )
+        gaps = _ccb.gate_gaps(
+            affection=aff,
+            base_affection=base_aff,
+            libido=libido,
+            base_libido=base_libido,
+            energy=eng,
+            cooldown_left=cooldown_left,
+            libido_min=libido_min,
+            libido_rise=libido_rise,
+            affection_min=aff_min,
+            affection_rise=aff_rise,
+            affection_deep=aff_deep,
+        )
+        lib_gap = gaps["libido_gap"]
+        lib_rise_gap = gaps["libido_rise_gap"]
+        aff_gap = gaps["affection_gap"]
+        aff_rise_gap = gaps["affection_rise_gap"]
+        energy_gap = gaps["energy_gap"]
+        cd_left = gaps["cooldown_left"]
         diff = libido - base_libido
         if diff >= 1.0:
             rel = f"比平常高 {diff:.0f}"
@@ -852,19 +935,30 @@ class PromptBuilder:
             rel = f"比平常低 {abs(diff):.0f}"
         else:
             rel = "和平常差不多"
-        if diff <= -1.0 and libido < threshold:
+        if diff <= -1.0 and lib_gap > 0.0:
             # 低于基线、又没过门槛：她这会儿确实没那个心思。给一句正面结论，
             # 比让模型自己从数字里推更不容易读错。
             return f"她此刻没有那个心思（亲近欲 {libido:.0f}/50，{rel}）"
-        gap = max(0.0, threshold - libido)
-        rise_gap = max(0.0, rise - diff)
-        if gap <= 0 and rise_gap <= 0:
-            tail = "已经到了会忍不住的那条线"
-        elif gap <= 0:
-            tail = f"只差没比平常高出 {rise_gap:.0f}，还差一点才到忍不住"
-        else:
-            tail = f"还差 {gap:.0f} 才到忍不住"
-        return f"她此刻的欲望：亲近欲 {libido:.0f}/50（{rel}），{tail}"
+        tails: List[str] = []
+        if lib_gap > 0.0:
+            tails.append(f"还差 {lib_gap:.0f} 才到忍不住")
+        elif lib_rise_gap > 0.0:
+            tails.append(f"只差没比平常高出 {lib_rise_gap:.0f}，还差一点才到忍不住")
+        if aff_gap > 0.0:
+            tails.append(
+                f"关系还没到那一步（好感 {aff:.0f}/100，离 {aff_min:.0f} 还差 {aff_gap:.0f}）"
+            )
+        elif aff_rise_gap > 0.0:
+            tails.append(
+                f"这份亲近还没攒够（这一阵涨了 {aff - base_aff:.0f}，还差 {aff_rise_gap:.0f}）"
+            )
+        if energy_gap > 0.0:
+            tails.append(f"精力见底（{eng:.0f}/100），这会儿撑不起一场")
+        if cd_left > 0.0:
+            tails.append(f"刚收场不久，还要等 {_ccb.duration_text(cd_left)}")
+        if not tails:
+            tails.append("已经到了会忍不住的那条线")
+        return f"她此刻的欲望：亲近欲 {libido:.0f}/50（{rel}），" + "；".join(tails)
 
     def _ccb_pose_just_changed(self, user_id: str, now: float) -> bool:
         """这一场里刚换过姿势吗（看 `ccb_log` 的 pose 账本）。

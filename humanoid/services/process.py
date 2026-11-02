@@ -17,7 +17,7 @@ from typing import Any
 
 from ..config import HumanoidConfig
 from ..role_scope import RoleScope
-from ..slots import Slot, is_meal_event, is_sleep_event
+from ..slots import Slot, is_meal_event, slot_sleeps
 from ..traits import PersonaTraits
 
 
@@ -560,12 +560,13 @@ class ProcessService:
         以前用一堆单字关键字判（其中「早/午/晚」会把「晚间洗漱」判成用餐，
         「跟客户过方案」因为不含「会议」而落到自由时间，于是阶段写着「暂时不安排目标」）。
         睡眠与用餐直接用 slots 里那一套（吃饭优先于午睡），工作类放到最后兜底，
-        让更具体的类别先抢。
+        让更具体的类别先抢。睡眠同样走 `slot_sleeps`：模型写的「阖眼，呼吸渐沉」这类
+        卧床段落没有睡字，只看关键词会把它挂成「自由时间/家务」的醒着过程。
         """
         event = str(slot.get("event", "")).lower()
         if is_meal_event(event):
             return "用餐"
-        if is_sleep_event(event):
+        if slot_sleeps(slot):
             return "睡眠"
         if any(k in event for k in ("学习", "读书", "复习", "做题", "上课", "作业", "背", "考试")):
             return "学习"

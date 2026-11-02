@@ -87,13 +87,13 @@ class SchemaTest(unittest.TestCase):
             self.assertIn(key, self.schema)
 
     def test_field_count_is_pinned(self):
-        """字段数变化必须同步改这里（v3.0.0 = 134：新增「正在输入」节流两项）。
+        """字段数变化必须同步改这里（v3.0.2 = 135：新增 CCB 白名单）。
 
         面板项数在 README / main.py 的帮助文案里也被引用，字段增删时一并对齐，
         否则用户看到的「共 N 项」与面板实际数量对不上。
         """
-        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 134)
-        self.assertEqual(len(self.schema), 134)
+        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 135)
+        self.assertEqual(len(self.schema), 135)
 
     def test_input_state_throttle_keys_are_consistent(self):
         """v3.0.0 新增的两个「正在输入」节流项：类型/区间/默认值三处一致。"""

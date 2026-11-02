@@ -29,6 +29,7 @@ from ..slots import (
     is_sleep_event,
     parse_time,
     sleep_window_minutes,
+    slot_sleeps,
 )
 from ..traits import detect as detect_traits, trait_hints
 from ..wording import pick
@@ -249,7 +250,7 @@ def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
 
 def sleep_spans(slots: list[Slot]) -> list[Slot]:
     """日程里算「她在睡」的时段（与身体层同一套判定）。"""
-    return [slot for slot in slots if is_sleep_event(slot.get("event"))]
+    return [slot for slot in slots if slot_sleeps(slot)]
 
 
 def schedule_wake_minute(slots: list[Slot]) -> int | None:
@@ -399,16 +400,16 @@ def day_phrases(
             continue
         ordered.append((lo, hi, str(slot.get("event") or "").strip(), slot))
 
-    for lo, hi, event, _slot in ordered:
+    for lo, hi, event, slot in ordered:
         if lo <= now_minutes < hi:
             phrase = _event_phrase(event)
             if phrase:
-                doing = "睡觉" if is_sleep_event(event) else phrase
+                doing = "睡觉" if slot_sleeps(slot) else phrase
             continue
         if hi <= now_minutes:
             if now_minutes - hi > DAY_RECENT_PAST_MINUTES:
                 continue
-            if is_sleep_event(event):
+            if slot_sleeps(slot):
                 # 睡眠不报成「刚在睡觉」：那是刚醒的人说的话，醒三小时就不算了。
                 if now_minutes - hi <= 90:
                     done.insert(0, "才醒")
@@ -422,7 +423,7 @@ def day_phrases(
             if phrase:
                 # 说「夜里要睡了」而不是「夜里就该睡了」：后者听着像谁在管她。
                 upcoming.append(
-                    f"{period_of(lo)}要睡了" if is_sleep_event(event)
+                    f"{period_of(lo)}要睡了" if slot_sleeps(slot)
                     else f"{period_of(lo)}还要{phrase}"
                 )
 
@@ -430,7 +431,7 @@ def day_phrases(
     # 不按 end 取：23:00→24:00 与 00:00→07:00 是同一觉拆成的两段，按 end 比
     # 24:00 会永远赢过 07:00；按开始时间取最后一段就对了（两段的梦本来就该一致）。
     for _lo, _hi, event, slot in ordered:
-        if is_sleep_event(event):
+        if slot_sleeps(slot):
             dreams = _clean_dreams(slot.get("dreams"))
 
     # 「她自己想做的」：今天（以及接下来）标了 wants 的那几段。
@@ -999,7 +1000,8 @@ def parse_segment(
     suspended_event = str((susp or {}).get("event") or "").strip()[:24]
     want_resume = _truthy_flag(raw.get("resume")) and bool(suspended_event)
     if want_resume:
-        sleeping = is_sleep_event(suspended_event)
+        # 挂起记录里带着解析时的睡着判定：醒来前被打断的那件事可能没有睡词。
+        sleeping = is_sleep_event(suspended_event) or bool((susp or {}).get("sleep"))
         try:
             remaining = int(float((susp or {}).get("remaining_minutes", 0) or 0))
         except (TypeError, ValueError):
@@ -1022,6 +1024,7 @@ def parse_segment(
         if (susp or {}).get("wants"):
             slot["wants"] = True
         if sleeping:
+            slot["sleep"] = True
             raw_dreams = raw.get("dreams")
             if raw_dreams is None:
                 raw_dreams = (susp or {}).get("dreams")
@@ -1034,9 +1037,12 @@ def parse_segment(
         want_continue = want_continue.strip().lower() in ("true", "1", "yes", "是", "继续")
     want_continue = bool(want_continue) and bool(str(prev.get("event") or "").strip())
 
-    event = str(raw.get("event") or "").strip()[:24]
+    # 原文留着判「是不是睡着」：截到 24 字之后，睡字常常正好被切掉。
+    raw_event = str(raw.get("event") or "").strip()
+    event = raw_event[:24]
     if want_continue:
-        event = str(prev.get("event") or "").strip()[:24]
+        raw_event = str(prev.get("event") or "").strip()
+        event = raw_event[:24]
     if not event:
         return None
 
@@ -1051,7 +1057,7 @@ def parse_segment(
         or "平常"
     )
 
-    sleeping = is_sleep_event(event)
+    sleeping = is_sleep_event(raw_event)
     minutes = _segment_minutes(raw, now_minute, sleeping)
     start = segment_start(now_minute, step)
     end = start + minutes
@@ -1065,7 +1071,16 @@ def parse_segment(
         "emotion": emotion,
         "energy_rate": clamp_rate(rate_raw),
     }
+    if not sleeping and slot_sleeps({**slot, "event": raw_event}):
+        # 关键词没命中，但整段就是一段安静的卧床休息（模型写「阖眼，呼吸渐沉」这类）。
+        # 按睡着处理，并把这当成睡眠段重算时长上限——不然一夜八小时会被 180 分钟截断，
+        # 剩下七小时变成「她醒着在床上躺着」。
+        sleeping = True
+        minutes = _segment_minutes(raw, now_minute, True)
+        end = start + minutes
+        slot["end"] = format_time(min(DAY_MINUTES, end))
     if sleeping:
+        slot["sleep"] = True
         # 梦只属于睡眠段。`continue=true` 接着睡时模型通常不会把梦再写一遍，
         # 沿用上一段的梦——否则同一觉被拆成两段后，后一段会把梦洗掉。
         raw_dreams = raw.get("dreams")
@@ -1109,6 +1124,23 @@ def in_scheduled_night(slots: list[Slot], moment: Any) -> bool:
     return _in_window(moment.hour * 60 + moment.minute, start, end)
 
 
+# 兜底分段里「睡够了」的下限（v3.0.2）。连续睡了这么久（且不少于她需要的睡眠量）
+# 之后，即使身体还标着 asleep，兜底也该给一段醒着的时段——否则「睡着」会自我延续：
+# 兜底每被问一次就再排一段睡，模型不可用时她能一整天只做睡觉这一件事。
+WAKE_AFTER_SLEEP_MIN_MINUTES = 240.0
+
+
+def _wake_up_minutes(cfg: Any) -> float:
+    """兜底判「睡够了」的时长：她需要的睡眠（`sleep_need_hours`），下限 4 小时。"""
+    try:
+        need = float(getattr(cfg, "sleep_need_hours", 8.0) or 8.0)
+    except (TypeError, ValueError):
+        need = 8.0
+    if not (need > 0) or need != need:
+        need = 8.0
+    return max(WAKE_AFTER_SLEEP_MIN_MINUTES, need * 60.0)
+
+
 def dynamic_segment(
     cfg: HumanoidConfig,
     body: dict[str, Any] | None,
@@ -1117,6 +1149,7 @@ def dynamic_segment(
     step: int = 1,
     prev: Slot | None = None,
     seed: list[Any] | None = None,
+    asleep_minutes: float = 0.0,
 ) -> Slot:
     """没有可用模型时的兜底：**只给状态，不给事件**。
 
@@ -1132,6 +1165,9 @@ def dynamic_segment(
     那是这个模块自己的标准，这里跟它对齐。
 
     措辞仍按 (角色, 日期, 钟点) 抽签，同一时刻不会每天给出同一个答案。
+
+    `asleep_minutes` 是「这一觉已经睡了多久」（调用方从日程里连着的睡段算出来）：
+    睡过该睡的量之后就不再续排睡觉，给一段醒着的时段把 `asleep` 这个状态解开。
     """
     body = body or {}
     prev = prev or {}
@@ -1146,6 +1182,15 @@ def dynamic_segment(
     if not cfg.night_mode_enabled or night_start == night_end:
         night_start, night_end = 23 * 60, 7 * 60
     in_night = _in_window(now_minute, night_start, night_end)
+
+    # 睡够了就该醒。`asleep` 只由「装上的一段不是睡眠」来解（soma 记到非睡段才清
+    # asleep_since），而兜底分段每被问一次就再排一段睡：睡着了 → 再排 90 分钟睡 →
+    # 仍然睡着 → 再排……模型不可用（provider 冷却、抽不到调用间隔）时她能这样睡一整天，
+    # 日程里除了睡觉什么都没有。所以超过该睡的量就主动给醒着的段。
+    if asleep_minutes >= _wake_up_minutes(cfg) and (
+        not in_night or asleep_minutes >= _wake_up_minutes(cfg) + 180.0
+    ):
+        asleep = False
 
     seed_key = list(seed or []) + [now_minute // 60]
 
@@ -1352,6 +1397,45 @@ class ScheduleService:
             # 梦跟着这一觉跨过午夜：旧结转没有这个键，洗成空列表即可。
             "dreams": _clean_dreams(carry.get("dreams")),
         }
+
+    def sleeping_minutes(self, now_minute: int | None = None) -> float:
+        """这一觉已经睡了多久（分钟）；此刻不在睡返回 0。
+
+        兜底分段用它判「睡够了没有」。只数**今天连着**的那几段：模型常把一夜拆成好几段，
+        跨午夜的那一截由结转段从 00:00 起算。
+        """
+        segs = self.segments()
+        if not segs:
+            return 0.0
+        if now_minute is None:
+            now = self._clock.now()
+            now_minute = now.hour * 60 + now.minute
+        index = -1
+        for i, slot in enumerate(segs):
+            lo = parse_time(slot.get("start"))
+            hi = parse_time(slot.get("end"))
+            if lo is None or hi is None:
+                continue
+            if lo <= now_minute < hi:
+                index = i
+                break
+        if index < 0 or not slot_sleeps(segs[index]):
+            return 0.0
+        start = parse_time(segs[index].get("start"))
+        if start is None:
+            return 0.0
+        total = max(0.0, float(now_minute - start))
+        cursor = start
+        j = index - 1
+        while j >= 0 and slot_sleeps(segs[j]) and slot_sleeps(segs[j + 1]):
+            lo = parse_time(segs[j].get("start"))
+            hi = parse_time(segs[j].get("end"))
+            if lo is None or hi is None or hi != cursor:
+                break
+            total += float(hi - lo)
+            cursor = lo
+            j -= 1
+        return total
 
     # 「还没做完的事」最多留 3 件、每件最多记 4 天。
     ONGOING_KEY = "ongoing_tasks"
@@ -1878,6 +1962,7 @@ class ScheduleService:
             "ongoing": str(raw.get("ongoing") or "").strip()[:40],
             "wants": bool(raw.get("wants")),
             "remaining_minutes": min(remaining, DAY_MINUTES),
+            "sleep": bool(raw.get("sleep")),
             "at": at,
             "ttl_minutes": ttl_minutes,
         }
@@ -1982,7 +2067,7 @@ class ScheduleService:
         if active is None:
             return True
         event = str(active.get("event") or "")
-        if is_sleep_event(event):
+        if slot_sleeps(active):
             # 睡着：这一觉睡到这段结束为止，夜里不重掷、不越线打断。
             # **消息也不算**：多用户部署里夜里总有人发消息，让消息能撕被子，
             # 她就没有一个完整的觉了（这个口子原来只按「一个话多的人」设计，
@@ -2254,6 +2339,7 @@ class ScheduleService:
                     slot = dynamic_segment(
                         cfg, self._body_snapshot(), now_minute=minutes,
                         step=cfg.granularity_minutes, prev=prev, seed=self._seed(),
+                        asleep_minutes=self.sleeping_minutes(minutes),
                     )
                     self._set_source(SOURCE_TEMPLATE)
                 if slot is None:
@@ -2299,7 +2385,7 @@ class ScheduleService:
             sleep_pressure = float(body.get("sleep_pressure", 0.0) or 0.0)
         except (TypeError, ValueError):
             sleep_pressure = 0.0
-        prev_sleep = bool(prev) and is_sleep_event(str((prev or {}).get("event") or ""))
+        prev_sleep = bool(prev) and slot_sleeps(prev)
         prompt = segment_prompt(
             cfg,
             now_text=now.strftime("%H:%M"),
@@ -2531,6 +2617,9 @@ class ScheduleService:
                     "ongoing": str(truncated.get("ongoing") or "").strip()[:40],
                     "wants": bool(truncated.get("wants")),
                     "remaining_minutes": int(truncated_remaining),
+                    # 解析时判过的睡着标记一起带走：被打断的这事可能是段没有睡词的睡，
+                    # 只看事件名会把「回去接着睡」重建成一个醒着的段。
+                    "sleep": bool(slot_sleeps(truncated)),
                     "at": float(self._wall_clock()),
                     "ttl_minutes": _pause_ttl_minutes(self.config),
                 }

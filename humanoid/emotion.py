@@ -578,6 +578,8 @@ class EmotionLayer:
         cfg = getattr(self._core, "config", None)
         if not bool(getattr(cfg, "ccb", False)):
             return None
+        if not _ccb.allowed_for(cfg, user_id):
+            return None
         state = self._core.mood.profile(user_id) or profile or {}
         try:
             energy = float(self._core.energy.energy)

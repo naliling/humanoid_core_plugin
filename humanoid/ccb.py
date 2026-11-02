@@ -667,6 +667,90 @@ def _band_for(libido: float, libido_min: float) -> Optional[Tuple[float, Tuple[s
     return picked
 
 
+def allowed_for(config: Any, user_id: Any) -> bool:
+    """这个人是否在亲密功能的开放名单里（`ccb_allowed_users`）。
+
+    空名单 = 不设限（默认行为一律不变）；名单里写了 `"*"` 也等于不设限。
+    拿不到配置时按「不设限」处理：宁可在坏数据下照旧，也不要因为读不到
+    配置把所有人一起挡掉——挡错了是功能消失，放过了只是回到旧行为。
+
+    名单是给「这台设备只想对某几个人开」的场景用的：以前只靠好感门槛，
+    熟人养到 50 就自动解锁，且 `/你的状态` 会把亲近欲与差值摆给他看——
+    那对朋友关系来说是件难解释的事。
+    """
+    try:
+        raw = getattr(config, "ccb_allowed_users", ()) or ()
+    except Exception:
+        return True
+    if isinstance(raw, str):
+        raw = (raw,)
+    try:
+        items = [str(item).strip() for item in raw]
+    except TypeError:
+        return True
+    items = [item for item in items if item]
+    if not items or "*" in items:
+        return True
+    return str(user_id or "").strip() in items
+
+
+def gate_gaps(    *,
+    affection: float,
+    base_affection: float,
+    libido: float,
+    base_libido: float,
+    energy: float = 100.0,
+    cooldown_left: float = 0.0,
+    libido_min: float = CCB_LIBIDO_MIN,
+    libido_rise: float = CCB_LIBIDO_RISE,
+    affection_min: float = CCB_AFFECTION_MIN,
+    affection_rise: float = CCB_AFFECTION_RISE,
+    affection_deep: float = CCB_AFFECTION_DEEP,
+) -> Dict[str, float]:
+    """每一项门槛「还差多少」——0 表示这一项已经满足。
+
+    为什么非要抽出来：能不能进场景这件事原来有**三份**各写一遍的判定——
+    《_values_hold()》（真正拦门的）、《scene_status()》（/亲密状态 的阻塞清单）和
+    注入层的「她此刻的欲望」。注入层只抄了亲近欲那一半，好感/精力/冷却全没算，
+    于是模型会收到「她已经到了会忍不住的那条线」这种话，而同一时刻 evaluate()
+    因为好感不够直接 return None——写着有戏、实际进不去，用户看到的就是「场景
+    是个摆件」。现在数值门槛只在这里定义一次，三处共用，改阈值也不会走歪。
+
+    返回的键固定为：
+    · libido_gap：离实际生效的亲近欲门槛还差多少（已按可达上限夹过）
+    · libido_rise_gap：离「比平常高 N」还差多少（顶到量程时为 0）
+    · affection_gap：离好感门槛还差多少
+    · affection_rise_gap：离「这一阵涨够 N」还差多少（进了深入档为 0）
+    · energy_gap：离精力下限还差多少
+    · cooldown_left：还要等多少秒才能再进
+    · libido_min_eff：实际生效的亲近欲门槛（reachable_libido_min 夹过之后）
+
+    数值一律走 _fs()：拿不到 / NaN 退回默认值，绝不让 nan 参与比较——
+    nan < x 恒为假，会让一堆门槛「看起来全过」。
+    """
+    aff = _fs(affection, 0.0)
+    base_aff = _fs(base_affection, 0.0)
+    lib = _fs(libido, 0.0)
+    base_lib = _fs(base_libido, 0.0)
+    low = reachable_libido_min(_fs(libido_min, CCB_LIBIDO_MIN), base_lib)
+    need_lib_rise = _fs(libido_rise, CCB_LIBIDO_RISE)
+    need_aff = _fs(affection_min, CCB_AFFECTION_MIN)
+    need_aff_rise = _fs(affection_rise, CCB_AFFECTION_RISE)
+    deep_at = _fs(affection_deep, CCB_AFFECTION_DEEP)
+    # 两处饱和例外与 _values_hold 的历史语义完全一致：顶到量程 / 已进深入档时
+    # 「涨上来」不再是要求，否则最亲密的那批人反而永远进不了场景。
+    pinned = lib >= LIBIDO_MAX - 1.0
+    deep = aff >= deep_at
+    return {
+        "libido_gap": max(0.0, low - lib),
+        "libido_rise_gap": 0.0 if pinned else max(0.0, need_lib_rise - (lib - base_lib)),
+        "affection_gap": max(0.0, need_aff - aff),
+        "affection_rise_gap": 0.0 if deep else max(0.0, need_aff_rise - (aff - base_aff)),
+        "energy_gap": max(0.0, CCB_ENERGY_MIN - _fs(energy, 100.0)),
+        "cooldown_left": max(0.0, _fs(cooldown_left, 0.0)),
+        "libido_min_eff": low,
+    }
+
 def _values_hold(
     *,
     affection: float,
@@ -690,26 +774,23 @@ def _values_hold(
     最亲密的那批人反而永远进不了场景（线上实测：libido 50/base 50、好感 100/100 的
     用户被「涨得不够」挡在门外）。
     """
-    low = reachable_libido_min(libido_min, base_libido)
-    if libido < low:
-        return False
-    if (libido - base_libido) < float(libido_rise):
-        try:
-            pinned = float(libido) >= LIBIDO_MAX - 1.0
-        except (TypeError, ValueError):
-            pinned = False
-        if not pinned:
-            return False
-    if affection < float(affection_min):
-        return False
-    if (affection - base_affection) < float(affection_rise):
-        try:
-            deep = float(affection) >= float(affection_deep)
-        except (TypeError, ValueError):
-            deep = False
-        if not deep:
-            return False
-    return True
+    gaps = gate_gaps(
+        affection=affection,
+        base_affection=base_affection,
+        libido=libido,
+        base_libido=base_libido,
+        libido_min=libido_min,
+        libido_rise=libido_rise,
+        affection_min=affection_min,
+        affection_rise=affection_rise,
+        affection_deep=affection_deep,
+    )
+    return (
+        gaps["libido_gap"] <= 0.0
+        and gaps["libido_rise_gap"] <= 0.0
+        and gaps["affection_gap"] <= 0.0
+        and gaps["affection_rise_gap"] <= 0.0
+    )
 
 
 def _qualifies(
@@ -1392,6 +1473,20 @@ def scene_status(
     aff_low = _fs(affection_min, CCB_AFFECTION_MIN)
     need_aff = _fs(affection_rise, CCB_AFFECTION_RISE)
     aff_deep = _fs(affection_deep, CCB_AFFECTION_DEEP)
+    # 数值门槛一律从 gate_gaps() 取：它是 evaluate()（真正拦门的）与注入层共用
+    # 的那一份定义，面板上写「还差 X」和实际拦不拦必须同源，否则又是两套说法。
+    gaps = gate_gaps(
+        affection=aff,
+        base_affection=base_aff,
+        libido=lib,
+        base_libido=base_lib,
+        energy=eng,
+        libido_min=low_cfg,
+        libido_rise=need_lib,
+        affection_min=aff_low,
+        affection_rise=need_aff,
+        affection_deep=aff_deep,
+    )
 
     # 场景闲置过期：`ccb_stage` 会因为「没人说话」而挂在那里过夜，
     # 照实显示"进行中"就是骗人——6 小时没人碰过的那一场早就过去了。
@@ -1439,26 +1534,27 @@ def scene_status(
             blockers.append("群聊里不会进场景")
         if not looks_female(persona_prompt):
             blockers.append("人设判成男角色（只对女角色开）")
-        if aff < aff_low:
-            blockers.append(f"好感不够（{aff:.0f}/100，差 {aff_low - aff:.0f}）")
-        elif (aff - base_aff) < need_aff and aff < aff_deep:
+        aff_gap = gaps["affection_gap"]
+        if aff_gap > 0.0:
+            blockers.append(f"好感不够（{aff:.0f}/100，差 {aff_gap:.0f}）")
+        elif gaps["affection_rise_gap"] > 0.0:
             # 深入档（默认 75）算「关系已经够深」，不再要求这一阵子涨过 8 分。
             blockers.append(
-                f"好感涨得不够（{delta_text(aff - base_aff)}，还差 {need_aff - (aff - base_aff):.1f}，"
+                f"好感涨得不够（{delta_text(aff - base_aff)}，还差 {gaps['affection_rise_gap']:.1f}，"
                 f"或把好感养到深入档 {aff_deep:.0f}）"
             )
-        if lib < low:
+        if gaps["libido_gap"] > 0.0:
             hint = ""
             if low < low_cfg - 1e-6:
                 hint = f"（配置 {low_cfg:.0f} 超出她这具身体一天能涨到的上限，已按可达值算）"
-            blockers.append(f"亲近欲不够（{lib:.0f}/50，差 {low - lib:.0f}）{hint}")
-        elif (lib - base_lib) < need_lib and lib < LIBIDO_MAX - 1.0:
+            blockers.append(f"亲近欲不够（{lib:.0f}/50，差 {gaps['libido_gap']:.0f}）{hint}")
+        elif gaps["libido_rise_gap"] > 0.0:
             # 已经顶到量程（50）算「她一直很想要」，不再要求还能再涨。
             blockers.append(
-                f"亲近欲涨得不够（{delta_text(lib - base_lib)}，还差 {need_lib - (lib - base_lib):.1f}，"
+                f"亲近欲涨得不够（{delta_text(lib - base_lib)}，还差 {gaps['libido_rise_gap']:.1f}，"
                 f"或顶到 {LIBIDO_MAX:.0f} 满格）"
             )
-        if eng < CCB_ENERGY_MIN:
+        if gaps["energy_gap"] > 0.0:
             blockers.append(f"精力不足（{eng:.0f} < {CCB_ENERGY_MIN:.0f}）")
         if cooldown_left > 0:
             blockers.append(f"冷却中（还要 {duration_text(cooldown_left)}）")

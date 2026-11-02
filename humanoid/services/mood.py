@@ -88,7 +88,7 @@ _INTIMATE_PATTERN = re.compile(
 #
 # 权重刻意轻（脏话是 -2~-4，这里只有 -0.4~-1.2）：日常冷淡是**一滴滴**的，不是
 # 一记重拳。真正让它显形的是账本的累积——单句几乎不动，连着好些天的敷衍才会把
-# 好感拉下来（v2.28.9 起单日负向另有 `DAILY_NET_LOSS_CAP` 封顶，一天最多掉 6.5）。
+# 好感拉下来（v2.28.9 起单日负向另有 `DAILY_NET_LOSS_CAP` 封顶，一天最多掉 4.5）。
 # 这比在文本里猜「TA 是不是故意的」可靠得多。
 _COLD_PATTERN = re.compile(
     r"(嗯+|哦+|唔+|随便|随你|都行|无所谓|不用了|没必要|不想说|没什么好说的|"
@@ -288,17 +288,20 @@ POSITIVE_MESSAGE_CAP = 2.4
 # 基线 30 的人要攒四天才能碰一次 ccb 涨幅门槛；单句给到 1.5、日额度 6 之后，
 # 一次认真聊就能把欲望推过门槛。
 LIBIDO_MESSAGE_CAP = 1.5
-# 甜话压脾气也要慢：单句最多压 0.3 分，否则几十句甜话就把攻击性打到 0。
-AGGRESSION_DOWN_CAP = 0.3
-# 每日净增封顶（按她城市的自然日计）。封顶值与时衰半衰期是**配套**的：
-# 无截断均衡 = 日净增 / (1 - 0.5^(24/168)) = 3.1 / 0.0943 ≈ 32.9 → affection
-# ≈ 基线 35 + 32.9 ≈ 68，曲线在 12~14 天走到 60 上下。
+# 甜话压脾气的单句上限。
+# v3.0.1：0.3 → 1.5。原来正向单句最多只能压 0.3，而一句难听话单句就能推 +2.0，
+# 攻击性**涨得比降快六倍多**，几十句好话也压不回基线——「数值只往坏的方向走」
+# 有一半是这条造成的。1.5 是一次认真聊天能把脾气真正哄下来的量级。
+AGGRESSION_DOWN_CAP = 1.5
+# 每日净增封顶（按她城市的自然日计）。封顶值与时衰半衰期、账本容量是**配套**的：
+# 无截断均衡 = 日净增 / (1 - 0.5^(24/168)) = 6.0 / 0.0943 ≈ 63.6 → affection
+# ≈ 基线 35 + 63.6；账本按 400 条截断后实测稳态落在 70~90，12~14 天走到 60 上下。
 #
-# v2.28.9（D2）：6.5 → 3.1。6.5 的实测是 **8 天**就到 70、400 天均衡停在 77.6
-# （120 条账本截断后的实测值），和这里宣称的「12~14 天」对不上；3.1 正是注释里
-# 「ledger≈33」反推出来的日净增。注意 3.1 的均衡是 68 —— **70 在 3.1 下不可达**，
-# 别再照抄旧注释里的「到 70」。
-DAILY_NET_GAIN_CAP = 3.1
+# v3.0.1：3.1 → 6.0。3.1 的均衡只有 68，而负向单日能掉 7.8 —— 正负比 1 : 2.5。
+# 一天 30 句暖话加十几句「嗯」实测净**负**四分左右，好感只会往下走：用户反馈的
+# 「好感度不会提升」在算术上就是这条造成的。现在正向 6.0、负向 4.5×1.2 = 5.4，
+# 两边基本对等，正常聊天能稳定正积累。
+DAILY_NET_GAIN_CAP = 6.0
 DAILY_LIBIDO_GAIN_CAP = 6.0
 # 同类话递减系数：同一天里第 1/2/3/4+ 次只有对应比例生效。
 # 「新话题不受限」——它只打在反复刷的同类话上（本地词典命中类别）。
@@ -322,14 +325,14 @@ IGNORE_PENALTY_CAP = 2.0
 # 每日净损封顶（v2.28.9，与 DAILY_NET_GAIN_CAP 对称）。
 #
 # 正向有三道闸 + 每日封顶，负向原先**一道日闸都没有**：实测单日连发 200 句「嗯」
-# （cold 路径）或单日 60 次 `note_ignored_by_peer` 都能把好感从 60 直接打到 0，
-# 而正向一天最多 +6.5。现在负向也按自然日累计，当天扣满这个数之后一律归零。
-# 取与正向同量级（6.5）：负向仍然比正向快（同类递减不作用于 cold，且账本对负向另有
-# ×1.2 放大），但一天最多掉 6.5，从 60 拉到底至少要十来天。
+# （cold 路径）或单日 60 次 `note_ignored_by_peer` 都能把好感从 60 直接打到 0。
+# 现在负向也按自然日累计，当天扣满这个数之后一律归零。
+#
+# v3.0.1：6.5 → 4.5。负向仍然比正向快（同类递减不作用于 cold，且账本对负向另有
+# ×1.2 放大，实际单日跌幅 4.5 × 1.2 = 5.4），但不再压过正向的 6.0 —— 原来
+# 7.8 : 3.1 的比例让正常聊天净掉分，正是「越聊越低」的来源。
 # 口径与 `_throttle_positive` 的 `warm_day` 完全对称，见 `_charge_negative_day`。
-# 注意账本对负向另有 `LEDGER_NEGATIVE_AMPLIFY`（×1.2）的放大，所以**实际好感**的
-# 单日跌幅上限是 6.5 × 1.2 = 7.8；正向没有放大，日涨幅就是 3.1。
-DAILY_NET_LOSS_CAP = 6.5
+DAILY_NET_LOSS_CAP = 4.5
 
 # 情绪日志的触发阈值（v2.28.9，按实测单句幅度重标）。
 #
@@ -383,6 +386,10 @@ RETENTION_DROPPED_FIELDS = (
 _STALE_SHELL_FIELDS = (
     "nickname", "nickname_src", "first_met", "last_interaction",
     "display_name", "display_name_at",
+    # v3.0.1：关系基线（见 `prune_expired` 里的 base_affection_kept）。它必须在这份
+    # 名单里，否则一个只剩称呼+基线的条目就再也进不了「90 天整条删除」，state.json
+    # 又会随群规模一路涨——那是 v2.27.38 专门修过的问题。
+    "base_affection_kept",
 )
 # 整条删除的静默期（天）的**兜底值**。真正的取值来自配置项
 # `stale_user_retention_days`（v2.27.38 起可配；之前这里是唯一来源、写死 90 天）。
@@ -660,10 +667,10 @@ def local_delta(text: str) -> Delta:
     # 亲近信号：走 libido 通道，好感涨得少。排在正向词之前——
     # 「喜欢你」既命中「喜欢」也命中亲近，亲近通道更准（原来纯正词通道）。
     if _INTIMATE_PATTERN.search(cleaned):
-        return Delta(random.uniform(1.4, 2.1), random.uniform(0.8, 1.4), random.uniform(-0.6, -0.3))
+        return Delta(random.uniform(1.4, 2.1), random.uniform(0.8, 1.4), random.uniform(-1.0, -0.5))
 
     if POSITIVE_PATTERN.search(cleaned):
-        return Delta(random.uniform(1.2, 1.8), random.uniform(0.4, 0.9), random.uniform(-0.7, -0.4))
+        return Delta(random.uniform(1.2, 1.8), random.uniform(0.4, 0.9), random.uniform(-1.2, -0.6))
 
     if _COLD_PATTERN.search(body):
         # 轻。一句「嗯」几乎不推好感，但连着两周的敷衍会在账本里攒成一条。
@@ -776,6 +783,15 @@ class MoodService:
         override = cfg.affection_override_for(user_id)
         if override is not None:
             affection = override
+        # v3.0.1：情绪档案被过期清理掉之后，**关系基线**要接回来。
+        #
+        # 原来清理是把整份 mood 删掉，于是「聊了三个月、好感 70」的人出门一周回来
+        # 就变回面板初始值——用户看到的是「好感度永远不会涨」。清理的初衷是别让
+        # state.json 攒着一堆陈年对话细节，不是把关系一起清零：这里只接回那一个数字
+        # （长期下限），账本、记忆、标签照旧全部丢掉。
+        kept = self._kept_base_of(user_state)
+        if kept is not None and kept > affection:
+            affection = kept
         record = {
             "affection": affection,
             "libido": float(cfg.mood_initial_libido),
@@ -797,6 +813,17 @@ class MoodService:
         user_state["mood"] = record
         self._scope.mark_dirty()
         return record
+
+    @staticmethod
+    def _kept_base_of(user_state: dict) -> Optional[float]:
+        """过期清理时留下的关系基线（没有就返回 None）。坏值当没有。"""
+        try:
+            kept = float(user_state.get("base_affection_kept", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not _finite(kept) or kept <= 0.0:
+            return None
+        return max(AFFECTION_RANGE[0], min(AFFECTION_RANGE[1], kept))
 
     def _first_met_of(self, user_state: dict) -> float:
         """认识的时间点。优先用**没被过期清理删掉**的那份。
@@ -1415,6 +1442,17 @@ class MoodService:
                     first_met = 0.0
                 if first_met > 0:
                     user_state["first_met"] = first_met
+                # v3.0.1：关系基线同样搬走再删档案。清理要丢掉的是「三个月的对话
+                # 细节」，不是「你们处到了哪一步」——基线一旦跟着归零，出门一周回来
+                # 就变回面板初始值，用户看到的就是「好感度永远不会涨」。
+                try:
+                    kept_base = float(mood.get("base_affection", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    kept_base = 0.0
+                if _finite(kept_base) and kept_base > 0.0:
+                    user_state["base_affection_kept"] = max(
+                        AFFECTION_RANGE[0], min(AFFECTION_RANGE[1], kept_base)
+                    )
             # 把最后活动时间也留在 user 级：mood 被清掉之后，它就是下一次判定的依据
             # （顶部注释一直这么写，但代码从没写过这个字段，于是清过一次的条目再也
             # 判不出过期——D4 的「90 天不活跃」正是靠它）。
@@ -1461,7 +1499,16 @@ class MoodService:
             return False
 
         duration = max(0.5, _num_or(cfg.mood_decay_hours, 6.0))
-        ratio = 1.0 if elapsed_hours >= duration else (elapsed_hours / duration) ** 2
+        # v3.0.1：亲近欲 / 攻击性的回落改成**半衰式**，不再「到点一步拉回基线」。
+        #
+        # 原来是 `ratio = 1.0 if elapsed >= duration else (elapsed/duration)**2`：
+        # 面板默认 6 小时，于是隔一夜、上一趟班，libido / aggression 就被完整拉回
+        # base_libido / base_aggression —— `DAILY_LIBIDO_GAIN_CAP` 完全白给，
+        # ccb 的 libido_min（38，基线 34）在实际作息下永远够不到。
+        # 现在按 4×mood_decay_hours（默认 24h）做半衰：一天掉一半、两天掉四分之三，
+        # 一次认真聊天攒下的欲望能撑到第二天。
+        axis_hours = max(1.0, duration * 4.0)
+        ratio = 1.0 - 0.5 ** (elapsed_hours / axis_hours)
         changed = False
         for key, base_key, bounds in DIMENSIONS:
             # 好感不走这条「按比例往 base 回落」的衰减。
@@ -1885,7 +1932,7 @@ class MoodService:
         2. **同类递减**：同一天里同类话第 2 次 ×0.6、第 3 次 ×0.35、第 4 次起 ×0.2。
            刷一百句「喜欢你」和说一句「喜欢你」没有区别。
         3. **每日净增封顶**：按她城市的自然日，正向上的净增封顶 3.1 / 6.0
-           （好感是 `DAILY_NET_GAIN_CAP`，v2.28.9 的 D2 从 6.5 收到 3.1）。
+           （好感是 `DAILY_NET_GAIN_CAP`，v3.0.1 从 3.1 提到 6.0，与负向 4.5×1.2 对齐）。
            刷屏一天也不会比认真聊一天额外收获多少。
         只削正向；负向（骂人/冷淡）不动——那个该疼就疼。
         """
@@ -1896,11 +1943,11 @@ class MoodService:
         libido = min(delta.libido, LIBIDO_MESSAGE_CAP)
         aggression = max(delta.aggression, -AGGRESSION_DOWN_CAP)
 
-        today = ""
-        try:
-            today = str(self._clock.today_str() or "") if self._clock else ""
-        except Exception:
-            today = ""
+        today = self._day_key()
+        if not today:
+            # 连账本时间都取不到才走到这里：不记当日账，宁可这一天不封顶，
+            # 也不把额度永久记在一个空日期上（那等于「这辈子只能加 6.0」）。
+            return Delta(affection, libido, aggression)
         # 当日累计计数器（不是滑窗日志）：滑窗会把放不下的行丢出去，丢一行封顶就漏一分，
         # 刷得足够多照样能超顶。累计数一旦当天定下就不再丢，闸门才真的封得住。
         day = record.get("warm_day")
@@ -1937,22 +1984,35 @@ class MoodService:
         record["warm_day"] = day
         return Delta(affection, libido, aggression)
 
-    def _negative_day_key(self) -> str:
-        """当日净损额度的「日」键。
+    def _day_key(self) -> str:
+        """当日额度的「日」键（正向 `warm_day` 与负向 `loss_day` 共用）。
 
         用 `_time()`（**账本的时间基**）换算到角色所在时区，而不是直接取
         `clock.today_str()`：账本时衰走 `_time()`，日闸必须跟同一台钟走——两台钟被
         分别替换时（测试冻结时钟、角色换城市），按另一条时间线算出来的「今天」会让
         日闸要么永远不重置、要么一天重置好几次。
+
+        原来只有负向走这里，正向直接读 `clock.today_str()`：时钟缺失时正向记下的
+        日期是空串，而空串永远等于空串，于是当日额度再也不会重置——「这辈子只能加
+        6.0」。现在两边同一把尺子；连时钟都没有时按账本时间兜底取日期，日额度照样会翻篇。
         """
         try:
             tz = self._clock.now().tzinfo
             return datetime.fromtimestamp(float(self._time()), tz=tz).strftime("%Y-%m-%d")
         except Exception:
-            try:
-                return str(self._clock.today_str() or "") if self._clock else ""
-            except Exception:
-                return ""
+            pass
+        try:
+            today = str(self._clock.today_str() or "") if self._clock else ""
+            if today:
+                return today
+        except Exception:
+            pass
+        # 最后一档兜底：没有时钟也要给得出一个「今天」，否则日额度会永远记在空日期上、
+        # 攒满一次就再也不重置（正向尤其致命：等于「这辈子只能加 6.0」）。
+        try:
+            return datetime.fromtimestamp(float(self._time())).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
 
     def _charge_negative_day(self, record: dict, want: float) -> float:
         """从当日的「净损额度」里扣掉 `want`，返回**实际允许**扣掉的好感量（正数）。
@@ -1966,7 +2026,7 @@ class MoodService:
         """
         if want <= 0:
             return 0.0
-        today = self._negative_day_key()
+        today = self._day_key()
         if not today:
             return float(want)
         day = record.get("loss_day")
@@ -2268,11 +2328,11 @@ class MoodService:
     # 账本条目数上限。够记住「最近这阵子都发生了什么」，又不至于让 state.json
     # 随时间膨胀。按 6 小时时衰，半衰期 3 天的话 60 条约等于两三周。
     #
-    # v2.27.2：60 → 120。60 条在「每天 40 句、每 4 句左右入账一笔」的节奏下只存得下
-    # 6 天，持续聊天时**最早的正分被截断丢掉**，而负账留着——账本会越用越偏负。
-    # 「120 条 ≈ 多少天」取决于**入账笔数/天**，不是一个固定天数：每天入账 N 笔就是
-    # 120 / N 天（旧注释写死「≈12 天」，只在 10 笔/天时成立）。
-    LEDGER_MAX = 120
+    # v3.0.1：120 → 400。120 条在「每天 20~40 句、每 2~4 句入一笔」的节奏下只存得下
+    # 4~6 天，而时衰半衰期是 7 天——**账本比半衰期还短**，持续聊天时最早的正分被
+    # 截断丢掉，稳态只能到 ledger≈28（aff≈63），75 / 88 两档关系永远够不到。
+    # 400 条覆盖 10~20 天，半衰期才真的按设计生效。
+    LEDGER_MAX = 400
     # 时衰半衰期（小时）。
     #
     # 120h（5 天）时，日净增与时衰在 ledger≈25（aff≈60）处平衡——持续认真聊天也到不了
@@ -2852,18 +2912,38 @@ class MoodService:
         # 「被冷落」的已罚计数也要清：不清的话 `note_ignored_by_peer` 里
         # `now_streak <= seen` 恒成立，冷落惩罚对这个人**永久免罚**。
         user_state.pop("ignored_seen", None)
+        # 清理留下的关系基线同样要清：重置就是「回到面板初始值」，留着它下次重建
+        # 档案时会被接回来，用户看到的还是「重置没生效」。
+        user_state.pop("base_affection_kept", None)
         self._scope.mark_dirty()
         return record
 
     def set_affection(self, user_id: str, value: float) -> float:
         clamped = max(0.0, min(100.0, value))
         record = self.profile(user_id)
-        record["affection"] = clamped
-        record["base_affection"] = clamped
-        # 同上：账本是真源，不清账本的话这次「设置」会被旧账本顶回去。
-        record.pop(LEDGER_KEY, None)
+        now = self._time()
+        self._rebase_ledger(record, now)
+        net = self._ledger_total(record, now)
+        # v3.0.1：**保留账本**，只把基线挪到「设定值 - 账本净值」上。
+        #
+        # 原来是「affection = base = 设定值」再 pop 掉账本：ccb 的 occurrence_effects
+        # 每次都会调本方法，于是一场亲密戏就把这段关系攒下的全部账目抹掉、基线也被
+        # 重置成当时的值——用户看到的是一段时间后好感莫名其妙回退。
+        # 现在只挪基线，账本和它记着的历史都留着；算出来越界（<0 或 >100）时才退回
+        # 清账本的旧行为。
+        new_base = clamped - net
+        if record.get(LEDGER_KEY) and 0.0 <= new_base <= 100.0:
+            record["base_affection"] = new_base
+            record["affection"] = max(0.0, min(100.0, new_base + net))
+        else:
+            record["affection"] = clamped
+            record["base_affection"] = clamped
+            record.pop(LEDGER_KEY, None)
         # 手动改好感同样要让在飞的模型结果作废：否则它回来会按旧 delta 把刚设的
         # 值改掉，用户看到的是「设置没生效」。
+        # 手动设定/重置就是「以我说的为准」：连清理留下的基线一起清掉，
+        # 否则下一次重建档案时它又会被接回来。
+        self._scope.user_state(user_id).pop("base_affection_kept", None)
         self._bump_judge_gen(record)
         self._scope.user_state(user_id)["mood"] = record
         self._scope.mark_dirty()

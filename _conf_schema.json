@@ -9,7 +9,10 @@
     "description": "日程按人设排",
     "hint": "开：排日程时读取 AstrBot 当前生效的人格，她是谁就照谁排；关：只按下面「日程补充偏好」中性地排",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "use_llm_schedule": true
+    }
   },
   "use_llm_schedule": {
     "description": "大模型排日程",
@@ -131,7 +134,10 @@
     "description": "日程补充偏好",
     "hint": "以「仅供参考」递给模型，与人设、身体状态一起权衡，不是必须执行的指令",
     "type": "string",
-    "default": "劳逸结合，有动有静，节奏均衡。"
+    "default": "劳逸结合，有动有静，节奏均衡。",
+    "condition": {
+      "use_llm_schedule": true
+    }
   },
   "input_state_enabled": {
     "description": "输入状态（正在输入）",
@@ -145,24 +151,30 @@
     "type": "float",
     "default": 0.5,
     "minimum": 0.1,
-    "maximum": 10.0,
+    "maximum": 10,
     "slider": {
       "min": 0.1,
-      "max": 10.0,
+      "max": 10,
       "step": 0.1
+    },
+    "condition": {
+      "input_state_enabled": true
     }
   },
   "input_state_timeout_seconds": {
     "description": "输入状态超时（秒）",
     "hint": "万一响应钩子没回来，最多显示这么久就自己停，免得「正在输入」一直闪",
     "type": "float",
-    "default": 120.0,
-    "minimum": 10.0,
-    "maximum": 600.0,
+    "default": 120,
+    "minimum": 10,
+    "maximum": 600,
     "slider": {
-      "min": 10.0,
-      "max": 600.0,
-      "step": 5.0
+      "min": 10,
+      "max": 600,
+      "step": 5
+    },
+    "condition": {
+      "input_state_enabled": true
     }
   },
   "input_state_min_interval_seconds": {
@@ -171,11 +183,14 @@
     "type": "float",
     "default": 0.3,
     "minimum": 0.1,
-    "maximum": 10.0,
+    "maximum": 10,
     "slider": {
       "min": 0.1,
-      "max": 10.0,
+      "max": 10,
       "step": 0.1
+    },
+    "condition": {
+      "input_state_enabled": true
     }
   },
   "input_state_max_frames": {
@@ -189,6 +204,9 @@
       "min": 5,
       "max": 500,
       "step": 5
+    },
+    "condition": {
+      "input_state_enabled": true
     }
   },
   "inject_activity_context": {
@@ -242,7 +260,7 @@
     "description": "【进阶】精力上限",
     "hint": "她的精力条顶格值，默认 100。",
     "type": "float",
-    "default": 100.0
+    "default": 100
   },
   "enable_cycle": {
     "description": "【进阶】生理周期",
@@ -261,6 +279,9 @@
       "min": 1,
       "max": 365,
       "step": 5
+    },
+    "condition": {
+      "enable_cycle": true
     }
   },
   "energy_decay_rate": {
@@ -283,27 +304,39 @@
     "options": [
       "default",
       "simple"
-    ]
+    ],
+    "condition": {
+      "enable_cycle": true
+    }
   },
   "schedule_provider_name": {
     "description": "【进阶】日程首选模型",
     "hint": "生成日程用哪个模型",
     "type": "string",
     "_special": "select_provider",
-    "default": ""
+    "default": "",
+    "condition": {
+      "use_llm_schedule": true
+    }
   },
   "schedule_fallback_provider_name": {
     "description": "【进阶】日程备用模型",
     "hint": "首选「未找到/超时/报错」时自动切到这个。",
     "type": "string",
     "_special": "select_provider",
-    "default": ""
+    "default": "",
+    "condition": {
+      "use_llm_schedule": true
+    }
   },
   "schedule_allow_global_fallback": {
     "description": "【进阶】允许回退全局模型",
     "hint": "首选和备用都失败时，要不要再试 AstrBot 全局默认模型",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "use_llm_schedule": true
+    }
   },
   "schedule_retry_interval_seconds": {
     "description": "【进阶】同模型重试间隔(秒)",
@@ -316,6 +349,9 @@
       "min": 0,
       "max": 600,
       "step": 10
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "schedule_llm_timeout_seconds": {
@@ -329,6 +365,9 @@
       "min": 10,
       "max": 300,
       "step": 5
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "schedule_generation_max_attempts": {
@@ -342,6 +381,9 @@
       "min": 1,
       "max": 5,
       "step": 1
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "schedule_max_slots": {
@@ -368,6 +410,9 @@
       "min": 0,
       "max": 1440,
       "step": 20
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "schedule_min_interval_minutes": {
@@ -381,6 +426,9 @@
       "min": 0,
       "max": 1440,
       "step": 20
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "schedule_max_interval_minutes": {
@@ -394,6 +442,9 @@
       "min": 0,
       "max": 1440,
       "step": 20
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "llm_idle_silence_minutes": {
@@ -447,13 +498,19 @@
     "description": "天气API Key",
     "hint": "OpenWeather 的 32 位密钥，免费档就够（注册即送）。",
     "type": "string",
-    "default": ""
+    "default": "",
+    "condition": {
+      "weather_enabled": true
+    }
   },
   "weather_location": {
     "description": "天气城市(英文)",
     "hint": "天气取哪个城市（英文名，如 Beijing,CN）",
     "type": "string",
-    "default": ""
+    "default": "",
+    "condition": {
+      "weather_enabled": true
+    }
   },
   "weather_refresh_minutes": {
     "description": "【进阶】天气刷新(分)",
@@ -466,6 +523,9 @@
       "min": 1,
       "max": 1440,
       "step": 20
+    },
+    "condition": {
+      "weather_enabled": true
     }
   },
   "enable_chat_awareness": {
@@ -490,13 +550,19 @@
     "description": "【进阶】手写穿搭预设",
     "hint": "留空 = 按人设自动判物种取默认；填了就优先用它（也可用 /拟人 设置 穿搭 单独给某个角色设）",
     "type": "string",
-    "default": ""
+    "default": "",
+    "condition": {
+      "outfit_enabled": true
+    }
   },
   "outfit_scene_variation": {
     "description": "【进阶】穿搭随场景变",
     "hint": "开：睡觉换睡衣、洗澡不穿、出门天冷加外套、生理期/不适换宽松；关：一直是那一件",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "outfit_enabled": true
+    }
   },
   "mood_enabled": {
     "description": "情绪模拟",
@@ -515,19 +581,25 @@
       "min": 1,
       "max": 100,
       "step": 2
+    },
+    "condition": {
+      "mood_enabled": true
     }
   },
   "mood_decay_hours": {
     "description": "【进阶】情绪回缓周期",
     "hint": "情绪回到基线要几小时",
     "type": "float",
-    "default": 6.0,
+    "default": 6,
     "minimum": 0.1,
     "maximum": 720,
     "slider": {
       "min": 0.1,
       "max": 720,
-      "step": 5.0
+      "step": 5
+    },
+    "condition": {
+      "mood_enabled": true
     }
   },
   "mood_initial_affection": {
@@ -541,6 +613,9 @@
       "min": 0,
       "max": 100,
       "step": 2
+    },
+    "condition": {
+      "mood_enabled": true
     }
   },
   "mood_initial_libido": {
@@ -554,6 +629,9 @@
       "min": 0,
       "max": 50,
       "step": 1
+    },
+    "condition": {
+      "mood_enabled": true
     }
   },
   "mood_initial_aggression": {
@@ -567,13 +645,19 @@
       "min": 0,
       "max": 50,
       "step": 1
+    },
+    "condition": {
+      "mood_enabled": true
     }
   },
   "mood_affection_override": {
     "description": "【进阶】指定某人好感",
     "hint": "每个条目写一条 QQ:数值（如 100000003:100）；钉死后不随聊天变化",
     "type": "list",
-    "default": []
+    "default": [],
+    "condition": {
+      "mood_enabled": true
+    }
   },
   "mood_affection_delta_cap": {
     "description": "【进阶】单次好感变化上限",
@@ -586,6 +670,9 @@
       "min": 1,
       "max": 10,
       "step": 1
+    },
+    "condition": {
+      "mood_enabled": true
     }
   },
   "mood_negative_streak_required": {
@@ -599,25 +686,37 @@
       "min": 2,
       "max": 10,
       "step": 1
+    },
+    "condition": {
+      "mood_enabled": true
     }
   },
   "mood_negative_softening": {
     "description": "【进阶】负向软化",
     "hint": "开：好感越低扣得越少（底部减速），关系越深越抗打击（韧性）；关：按原样扣。",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "mood_enabled": true
+    }
   },
   "mood_recovery_bonus": {
     "description": "【进阶】回温加成",
     "hint": "开：她低于基线时，明确道歉会快速回温、暖话更管用、连着哄消气更快；关：不加成。",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "mood_enabled": true
+    }
   },
   "cooling_enabled": {
     "description": "冷静期",
     "hint": "开：好感跌破门槛后她会冷着一段时间（带情绪、想让他先别来吵），且这段时间不主动找他；关：无冷静期。",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "mood_enabled": true
+    }
   },
   "cooling_affection": {
     "description": "【进阶】冷静期门槛",
@@ -630,6 +729,10 @@
       "min": 0,
       "max": 100,
       "step": 2
+    },
+    "condition": {
+      "mood_enabled": true,
+      "cooling_enabled": true
     }
   },
   "cooling_minutes": {
@@ -643,6 +746,10 @@
       "min": 1,
       "max": 1440,
       "step": 20
+    },
+    "condition": {
+      "mood_enabled": true,
+      "cooling_enabled": true
     }
   },
   "cooling_no_proactive_days": {
@@ -656,13 +763,20 @@
       "min": 0,
       "max": 30,
       "step": 1
+    },
+    "condition": {
+      "mood_enabled": true,
+      "cooling_enabled": true
     }
   },
   "mood_log_enabled": {
     "description": "【进阶】情绪日志",
     "hint": "记下明显的情绪波动事件，/情绪日志 可查，给「今天被TA气到了」这类延续感供料",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "mood_enabled": true
+    }
   },
   "mood_log_max_entries": {
     "description": "【进阶】日志每人几条",
@@ -675,6 +789,10 @@
       "min": 1,
       "max": 1000,
       "step": 20
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_log_enabled": true
     }
   },
   "mood_log_threshold_affection": {
@@ -683,11 +801,15 @@
     "type": "float",
     "default": 0.6,
     "minimum": 0,
-    "maximum": 1.0,
+    "maximum": 1,
     "slider": {
       "min": 0,
-      "max": 1.0,
+      "max": 1,
       "step": 0.01
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_log_enabled": true
     }
   },
   "mood_log_threshold_libido": {
@@ -696,11 +818,15 @@
     "type": "float",
     "default": 0.5,
     "minimum": 0,
-    "maximum": 1.0,
+    "maximum": 1,
     "slider": {
       "min": 0,
-      "max": 1.0,
+      "max": 1,
       "step": 0.01
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_log_enabled": true
     }
   },
   "mood_log_threshold_aggression": {
@@ -709,11 +835,15 @@
     "type": "float",
     "default": 0.8,
     "minimum": 0,
-    "maximum": 1.0,
+    "maximum": 1,
     "slider": {
       "min": 0,
-      "max": 1.0,
+      "max": 1,
       "step": 0.01
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_log_enabled": true
     }
   },
   "mood_update_timeout": {
@@ -726,27 +856,41 @@
     "slider": {
       "min": 5,
       "max": 600,
-      "step": 5.0
+      "step": 5
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_use_llm_for_delta": true
     }
   },
   "mood_tag_enabled": {
     "description": "【进阶】心情标签",
     "hint": "生成「有点疲惫，开心」这类可读标签，显示在 /情绪详情；同一状态有多种说法随机换",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "mood_enabled": true
+    }
   },
   "mood_use_llm_for_delta": {
     "description": "【进阶】用模型分析情绪",
     "hint": "要不要用模型判断情绪变化",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "mood_enabled": true
+    }
   },
   "mood_provider_name": {
     "description": "【进阶】情绪分析模型",
     "hint": "情绪分析专用 Provider；留空沿用日程那条模型链。",
     "type": "string",
     "_special": "select_provider",
-    "default": ""
+    "default": "",
+    "condition": {
+      "mood_enabled": true,
+      "mood_use_llm_for_delta": true
+    }
   },
   "mood_provider_cooldown_minutes": {
     "description": "【进阶】情绪模型冷却(分)",
@@ -759,6 +903,10 @@
       "min": 0,
       "max": 1440,
       "step": 20
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_use_llm_for_delta": true
     }
   },
   "mood_llm_interval_messages": {
@@ -772,19 +920,29 @@
       "min": 1,
       "max": 100,
       "step": 2
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_use_llm_for_delta": true
     }
   },
   "mood_verbose_log": {
     "description": "【进阶】情绪计数日志",
     "hint": "打印每人攒了几条待分析，排查用；平时关着避免刷屏。",
     "type": "bool",
-    "default": false
+    "default": false,
+    "condition": {
+      "mood_enabled": true
+    }
   },
   "mood_enabled_in_group": {
     "description": "【进阶】群聊也算情绪",
     "hint": "关：群消息不做情绪分析（私聊始终生效）；开：群里每人各自积累好感",
     "type": "bool",
-    "default": false
+    "default": false,
+    "condition": {
+      "mood_enabled": true
+    }
   },
   "mood_data_retention_days": {
     "description": "【进阶】情绪数据保留(天)",
@@ -797,6 +955,9 @@
       "min": 0,
       "max": 365,
       "step": 5
+    },
+    "condition": {
+      "mood_enabled": true
     }
   },
   "stale_user_retention_days": {
@@ -836,24 +997,30 @@
     "type": "float",
     "default": 0.5,
     "minimum": 0,
-    "maximum": 1.0,
+    "maximum": 1,
     "slider": {
       "min": 0,
-      "max": 1.0,
+      "max": 1,
       "step": 0.01
+    },
+    "condition": {
+      "social_energy_enabled": true
     }
   },
   "social_energy_recovery_per_minute": {
     "description": "【进阶】每分钟回血",
     "hint": "每分钟回多少。和「每条消息耗能」一起决定她多久会累：回血速率大于消耗速率时她一直满格（机制等于不存在）",
     "type": "float",
-    "default": 1.0,
+    "default": 1,
     "minimum": 0,
-    "maximum": 3.0,
+    "maximum": 3,
     "slider": {
       "min": 0,
-      "max": 3.0,
+      "max": 3,
       "step": 0.02
+    },
+    "condition": {
+      "social_energy_enabled": true
     }
   },
   "social_energy_reset_hour": {
@@ -867,6 +1034,9 @@
       "min": -1,
       "max": 23,
       "step": 1
+    },
+    "condition": {
+      "social_energy_enabled": true
     }
   },
   "social_energy_recovery_interval_seconds": {
@@ -880,6 +1050,9 @@
       "min": 60,
       "max": 300,
       "step": 5
+    },
+    "condition": {
+      "social_energy_enabled": true
     }
   },
   "process_min_duration": {
@@ -938,6 +1111,9 @@
       "min": 0,
       "max": 23,
       "step": 1
+    },
+    "condition": {
+      "night_mode_enabled": true
     }
   },
   "night_end_hour": {
@@ -951,13 +1127,19 @@
       "min": 0,
       "max": 23,
       "step": 1
+    },
+    "condition": {
+      "night_mode_enabled": true
     }
   },
   "show_sleep_window": {
     "description": "【进阶】提不提睡眠这件事",
     "hint": "要不要说她什么时候睡",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "night_mode_enabled": true
+    }
   },
   "night_deep_sleep_ratio": {
     "description": "【进阶】深睡占比",
@@ -965,11 +1147,14 @@
     "type": "float",
     "default": 0.5,
     "minimum": 0.1,
-    "maximum": 1.0,
+    "maximum": 1,
     "slider": {
       "min": 0.1,
-      "max": 1.0,
+      "max": 1,
       "step": 0.01
+    },
+    "condition": {
+      "night_mode_enabled": true
     }
   },
   "holidays": {
@@ -995,6 +1180,9 @@
       "min": 0,
       "max": 0.9,
       "step": 0.01
+    },
+    "condition": {
+      "enable_energy_natural_recovery": true
     }
   },
   "energy_natural_recovery_interval_minutes": {
@@ -1008,6 +1196,9 @@
       "min": 1,
       "max": 1440,
       "step": 20
+    },
+    "condition": {
+      "enable_energy_natural_recovery": true
     }
   },
   "energy_consumption_per_msg": {
@@ -1029,14 +1220,17 @@
     "type": "list",
     "default": [
       0.5,
-      1.0,
+      1,
       1.6,
       1.9,
-      2.0,
+      2,
       1.1,
       0.9,
       0.7
-    ]
+    ],
+    "condition": {
+      "enable_cycle": true
+    }
   },
   "state_flush_interval_seconds": {
     "description": "【进阶】写盘间隔(秒)",
@@ -1091,26 +1285,35 @@
       "min": 15,
       "max": 600,
       "step": 10
+    },
+    "condition": {
+      "soma_enabled": true
     }
   },
   "sleep_need_hours": {
     "description": "【进阶】一晚该睡多久",
     "hint": "小时：睡够这个数刚好把一夜的困意清干净；熬夜欠的债按它放大。",
     "type": "float",
-    "default": 8.0,
-    "minimum": 3.0,
-    "maximum": 14.0,
+    "default": 8,
+    "minimum": 3,
+    "maximum": 14,
     "slider": {
-      "min": 3.0,
-      "max": 14.0,
+      "min": 3,
+      "max": 14,
       "step": 0.1
+    },
+    "condition": {
+      "soma_enabled": true
     }
   },
   "schedule_follow_night_window": {
     "description": "【进阶】作息贴夜间窗口",
     "hint": "硬覆盖：把她的睡眠强制切到你设的夜间窗口",
     "type": "bool",
-    "default": false
+    "default": false,
+    "condition": {
+      "night_mode_enabled": true
+    }
   },
   "meal_interval_hours": {
     "description": "【进阶】多久不吃算饿",
@@ -1118,11 +1321,14 @@
     "type": "float",
     "default": 4.5,
     "minimum": 1.5,
-    "maximum": 12.0,
+    "maximum": 12,
     "slider": {
       "min": 1.5,
-      "max": 12.0,
+      "max": 12,
       "step": 0.1
+    },
+    "condition": {
+      "soma_enabled": true
     }
   },
   "sitting_discomfort_minutes": {
@@ -1136,32 +1342,45 @@
       "min": 15,
       "max": 600,
       "step": 10
+    },
+    "condition": {
+      "soma_enabled": true
     }
   },
   "desire_refill_hours": {
     "description": "【进阶】独处多久想说话",
     "hint": "独处多久会攒起想说话的念头",
     "type": "float",
-    "default": 12.0,
+    "default": 12,
     "minimum": 0.5,
-    "maximum": 72.0,
+    "maximum": 72,
     "slider": {
       "min": 0.5,
-      "max": 72.0,
+      "max": 72,
       "step": 0.5
+    },
+    "condition": {
+      "soma_enabled": true
     }
   },
   "weather_affects_body": {
     "description": "【进阶】冷热算进身体",
     "hint": "天气的冷热计入躯体不适轴（需要天气功能可用）。",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "soma_enabled": true,
+      "weather_enabled": true
+    }
   },
   "contract_enabled": {
     "description": "【进阶】导出契约给社交层",
     "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度。总开关：false 时整份跨插件契约（含 identity/日程/天气/节日等非身体块）都不导出，自主拟人社交会退回旧字段；只关身体请用 soma_enabled",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "soma_enabled": true
+    }
   },
   "schedule_persona_max_chars": {
     "type": "int",
@@ -1175,6 +1394,9 @@
       "min": 200,
       "max": 8000,
       "step": 100
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "mood_llm_batch_max": {
@@ -1189,6 +1411,10 @@
       "min": 1,
       "max": 30,
       "step": 1
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_use_llm_for_delta": true
     }
   },
   "mood_llm_message_chars": {
@@ -1203,6 +1429,10 @@
       "min": 50,
       "max": 2000,
       "step": 20
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_use_llm_for_delta": true
     }
   },
   "ccb": {
@@ -1213,55 +1443,79 @@
   },
   "ccb_libido_min": {
     "type": "float",
-    "default": 38.0,
+    "default": 38,
     "description": "亲近欲达到多少才可能进入情境（0~50）。",
-    "hint": "越低越容易被触发。"
+    "hint": "越低越容易被触发。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_libido_rise": {
     "type": "float",
-    "default": 4.0,
-    "description": "比自己的基线高出多少才算「明显想要」（0~20）。"
+    "default": 4,
+    "description": "比自己的基线高出多少才算「明显想要」（0~20）。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_affection_min": {
     "type": "float",
-    "default": 50.0,
+    "default": 50,
     "description": "好感达到多少才可能进入情境（0~100）。",
-    "hint": "线上用户好感多在 35~60，设太高会永远触发不到。"
+    "hint": "线上用户好感多在 35~60，设太高会永远触发不到。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_affection_rise": {
     "type": "float",
-    "default": 8.0,
-    "description": "比基线高出多少才算「明显亲近」（0~50）。"
+    "default": 8,
+    "description": "比基线高出多少才算「明显亲近」（0~50）。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_affection_deep": {
     "type": "float",
-    "default": 75.0,
-    "description": "好感达到这条线进入更亲密的一档（0~100）。"
+    "default": 75,
+    "description": "好感达到这条线进入更亲密的一档（0~100）。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_use_arousal": {
     "type": "bool",
     "default": true,
     "description": "让她的身体唤醒参与「她现在有多想」。",
-    "hint": "关掉只去掉身体这一项，其他三项照常参与。"
+    "hint": "关掉只去掉身体这一项，其他三项照常参与。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_proactive": {
     "type": "bool",
     "default": false,
     "description": "允许她主动开口表达想要（需要装自主社交插件）。",
-    "hint": "默认关闭。开启后社交层可能因此替她主动发一条消息。"
+    "hint": "默认关闭。开启后社交层可能因此替她主动发一条消息。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_body_depth_cap_cm": {
     "type": "float",
-    "default": 14.0,
-    "minimum": 1.0,
-    "maximum": 18.0,
+    "default": 14,
+    "minimum": 1,
+    "maximum": 18,
     "slider": {
-      "min": 1.0,
-      "max": 18.0,
+      "min": 1,
+      "max": 18,
       "step": 0.5
     },
     "description": "她身体能容纳的最深处（cm）。这是固定上限，不是此刻的深度。",
-    "hint": "只在第一次读取时生效，之后固定不再变。"
+    "hint": "只在第一次读取时生效，之后固定不再变。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_body_sensitivity": {
     "type": "int",
@@ -1274,45 +1528,67 @@
       "step": 5
     },
     "description": "她的敏感程度（0~100），影响反应措辞的强度。",
-    "hint": "只在第一次读取时生效，之后固定不再变。"
+    "hint": "只在第一次读取时生效，之后固定不再变。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_partner_length_cm": {
     "type": "float",
-    "default": 13.0,
-    "minimum": 0.0,
-    "maximum": 30.0,
+    "default": 13,
+    "minimum": 0,
+    "maximum": 30,
     "slider": {
-      "min": 0.0,
-      "max": 30.0,
+      "min": 0,
+      "max": 30,
       "step": 0.5
     },
     "description": "对方尺寸的初值（cm）。0 表示不判定深度。",
-    "hint": "每个用户各存一份初值，第一次进入场景时定下，之后不再变。"
+    "hint": "每个用户各存一份初值，第一次进入场景时定下，之后不再变。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_scene_detail": {
     "type": "bool",
     "default": true,
     "description": "场景进行中额外给出一句姿势 / 位置 / 深度 / 阶段。",
-    "hint": "关掉后退回纯单行，与上一版行为一致。"
+    "hint": "关掉后退回纯单行，与上一版行为一致。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_presence": {
     "type": "bool",
     "default": true,
     "description": "每轮把她的欲望 / 是否在亲密场景里写进上下文。",
-    "hint": "关掉就回到旧版：只在真的触发时才有那一句，看不到「有点想但还没到」。"
+    "hint": "关掉就回到旧版：只在真的触发时才有那一句，看不到「有点想但还没到」。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_lead": {
     "type": "string",
     "description": "这一场谁主导（auto / her / him）",
     "hint": "auto = 按人设与这一场的动作自动判断；her = 注入「她想自己来」的主动措辞；him = 被动措辞。只改注入，不强制模型行为。",
-    "options": ["auto", "her", "him"],
-    "default": "auto"
+    "options": [
+      "auto",
+      "her",
+      "him"
+    ],
+    "default": "auto",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_species": {
     "type": "string",
     "description": "她的物种 / 身体结构（留空自动识别）",
     "hint": "留空 = 按人设自动识别（小马宝莉 / 半人马 / 人鱼 / 龙 / 魅魔 / 触手系等）。人设没写清楚时再手动填，例如「小马宝莉」「半人马+触手」。只描述结构，不写器官。",
-    "default": ""
+    "default": "",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_aftercare_minutes": {
     "type": "int",
@@ -1324,25 +1600,43 @@
       "max": 720,
       "step": 10
     },
-    "description": "收场之后的余韵时长（分钟）。0 表示不留余韵。"
+    "description": "收场之后的余韵时长（分钟）。0 表示不留余韵。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_scene_log_debug": {
     "type": "bool",
     "default": false,
     "description": "把每次姿势/位置判定写进日志（命中词、判成了什么、原文）。",
-    "hint": "用来验证判定准不准；平时关着，排查时才开。"
+    "hint": "用来验证判定准不准；平时关着，排查时才开。",
+    "condition": {
+      "ccb": true
+    }
   },
   "ccb_refractory_libido": {
     "type": "float",
-    "default": 12.0,
-    "minimum": 0.0,
-    "maximum": 30.0,
+    "default": 12,
+    "minimum": 0,
+    "maximum": 30,
     "slider": {
-      "min": 0.0,
-      "max": 30.0,
-      "step": 1.0
+      "min": 0,
+      "max": 30,
+      "step": 1
     },
     "description": "收场之后亲近欲回落多少（0~30）。0 表示不回落。",
-    "hint": "不回落的话，欲望只会越做越高，下一次更容易被触发。"
+    "hint": "不回落的话，欲望只会越做越高，下一次更容易被触发。",
+    "condition": {
+      "ccb": true
+    }
+  },
+  "ccb_allowed_users": {
+    "description": "亲密功能只对这些人开放",
+    "hint": "填 QQ 号，一行一个。留空表示不设限（谁都可以，和旧版一致）。填了之后，名单外的人看不到「亲密」那一段，也不会被算进亲密事件。",
+    "type": "list",
+    "default": [],
+    "condition": {
+      "ccb": true
+    }
   }
 }

@@ -219,7 +219,9 @@ class HardGates(unittest.TestCase):
     """不该出的人/场合一个字都不出。"""
 
     def _assert_absent(self, text: str) -> None:
-        for word in ("欲望", "正在亲密里", "余韵里"):
+        # 只查这句常驻事实自己的措辞，不查「欲望」两个字：身体/状态那句本来就会写
+        # 「社交的欲望也在抬头」，那不是 ccb，命中它等于这条硬闸永远是红的。
+        for word in ("她此刻的欲望", "她此刻没有那个心思", "她正在亲密里", "她还在余韵里"):
             self.assertNotIn(word, text, f"不该出现却出现了「{word}」：{text}")
 
     def test_ccb_off(self):
@@ -267,7 +269,13 @@ class Significance(unittest.TestCase):
 
     def _presence_salience(self, sents) -> float:
         for text, salience in sents:
-            if text and ("欲望" in text or "正在亲密里" in text):
+            # 认这句常驻事实自己的开头，不认「欲望」二字：full 模式里身体/状态那句
+            # 会先写「社交的欲望也在抬头」，按两个字找会量到它的 4.0 而不是这句的 9.5。
+            if text and (
+                "她此刻的欲望" in text
+                or "她此刻没有那个心思" in text
+                or "她正在亲密里" in text
+            ):
                 return float(salience)
         self.fail(f"组装结果里没有常驻状态句：{sents!r}")
         return 0.0

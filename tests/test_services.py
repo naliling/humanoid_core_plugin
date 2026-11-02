@@ -112,6 +112,22 @@ class EnergyTest(unittest.TestCase):
         # 只剩日程本身的 0.1/分钟 × decay 0.5 × 60 = 3
         self.assertAlmostEqual(energy, 53.0, places=1)
 
+    def test_per_minute_ticks_accumulate(self):
+        """v3.0.1：逐格结算必须真的掉，不能每格都被四舍五入丢掉。
+
+        默认身体 tick 是 60 秒，上班时段每分钟只掉约 0.045。以前按 1 位小数落盘，
+        `round(100 - 0.045, 1)` 仍然等于 100.0，一小时下来精力纹丝不动。
+        """
+        service, store, clock = self.build(moment=datetime(2026, 8, 22, 9, 0, tzinfo=TZ))
+        store.data["energy"] = 100.0
+        store.data["last_update"] = "2026-08-22 09:00:00"
+        for _ in range(60):
+            clock.advance(minutes=1)
+            service.advance()
+        left = float(store.get("energy"))
+        self.assertLess(left, 99.0, "上班一小时精力必须掉下来")
+        self.assertGreater(left, 96.0, "一小时的消耗不该超出日程速率给的范围")
+
     def test_recovery_interval_quantizes(self):
         conf = cfg(energy_natural_recovery_interval_minutes=30)
         service, store, _ = self.build(conf, datetime(2026, 8, 22, 12, 20, tzinfo=TZ))

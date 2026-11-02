@@ -43,6 +43,68 @@ def is_meal_event(event: Any) -> bool:
     text = str(event or "")
     return any(word in text for word in MEAL_WORDS)
 
+# 「她其实在睡」的第二道判据（v3.0.2）。只看事件名里有没有睡字时，模型写的安静段落
+# 会被判成「醒着」：「回到卧室，将浅蓝瞳孔轻阖，呼吸渐沉」「彻底合上眼，任由困意把身体
+# 拖进深海」——一个睡字都没有，可她确实在床上睡着。误判是连锁的：soma 按「醒着」记睡眠
+# 压力（每小时 +7.5，一整天下来顶到 82）、按醒着掉精力，提示词里的「她醒着」又和日程里
+# 的卧床描述互相打脸。
+#
+# 所以再给一条能自证的判据：地点在床上类的地方 + 能量消耗是睡着的量级 + 够一段觉的时长 +
+# 没有任何「醒着才能做」的动作词。四条同时成立才算睡——单独一条都不足以定案
+# （「躺在床上刷手机」被动作词挡下，「躺着发呆」被消耗量挡下）。
+BED_WORDS = ("床", "被窝", "枕", "毯", "卧室", "榻", "沙发")
+AWAKE_WORDS = (
+    "刷", "看", "玩", "吃", "喝", "写", "学", "走", "跑", "聊", "说",
+    "工作", "开会", "手机", "电脑", "电视", "出门", "收拾", "整理", "通勤",
+    "打扫", "做饭", "洗", "化妆", "换衣", "起床", "醒来",
+    # 「回消息」是清醒动作：少了这几个词，「靠着枕头回消息」会被判成睡着。
+    "消息", "回复", "打字", "电话",
+)
+SLEEP_RATE_MIN = 0.08
+SLEEP_SPAN_MIN_MINUTES = 30
+# 兜底填出来的段不是「她在睡」：「夜间休息」「自由活动/休息」只表示这段时间没排日程。
+# 判成睡着会把「今天什么都没排」变成「她睡了十六个小时」，睡眠债与精力会跟着一起错。
+FILLER_EVENTS = (str(FILLER_SLOT["event"]), str(NIGHT_FILLER_SLOT["event"]))
+
+
+def slot_sleeps(slot: Any) -> bool:
+    """这一个时段她是不是在睡觉。
+
+    三种证据任一成立即可：事件名里有睡词（原来的唯一判据）、解析时已经按完整原文判过并
+    打了 `sleep` 标记、或者上面那条「床上 + 睡着量级的消耗 + 够长 + 没有动作词」的复合
+    判据。`dreams` 也算证据——只有睡段才会写梦。
+
+    判断睡没睡的地方都该用它，而不是 `is_sleep_event(slot.get("event"))`：后者只拿到
+    事件名（还常被截断），判不出模型写的那种安静的卧床段落。
+    """
+    if not isinstance(slot, Mapping):
+        return False
+    event = str(slot.get("event") or "").strip()
+    if is_meal_event(event):
+        return False
+    if event in FILLER_EVENTS:
+        return False
+    if bool(slot.get("sleep")) or slot.get("dreams"):
+        return True
+    if is_sleep_event(event):
+        return True
+    if any(word in event for word in AWAKE_WORDS):
+        return False
+    location = str(slot.get("location") or "")
+    if not any(word in location for word in BED_WORDS) and not any(
+        word in event for word in BED_WORDS
+    ):
+        return False
+    if clamp_rate(slot.get("energy_rate", 0.0)) < SLEEP_RATE_MIN:
+        return False
+    lo, hi = parse_time(slot.get("start")), parse_time(slot.get("end"))
+    if lo is None or hi is None or lo == hi:
+        return False
+    span = (hi - lo) % DAY_MINUTES
+    if span <= 0:
+        return False
+    return span >= SLEEP_SPAN_MIN_MINUTES
+
 
 def parse_time(raw: Any) -> int | None:
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
@@ -114,6 +176,13 @@ def _make_slot(start: int, end: int, template: Mapping[str, Any]) -> Slot:
     # 以前她的日程全是 duty（门诊接待、写记录、外出），于是她像个只有日程没有生活的人。
     if template.get("wants"):
         slot["wants"] = True
+    # 解析时按**完整原文**判出来的睡着标记要留下来：规范化会重建 slot，丢了它，
+    # 被截断成 24 字的事件名就再也说不清那一段是睡了还是醒着。
+    if template.get("sleep"):
+        slot["sleep"] = True
+    dreams = template.get("dreams")
+    if isinstance(dreams, (list, tuple)) and dreams:
+        slot["dreams"] = list(dreams)[:3]
     return slot
 
 
@@ -268,8 +337,10 @@ def sleep_window_minutes(slots: Iterable[Slot]) -> tuple[int, int] | None:
     """
     segs: list[list[int]] = []
     for slot in slots or []:
-        event = slot.get("event") if isinstance(slot, dict) else None
-        if is_meal_event(event) or not is_sleep_event(event):
+        # 判据统一走 slot_sleeps：关键词、解析时的判定、以及「床上 + 睡着量级的消耗 +
+        # 够长 + 没有动作词」的复合判据。只看事件名时，模型写的那种安静卧床段落会被漏掉，
+        # 生物钟夜跟着退回配置窗口——soma 的昼夜低谷、睡眠债、她几点起，全按错的那一段算。
+        if not slot_sleeps(slot):
             continue
         lo, hi = parse_time(slot.get("start")), parse_time(slot.get("end"))
         if lo is None or hi is None or hi == lo:

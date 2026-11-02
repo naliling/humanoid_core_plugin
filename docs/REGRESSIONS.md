@@ -50,6 +50,33 @@
 | 系统时钟回拨后好感凭空跳涨、衰减冻结 | 未来时间戳被当成「刚刚发生」按满权重计入 | `test_v300_services.py::MoodClockRollbackTest` | 回拨时先把账本时间轴平移回 now；读 age 时对「未来」条目跳过，绝不夹成 0。 |
 | 「恢复阶段倍率」又每次启动刷 WARN，用户 6 段自定义失效 | 旧 6 段配置没有迁移路径 | `test_v300_state.py::PhaseMultiplierMigrationTest` | 长度 = 6 判为旧格式，迁到 8 段默认并写回；别再拿「当前值 == 旧默认」当唯一判据覆盖用户的合法选择（见 `DefaultMigrationUserChoiceTest`）。 |
 
+## v3.0.1 之后新增的守则
+
+这些是 v3.0.1 修掉的、删掉一行就会回来的毛病。动情绪数值前先看用例：
+
+| 症状 | 根因 | 守门测试 | 以后改这里要注意什么 |
+|---|---|---|---|
+| 好感只跌不涨：正常聊一个月反而更低 | 正向日额度 3.1、负向 4.5×1.2 = 5.4，涨得比掉慢一倍；再叠单句封顶与同类递减，长期必然向下 | `test_v301_growth.py::CapSymmetry`、`GrowthOverDays`；`test_v2272_throttle.py::test_normal_chat_grows` | 正向日额度**不许小于** `DAILY_NET_LOSS_CAP × LEDGER_NEGATIVE_AMPLIFY`。要收紧就两边一起收，别只削正向。 |
+| 脾气涨得比降快六倍，被点着一次压不回来；亲近欲到点直接跳回基线，ccb 永远「差一点」 | `AGGRESSION_DOWN_CAP` 只有 0.3（上行没有同等限制）；`_decay_record` 的 `ratio = 1.0 if elapsed >= duration` 让 libido/aggression 隔夜整段归位 | `test_v301_growth.py::CapSymmetry::test_aggression_can_fall_as_fast_as_it_rises`、`test_v22814_mood_balance.py::LibidoGainTest` | 三条轴的回落一律走半衰（`axis_hours = mood_decay_hours × 4`）；好感例外——它的时衰由账本自己做，别再叠第二遍。 |
+| 离开一周回来，好感变回面板初始值：攒多久都白攒 | 情绪档案按 `mood_data_retention_days`（默认 7 天）整条删除，`base_affection` 一起没了 | `test_v301_growth.py::RelationshipFloorSurvivesPruning` | 清档只清明细（账本/记忆/标签），关系基线搬进 `user_state["base_affection_kept"]`；手动 `set_affection` 与 `reset` 必须把它清掉。 |
+| 当日额度攒满一次就再也不重置（正向尤其致命） | 正向日键读 `clock.today_str()`，没有时钟时记下的日期是空串，而空串永远等于空串 | `test_v301_growth.py::DailyBudget` | 正负两侧共用 `_day_key()`，取不到时钟按账本时间兜底；判不出日期时宁可当天不封顶，也不要把额度记在空日期上。 |
+| 出厂就挂着两条红的：ccb 关掉时注入里仍能搜到「欲望」；full 模式那句的显著度只有 4.0 | 断言拿裸词「欲望」去找，而身体状态句本来就会写「社交的欲望也在抬头」；full 模式先命中那句，量到的是它的 4.0 而不是常驻句的 9.5 | `test_v2287_ccb_presence.py::HardGates`、`Significance` | 断言认常驻句自己的措辞（「她此刻的欲望」/「她此刻没有那个心思」/「她正在亲密里」/「她还在余韵里」），别用裸词——别的服务也会合法地用同一个词。 |
+| 精力白天怎么都不掉，一直顶在满格，上班、熬夜都看不出累 | 精力落盘按 1 位小数（`round(energy, 1)`），而默认身体 tick 是 60 秒、上班每分钟只掉约 0.045，每一格都被四舍五入吃掉，值永远等于上一格 | `test_services.py::EnergyTest::test_per_minute_ticks_accumulate` | 状态数值的落盘精度必须细于「一个 tick 的最小增量」：改 tick 间隔（`body_tick_seconds`）或日程速率时重算一次；面板显示再单独 `round`，不要靠降低存储精度来图好看。 |
+
+## v3.0.2 之后新增的守则
+
+这些是 v3.0.2 修掉的、删掉一行就会回来的毛病。动日程/睡眠/亲密提示/配置面板前先看用例：
+
+| 症状 | 根因 | 守门测试 | 以后改这里要注意什么 |
+|---|---|---|---|
+| 日程写「回到卧室，将浅蓝瞳孔轻阖，呼吸渐沉」她却在满格精力地醒着；夜里一直在补觉；状态页说她醒着而日程在睡 | 睡段只按字面关键词认（`SLEEP_WORDS`），模型写的诗化睡段一个都不命中；判定用的还是截断到 24 字的 `event` | `test_v302_sleep_recognition.py::SleepRecognitionTest` | 判据必须三证合一：睡词、解析时按**完整原文**判出的 `sleep` 标记、`dreams` 或「床上 + 睡着量级的消耗 + 够长 + 没有清醒动作词」的复合判据。`AWAKE_WORDS` 里不能加裸「回」（诗化睡段以「回到卧室」开头），但「消息/回复/打字/电话」必须在——「靠着枕头回消息」是醒着。 |
+| 睡了一整夜睡眠债还是满的，第二天继续补觉 | 攒债 `sleep_debt_gain_per_hour`（默认 8/7 ≈ 1.14/h）是还债 `SLEEP_DEBT_RELIEF_PER_HOUR`（0.5/h）的两倍多，顶到 `SLEEP_DEBT_CAP` 就再也回不来 | `test_v302_sleep_recognition.py::SleepDebtTest` | 还债速率取 `max(SLEEP_DEBT_RELIEF_PER_HOUR, cfg.sleep_debt_gain_per_hour)`：改攒债速率时必须一起看还债，别让「睡一觉」变成负收益。 |
+| 模型一次参数类报错（4xx）之后整晚都走本地模板日程 | 任何非 OK 结局都进 `_enter_cooldown`，而日程冷却默认 30 分钟；两个供应商都冷却 = 一次都不再试 | `test_v302_sleep_recognition.py::PermanentFailureCooldownTest` | 永久性失败（重试也没用的 4xx）冷却上限 `PERMANENT_FAILURE_COOLDOWN_SECONDS` = 180 秒；瞬时错误仍按 `*_provider_cooldown_minutes` 走。别把两类混成一个时长。 |
+| 本地兜底日程一整天只安排睡觉：睡够了也接着排「睡一觉」 | `dynamic_segment` 不知道今天已经睡了多久，只要当前是夜间/压力高就往睡段走 | `test_v302_sleep_recognition.py::DynamicSegmentWakeUpTest`、`SleepingMinutesTest` | 「已经睡了多久」由 `schedule.sleeping_minutes()` 用 `slot_sleeps` 连续累加给出；醒来门槛 `max(WAKE_AFTER_SLEEP_MIN_MINUTES=240, sleep_need_hours × 60)`。两个数都要跟着 `sleep_need_hours` 一起想。 |
+| 注入说「她已经到了会忍不住的那条线」，实际亲密场景一道门槛都没过 | 欲望提示只算亲近欲/基线，完全不看好感、精力与冷却，与 `ccb.evaluate` 不是同一套数 | `test_v302_ccb_truth.py::ClaimImpliesTheSceneWouldOpen`、`DesiredButNotYet` | `ccb.gate_gaps()` 是**唯一**真源：`_values_hold`、`scene_status` 的 blockers、注入文案都从它取值。新增任何门槛先加进 `gate_gaps`，再改三处文案。 |
+| 白名单外的人仍能在 `/你的状态` 看到裸的「亲近欲 41/50」 | 状态页在「亲密」段为空时会退回显示裸数字（`if not intimate: out.append(row("亲近欲" ...))`） | `test_v302_ccb_whitelist.py::PanelHidden` | `ccb.allowed_for()` 读不到配置一律放行（挡错 = 功能整条消失）；名单外既不能出「亲密」段，也不能退回裸数值——那正是这份名单要挡的东西。 |
+| 关掉 `ccb`/`mood_enabled` 之后，下面那几十项照样铺满面板 | `_conf_schema.json` 没有任何 `condition`，面板只认「有没有这一项」 | `test_v302_schema_conditions.py` | `condition` 的值类型必须与主开关默认值一致（前端是严格 `!==`，写成 `"true"` 等于永久隐藏）；主开关自己绝不能加 `condition`；新增从属项时一并加上，否则面板又会长回去。 |
+
 ## 「现实→网友」/「变成手机发消息」是什么（v1.28.1 / v2.28.1 调查结论）
 
 **不是插件的问题，也无需修。** 已按一位用户的反馈逐条核对过日志（其 QQ 号与昵称已隐去）。

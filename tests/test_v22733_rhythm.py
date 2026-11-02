@@ -271,16 +271,23 @@ class MoodMapNanTest(unittest.TestCase):
 
 
 class SomaExtremesTest(unittest.TestCase):
-    def _soma(self, moment=None, slots=None, weather=None):
+    def _soma(self, moment=None, slots=None, weather=None, freeze_time=False):
         store = ScopeStore(Path(tempfile.mkdtemp()) / "state.json")
         store.load()
         clock = FrozenClock(moment or MOMENT)
+        # `time_source` 默认是 `time.time`（真实时间）。这里的用例大多只关心「同一时刻
+        # 的两拍」，真实时间在两次快照之间也会往前走几十微秒——落在日切换、整分钟这种
+        # 边界上时偶发一条红。需要确定性时把时间来源也钉住。
+        extra = (
+            {"time_source": lambda: clock.now().timestamp()} if freeze_time else {}
+        )
         soma = SomaService(
             store.scope,
             lambda: cfg(),
             clock,
             schedule_provider=(lambda: slots) if slots is not None else (lambda: []),
             weather_provider=(lambda: weather) if weather is not None else None,
+            **extra,
         )
         return soma, clock, store
 
@@ -299,7 +306,9 @@ class SomaExtremesTest(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_clock_rollback_does_not_diverge(self):
-        soma, clock, _ = self._soma()
+        # 时间来源也绑在同一个 FrozenClock 上：回拨这一步才真的走到「now <= last」
+        # 的分支，而不是拿真实时间往前多走几十微秒去比（那样比较的是舍入）。
+        soma, clock, _ = self._soma(freeze_time=True)
         soma.advance()
         before = dict(soma.snapshot())
         clock.advance(days=-3)

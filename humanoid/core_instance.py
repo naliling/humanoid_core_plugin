@@ -28,7 +28,7 @@ from .services.social import SocialEnergyService
 from .services.weather import WeatherService
 from .services.behavior import BehaviorService
 from .services.soma import SomaService
-from .slots import is_sleep_event
+from .slots import slot_sleeps
 
 LOG_PREFIX = "[humanoid_core]"
 
@@ -697,8 +697,10 @@ class HumanoidCoreInstance:
         新的一段换锚点：同一件事续了就接着排阶段，换了事就现开一个新过程。
         """
         try:
-            was_sleep = is_sleep_event(str((previous or {}).get("event") or ""))
-            now_sleep = is_sleep_event(str((current or {}).get("event") or ""))
+            # 判定要跟日程/身体同一套（`slot_sleeps`）：模型写的睡段没有睡字，
+            # 只看事件名会让「睡着→醒着」这一翻转永远不触发，睡多久也就一直不结算。
+            was_sleep = slot_sleeps(previous or {})
+            now_sleep = slot_sleeps(current or {})
             if was_sleep and not now_sleep:
                 self.soma.note_schedule_changed()
         except Exception:
@@ -906,7 +908,8 @@ class HumanoidCoreInstance:
         # 原来没有同一条闸——群里一句「你做了什么」照样 +1 次、照样结算好感/亲近欲/
         # 攻击性。状态机说"这里绝不可能发生"，账上却在加，规矩自己破了。
         # `readable()` 与 main.py 的同款判断一致：情绪层关着时她根本没有"这段关系"。
-        if not is_command and not is_group and getattr(cfg, 'ccb', False):
+        if (not is_command and not is_group and getattr(cfg, 'ccb', False)
+                and _ccb.allowed_for(cfg, user_id)):
             try:
                 # (P3）：安全闸。未成年 / 血缘人设**连账都不记**——
                 # 状态机那边已经拦了，这边不同口径的话，账上会留下"发生过 N 次"
@@ -1822,7 +1825,9 @@ class HumanoidCoreInstance:
             daily_max=_ccb.CCB_DAILY_MAX,
         )
         enabled = bool(getattr(cfg, "ccb", False))
+        allowed = _ccb.allowed_for(cfg, user_id)
         snap["enabled"] = enabled
+        snap["allowed"] = allowed
         if not enabled:
             # 开关关着时整条功能不生效：历史数字照给（那是真的发生过），但
             # 「能不能进」一律给不能——说"能"就是骗人，而用户会照着它去试。
@@ -1832,6 +1837,15 @@ class HumanoidCoreInstance:
             snap["aftercare_left"] = 0.0
             snap["can_enter"] = False
             snap["blockers"] = ["亲密场景未开启（ccb=false）"]
+        elif not allowed:
+            # 名单外的人：历史数字照给（那是真发生过的），但「能不能进」与
+            # 原因一律不谈——把亲近欲和差多少摆给朋友看，是这套名单要避免的事。
+            snap["in_scene"] = False
+            snap["stage_name"] = ""
+            snap["cooldown_left"] = 0.0
+            snap["aftercare_left"] = 0.0
+            snap["can_enter"] = False
+            snap["blockers"] = ["这部分没有对你开放。"]
         return snap
 
     def intimacy_rows(self, user_id: str) -> list[str]:
@@ -1841,6 +1855,8 @@ class HumanoidCoreInstance:
         指令那边是「亲密 · uid」）。`cfg.ccb` 关着时返回空列表——那一段整个不出现。
         """
         if not user_id or not bool(getattr(self.config, "ccb", False)):
+            return []
+        if not _ccb.allowed_for(self.config, user_id):
             return []
         snap = self.intimacy_status(user_id)
         if not snap:
@@ -1940,6 +1956,8 @@ class HumanoidCoreInstance:
         """
         if not bool(getattr(self.config, "ccb", False)):
             return "亲密场景未开启（ccb=false）。"
+        if not _ccb.allowed_for(self.config, user_id):
+            return "这部分没有对你开放。"
         rows = self.intimacy_rows(user_id)
         if not rows:
             return "亲密场景未开启，或没有可显示的数据。"
@@ -1954,6 +1972,8 @@ class HumanoidCoreInstance:
         """
         try:
             if not bool(getattr(self.config, "ccb", False)):
+                return
+            if not _ccb.allowed_for(self.config, user_id):
                 return
             if not _ccb.detect_intimacy(text):
                 return
@@ -2342,7 +2362,13 @@ class HumanoidCoreInstance:
             if mood_raw:
                 # ccb 开着时亲近欲由下面「亲密」段给（带基线/涨幅/门槛）。同一屏出现
                 # 两个「亲近欲」而数字口径不同时，用户只会当成又一个 bug。
-                if not intimate:
+                # 名单外的人拿不到「亲密」段，这里也**不能**退回去给裸数字——
+                # 那正是这份名单要挡住的东西（朋友关系里最不好解释的一项）。
+                hidden_by_whitelist = (
+                    bool(getattr(self.config, "ccb", False))
+                    and not _ccb.allowed_for(self.config, user_id)
+                )
+                if not intimate and not hidden_by_whitelist:
                     out.append(row("亲近欲", f"{float(mood_raw.get('libido', 0)):.0f}/50"))
                 out.append(row("攻击性", f"{float(mood_raw.get('aggression', 0)):.0f}/50"))
             try:

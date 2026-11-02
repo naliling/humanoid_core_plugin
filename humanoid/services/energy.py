@@ -28,6 +28,9 @@ CONSUMPTION_DISCOUNT = 0.7
 # 卵泡晚 / 排卵 / 黄体早 / 黄体中 / 黄体晚）。
 CONSUMPTION_PHASE_FACTORS = (1.3, 0.9, 0.8, 0.85, 1.0, 1.05, 1.1, 1.25)
 DAY_START_ENERGY = 80.0
+# 落盘精度：默认身体 tick 是 60 秒，上班时段每分钟只掉约 0.045。以前按 1 位小数落盘，
+# `round(99.95, 1)` 还是 100.0——每一格都白算，精力看着永远满格、白天不会累。
+ENERGY_STORE_DIGITS = 4
 # 8 个阶段的名字与角色扮演化的体感描述。
 #
 # 以前是 6 个阶段 + 几句干巴巴的「能量水平逐步回升」，读起来像仪表盘读数。
@@ -171,7 +174,7 @@ class EnergyService:
         # 错配到前一天。
         energy = self._settle_span(energy, last, now, cfg)
         energy = self._apply_body_ceiling(energy, cfg)
-        data["energy"] = round(energy, 1)
+        data["energy"] = round(energy, ENERGY_STORE_DIGITS)
         data["last_update"] = format_state_timestamp(now)
         self._scope.mark_dirty()
         return energy
@@ -349,7 +352,7 @@ class EnergyService:
         if amount <= 0:
             return self.energy
         energy = self._clamp(self.energy - amount, cfg)
-        self._scope.set_self("energy", round(energy, 1))
+        self._scope.set_self("energy", round(energy, ENERGY_STORE_DIGITS))
         return energy
 
     def reset(self, value: float | None = None) -> float:
@@ -360,7 +363,7 @@ class EnergyService:
             value = DAY_START_ENERGY * random.uniform(0.90, 1.10)
         energy = self._clamp(float(value), cfg)
         self._scope.update_self(
-            energy=round(energy, 1),
+            energy=round(energy, ENERGY_STORE_DIGITS),
             last_update=format_state_timestamp(self._clock.now())
         )
         return energy

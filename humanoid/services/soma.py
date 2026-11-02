@@ -24,7 +24,7 @@ from typing import Any
 
 from ..config import HumanoidConfig
 from ..role_scope import RoleScope
-from ..slots import is_meal_event, is_sleep_event, sleep_window_minutes
+from ..slots import is_meal_event, slot_sleeps, sleep_window_minutes
 from ..wording import FEELING_WORDS, band_index, pick, scale_word
 
 # 一次补算最多推进多久。插件停机一周后重启，不该攒出「睡眠压力 5000」。
@@ -35,7 +35,11 @@ STEP_MINUTES = 10.0
 SLEEP_PRESSURE_PER_HOUR = 7.5      # 清醒时每小时攒的睡眠压力
 # 睡着时的清除速率不在这里写定：它由 sleep_need_hours 推出来（见 config.sleep_relief_per_hour），
 # 否则「一晚该睡多久」那项配置根本进不了计算。
-SLEEP_DEBT_RELIEF_PER_HOUR = 0.5   # 生物钟夜里睡着时，每小时抵掉多少小时的债
+# 生物钟夜里睡着时，每小时抵掉多少小时的债。这是**下限**：实际速率取它和
+# `sleep_debt_gain_per_hour`（她攒债的速度）里更大的那个，不能比攒的慢——原来写死 0.5，
+# 攒债却按 sleep_need_hours 推出来约 1.14/小时，一天欠 8 小时、一晚只还 4 小时，
+# 债只增不减，顶到上限之后「睡一觉」就再也补不回来（表现是一直在补觉）。
+SLEEP_DEBT_RELIEF_PER_HOUR = 0.5
 SLEEP_DEBT_CAP = 20.0              # 睡眠债上限（小时）：人会补觉，不会欠 80 小时
 SITTING_DISCOMFORT_PER_HOUR = 6.0  # 久坐每小时累积的僵硬感
 COLD_DISCOMFORT_PER_DEGREE = 1.6   # 低于舒适温度每摄氏度累积的不适
@@ -271,6 +275,10 @@ class SomaService:
 
         同时提到吃饭的时段算吃饭：「午餐与午休发呆」里那个「午休」把她判成睡着的话，
         中午就再也不会主动找人了。
+
+        判定本身走 `slot_sleeps`，不只看事件名：模型写的「阖眼，呼吸渐沉」这类安静的
+        卧床段落没有睡字，只看关键词时她整夜都不算睡——睡眠压力一路涨、精力按醒着掉，
+        提示词里的「她醒着」还和日程里的卧床描述互相打脸。
         """
         slots = self._slots()
         if not slots:
@@ -278,10 +286,9 @@ class SomaService:
             # 那几分钟里积分出来的「假睡眠」比少记一段睡更难看。
             return False
         current = self.slot_at(moment)
-        event = str(current.get("event", "") or "") if current else ""
-        if not event:
+        if not current:
             return False
-        return is_sleep_event(event)
+        return slot_sleeps(current)
 
     def _slots(self) -> list[dict]:
         if self._schedule is None:
@@ -350,9 +357,14 @@ class SomaService:
                 # 记下这一觉从哪开始，醒来时才知道睡了多久、什么时候醒的。
                 self.data["asleep_since"] = _rounded(moment.timestamp())
             if in_night:
-                # 债的回收只在生物钟夜里计时，且按半速：天天凌晨两点睡的人不该永远零负债。
+                # 债的回收只在生物钟夜里计时：天天凌晨两点睡的人不该永远零负债。
+                # 速率取「她攒债的速度」与常量的较大值——比攒的慢就还不完（见常量注释）。
+                relief = max(
+                    SLEEP_DEBT_RELIEF_PER_HOUR,
+                    float(cfg.sleep_debt_gain_per_hour),
+                )
                 self.data["sleep_debt"] = _rounded(
-                    max(0.0, self._get("sleep_debt", 0.0) - hours * SLEEP_DEBT_RELIEF_PER_HOUR)
+                    max(0.0, self._get("sleep_debt", 0.0) - hours * relief)
                 )
         else:
             pressure = self._get("sleep_pressure", 20.0) + SLEEP_PRESSURE_PER_HOUR * hours

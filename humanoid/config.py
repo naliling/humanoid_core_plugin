@@ -363,6 +363,11 @@ class HumanoidConfig:
     # 不回落的话，亲近欲（ccb 的主门槛）只涨不退，等于每做一次都给下一次续火。
     # 只动 libido，不动好感——好感是长线评价，不该被一次性事件拉下来。
     ccb_refractory_libido: float = 12.0
+    # 亲密功能只对这些 QQ 开放（空 = 不设限，与旧行为一致；写 "*" 也等于不设限）。
+    # 好感门槛只回答「关系够不够近」，不回答「这个人该不该看到这一段」；
+    # 名单补的是后者：朋友养到 50 好感就自动解锁，还得在状态页看见亲近欲和
+    # 差值，是件很难解释的事。
+    ccb_allowed_users: tuple[str, ...] = ()
     mood_initial_libido: int = 34
     mood_initial_aggression: int = 28
     mood_affection_override: tuple[str, ...] = ()
@@ -617,6 +622,7 @@ class HumanoidConfig:
             ccb_aftercare_minutes=i("ccb_aftercare_minutes", 0, 720),
             ccb_scene_log_debug=b("ccb_scene_log_debug"),
             ccb_refractory_libido=f("ccb_refractory_libido", 0.0, 30.0),
+        ccb_allowed_users=_as_str_tuple(pick("ccb_allowed_users")),
             mood_initial_libido=i("mood_initial_libido", 0, 50),
             mood_initial_aggression=i("mood_initial_aggression", 0, 50),
             mood_affection_override=_as_str_tuple(pick("mood_affection_override")),

@@ -8,7 +8,7 @@
 > 不是一句人设，是一整天的生活。
 > 插件负责她的身体、日程、情绪和关系背景；怎么说话，仍然由大模型按人设自己决定。
 
-![version](https://img.shields.io/badge/version-v3.0.0-2563eb?style=flat-square)
+![version](https://img.shields.io/badge/version-v3.0.2-2563eb?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -158,7 +158,7 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 
 ### 关键配置项
 
-面板上共 134 项（多数带【进阶】标记），这里列真正需要动的：
+面板上共 135 项（多数带【进阶】标记），这里列真正需要动的：
 
 | 项 | 默认 | 什么时候调 |
 | --- | --- | --- |

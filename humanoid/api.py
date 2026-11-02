@@ -327,6 +327,10 @@ class CoreFacade:
             return {}
         if not isinstance(snap, dict) or not snap:
             return {}
+        if snap.get("allowed") is False:
+            # 白名单：这个人不在开放名单里。门面是别的插件读的窗口，返回空字典
+            # 等于「没有这份资料」——社交层就不会拿它去决定要不要主动开口。
+            return {}
         stage = int(_num(snap.get("stage")))
         satisfy = _num(snap.get("satisfy"))
         done = _num(snap.get("done_count"))
@@ -948,6 +952,11 @@ class CoreFacade:
                 stage = int(_num(core.scope.peek_user(user_id, "ccb_stage", 0.0)))
             except Exception:
                 done, satisfy, last_at, stage = 0.0, 0.0, 0.0, 0
+            fields = self._status_fields({})
+        if snap.get("allowed") is False:
+            # 名单外的人：亲密三键一律当「没有」，免得社交层拿一个本不该
+            # 开放的数字去决定主动不主动。
+            done, satisfy, last_at, stage = 0.0, 0.0, 0.0, 0
             fields = self._status_fields({})
         last_interaction = _num(peek("last_interaction", 0.0))
         peer_said_at = _num(peek("peer_said_at", last_interaction))

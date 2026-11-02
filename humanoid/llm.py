@@ -151,6 +151,11 @@ _COOLDOWN_CONFIG_BY_PURPOSE = {
     PURPOSE_MOOD: "mood_provider_cooldown_minutes",
 }
 _DEFAULT_COOLDOWN_CONFIG = "schedule_provider_cooldown_minutes"
+# 永久性失败（4xx/鉴权/内容拒绝/参数被拒）的冷却上限。这类失败换个时间点重试也不会好，
+# 但也**不该**按 30 分钟的完整冷却把 provider 停掉：一次「参数被模型提供方拒绝」就足以
+# 让首选和备用同时冷却，日程退回本地模板，一退就是半小时。短冷却足够避开这次坏请求，
+# 又让下一段日程还有机会用上模型。超时/限流/空回这类「等一会儿可能就好了」的失败仍走配置。
+PERMANENT_FAILURE_COOLDOWN_SECONDS = 180.0
 
 _OUTCOME_TEXT = {
     OUTCOME_OK: "成功",
@@ -728,8 +733,21 @@ class LLMGateway:
                 continue
             self._cooldown.pop((entry_purpose, pid), None)
 
-    def _enter_cooldown(self, provider_id: str, purpose: str) -> None:
-        seconds = self._cooldown_seconds(purpose)
+    def _failure_cooldown(self, purpose: str, permanent: bool) -> float:
+        """一次失败之后该冷却多久。
+
+        永久性失败取短冷却（`PERMANENT_FAILURE_COOLDOWN_SECONDS`），其余按配置；配置把
+        冷却设成 0 表示「不冷却」，那就一律不冷却。
+        """
+        base = self._cooldown_seconds(purpose)
+        if not permanent or base <= 0:
+            return base
+        return min(base, PERMANENT_FAILURE_COOLDOWN_SECONDS)
+
+    def _enter_cooldown(
+        self, provider_id: str, purpose: str, *, seconds: float | None = None
+    ) -> None:
+        seconds = self._cooldown_seconds(purpose) if seconds is None else seconds
         if provider_id and seconds > 0:
             self._cooldown[(purpose, provider_id)] = self._monotonic() + seconds
 
@@ -825,7 +843,7 @@ class LLMGateway:
             actual_id = self._resolver.id_of(provider) or configured_id
             if self._log and cfg.debug_mode:
                 self._log.debug(f"[humanoid_core] 调用 {label}({actual_id})")
-            outcome, detail, elapsed, text = await self._call_with_retries(
+            outcome, detail, elapsed, text, permanent = await self._call_with_retries(
                 provider=provider,
                 prompt=prompt,
                 timeout=timeout,
@@ -856,7 +874,11 @@ class LLMGateway:
                 return result
 
             if not is_global:
-                self._enter_cooldown(actual_id or configured_id, purpose)
+                self._enter_cooldown(
+                    actual_id or configured_id,
+                    purpose,
+                    seconds=self._failure_cooldown(purpose, permanent),
+                )
             self._warn(f"{purpose} {label}({actual_id}) {describe_outcome(outcome)}：{detail}")
 
         last = attempts[-1] if attempts else None
@@ -933,8 +955,14 @@ class LLMGateway:
         attempts: list[Attempt],
         call_kwargs: dict[str, Any],
         deadline: float,
-    ) -> tuple[str, str, float, str]:
+    ) -> tuple[str, str, float, str, bool]:
+        """返回 (outcome, detail, elapsed, text, permanent)。
+
+        `permanent` 表示这次失败换个时间点重试也不会好（4xx/鉴权/内容拒绝），调用方据此
+        决定冷却多久——一次写死的坏请求不该把 provider 停满整个冷却窗口。
+        """
         outcome, detail, elapsed = OUTCOME_ERROR, "", 0.0
+        permanent = False
         for attempt_no in range(1, attempts_per_provider + 1):
             remaining = deadline - self._monotonic()
             if remaining <= 0:
@@ -959,13 +987,13 @@ class LLMGateway:
                     # 永久性失败：不再重试。原实现一律重试，鉴权失败/内容审核拒绝也要
                     # 再打一遍，白烧额度、白让用户等。
                     attempts.append(Attempt(label, actual_id, outcome, detail, elapsed))
-                    return outcome, detail, elapsed, ""
+                    return outcome, detail, elapsed, "", True
             else:
                 elapsed = self._monotonic() - started
                 text = extract_text(response)
                 if text.strip():
                     attempts.append(Attempt(label, actual_id, OUTCOME_OK, "", elapsed))
-                    return OUTCOME_OK, "", elapsed, text
+                    return OUTCOME_OK, "", elapsed, text, False
                 outcome, detail = OUTCOME_EMPTY, f"第 {attempt_no} 次返回空内容"
 
             attempts.append(Attempt(label, actual_id, outcome, detail, elapsed))
@@ -974,7 +1002,7 @@ class LLMGateway:
                 if wait > deadline - self._monotonic():
                     break
                 await asyncio.sleep(wait)
-        return outcome, detail, elapsed, ""
+        return outcome, detail, elapsed, "", permanent
 
     def _not_found_detail(self, is_global: bool) -> str:
         if is_global:
