@@ -16,7 +16,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from humanoid.config import DEFAULTS, HumanoidConfig, plan_default_migrations
+from humanoid.config import (
+    DEFAULTS,
+    INJECT_MODES,
+    HumanoidConfig,
+    plan_default_migrations,
+)
 from humanoid.role_scope import RoleScope
 from humanoid.state import (
     STATE_VERSION,
@@ -357,7 +362,13 @@ class AdaptiveFlushIntervalTest(unittest.TestCase):
 
 
 class BadUserEntriesAreRepairedTest(unittest.TestCase):
-    """P1-5：users[*] 的坏条目必须自愈，且修完能正常读写、能持久化。"""
+    """P1-5：users[*] 的坏条目必须自愈，且修完能正常读写、能持久化。
+
+    B3 / #97 起行为有一处**有意**变化：坏值（`5` / `"broken"` / `None` / `[1, 2]`）里
+    没有任何可救的信息，修成 `{}` 之后立刻被 `_drop_empty_users` 删掉——留一条空壳
+    只会让 state.json 里多一条永远没人清、面板上还会显示成一个人的条目。
+    所以下面断言的是「键不存在」而不是「值等于 {}」。
+    """
 
     def test_load_repairs_every_bad_value(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -383,7 +394,7 @@ class BadUserEntriesAreRepairedTest(unittest.TestCase):
             users = store.data["roles"]["default"]["users"]
             for uid in ("42", "43", "44", "45"):
                 with self.subTest(uid=uid):
-                    self.assertEqual(users[uid], {})
+                    self.assertNotIn(uid, users, "坏值修成空壳后应该直接删掉")
             self.assertEqual(users["46"]["nickname"], "完好的")
             self.assertIn("不是对象", log.text("warning"))
             self.assertTrue(store.dirty, "修过的坏值必须标脏，否则下次启动又读到坏数据")
@@ -581,10 +592,15 @@ class DefaultMigrationUserChoiceTest(unittest.TestCase):
             "schedule_prompt_extra", plan_default_migrations({"schedule_prompt_extra": legacy})
         )
 
-    def test_inject_level_low_is_not_overwritten(self):
+    def test_inject_level_low_is_an_illegal_value(self):
+        """`"low"` 不在 `INJECT_MODES` 里：一处判非法、另一处不能又当成合法选择。"""
         self.assertNotIn(
             "inject_activity_context", plan_default_migrations({"inject_activity_context": "low"})
         )
+        # 交叉断言：解析结果与迁移结论必须一致——都是「这个值不生效」。
+        cfg = HumanoidConfig.from_raw({"inject_activity_context": "low"})
+        self.assertEqual(cfg.inject_activity_context, DEFAULTS.inject_activity_context)
+        self.assertNotIn("inject_activity_context", INJECT_MODES)
 
     def test_night_window_trio_is_not_overwritten(self):
         changes = plan_default_migrations({
@@ -608,9 +624,11 @@ class DefaultMigrationUserChoiceTest(unittest.TestCase):
 
     def test_explicit_and_applied_keys_are_skipped(self):
         raw = {"timezone_city": "北京", "weather_location": "Heyuan,CN"}
+        # weather_location 已经不再由迁移改写，三种调用都必须是空改动。
         self.assertEqual(plan_default_migrations(raw, applied={"weather_location"}), {})
         self.assertEqual(plan_default_migrations(raw, explicit_keys={"weather_location"}), {})
-        self.assertEqual(plan_default_migrations(raw), {"weather_location": ""})
+        with self.assertLogs("humanoid.config", level="WARNING"):
+            self.assertEqual(plan_default_migrations(raw), {})
 
 
 class PhaseMultiplierMigrationTest(unittest.TestCase):

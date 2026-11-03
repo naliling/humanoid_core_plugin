@@ -451,6 +451,9 @@ class DiagnosticsTimezoneTest(unittest.TestCase):
         self.assertIn("认不出城市", text)
         self.assertIn("没拿到可用时区", text)
         self.assertIn("按这台机器的时间排", text, "退化时不该再说「日程按她那个城市算」")
+        self.assertNotIn(
+            "机器本地时间与她的钟一致", text, "降级时不能既说「按机器时间过」又说「两者一致」"
+        )
 
     def test_report_gives_the_install_hint_when_tzdata_is_missing(self):
         real = clock_module.ZoneInfo

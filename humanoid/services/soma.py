@@ -22,9 +22,10 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
+from ..clock import local as _clock_local
 from ..config import HumanoidConfig
 from ..role_scope import RoleScope
-from ..slots import is_meal_event, slot_sleeps, sleep_window_minutes
+from ..slots import is_meal_event, iter_segments, slot_sleeps, sleep_window_minutes
 from ..wording import FEELING_WORDS, band_index, pick, scale_word
 
 # 一次补算最多推进多久。插件停机一周后重启，不该攒出「睡眠压力 5000」。
@@ -228,43 +229,28 @@ class SomaService:
     def slot_at(self, moment: datetime) -> dict:
         """这一刻落在日程的哪一段；没有/坏段返回空 dict。
 
-        **零长段（start == end）按 0 长度处理，不是「到 24:00」**：旧写法
-        `if e <= s: e = 1440` 把 `08:00-08:00` 解释成 08:00–24:00，于是她会被
-        判定「从 08:00 起一直在睡/在吃」最长 16 小时，睡眠压力、饥饿、久坐、
-        精力结算全部连锁跑偏。倒序段（end < start）同样是坏数据，一并跳过。
-        口径与 `slots.sleep_window_minutes`（同形状直接丢弃）一致。
+        判据走 `slots.iter_segments`，与 `sleep_window_minutes` 共用一份解析：
+
+        * **零长段（start == end）按 0 长度处理，不是「到 24:00」**：旧写法
+          `if e <= s: e = 1440` 把 `08:00-08:00` 解释成 08:00–24:00，于是她会被
+          判定「从 08:00 起一直在睡/在吃」最长 16 小时，睡眠压力、饥饿、久坐、
+          精力结算全部连锁跑偏；
+        * **倒序段（end < start）是跨午夜写法，不是坏数据**：`22:00→07:00` 在
+          00:00–24:00 的坐标里是 [22:00, 24:00) + [00:00, 07:00)。旧写法把凌晨那截
+          丢掉，于是凌晨三点她明明在睡，`slot_at` 却说「没有段」——`sleep_state`
+          只好判「日程空窗」，一整夜不记睡眠、睡眠压力照涨（审核 F4）。
         """
         minutes = moment.hour * 60 + moment.minute
         for slot in self._slots():
-            start = slot.get("start")
-            end = slot.get("end")
-            if not start or not end:
-                continue
-            s = self._to_minutes(start)
-            e = self._to_minutes(end)
-            if e == s:
-                # **零长段按 0 长度处理**（v3.0.0，审核 P2-20）：旧写法 `e <= s → e = 1440`
-                # 把 `08:00-08:00` 解释成 08:00–24:00，她会被判「从 08:00 起一直在睡/在吃」
-                # 最长 16 小时，睡眠压力、饥饿、久坐、精力结算全部连锁跑偏。
-                continue
-            if e < s:
-                # 跨午夜写法（`{'start': '22:00', 'end': '07:00'}`）：当天只覆盖到 24:00；
-                # 次日凌晨那一段由日程结转出的 `00:00-07:00` 段承担（生产里的两段拼法）。
-                e = 1440
-            if s <= minutes < e:
-                return slot
+            for lo, hi in iter_segments(slot):
+                if lo <= minutes < hi:
+                    return slot
         return {}
 
-    @staticmethod
-    def _to_minutes(text: Any) -> int:
-        try:
-            parts = str(text).split(":")
-            return int(parts[0]) * 60 + int(parts[1])
-        except (TypeError, ValueError, IndexError):
-            return 0
+    def sleep_state(self, moment: datetime) -> str:
+        """这一刻的睡眠态：asleep / awake / unknown（v3.0.4 审核 F3）。
 
-    def is_sleep_time(self, moment: datetime) -> bool:
-        """日程里写着睡才算睡着。
+        日程里写着睡才算睡着。
 
         不能把夜间窗口当成「她在睡」：熬夜的时候她 3 点仍然醒着，该记的是睡眠债而不是
         把困意清零。没有日程可用时才退到夜间窗口。
@@ -284,11 +270,20 @@ class SomaService:
         if not slots:
             # 完全没日程（新装、或跨天且新段还没排出来）：不看夜间窗口。
             # 那几分钟里积分出来的「假睡眠」比少记一段睡更难看。
-            return False
+            return "unknown"
         current = self.slot_at(moment)
         if not current:
-            return False
-        return slot_sleeps(current)
+            return "unknown"
+        return "asleep" if slot_sleeps(current) else "awake"
+
+    def is_sleep_time(self, moment: datetime) -> bool:
+        """兼容薄封装：只有 asleep 才是 True，unknown 一律按 False 返回。
+
+        三态由 sleep_state 给出；_integrate 已经改用三态，这里的 False 不再参与
+        睡眠压力/睡眠债的积分——空窗被当成「她醒着」时，夜里每空十分钟就白攒一段
+        困意和一段睡眠债，还会把被打断的一觉结算成「昨晚睡了 X 小时」。
+        """
+        return self.sleep_state(moment) == "asleep"
 
     def _slots(self) -> list[dict]:
         if self._schedule is None:
@@ -334,19 +329,35 @@ class SomaService:
 
     def _moment_at(self, epoch: float) -> datetime:
         try:
-            return datetime.fromtimestamp(epoch, tz=self._clock.now().tzinfo)
+            # 时区优先从时钟的 tz 属性取（clock.tz = 她的城市）。真时钟一定有它；
+            # 替身钟（测试里的 FrozenClock 之类）可能只有 now()，那就退回 now().tzinfo
+            # ——只在这一个分支里允许反推，因为替身钟没有城市这个概念，
+            # 它给的 tzinfo 就是它自己那个世界的时区。
+            tz = getattr(self._clock, "tz", None)
+            if tz is None:
+                try:
+                    tz = self._clock.now().tzinfo
+                except Exception:
+                    tz = None
+            return _clock_local(epoch, tz)
         except (OSError, OverflowError, ValueError, AttributeError):
             return self._clock.now()
 
     def _integrate(self, minutes: float, moment: datetime) -> None:
         cfg = self.config
         hours = minutes / 60.0
-        asleep = self.is_sleep_time(moment)
+        state = self.sleep_state(moment)
+        asleep = state == "asleep"
         hour_of_day = moment.hour + moment.minute / 60.0
 
         # --- 睡眠压力与睡眠债 ---
         in_night = self._in_biological_night(hour_of_day)
-        if asleep:
+        if state == "unknown":
+            # 日程空窗（刚跨过零点、新段还没排出来）：不记睡、不记醒、不涨压力、不记债。
+            # 旧写法把这里当 False（醒着）：夜里空窗十分钟就白攒 1.25 点困意和一段
+            # 睡眠债，asleep_since 非空时还会走 _record_wake 结算出一个假的「昨晚睡了 X 小时」。
+            pass
+        elif asleep:
             self._set(
                 "sleep_pressure",
                 self._get("sleep_pressure", 20.0) - cfg.sleep_relief_per_hour * hours,
@@ -412,7 +423,8 @@ class SomaService:
         # --- 久坐与躯体不适 ---
         sitting_limit = max(15.0, float(cfg.sitting_discomfort_minutes))
         active = self._is_active_now(moment)
-        if active:
+        # 睡着不是久坐：不重置的话一整夜都在累加，醒来第一句就是「身体不舒服」。
+        if active or asleep:
             self.data["sitting_since"] = _rounded(moment.timestamp())
         sitting_hours = max(0.0, (moment.timestamp() - self._get("sitting_since", moment.timestamp())) / 3600.0)
         stiffness = 0.0
@@ -829,7 +841,7 @@ class SomaService:
         except (TypeError, ValueError):
             energy = 60.0
 
-        def say(kind: str, value: float, floor: float, span: float, top: float,
+        def say(kind: str, value: float, floor: float, top: float,
                 reverse: bool = False) -> str:
             """挂一条体感：**分数跟着词走，不跟数值走。**
 
@@ -842,6 +854,11 @@ class SomaService:
             越难受越不说，和这层存在的理由正好相反。改成按档位给分：
             顶档拿满 `top`（那一档本来就是「值得说」的），越往下越低。
             `reverse=True` 用于「值越低越严重」的那种轴（没精神）。
+
+            `span` 参数随旧公式一起删掉了：旧公式没了以后它就是个没人读的数，六处调用
+            还在按旧分母传 45/5/40/60 —— 谁要调分制都会以为改它有用（实际只该动
+            `FEELING_WORDS` 的档位与 `top`）。删参数而不是留注释，是因为留着的参数会
+            被后来的人当成活的旋钮。
             """
             ladder = FEELING_WORDS.get(kind) or []
             band = band_index(value, ladder)
@@ -862,16 +879,16 @@ class SomaService:
         pressure = float(snap["sleep_pressure"])
         if pressure >= 88.0 and not self._drowsy_peak_now():
             pressure = 87.0
-        say("sleepy", pressure, 50.0, 45.0, 0.95)
+        say("sleepy", pressure, 50.0, 0.95)
 
         debt = snap["sleep_debt"]
         if debt >= 1.0:
-            say("debt", debt, 1.0, 5.0, 0.85)
+            say("debt", debt, 1.0, 0.85)
 
         if snap["asleep"] >= 1.0:
             out.append((0.9, "这会儿在睡"))
 
-        say("hunger", snap["hunger"], 55.0, 45.0, 0.8)
+        say("hunger", snap["hunger"], 55.0, 0.8)
 
         # 状态降温：同一个饥饿值，刚起的和持续了几小时的不是一句话。
         # 持续时间从 last_meal_at 算出来，是客观数，不是查表。
@@ -893,13 +910,13 @@ class SomaService:
 
         discomfort = snap["discomfort"]
         if discomfort >= 62:
-            say("discomfort", discomfort, 60.0, 40.0, 0.85)
+            say("discomfort", discomfort, 60.0, 0.85)
         elif discomfort >= 38:
             out.append((0.5, "略有不适"))
 
         chill = snap.get("chill", 0.0)
         if chill >= 28:
-            say("chill", chill, 28.0, 60.0, 0.8)
+            say("chill", chill, 28.0, 0.8)
 
         # 清醒度：精力掉了人会发懵，精力足了人才清醒。两者现在合在一起看，
         # 因为 arousal 本身也是从精力和作息推出来的，单独用会让同一件事说两遍。
@@ -914,7 +931,7 @@ class SomaService:
             # 同样进不去。两处一起修的。
             # `reverse=True`：这一支是「很没精神」才进的，值越低越该说。
             # 原来写死 `0.6`、低档写 `1 - level/45`，两处都跟档位脱钩。
-            say("arousal", min(arousal, energy), 0.0, 45.0, 0.8, reverse=True)
+            say("arousal", min(arousal, energy), 0.0, 0.8, reverse=True)
         elif energy >= 80.0 and arousal >= 70.0:
             # 显著度必须**高过** prompt 侧那道 0.7 的门槛，否则这一整档永远进不了上下文。
             #
@@ -998,7 +1015,7 @@ class SomaService:
         self._persist_if_changed()
 
     def note_message(self) -> None:
-        """每条消息：久坐计时不动，但连续说话会磨掉一点精神。"""
+        """每条消息：久坐计时不动，只推一点身体唤醒（与 note_chat 的 +6 同向）。"""
         self._set("arousal", self._get("arousal", 50.0) + 1.5)
         self._persist_if_changed()
 

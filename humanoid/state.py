@@ -101,6 +101,7 @@ class StateStore:
         "_dirty_event",
         "_dirty_generation",
         "_disk_version",
+        "_energy_cap",
         "_flush_failures",
         "_flush_task",
         "_interval",
@@ -108,6 +109,9 @@ class StateStore:
         "_last_serialize_seconds",
         "_last_write_error",
         "_load_failed",
+        "_load_permanent",
+        "_load_retry_at",
+        "_load_retry_count",
         "_log",
         "_path",
         "_state",
@@ -119,19 +123,34 @@ class StateStore:
         "writes",
     )
 
+    # 加载失败后的重试策略（见 `_ensure_loaded`）：5 秒起指数退避、上限 300 秒、最多 8 次。
+    LOAD_RETRY_BASE_SECONDS = 5.0
+    LOAD_RETRY_MAX_SECONDS = 300.0
+    LOAD_RETRY_MAX_ATTEMPTS = 8
+
     def __init__(
         self,
         path: str | Path,
         flush_interval_provider: Callable[[], float] | None = None,
         logger: Any = None,
+        energy_cap_provider: Callable[[], float] | None = None,
     ) -> None:
         self._path = Path(path)
         self._interval = flush_interval_provider or (lambda: 5.0)
         self._log = logger
+        # 精力上限的唯一来源是配置（max_energy）。存档层的职责只是「把坏值钳回合法区间」，
+        # 所以上限必须由调用方注入，不能在 state.py 里再写一个 1e6 之类的第二套量纲。
+        self._energy_cap = energy_cap_provider or (lambda: 100.0)
         self._state: dict[str, Any] = default_state()
         self._dirty = False
         # 加载失败 / 盘上版本更新 → 一律拒绝写盘（见 `_write_block_reason`）。
+        # 失败分两态：可重试（unavailable）与永久（permanent）。以前只有一个布尔，
+        # 置位后**永不复位**：一次瞬时占用（杀软扫描/编辑器保存/同步盘回写）会让本进程
+        # 此后再也不落盘，而界面上一切正常——重启后这段时间的改动全没了。
         self._load_failed = False
+        self._load_permanent = False
+        self._load_retry_at = 0.0
+        self._load_retry_count = 0
         self._version_blocked = False
         # 坏字符的那条 warning 只报一次：写不出去的那个字符会一直留在内存里，
         # 每次落盘都会重走一次替换，每 5 秒往日志里刷一行没有任何新信息。
@@ -222,6 +241,7 @@ class StateStore:
         if not self._path.exists():
             self._state = fresh
             self.mark_dirty()
+            self._clear_load_failure()
             return
 
         # 先读字节、再按多种编码试解码：**编码不对不是「文件损坏」**。以前直接
@@ -268,6 +288,16 @@ class StateStore:
                 "已停止写盘（请升级插件），读取仍按当前版本尽力解析"
             )
         self._info("状态加载成功")
+        self._clear_load_failure()
+
+    def _clear_load_failure(self) -> None:
+        """读盘成功：解除「拒绝写盘」，并把重试计数归零。"""
+        if self._load_failed or self._load_permanent:
+            self._info("状态文件已重新读到：恢复写盘")
+        self._load_failed = False
+        self._load_permanent = False
+        self._load_retry_at = 0.0
+        self._load_retry_count = 0
 
     def _backup_corrupt(self, exc: Exception) -> bool:
         """把损坏的状态文件挪去备份名；返回是否备份成功。
@@ -298,6 +328,54 @@ class StateStore:
         self._warn(f"状态文件损坏，已备份为 {backup.name} 并重建默认状态: {exc}")
         return True
 
+    def _ensure_loaded(self) -> bool:
+        """写盘前的兜底：上次读盘失败过就先重试读一次；返回「现在能不能写」。
+
+        为什么需要它：`_load_failed` 以前一旦置位就**永不复位**，而 `flush()` 只会
+        拒绝写盘、不会重新读——一次瞬时占用就让本进程此后再也不落盘（重启才恢复，
+        这期间的改动全部丢失）。这里按指数退避重试，成功后自动恢复写盘。
+
+        重试成功时**以盘上内容为准**替换内存：读盘失败只发生在启动阶段，此时内存里
+        那份是从 `default_state()` 长出来的，把它盖到盘上等于用空档案覆盖真数据。
+        """
+        if not self._load_failed:
+            return True
+        if self._load_permanent:
+            return False
+        now = time.monotonic()
+        if now < self._load_retry_at:
+            return False
+        self._load_retry_count += 1
+        if self._load_retry_count > self.LOAD_RETRY_MAX_ATTEMPTS:
+            self._load_permanent = True
+            self._error(
+                f"状态文件连续 {self.LOAD_RETRY_MAX_ATTEMPTS} 次重新读取失败：已停止写盘。"
+                "原文件仍保留在磁盘上；修好占用/权限后重启插件即可恢复"
+            )
+            return False
+        delay = min(
+            self.LOAD_RETRY_MAX_SECONDS,
+            self.LOAD_RETRY_BASE_SECONDS * (2 ** (self._load_retry_count - 1)),
+        )
+        self._load_retry_at = now + delay
+        try:
+            # 这里是同步读盘：只在「已经出过读失败」的少数路径上发生，不在常规落盘上。
+            self.load()
+        except Exception as exc:
+            self._warn(
+                f"重新读取状态文件出错（第 {self._load_retry_count} 次），{delay:.0f} 秒后再试: {exc}"
+            )
+            return False
+        if self._load_failed:
+            self._warn(
+                f"重新读取状态文件仍然失败（第 {self._load_retry_count} 次），{delay:.0f} 秒后再试"
+            )
+            return False
+        # 读到了：内存里这份是启动时那份默认状态，不能盖回盘上；把读到的状态标脏，
+        # 让下一轮正常落盘（迁移/修复产生的改动也要写出去）。
+        self.mark_dirty()
+        return True
+
     def _write_block_reason(self) -> str:
         """非空 = 此刻禁止写盘（盘上那份内容比内存里的更值得保留）。"""
         if self._load_failed:
@@ -310,11 +388,17 @@ class StateStore:
         return ""
 
     def _refuse_write(self, reason: str) -> None:
-        self._error(f"拒绝写盘：{reason}")
-        # 脏标记与事件一起清掉，否则 `_flush_loop` 会每个间隔重试一次并把日志刷满；
-        # 下一次真的改动会重新置位。
-        self._dirty = False
-        self._dirty_event.clear()
+        """记一次「此刻不能写」，但**不丢脏标记**。
+
+        以前这里把 `_dirty` 与 `_dirty_event` 一起清掉：一次瞬时读失败之后，内存里
+        还没落盘的改动就被当成「已保存」丢在一边，直到下一次改动才重新置脏——那之前
+        的所有改动永远不会写盘。现在脏标记保留，重试节奏交给 `_ensure_loaded` 的
+        指数退避，日志按理由只报一次（否则每个落盘间隔刷一行）。
+        """
+        # 用 error 级：拒绝写盘是「这次改动没进磁盘」的事实，warning 会被当成噪音忽略。
+        self._error_once(f"refuse_write:{reason}", f"拒绝写盘：{reason}")
+        # 事件保持置位：等 `_ensure_loaded` 重试成功（或用户修好文件）后能立刻写出去。
+        self._dirty_event.set()
 
     def _migrate(self, raw: dict[str, Any], fresh: dict[str, Any], cycle_length: int) -> dict[str, Any]:
         """把任意旧版结构收敛成 v3：顶层只留版本号与角色表。
@@ -370,6 +454,11 @@ class StateStore:
             # AttributeError、set_user 抛 TypeError，重新 load 也修不好）。
             if self._repair_bad_users(role_id, role_data["users"]):
                 repaired = True
+            # 空壳条目（`{}`）是「只被读过一次」留下的：没有任何字段、不会过期、
+            # 也不会被 prune 清掉，只会让 state.json 随群规模一直涨。删它是无损的
+            # （空 dict 不含信息），删了下次真写时 user_state() 会再建。
+            if self._drop_empty_users(role_id, role_data["users"]):
+                repaired = True
         if repaired:
             # 修过的坏值必须落盘，否则下次启动又读到同一份坏数据。
             self.mark_dirty()
@@ -411,6 +500,24 @@ class StateStore:
             users[user_id] = {}
             repaired = True
         return repaired
+
+    def _drop_empty_users(self, role_id: Any, users: dict[str, Any]) -> bool:
+        """删掉完全为空的用户条目（`{}`），返回是否删过。
+
+        这类条目来自「读路径顺手建档」（`RoleScope.user_state` 的 get-or-create）：
+        读过一眼昵称就留下一条 `{}`，它不含任何会被过期清理的字段，`prune_expired`
+        跳过它，于是 state.json 只增不减（审核 引擎与诊断 M7）。
+        只删**空**条目：哪怕只剩 `nickname`/`first_met` 也留着——那是称呼与「认识多久」，
+        是故意跨清理保留的信息。
+        """
+        dropped = 0
+        for user_id, entry in list(users.items()):
+            if isinstance(entry, dict) and not entry:
+                del users[user_id]
+                dropped += 1
+        if dropped:
+            self._info(f"角色 {role_id!r} 清理了 {dropped} 条空的用户条目")
+        return bool(dropped)
 
     def _absorb_legacy(
         self, state: dict[str, Any], roles: dict[str, Any]
@@ -471,11 +578,26 @@ class StateStore:
                     moved += 1
         return moved, repaired
 
-    @staticmethod
-    def _normalize_self(self_state: dict[str, Any], cycle_length: int) -> None:
-        """钳制角色自身状态里可能被打坏的数值。"""
-        self_state["energy"] = _clamp_float(self_state.get("energy"), 80.0, 0.0, 1e6)
-        self_state["social_energy"] = _clamp_float(self_state.get("social_energy"), 100.0, 0.0, 100.0)
+    def _energy_ceiling(self) -> float:
+        """精力上限：配置 max_energy（缺省 100）。取不到就退 100，绝不退到无上限。"""
+        try:
+            cap = float(self._energy_cap())
+        except Exception:  # noqa: BLE001 - 配置读失败不该让整份存档加载失败
+            return 100.0
+        if cap != cap or cap <= 0:  # NaN / 0 / 负数
+            return 100.0
+        return cap
+
+    def _normalize_self(self, self_state: dict[str, Any], cycle_length: int) -> None:
+        """钳制角色自身状态里可能被打坏的数值。
+
+        两条精力轴（energy / social_energy）共用**同一个**上限（配置 max_energy）：
+        原来 energy 钳到 1e6、social_energy 钳到 100，同一份状态两套量纲，
+        一个被写坏成 5000 的 energy 会让下游「精力」永远取顶档。
+        """
+        cap = self._energy_ceiling()
+        self_state["energy"] = _clamp_float(self_state.get("energy"), 80.0, 0.0, cap)
+        self_state["social_energy"] = _clamp_float(self_state.get("social_energy"), 100.0, 0.0, cap)
         self_state["_mood_decay_last_run"] = _clamp_float(
             self_state.get("_mood_decay_last_run"), 0.0, 0.0, 1e18
         )
@@ -559,6 +681,7 @@ class StateStore:
         async with self._write_lock:
             if not self._dirty:
                 return False
+            self._ensure_loaded()
             blocked = self._write_block_reason()
             if blocked:
                 self._refuse_write(blocked)
@@ -575,6 +698,13 @@ class StateStore:
                     f"分块序列化失败，已退回同步序列化（会短暂占用事件循环）: {exc}",
                 )
                 payload = _serialize(self._state)
+            if payload is None:
+                # 不可安全序列化：放弃这次落盘，脏标记与内存状态都保留（下一轮再试）。
+                self._error(
+                    "状态无法安全序列化（环引用/不可编码的值）：本次放弃落盘，"
+                    "内存状态与脏标记都保留"
+                )
+                return False
             self._last_serialize_seconds = max(0.0, time.perf_counter() - started)
             self._last_payload_bytes = len(payload)
             self._maybe_warn_volume()
@@ -611,12 +741,19 @@ class StateStore:
     def flush_sync(self) -> bool:
         if not self._dirty:
             return False
+        self._ensure_loaded()
         blocked = self._write_block_reason()
         if blocked:
             self._refuse_write(blocked)
             return False
         started = time.perf_counter()
         payload = _serialize(self._state)
+        if payload is None:
+            self._error(
+                "状态无法安全序列化（环引用/不可编码的值）：本次放弃落盘，"
+                "内存状态与脏标记都保留"
+            )
+            return False
         self._last_serialize_seconds = max(0.0, time.perf_counter() - started)
         self._last_payload_bytes = len(payload)
         self._maybe_warn_volume()
@@ -676,6 +813,13 @@ class StateStore:
         self._warned_once.add(key)
         self._warn(message)
 
+    def _error_once(self, key: str, message: str) -> None:
+        """与 `_warn_once` 同一套去重，但走 error 级（"这次没写进去"必须能被看见）。"""
+        if key in self._warned_once:
+            return
+        self._warned_once.add(key)
+        self._error(message)
+
     def _maybe_warn_volume(self) -> None:
         """体积/耗时/写盘量的一次性告警（P1-4 可观测性）。"""
         size = self._last_payload_bytes
@@ -723,7 +867,7 @@ class StateStore:
             self._log.error(f"[humanoid_core] {message}")
 
 
-def _serialize(state: dict[str, Any]) -> str:
+def _serialize(state: dict[str, Any]) -> str | None:
     """序列化整个状态。
 
     用紧凑分隔符只为控制体积（`indent=2` 会把文件撑大）。它是**同步**版本：`flush_sync()`
@@ -739,23 +883,29 @@ def _serialize(state: dict[str, Any]) -> str:
     第二次尝试同样要接住 **TypeError**：`set`/自定义对象这类值根本没有 JSON 表示，
     而原来的写法只接 ValueError，于是它会一路冒到 `flush()`，变成「从此再也写不出
     状态」（每次落盘都在同一个值上失败）。清洗比丢弃整棵树便宜。
+
+    **返回 None = 这份状态不可安全序列化**，调用方必须放弃这次落盘。最后一级以前是
+    `json.dumps(default_state())`：写盘「成功」了，写出去的却是一份空状态——用户的
+    好感、关系、记忆全被这份「兜底」抹掉，而日志里只有一条 warning。宁可这次不写，
+    也不能用空状态覆盖真数据。`RecursionError`（环引用）以前根本没被捕获，会一路
+    冒到落盘循环里。
     """
     try:
         return json.dumps(
             state, ensure_ascii=False, separators=(",", ":"), allow_nan=False
         )
-    except (TypeError, ValueError):
-        sanitized = _finite_safe(state)
+    except (TypeError, ValueError, RecursionError):
+        try:
+            sanitized = _finite_safe(state)
+        except RecursionError:
+            return None
         try:
             return json.dumps(
                 sanitized, ensure_ascii=False, separators=(",", ":"), allow_nan=False
             )
-        except (TypeError, ValueError):
-            # 连清洗后都写不出来（循环引用这类）：宁可退回一份最小的合法状态，
-            # 也不写出坏文件。
-            return json.dumps(
-                default_state(), ensure_ascii=False, separators=(",", ":")
-            )
+        except (TypeError, ValueError, RecursionError):
+            # 连清洗后都写不出来（环引用这类）：放弃本次落盘，绝不写一份空状态回去。
+            return None
 
 
 class _ChunkedJSONEncoder:
@@ -928,7 +1078,7 @@ class _ChunkedJSONEncoder:
             await self._maybe_yield()
 
 
-async def _serialize_async(state: dict[str, Any]) -> str:
+async def _serialize_async(state: dict[str, Any]) -> str | None:
     """分块异步序列化（P1-4）：输出与 `_serialize` 逐字节一致，但不长时间占用事件循环。"""
     if not isinstance(state, dict):
         return _serialize(state)

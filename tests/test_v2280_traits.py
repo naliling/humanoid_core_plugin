@@ -70,6 +70,15 @@ class DetectTest(unittest.TestCase):
         self.assertTrue(outgoing.outgoing)
         self.assertFalse(outgoing.homebody)
 
+    def test_homebody_is_not_lazy(self):
+        """「宅」只说明活动半径，不是懒：不该触发「允许赖床、拖延、躺一天」。"""
+        got = traits.detect("她是个宅女，社恐，不爱出门")
+        self.assertTrue(got.homebody)
+        self.assertFalse(got.lazy, f"「宅」被判成懒：{got}")
+        hints = " ".join(got.hints)
+        self.assertIn("偏宅", hints)
+        self.assertNotIn("不算勤快", hints, f"宅不该往日程里塞赖床提示：{got.hints}")
+
     def test_identity_words(self):
         got = traits.detect("她还是学生，每天上课；周末去打工，平时要上班")
         self.assertTrue(got.student)
@@ -116,6 +125,46 @@ class DetectTest(unittest.TestCase):
         joined = " ".join(got.hints)
         self.assertIn("夜猫子", joined)
         self.assertIn("00:00-06:00", joined, f"没把「凌晨也是完整一天」说清楚：{got.hints}")
+
+    def test_shift_worker_gets_one_sleep_line_not_three(self):
+        """#46：一个「夜班」人设原来同时注入「夜猫子」「倒班/夜班」「上班族」三行。
+
+        它们说的是同一个作息事实，模型收到三条只会自己挑一条或混着用。
+        """
+        got = traits.detect("她在医院上夜班，三班倒")
+        self.assertTrue(got.shift_worker and got.worker and got.night_owl)
+        joined = " ".join(got.hints)
+        self.assertEqual(len(got.hints), 1, f"夜班人设只该有一条作息线索：{got.hints}")
+        self.assertIn("倒班", joined)
+        self.assertNotIn("上班族", joined, "倒班已经说明了工作状态，不再重复")
+        self.assertNotIn("夜猫子", joined, "同一组互斥：倒班比夜猫子更强")
+
+    def test_sleep_group_keeps_only_the_strongest(self):
+        """夜猫子 × 早起型同时命中（「习惯早起，但最近总熬夜」）也只留一条。"""
+        got = traits.detect("她习惯早起，但最近经常熬夜")
+        self.assertTrue(got.night_owl and got.early_bird)
+        joined = " ".join(got.hints)
+        self.assertIn("夜猫子", joined)
+        self.assertNotIn("早起型", joined, f"同一组只留最强线索：{got.hints}")
+
+    def test_hints_are_state_statements_not_commands(self):
+        """#55：线索是「她的状态」，不是给模型的指令。
+
+        出现「请 / 要 / 应该 / 记得 / 别 / 可以」就把背景变成祈使句：模型会照着
+        执行而不是按她这个人生成，用户改人设也改不动这几句。
+        """
+        personas = (
+            "她是夜猫子，凌晨才睡，白天补觉，很懒散，爱拖延，是个宅女，还是学生。",
+            "她上夜班，三班倒，很自律，爱出门，朋友多。",
+            "她习惯早起，作息规律，很勤快，是个上班族。",
+        )
+        banned = ("请", "要", "应该", "记得", "别", "可以")
+        for text in personas:
+            with self.subTest(persona=text):
+                joined = " ".join(traits.detect(text).hints)
+                self.assertTrue(joined, "用例本身要有线索才验得到")
+                for word in banned:
+                    self.assertNotIn(word, joined, f"线索里出现了指令词「{word}」：{joined}")
 
     def test_trait_hints_accepts_none(self):
         self.assertEqual(traits.trait_hints(None), ())

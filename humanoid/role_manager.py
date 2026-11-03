@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from .core_instance import HumanoidCoreInstance
 from .state import StateStore
 
 LOG_PREFIX = "[humanoid_core]"
+
+#: 启动失败后隔多久再试一次。太短会在「日程服务还没就绪」时反复重建循环，
+#: 太长则一个偶发失败要等一整个间隔。
+RETRY_SECONDS = 30.0
 
 
 class RoleManager:
@@ -37,6 +42,9 @@ class RoleManager:
         self._stop_event = asyncio.Event()
         self._started = False
         self._start_tasks: set[asyncio.Task] = set()
+        # 启动失败的实例留在 _instances 里（消息还得能用它读状态），但后台循环没跑：
+        # 这里记下失败时刻，下一次 get_or_create 在退避期后重试 start()。
+        self._failed_at: dict[str, float] = {}
 
     def get_or_create(self, role_id: str) -> HumanoidCoreInstance:
         if role_id not in self._instances:
@@ -58,15 +66,34 @@ class RoleManager:
             # 实例列表为空。后续首次收到消息创建角色后，也必须启动该角色的
             # 日程/过程/天气/社交后台循环，否则这些功能会“看起来存在但不运行”。
             if self._started:
-                task = asyncio.create_task(
-                    instance.start(),
-                    name=f"humanoid-role-start-{role_id}",
-                )
-                self._start_tasks.add(task)
-                task.add_done_callback(self._on_start_task_done)
+                self._try_start(role_id)
+        elif role_id in self._failed_at:
+            # 上一次启动失败了：实例还在缓存里（消息仍能读到她的状态），但后台循环
+            # 一个都没跑。退避期过后重试——**不清实例**，调用方不需要处理 None。
+            # 原来这里什么都不做：失败一次之后这个角色永远不再尝试启动，
+            # 日程/身体/过程循环直到插件重载都不会跑，日志里也只有一条 warning。
+            if time.monotonic() - self._failed_at[role_id] >= RETRY_SECONDS:
+                del self._failed_at[role_id]
+                self._try_start(role_id)
         return self._instances[role_id]
 
-    def _on_start_task_done(self, task: asyncio.Task) -> None:
+    def _try_start(self, role_id: str) -> None:
+        """起一个角色的启动任务（失败会被记进 _failed_at，等下次重试）。"""
+        instance = self._instances.get(role_id)
+        if instance is None:  # pragma: no cover - 只在 stop() 与 get_or_create 交错时发生
+            return
+        task = asyncio.create_task(
+            instance.start(),
+            name=f"humanoid-role-start-{role_id}",
+        )
+        self._start_tasks.add(task)
+        task.add_done_callback(lambda done, rid=role_id: self._on_start_task_done(done, rid))
+
+    def failed_roles(self) -> dict[str, float]:
+        """启动失败、正在等重试的角色（诊断页用）：{role_id: 失败时刻(monotonic)}。"""
+        return dict(self._failed_at)
+
+    def _on_start_task_done(self, task: asyncio.Task, role_id: str | None = None) -> None:
         """启动任务退出时读一次结局。
 
         原来只挂 `self._start_tasks.discard`：`instance.start()` 抛出的任何异常都没人
@@ -83,6 +110,8 @@ class RoleManager:
             self._log.warning(
                 f"{LOG_PREFIX} 角色启动任务 {task.get_name()} 异常退出: {exc!r}"
             )
+            if role_id is not None:
+                self._failed_at[role_id] = time.monotonic()
             return
         try:
             started = task.result()
@@ -93,6 +122,11 @@ class RoleManager:
             self._log.warning(
                 f"{LOG_PREFIX} 角色启动任务 {task.get_name()} 未能启动（已收到停止信号）"
             )
+            if role_id is not None:
+                self._failed_at[role_id] = time.monotonic()
+            return
+        if role_id is not None:
+            self._failed_at.pop(role_id, None)
 
     def get_all(self) -> list[HumanoidCoreInstance]:
         return list(self._instances.values())
@@ -115,6 +149,8 @@ class RoleManager:
         self._stop_event.set()
         pending = list(self._instances.values())
         self._instances.clear()
+        # 实例都没了，失败记录也没意义：留着会让下次 get_or_create 误以为要退避重试。
+        self._failed_at.clear()
         # 「正在启动」的角色任务不在 `_instances` 的遍历范围里，必须单独取消并 await，
         # 否则 stop() 返回后它们还在启动。
         starting = [t for t in self._start_tasks if not t.done()]

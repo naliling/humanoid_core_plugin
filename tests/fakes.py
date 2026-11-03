@@ -249,6 +249,32 @@ class FrozenClock:
         """与真实 Clock 对齐的 epoch：身体/间隔计算共用这一台冻结的钟。"""
         return self.moment.timestamp()
 
+    @property
+    def tz(self):
+        """与真实 Clock 对齐：冻结时刻自带 tzinfo 时就是她的时区。"""
+        return self.moment.tzinfo
+
+    def local(self, ts: float):
+        from humanoid.clock import local
+
+        return local(ts, self.tz)
+
+    def day_key(self, ts: float | None = None) -> str:
+        from humanoid.clock import day_key
+
+        return day_key(self.timestamp() if ts is None else ts, self.tz)
+
+    def day_ordinal(self, ts: float | None = None) -> int:
+        from humanoid.clock import day_ordinal
+
+        return day_ordinal(self.timestamp() if ts is None else ts, self.tz)
+
+    def day_gap(self, then: float, now: float | None = None) -> int:
+        """与真实 Clock 对齐（R5）：日历天差，别让测试替身把时区口径吃掉。"""
+        from humanoid.clock import day_gap
+
+        return day_gap(then, self.timestamp() if now is None else now, self.tz)
+
     def today_str(self) -> str:
         return self.moment.strftime("%Y-%m-%d")
 

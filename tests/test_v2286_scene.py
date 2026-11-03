@@ -102,9 +102,23 @@ class Safety(unittest.TestCase):
                 self.assertTrue(ccb.safety_block(f"你是小满，{word}。"))
 
     def test_minor_markers(self):
-        for word in ("幼女", "萝莉", "小学生", "初中生", "未成年", "儿童"):
+        for word in ("幼女", "萝莉", "小学生", "初中生", "未成年", "儿童色情"):
             with self.subTest(word=word):
                 self.assertTrue(ccb.safety_block(f"你是{word}小满。"))
+
+    def test_school_context_is_not_a_minor_marker(self):
+        """年级词本身不指人（B6 #81）：「小学教书」「初中同学」不是未成年标识。
+
+        旧词表里有裸「小学」「初中」「儿童」，于是正常的人设描述会把人设判成
+        未成年、静默关掉整条功能——用户只看到「没反应」。
+        """
+        for text in (
+            "她在小学教书，今天开家长会。",
+            "初中同学聚会，聊到很晚。",
+            "明天是儿童节，她答应陪小孩去公园。",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(ccb.safety_block(text), "")
 
     def test_incest_requires_a_pairing_word(self):
         self.assertTrue(ccb.safety_block(INCEST))
@@ -166,14 +180,37 @@ class StaticBody(unittest.TestCase):
         self.assertNotIn(ccb.BODY_KEY, _state(core))
 
     def test_it_is_initialised_once_then_frozen(self):
+        """配置没变 → 档案固定不变（不为每轮重算）；配置变了 → 跟着重建。
+
+        v3.0.3（联动 main.py F6）：原来的判据是「键在不在」，于是改面板永远无效；
+        现在比的是配置值本身。
+        """
         core = _core(ccb_body_depth_cap_cm=16.0)
         first = core.ccb_body()
         self.assertEqual(first["depth_cap_cm"], 16.0)
-        # 换一份配置：已经定下的档案不许变
+        self.assertIs(core.ccb_body(), first, "配置没变时必须是同一份对象（不重算）")
+        # 换一份配置：档案跟着重建，否则面板上改了也白改
         core._config_provider = lambda: HumanoidConfig.from_raw(
             {"timezone_city": "北京", "ccb": True, "ccb_body_depth_cap_cm": 9.0}
         )
-        self.assertEqual(core.ccb_body()["depth_cap_cm"], 16.0)
+        self.assertEqual(core.ccb_body()["depth_cap_cm"], 9.0)
+
+    def test_sensitivity_zero_is_a_real_value(self):
+        """面板允许 0：0 被 `or` 吞成 60 是 bug，不是「默认值」。"""
+        core = _core(ccb=True, ccb_body_sensitivity=0)
+        self.assertEqual(core.ccb_body()["sensitivity"], 0)
+        core._config_provider = lambda: HumanoidConfig.from_raw(
+            {"timezone_city": "北京", "ccb": True, "ccb_body_sensitivity": 35}
+        )
+        self.assertEqual(core.ccb_body()["sensitivity"], 35)
+
+    def test_default_length_can_actually_reach_over_depth(self):
+        """出厂默认必须能走到「过深」：length(15) > depth_cap(14)。"""
+        core = _core()
+        cap = core.ccb_body()["depth_cap_cm"]
+        length = core.ccb_partner("u1")["length_cm"]
+        self.assertGreater(length, cap)
+        self.assertTrue(ccb.is_over_depth(ccb.depth_estimate(length, 3), cap))
 
     def test_partner_profile_is_per_user(self):
         core = _core(ccb_partner_length_cm=15.0)
@@ -296,12 +333,22 @@ class Fallback(unittest.TestCase):
     """A 的兜底：判不出就少说一句，绝不报错、绝不中断。"""
 
     def test_scene_note_empty_when_nothing_known(self):
-        note = ccb.scene_note(pose=-1, site=-1, phase=0, depth_cm=0.0, cap_cm=14.0)
+        note = ccb.scene_note(pose=-1, site=-1, phase=0, over=None)
         self.assertEqual(note, "")
 
     def test_scene_note_partial_when_only_phase(self):
-        note = ccb.scene_note(pose=-1, site=-1, phase=2, depth_cm=0.0, cap_cm=14.0)
-        self.assertIn("平台", note)
+        note = ccb.scene_note(pose=-1, site=-1, phase=2, over=False)
+        self.assertIn("沉醉", note)
+
+    def test_scene_note_never_leaks_cm(self):
+        """代理量不进注入：撑满只给感受词，不给 cm 数字/上限。"""
+        for over in (True, False, None):
+            with self.subTest(over=over):
+                note = ccb.scene_note(pose=0, site=1, phase=2, over=over)
+                self.assertNotIn("cm", note)
+                self.assertNotIn("过深", note)
+        self.assertIn("撑得有点满", ccb.scene_note(pose=-1, site=-1, phase=2, over=True))
+        self.assertNotIn("撑得", ccb.scene_note(pose=-1, site=-1, phase=2, over=False))
 
     def test_injection_degrades_to_one_line(self):
         core = _core(ccb_scene_detail=False)
@@ -310,7 +357,7 @@ class Fallback(unittest.TestCase):
         self.assertIn("内心：", text)
         self.assertNotIn("·", text.split("内心：")[1].split("\n")[0].split("。")[0])
 
-    def test_unknown_pose_still_gives_depth_and_phase(self):
+    def test_unknown_pose_still_gives_phase_without_cm(self):
         core = _core()
         _mood(core)
         state = _state(core)
@@ -318,8 +365,12 @@ class Fallback(unittest.TestCase):
         # 45 + 40 = 85 → 临界，不会到顶（到顶会清姿势，那是另一条用例）
         state["ccb_satisfy"] = 45.0
         text = core.build_injection("u1")
-        self.assertIn("临界", text)
-        self.assertIn("cm", text)
+        # #62：注入给感受，不给档位名（45+40=85 → 相位 3）。
+        self.assertIn("快忍不住了", text)
+        for word in ccb.PHASE_NAMES:
+            if word:
+                self.assertNotIn(word, text)
+        self.assertNotIn("cm", text)
 
 
 class Injection(unittest.TestCase):
@@ -335,7 +386,9 @@ class Injection(unittest.TestCase):
         text = core.build_injection("u1")
         self.assertIn("后入", text)
         self.assertIn("后面", text)
-        self.assertIn("临界", text)
+        # #62：45+40=85 → 相位 3，注入里是感受词而不是「临界」。
+        self.assertIn("快忍不住了", text)
+        self.assertNotIn("临界", text)
 
     def test_group_never_leaks_the_scene_line(self):
         core = _core()
@@ -345,7 +398,7 @@ class Injection(unittest.TestCase):
         state["ccb_pose"] = 0.0
         state["ccb_site"] = 1.0
         text = core.build_injection("u1", is_group=True)
-        for word in ("后入", "临界", "过深"):
+        for word in ("后入", "临界", "过深", "快忍不住了", "正舒服"):
             self.assertNotIn(word, text)
 
     def test_her_words_drive_the_pose_state(self):
@@ -656,7 +709,7 @@ class AuditRegressions(unittest.TestCase):
     def test_state_segment_does_not_lag_one_turn(self):
         """S3：状态段原来在写 stage **之前**算，进场那轮整段不出、之后每轮慢一拍。
 
-        进场那次满足度 0 → 推进到 40 → 应该已经是「平台」，不是「动情」。
+        F3 之后：进场那一轮**不推进**满足度（首轮 0 → 动情），第二场内轮才 40 → 沉醉。
         """
         core = _core()
         _mood(core)
@@ -666,7 +719,14 @@ class AuditRegressions(unittest.TestCase):
         # 进门需要一点证据（模型分不在时走兜底），这里直接给兜底信号。
         state["ccb_intimacy_at"] = core.now_epoch()
         text = core.build_injection("u1")
-        self.assertIn("平台", text, "进场那一轮就该带状态段，且是推进后的阶段")
+        self.assertIn("心跳有点快", text, "进场那一轮就该带状态段（首轮是相位 1）")
+        self.assertNotIn("动情", text, "#62：档位名不进注入")
+        self.assertEqual(float(state.get("ccb_satisfy", 0.0) or 0.0), 0.0, "进场那轮不推进")
+        # 第二场内轮：越过「同一轮请求」去重，推进一格 → 40 → 沉醉。
+        state["ccb_advance_at"] = 0.0
+        text = core.build_injection("u1")
+        self.assertIn("正舒服", text, "第二场内轮推进到 40，状态段该是相位 2 的感受")
+        self.assertNotIn("沉醉", text, "#62：档位名不进注入")
         self.assertEqual(float(state.get("ccb_satisfy", 0.0) or 0.0), 40.0)
 
     def test_peak_turn_still_says_something(self):
@@ -677,7 +737,8 @@ class AuditRegressions(unittest.TestCase):
         state["ccb_stage"] = 2.0
         state["ccb_satisfy"] = 80.0
         text = core.build_injection("u1")
-        self.assertIn("爆发", text)
+        self.assertIn("到了", text, "#62：相位 4 在注入里是「到了」，不是「爆发」")
+        self.assertNotIn("爆发", text)
 
 
 class NewSwitches(unittest.TestCase):
@@ -686,7 +747,7 @@ class NewSwitches(unittest.TestCase):
         self.assertFalse(cfg.ccb)
         self.assertEqual(cfg.ccb_body_depth_cap_cm, 14.0)
         self.assertEqual(cfg.ccb_body_sensitivity, 60)
-        self.assertEqual(cfg.ccb_partner_length_cm, 13.0)
+        self.assertEqual(cfg.ccb_partner_length_cm, 15.0)
         self.assertTrue(cfg.ccb_scene_detail)
         self.assertEqual(cfg.ccb_aftercare_minutes, 120)
         self.assertFalse(cfg.ccb_scene_log_debug)

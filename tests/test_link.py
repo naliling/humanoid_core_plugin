@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from humanoid import contract as _contract
 from humanoid.config import ConfigBox
 from humanoid.engine import HumanoidEngine
 from humanoid.link import (
@@ -32,6 +33,12 @@ from humanoid.role_manager import RoleManager
 from humanoid.state import StateStore
 
 from .fakes import FakeContext, FrozenClock, RecordingLogger
+
+
+def unknown(reason: str) -> dict:
+    """「读不到」的统一形状（契约 v3：带原因，不再是空字典）。"""
+    return _contract.unavailable(reason)
+
 
 def freeze(core, moment=None):
     """把角色的所有服务换成同一个假时钟：滚动日程按「现在」截段，测试必须定住现在。"""
@@ -217,14 +224,21 @@ class ContractTest(unittest.TestCase):
         for key in ("identity", "day", "outfit", "routine", "weather", "holiday",
                     "persona", "time", "wake", "event"):
             self.assertIn(key, contract, key)
-        # 身体块键名不变、值为中性表示。
+        # 身体块键名一个不少，但**不再用中性数值冒充真值**（契约 v3 / 契约 2）：
+        # 关掉的轴给 None（不知道），块本身标 available=false + 原因。
         body = contract.get("body") or {}
+        self.assertIs(body.get("available"), False, "关掉身体轴时该块必须标不可用")
+        self.assertEqual(body.get("reason"), "soma_disabled")
         for key in ("energy", "energy_text", "sleep_pressure", "sleep_debt", "hunger",
                     "discomfort", "arousal", "asleep", "last_sleep_hours",
                     "social_energy", "social_desire", "cycle_day", "cycle_phase"):
             self.assertIn(key, body, key)
-        self.assertEqual(body.get("sleep_pressure"), 0.0)
-        self.assertFalse(body.get("asleep"))
+        for key in ("sleep_pressure", "sleep_debt", "hunger", "discomfort",
+                    "arousal", "asleep", "last_sleep_hours", "social_desire"):
+            self.assertIsNone(body.get(key), f"{key} 关掉时必须是 None（不知道），不是中性值")
+        # 与身体轴无关、照真值给的几项仍在（社交层要靠它们）。
+        self.assertIsNotNone(body.get("energy"))
+        self.assertIsNotNone(body.get("social_energy"))
 
     def test_contract_disabled_stops_everything(self):
         """contract_enabled=false 才是整份停发（总开关）。"""
@@ -320,7 +334,9 @@ class SignalsTest(unittest.TestCase):
         from humanoid.link import SocialSignals
 
         signals = SocialSignals(lambda: Path(tempfile.mkdtemp()))
-        self.assertEqual(signals.read(), {})
+        # 契约 v3：读不到时给「带原因的空」，而不是裸 `{}`——消费方要能分清
+        # 「没装 / 没写过 / 写坏了 / 过期了」。
+        self.assertEqual(signals.read(), unknown("no_data_root"))
         self.assertEqual(signals.last_proactive(), ("", 0.0))
         self.assertEqual(signals.ignored_streak(), 0)
 
@@ -333,8 +349,48 @@ class SignalsTest(unittest.TestCase):
             mtime_age=SIGNALS_TTL_SECONDS + 60,
         )
         signals = SocialSignals(lambda: root)
-        self.assertEqual(signals.read(), {}, "超过 TTL 的信号必须作废")
+        self.assertEqual(signals.read(), unknown("stale"), "超过 TTL 的信号必须作废")
         self.assertEqual(signals.ignored_streak(), 0)
+
+    def test_corrupt_file_after_ttl_is_dropped(self):
+        """写坏的文件不能无限期沿用上一份：过了保鲜期就必须当没有。
+
+        read() 里四个「读不出来」的早退分支原来直接 `return self._payload or {}`，
+        把 597 行的 TTL 判定整段绕过去了：社交层写坏文件以后，Core 会永远拿着
+        过期的那份「刚主动找过谁」去改好感，而类 docstring 承诺的是「过期时一切返回空」。
+        """
+        from humanoid.link import SocialSignals
+
+        root = self.write_signals({"last_proactive_at": 1_800_000_000.0, "ignored_streak": 4})
+        signals = SocialSignals(lambda: root)
+        self.assertEqual(signals.ignored_streak(), 4)
+        path = root / "plugin_data" / SOCIAL_PLUGIN_DIR_NAME / SIGNALS_FILE_NAME
+        path.write_text("{not json", encoding="utf-8")
+        import os
+
+        stamp = time.time() - (SIGNALS_TTL_SECONDS + 60)
+        os.utime(path, (stamp, stamp))
+        self.assertEqual(signals.read(), unknown("corrupt"), "坏文件 + 超过 TTL 必须作废")
+        self.assertEqual(signals.ignored_streak(), 0)
+        self.assertFalse(signals.is_fresh())
+
+    def test_corrupt_file_within_ttl_is_not_the_old_payload(self):
+        """保鲜期内写坏也不是「沿用上一份」：读坏了就是读坏了（B5 矩阵 D3）。
+
+        旧行为在 TTL 内 `return self._payload`，于是 `read()` 给出旧数据（不带任何
+        标记，看起来与新鲜数据一样），`status()` 却因为 `_unreadable` 报 unreadable——
+        同一对象对同一份文件两个答案。上一次的事实不是这一次的读取结果。
+        """
+        from humanoid.link import SocialSignals
+
+        root = self.write_signals({"last_proactive_at": 1_800_000_000.0, "ignored_streak": 4})
+        signals = SocialSignals(lambda: root)
+        self.assertEqual(signals.ignored_streak(), 4)
+        path = root / "plugin_data" / SOCIAL_PLUGIN_DIR_NAME / SIGNALS_FILE_NAME
+        path.write_text("{not json", encoding="utf-8")
+        self.assertEqual(signals.read(), unknown("corrupt"))
+        self.assertEqual(signals.status()["state"], "unreadable")
+        self.assertFalse(signals.is_fresh())
 
     def test_fresh_within_ttl_is_kept(self):
         """TTL 之内必须采信——原来 TTL 写死 900 秒，而心跳间隔可配到 120 分钟，
@@ -361,7 +417,7 @@ class SignalsTest(unittest.TestCase):
             {"ignored_streak": 4, "ttl_seconds": 120}, mtime_age=600
         )
         signals = SocialSignals(lambda: root)
-        self.assertEqual(signals.read(), {}, "声明了 120 秒就该按 120 秒算")
+        self.assertEqual(signals.read(), unknown("stale"), "声明了 120 秒就该按 120 秒算")
         self.assertEqual(signals._ttl(), 120.0, "过期之后也要按写方声明的算，不许落回默认值")
         self.assertEqual(signals.ignored_streak(), 0)
 
@@ -386,7 +442,7 @@ class SignalsTest(unittest.TestCase):
         social.mkdir(parents=True)
         (social / SIGNALS_FILE_NAME).write_text("not json at all", encoding="utf-8")
         signals = SocialSignals(lambda: root)
-        self.assertEqual(signals.read(), {})
+        self.assertEqual(signals.read(), unknown("corrupt"))
 
     def test_proactive_signal_drains_desire_once(self):
         harness = Harness()
@@ -541,7 +597,7 @@ class InjectionBudgetTest(unittest.TestCase):
         self.assertEqual(text.count(MARK_PREFIX), 1, text)
         self.assertNotIn("由你自己判断", text, "框架句被复制进每条消息了")
         self.assertIn("由你自己判断", FRAMING_TEXT, "怎么读这些事实，得在 system_prompt 里说清")
-        self.assertIn("身体与生活", FRAMING_TEXT)
+        self.assertIn("我现在的身体", FRAMING_TEXT)
 
 
 class DiagnosticsTest(unittest.TestCase):
@@ -554,7 +610,29 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertIn("联动契约", text)
         self.assertIn("社交层信号", text)
         self.assertIn("Token 预算", text)
-        self.assertIn("实测", text)
+        # 数字来自一次**假用户私聊**探针，不是聊天时真实追加的上下文；文案必须这么说。
+        self.assertIn("私聊探针", text)
+        self.assertNotIn("聊天时追加的上下文", text)
+
+    def test_probe_failure_is_reported_instead_of_vanishing(self):
+        """探针炸了/注入为空时，诊断页必须写「测不出来：<原因>」，不能让整节静默消失。"""
+        harness = Harness()
+        core = harness.roles.get_or_create("bot1")
+
+        def boom(*_a, **_k):
+            raise RuntimeError("探针炸了")
+
+        core.build_injection = boom
+        text = harness.engine.diagnostics_text(core)
+        self.assertIn("测不出来", text)
+        self.assertIn("探针炸了", text)
+
+    def test_empty_probe_is_reported_as_such(self):
+        harness = Harness()
+        core = harness.roles.get_or_create("bot1")
+        core.build_injection = lambda *_a, **_k: ""
+        text = harness.engine.diagnostics_text(core)
+        self.assertIn("测不出来：注入为空", text)
 
     def test_report_shows_routine_and_wake_time(self):
         harness = Harness()
@@ -692,7 +770,7 @@ class SignalsScopeAndTtlTest(unittest.TestCase):
         # 文件再出现时指纹没变就直接返回空。
         stamp = time.time() - 10 ** 6
         os.utime(signals_path(root), (stamp, stamp))
-        self.assertEqual(signals.read(), {})
+        self.assertEqual(signals.read(), unknown("stale"))
         self.assertIsNone(signals._fingerprint)
         self.assertEqual(signals._payload, {})
         # 但写方声明的保鲜期**留着**：它是写方的属性，不是这一份 payload 的。
@@ -725,7 +803,7 @@ class SignalsScopeAndTtlTest(unittest.TestCase):
             {"ignored_streak": 4, "ttl_seconds": 120}, mtime_age=600
         )
         signals = SocialSignals(lambda: root)
-        self.assertEqual(signals.read(), {})  # 先让它过期一次，缓存被清
+        self.assertEqual(signals.read(), unknown("stale"))  # 先让它过期一次，缓存被清
         path = signals_path(root)
         path.write_text(json.dumps({"ignored_streak": 9}), encoding="utf-8")
         stamp = time.time() - 600

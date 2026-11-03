@@ -93,6 +93,86 @@ class SiblingChatGuardTest(unittest.TestCase):
             "拒绝不记账：窗口仍从最后一次**放行**算起",
         )
 
+    def test_human_clears_only_the_pair_that_spoke(self):
+        """人在这条链上说话，只该结束这条链：另一对 bot 的额度不能被动到。
+
+        额度是按 (role, peer) 记的。以前 note_human 无条件清该角色名下全部 peer，
+        于是 A 群有人说句话，B 群那对 bot 的额度也被清零——一条人类消息就重开一轮。
+        """
+        guard = SiblingChatGuard()
+        now = 9_000.0
+        for peer in ("p1", "p2"):
+            for _ in range(3):
+                guard.allow("role", peer, now)
+            self.assertFalse(guard.allow("role", peer, now))
+        guard.note_human("role", "p1")
+        self.assertTrue(guard.allow("role", "p1", now), "说话的这一对该重新可聊")
+        self.assertFalse(guard.allow("role", "p2", now), "没说话的 peer 额度不该被清")
+
+    def test_human_without_peer_falls_back_to_every_peer(self):
+        """拿不到 peer（None / 空 / 病态值）时宁可多清，也不能让链继续。"""
+        for bad_peer in (None, ""):
+            with self.subTest(peer=repr(bad_peer)):
+                guard = SiblingChatGuard()
+                now = 9_000.0
+                for peer in ("p1", "p2"):
+                    for _ in range(3):
+                        guard.allow("role", peer, now)
+                guard.note_human("role", bad_peer)
+                for peer in ("p1", "p2"):
+                    self.assertTrue(guard.allow("role", peer, now))
+
+    def test_quota_is_per_conversation(self):
+        """同一个 peer 在两个会话里各算各的：A 群聊满不该让 B 群也静默。"""
+        guard = SiblingChatGuard()
+        now = 9_000.0
+        for _ in range(3):
+            self.assertTrue(guard.allow("r", "p", now, scope="group:A"))
+        self.assertFalse(guard.allow("r", "p", now, scope="group:A"))
+        self.assertTrue(
+            guard.allow("r", "p", now, scope="group:B"),
+            "另一个会话的第一句该放行",
+        )
+
+    def test_human_clears_only_the_conversation_that_spoke(self):
+        """人只在某一条链上说话：别的会话里那对 bot 的额度不能被顺手清零。"""
+        guard = SiblingChatGuard()
+        now = 9_000.0
+        for _ in range(3):
+            guard.allow("r", "p", now, scope="group:A")
+            guard.allow("r", "p", now, scope="group:B")
+        guard.note_human("r", "p", "group:A")
+        self.assertTrue(guard.allow("r", "p", now, scope="group:A"))
+        self.assertFalse(
+            guard.allow("r", "p", now, scope="group:B"),
+            "没说话的会话额度不该被清",
+        )
+
+    def test_human_with_scope_but_no_peer_clears_that_conversation_only(self):
+        """人在某个会话里说话：只清这个会话的链，别的会话不受影响。"""
+        guard = SiblingChatGuard()
+        now = 9_000.0
+        for _ in range(3):
+            guard.allow("r", "p1", now, scope="group:A")
+            guard.allow("r", "p2", now, scope="group:B")
+        guard.note_human("r", None, "group:A")
+        self.assertTrue(guard.allow("r", "p1", now, scope="group:A"))
+        self.assertFalse(
+            guard.allow("r", "p2", now, scope="group:B"),
+            "别的会话的额度不该被清",
+        )
+
+    def test_human_with_peer_but_no_scope_clears_every_conversation(self):
+        """只拿到 peer、拿不到会话时，清这一对在所有会话里的额度（宁可多清）。"""
+        guard = SiblingChatGuard()
+        now = 9_000.0
+        for _ in range(3):
+            guard.allow("r", "p", now, scope="group:A")
+            guard.allow("r", "p", now, scope="group:B")
+        guard.note_human("r", "p")
+        for scope in ("group:A", "group:B"):
+            self.assertTrue(guard.allow("r", "p", now, scope=scope))
+
     def test_human_clears_every_peer_of_that_role(self):
         guard = SiblingChatGuard()
         now = 9_000.0
@@ -242,16 +322,57 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(blocked.is_stopped())
 
     async def test_human_message_clears_the_sibling_chain(self):
+        """同一个群里真人开口 → 这个群的机器对机器链结束。
+
+        必须用同一个会话（umo）：额度是按 (role, peer, 会话) 记的，私聊里人说话
+        与 bot 私聊本就不是一个会话，清不到也不该清。
+        """
+        group = "aiocqhttp:group:G"
         for _index in range(3):
-            event, _req = await self._reply()
+            event = FakeEvent("兄弟说话", sender=SIBLING, private=False)
+            event.unified_msg_origin = group
+            await self.star.inject_context(event, FakeProviderRequest(""))
             self.assertFalse(event.is_stopped())
-        blocked, _req = await self._reply()
+        blocked = FakeEvent("兄弟第 4 句", sender=SIBLING, private=False)
+        blocked.unified_msg_origin = group
+        await self.star.inject_context(blocked, FakeProviderRequest(""))
         self.assertTrue(blocked.is_stopped(), "额度先要真的用完")
 
-        # 真人开口 → 机器对机器那条链结束
-        await self.star.on_message(FakeEvent("在吗", sender=HUMAN))
-        fresh, _req = await self._reply("兄弟又来了")
+        # 同一个群里真人开口 → 机器对机器那条链结束
+        human = FakeEvent("在吗", sender=HUMAN, private=False)
+        human.unified_msg_origin = group
+        await self.star.on_message(human)
+        fresh = FakeEvent("兄弟又来了", sender=SIBLING, private=False)
+        fresh.unified_msg_origin = group
+        await self.star.inject_context(fresh, FakeProviderRequest(""))
         self.assertFalse(fresh.is_stopped(), "真人开口后兄弟 bot 应能重新聊")
+
+    async def test_human_in_another_group_does_not_clear_this_chain(self):
+        """额度按 (role, peer, 会话) 记：别的群有人说话，不该重开这个群的互刷。"""
+        group_a = FakeEvent("A 群兄弟说话", sender=SIBLING, private=False)
+        group_a.unified_msg_origin = "aiocqhttp:group:A"
+        for _index in range(3):
+            event = FakeEvent("A 群兄弟说话", sender=SIBLING, private=False)
+            event.unified_msg_origin = "aiocqhttp:group:A"
+            await self.star.inject_context(event, FakeProviderRequest(""))
+            self.assertFalse(event.is_stopped())
+        blocked = FakeEvent("A 群兄弟第 4 句", sender=SIBLING, private=False)
+        blocked.unified_msg_origin = "aiocqhttp:group:A"
+        await self.star.inject_context(blocked, FakeProviderRequest(""))
+        self.assertTrue(blocked.is_stopped(), "额度先要真的用完")
+
+        # B 群里真人开口：只该结束 B 群那条链
+        human_b = FakeEvent("B 群有人说话", sender=HUMAN, private=False)
+        human_b.unified_msg_origin = "aiocqhttp:group:B"
+        await self.star.on_message(human_b)
+
+        still = FakeEvent("A 群兄弟又来了", sender=SIBLING, private=False)
+        still.unified_msg_origin = "aiocqhttp:group:A"
+        await self.star.inject_context(still, FakeProviderRequest(""))
+        self.assertTrue(
+            still.is_stopped(),
+            "A 群的额度用完了，B 群有人说话不该把它清掉",
+        )
 
     async def test_human_messages_are_not_rate_limited(self):
         """护栏只打在兄弟 bot 上：真人的消息一次都不该被它挡。"""

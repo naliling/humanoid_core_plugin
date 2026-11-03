@@ -21,7 +21,7 @@ ENERGY_WORDS: list[tuple[float, tuple[str, ...]]] = [
     (0, ("很疲惫", "身上没劲", "累得不想动")),
 ]
 from ..role_scope import RoleScope
-from ..slots import Slot, clamp_rate, parse_time
+from ..slots import Slot, clamp_rate, iter_segments
 
 CONSUMPTION_DISCOUNT = 0.7
 # 8 个阶段各一段的精力消耗系数（按 28 天标准轴：月经期 / 卵泡早 / 卵泡中 /
@@ -92,6 +92,25 @@ def _covered_minutes(spans: list[tuple[float, float]], start_ts: float, end_ts: 
     return total / 60.0
 
 
+def _free_pieces(
+    start: float, end: float, taken: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """[start, end) 里还没被 `taken` 结算过的子区间（先到先得）。"""
+    pieces: list[tuple[float, float]] = [(start, end)]
+    for taken_lo, taken_hi in taken:
+        if taken_hi <= taken_lo or not pieces:
+            continue
+        next_pieces: list[tuple[float, float]] = []
+        for lo, hi in pieces:
+            if taken_hi <= lo or taken_lo >= hi:
+                next_pieces.append((lo, hi))
+                continue
+            if lo < taken_lo:
+                next_pieces.append((lo, min(taken_lo, hi)))
+            if taken_hi < hi:
+                next_pieces.append((max(taken_hi, lo), hi))
+        pieces = next_pieces
+    return pieces
 def describe_energy(energy: float, seed=None) -> str:
     """精力档位词。**只说身体，不说语气**——「精力充沛，语气轻快」那半句是在教她怎么说话。"""
     ladder = ENERGY_WORDS
@@ -289,35 +308,49 @@ class EnergyService:
 
         total = 0.0
         covered: list[tuple[float, float]] = []
+        # 已经结算过的分钟区间。历史存档里结转段会既物化进 daily_schedule、
+        # 又留在 segment_carry 里，current_slots() 于是给出两段完全相同的时段
+        # （schedule.current_slots）。旧写法对每段各加一遍，同一觉被扣两次。
+        settled: list[tuple[float, float]] = []
         for slot in slots:
-            slot_start = parse_time(slot.get("start"))
-            slot_end = parse_time(slot.get("end"))
-            if slot_start is None or slot_end is None or slot_end <= slot_start:
-                continue
-            lo = _day_epoch(anchor, slot_start)
-            hi = _day_epoch(anchor, slot_end)
-            overlap_start = max(lo, start_ts)
-            overlap_end = min(hi, end_ts)
-            if overlap_end <= overlap_start:
-                continue
-            covered.append((overlap_start, overlap_end))
-            minutes = (overlap_end - overlap_start) / 60.0
+            # 跨午夜段拆成两截、各自锚在**同一份日程**的坐标里（日循环口径，
+            # 见 slots.iter_segments）：22:00→07:00 是当天的 [22:00, 24:00) 与
+            # [00:00, 07:00)。旧写法 `if slot_end <= slot_start: continue` 把整段
+            # 丢掉，于是 `_settle_span` 在午夜切开之后，熬夜段那一整夜既不消耗也
+            # 不进 covered，落进下面的「空隙」分支只拿自然恢复——熬夜越久回血越多
+            # （审核 F5）。`covered.append` 必须在按 rate 分支 continue 之前，
+            # 否则「只消耗不恢复」的那一截会被当成空隙再补一次恢复。
+            for start_m, end_m in iter_segments(slot):
+                lo = _day_epoch(anchor, start_m)
+                hi = _day_epoch(anchor, end_m)
+                overlap_start = max(lo, start_ts)
+                overlap_end = min(hi, end_ts)
+                if overlap_end <= overlap_start:
+                    continue
+                covered.append((overlap_start, overlap_end))
+                # 同一分钟只结算一次：先到先得，后来者只结算还没被结算的那部分。
+                # 分钟数先加总再套一次公式，单段/不重叠时取整与旧行为完全一致。
+                pieces = _free_pieces(overlap_start, overlap_end, settled)
+                settled.append((overlap_start, overlap_end))
+                minutes = sum(piece_hi - piece_lo for piece_lo, piece_hi in pieces) / 60.0
+                if minutes <= 0:
+                    continue
 
-            rate = clamp_rate(slot.get("energy_rate", 0.0))
-            if rate < 0:
-                # 消耗永远计：跨天之后那一截也要算，旧写法整段丢掉。
-                total += (
-                    rate * CONSUMPTION_DISCOUNT * consumption_factor * decay * minutes * discomfort_factor
-                )
-                continue
-            if not recovery:
-                continue
+                rate = clamp_rate(slot.get("energy_rate", 0.0))
+                if rate < 0:
+                    # 消耗永远计：跨天之后那一截也要算，旧写法整段丢掉。
+                    total += (
+                        rate * CONSUMPTION_DISCOUNT * consumption_factor * decay * minutes * discomfort_factor
+                    )
+                    continue
+                if not recovery:
+                    continue
 
-            total += rate * decay * minutes
-            if cfg.enable_energy_natural_recovery and recovery_per_min > 0:
-                credited = (int(minutes) // recovery_step) * recovery_step
-                if credited > 0:
-                    total += recovery_per_min * recovery_factor * decay * credited
+                total += rate * decay * minutes
+                if cfg.enable_energy_natural_recovery and recovery_per_min > 0:
+                    credited = (int(minutes) // recovery_step) * recovery_step
+                    if credited > 0:
+                        total += recovery_per_min * recovery_factor * decay * credited
 
         # 空隙：日程非空但没盖到的那几分钟，旧写法既不消耗也不恢复 —— 精力被冻住。
         # 这与 185-187 行「没日程可依时按自然恢复算，不按 0」是同一条口径，只是

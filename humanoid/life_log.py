@@ -97,8 +97,12 @@ def _as_list(raw: Any) -> list[dict[str, Any]]:
     return out
 
 
-def parse_open(raw: Any) -> list[dict[str, Any]]:
+def parse_open(raw: Any) -> list[dict[str, Any]] | None:
     """解析社交层发布的 `open_items`（`link.SocialSignals.open_items` 用它）。
+
+    **返回 None = 不知道**（形状不认识/读不出来），返回 `[]` = 确定「一件事都没开着」。
+    以前两种都返回 `[]`，于是「信号文件写坏了」被下游读成「全结了」：
+    `_ingest_open_items` 拿 `[]` 去整体替换，当场清空她全部的未完事项。
 
     这里**不算** `until`：写方给的是发布时刻，到期时刻得由 Core 在摄取时按她自己的
     钟算（见 `merge_open`）。两边的钟本来就可能差着时区，拿对方的时刻当到期时刻
@@ -110,7 +114,8 @@ def parse_open(raw: Any) -> list[dict[str, Any]]:
     一条她自己许下的诺（「明天给你看那个」）会被读成「刚才那段话被打断了」。
     """
     if not isinstance(raw, list):
-        return []
+        # 不是 list：形状不认识 → 不知道，不是「空的」。
+        return None
     return [entry for entry in (_normalize(item) for item in raw) if entry][:MAX_OPEN]
 
 
@@ -129,9 +134,13 @@ def merge_open(
     读回来是空的，那种「空」表示「不知道」，不表示「全结了」——拿它当结论会把
     她的未完事项在她不知情的时候整本清掉。社交层停摆的兜底是 `OPEN_TTL_HOURS`。
     """
+    parsed = parse_open(incoming)
+    if parsed is None:
+        # 「不知道」不能当「全结了」：原样保留现有那本账（与 docstring 的口径一致）。
+        return _as_list(existing)
     fresh: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in parse_open(incoming):
+    for item in parsed:
         if item["text"] in seen:
             # 同一件事被社交层列了两遍（它那边 loop 与 promise 可能同时命中）：
             # 留一条，否则同一个话题会占掉两个名额。
@@ -187,15 +196,21 @@ def ago_text(at: Any, now: Any) -> str:
 
 
 def _who(uid: str, name_of: Callable[[str], str] | None) -> str:
-    """这件事是跟谁有关的。认不出名字就退回「TA」——注入里对对方的称呼就是这个。"""
+    """这件事是跟谁有关的；认不出名字就返回空串（不指名）。
+
+    **不能退回「TA」**：`prompt_builder._personalize` 的约定是「词表里 TA 指玩家」，
+    它会把每一个独立成词的 TA 换成**当前说话人**的名字（prompt_builder.py:1862）。
+    这里退回「TA」再被替换，就等于把 A 的私事写成「和当前说话人之间还有件事没完」
+    ——指错人（审核 注入取舍 #88）。名字认不出时宁可只说「她手上还有件事没完」。
+    """
     if not uid:
         return ""
     if name_of is None:
-        return "TA"
+        return ""
     try:
-        return str(name_of(uid) or "").strip() or "TA"
+        return str(name_of(uid) or "").strip()
     except Exception:
-        return "TA"
+        return ""
 
 
 def render_lines(
@@ -225,7 +240,7 @@ def render_lines(
     entries = sorted(_as_list(items), key=lambda entry: (-entry["at"], entry["text"]))
     # 按**身份**（uid）聚成一组，相邻的同一个人合成一句。分组只认相邻：entries 已按时间排好，
     # 跨过去把同一个人的事凑到一起会打乱「新的在前」。按 uid 而不是按渲染出来的名字分组，
-    # 是因为两个都认不出名字的人渲染出来都是「TA」——按名字分会把两个人的事并成一句。
+    # 是因为认不出名字的人渲染出来都是空称呼——按名字分会把两个人的事并成一句。
     groups: list[tuple[str, str, list[str]]] = []
     for entry in entries[: max(0, int(max_open))]:
         ago = ago_text(entry["at"], now)

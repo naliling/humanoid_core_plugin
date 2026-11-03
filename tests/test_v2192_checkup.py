@@ -182,11 +182,12 @@ class TokenBudgetTest(unittest.TestCase):
             ("她困得不行", 8.0),
             (long_day, 4.0),
         ]
+        rendered_head = long_day.replace("她", "我")[:6]  # _finish 出口把「她」转第一人称
         tight = self._finish(200, sents)
         loose = self._finish(20000, sents)
-        self.assertIn(long_day[:6], loose, "预算宽裕时长句本该留下")
-        self.assertNotIn(long_day[:6], tight, "预算调小后低显著度的句子没被丢：预算没用上")
-        for must_keep in ("私聊", "15:00", "小鱼", "她困得不行"):
+        self.assertIn(rendered_head, loose, "预算宽裕时长句本该留下")
+        self.assertNotIn(rendered_head, tight, "预算调小后低显著度的句子没被丢：预算没用上")
+        for must_keep in ("私聊", "15:00", "小鱼", "我困得不行"):
             self.assertIn(must_keep, tight, f"必需品被丢了：{tight}")
 
     def test_smaller_budget_never_grows_the_block(self):
@@ -299,7 +300,7 @@ class SleepSentenceTest(unittest.TestCase):
         text = core.build_injection("42", is_group=False)
         # v2.28.0 起睡着那句由 `_sleep_state_lines` 给（并带被吵到/没醒透的细分），
         # 体感里那句「这会儿在睡」不再重复——断言跟着句子更新，防病句的意图不变。
-        self.assertIn("她这会儿正睡着", text, f"睡着没说、或又说两遍主语：{text}")
+        self.assertIn("我这会儿正睡着", text, f"睡着没说、或又说两遍主语：{text}")
         self.assertNotIn("她她", text, f"病句：{text}")
         self.assertNotIn("她这会儿她在睡", text, f"主语重复：{text}")
 

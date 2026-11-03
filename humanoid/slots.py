@@ -28,15 +28,41 @@ NIGHT_FILLER_SLOT = {
 
 # 日程里算「她在睡」的事件名关键词。不能只用「觉」：「觉得」会把一句普通话误判成睡着。
 SLEEP_WORDS = ("睡", "眠", "午休", "小憩", "懒觉", "入睡")
+# 「失眠」「睡不着」「熬夜」都含睡词/眠字，却正相反：她在床上醒着。裸「眠」保留，
+# 由这张排除表兜住（审核 状态9）。
+SLEEP_EXCLUDE_WORDS = ("失眠", "睡不着", "睡眠不足", "睡眠浅")
+# 「熬夜」**不在这张表里**：它是醒着的动作，但句子里往往还带着真正的睡（「熬夜后睡到
+# 中午」）。放在排除表里会连后半句的睡一起否掉——排除表在睡词之前生效，等于让一个
+# 醒词压掉一句明确的睡。它现在归 AWAKE_WORDS：那里只否掉复合判据，睡词照样赢。
 # 吃饭优先于「午休」：「午餐与午休发呆」是在吃饭，不是在睡觉。
 MEAL_WORDS = ("餐", "吃", "饭", "外卖", "食堂")
 
 
+# 睡词与醒词会同时出现在一句话里（「洗漱后上床睡觉」），所以判定顺序固定为：
+# **强醒 → 强睡 → 默认醒着**（审核 #58）。「洗」这类睡前也会做的弱醒词不单独成档：
+# 它在 is_sleep_event 里等同「没有线索」，也**不**挡 slot_sleeps 的复合判据（见该函数注释）。
+# 旧写法没有「强醒」这一档：只要句子里有睡字就算睡，「起床后洗了个澡，准备睡个午觉」
+# 会被判成她正在睡——一个刚起床的人被记成睡觉，比漏判更糟。
+STRONG_AWAKE_WORDS = ("起床", "醒来", "睁眼", "醒了")
+# 「躺下」「上床」是睡的动作而不是睡的词：补上它们，「洗漱后回卧室躺下」这类没有
+# 睡字的真实睡段才判得出来（原来要靠 slot_sleeps 的复合判据，而那条被「洗」挡住了）。
+STRONG_SLEEP_WORDS = SLEEP_WORDS + ("躺下", "上床")
+
+
 def is_sleep_event(event: Any) -> bool:
+    """事件名是否表示她在睡。顺序：强醒 → 强睡 → 默认（醒着）。"""
     text = str(event or "")
     if any(word in text for word in MEAL_WORDS):
         return False
-    return any(word in text for word in SLEEP_WORDS)
+    if any(word in text for word in SLEEP_EXCLUDE_WORDS):
+        return False
+    if any(word in text for word in STRONG_AWAKE_WORDS):
+        return False
+    if any(word in text for word in STRONG_SLEEP_WORDS):
+        return True
+    # 「洗」与「没有任何线索」在这里同归醒着：洗过澡不构成睡眠证据。它也不挡
+    # slot_sleeps 的复合判据（否则「洗漱完在卧室安静待着」这种没有睡字的真睡段会被判醒）。
+    return False
 
 
 def is_meal_event(event: Any) -> bool:
@@ -56,9 +82,14 @@ BED_WORDS = ("床", "被窝", "枕", "毯", "卧室", "榻", "沙发")
 AWAKE_WORDS = (
     "刷", "看", "玩", "吃", "喝", "写", "学", "走", "跑", "聊", "说",
     "工作", "开会", "手机", "电脑", "电视", "出门", "收拾", "整理", "通勤",
-    "打扫", "做饭", "洗", "化妆", "换衣", "起床", "醒来",
+    "打扫", "做饭", "化妆", "换衣", "起床", "醒来",
     # 「回消息」是清醒动作：少了这几个词，「靠着枕头回消息」会被判成睡着。
     "消息", "回复", "打字", "电话",
+    # 「精神了」「清醒」是醒着的状态词：洗完澡精神了却被判成睡，是 #58 的验收反例。
+    "精神", "清醒",
+    # 「熬夜」是醒着的动作，但不是睡的反证：「熬夜后睡到中午」里睡词该赢。所以它只在
+    # 这一档（否掉复合判据），不进 SLEEP_EXCLUDE_WORDS（那张表在睡词之前生效）。
+    "熬夜",
 )
 SLEEP_RATE_MIN = 0.08
 SLEEP_SPAN_MIN_MINUTES = 30
@@ -88,6 +119,14 @@ def slot_sleeps(slot: Any) -> bool:
         return True
     if is_sleep_event(event):
         return True
+    # 排除表与 is_sleep_event 共用同一张表，别放两份：「失眠」「睡不着」在 is_sleep_event
+    # 里被否掉了，但复合判据不再回头看它，于是「卧室 + 睡量级消耗 + 够长」会把失眠判成睡着。
+    if any(word in event for word in SLEEP_EXCLUDE_WORDS):
+        return False
+    if any(word in event for word in STRONG_AWAKE_WORDS):
+        return False
+    # 其余清醒动作（刷手机 / 工作 / 回消息…）否掉下面的复合判据；**「洗」不在其中**：
+    # 它是睡前也会做的事，当成醒着的证据会把「洗漱完在卧室安静待着」判成醒着。
     if any(word in event for word in AWAKE_WORDS):
         return False
     location = str(slot.get("location") or "")
@@ -100,9 +139,8 @@ def slot_sleeps(slot: Any) -> bool:
     lo, hi = parse_time(slot.get("start")), parse_time(slot.get("end"))
     if lo is None or hi is None or lo == hi:
         return False
+    # lo == hi 已在上面 return；取模后 span ∈ [1, 1439]，不会 <= 0。
     span = (hi - lo) % DAY_MINUTES
-    if span <= 0:
-        return False
     return span >= SLEEP_SPAN_MIN_MINUTES
 
 
@@ -127,6 +165,48 @@ def parse_time(raw: Any) -> int | None:
     return total
 
 
+def slot_span(slot: Any) -> tuple[int, int] | None:
+    """一段的 (起, 止) 墙钟分钟；跨午夜时 止 < 起 表示跨到次日。
+
+    零长段（`start == end`）与坏段返回 None：`08:00-08:00` 是坏数据，不是
+    「从 08:00 一直到 24:00」。这里只解析一次，`iter_segments`、
+    `sleep_window_minutes`、`energy._compute_delta` 都从这一个口径取——
+    以前三处各写一遍，于是「22:00→07:00 到底算不算睡」有两个答案
+    （审核 F4）。
+    """
+    if not isinstance(slot, Mapping):
+        return None
+    start = parse_time(slot.get("start"))
+    end = parse_time(slot.get("end"))
+    if start is None or end is None or start == end:
+        return None
+    return start, end
+
+
+def iter_segments(slot: Any) -> list[tuple[int, int]]:
+    """把一段拆成 [起, 止) 的分钟区间；跨午夜拆成「当天尾巴 + 凌晨那截」。
+
+    `{'start': '22:00', 'end': '07:00'}` → `[(1320, 1440), (0, 420)]`。
+    这是**日循环**口径：凌晨那截锚在同一份日程的 00:00–07:00 上，因为这份日程
+    每天都重来一遍（今天 22:00 那一觉的尾巴，在明天的同形状日程里就是 00:00–07:00）。
+
+    要按「哪一天」还原成时间戳的调用方（`energy._compute_delta`）也逐截用本函数、
+    每截锚在自己的 anchor 当天：`_settle_span` 已经在本地午夜把窗口切开，两截各算
+    各的，接起来正好是一整段。若改成「取 `slot_span` 补一天」，第二截（00:00–07:00）
+    的 anchor 是次日，前一晚那个结算窗口就盖不上它。
+    """
+    span = slot_span(slot)
+    if span is None:
+        return []
+    start, end = span
+    if end > start:
+        return [(start, end)]
+    segments = [(start, DAY_MINUTES)]
+    if end > 0:
+        segments.append((0, end))
+    return segments
+
+
 def format_time(minutes: int) -> str:
     minutes = max(0, min(DAY_MINUTES, int(minutes)))
     if minutes == DAY_MINUTES:
@@ -142,158 +222,6 @@ def clamp_rate(raw: Any) -> float:
     if rate != rate:
         return 0.0
     return max(-MAX_ENERGY_RATE, min(MAX_ENERGY_RATE, rate))
-
-
-def _snap(minutes: int, step: int) -> int:
-    if step <= 1:
-        return minutes
-    if minutes in (0, DAY_MINUTES):
-        return minutes
-    # 向下对齐，与 `schedule.segment_start`（655-662）同一立场：四舍五入会把起点
-    # 推到未来（20:40 对齐成 20:45），那一段就罩不住「现在」。
-    snapped = (minutes // step) * step
-    return max(0, min(DAY_MINUTES, snapped))
-
-
-def _make_slot(start: int, end: int, template: Mapping[str, Any]) -> Slot:
-    slot = {
-        "start": format_time(start),
-        "end": format_time(end),
-        "event": str(template.get("event", "") or FILLER_SLOT["event"]),
-        "location": str(template.get("location", "") or FILLER_SLOT["location"]),
-        "emotion": str(template.get("emotion", "") or FILLER_SLOT["emotion"]),
-        "energy_rate": clamp_rate(template.get("energy_rate", 0.0)),
-    }
-    # 「还没做完」：这件是不是一件要跨几天的事（整理那份个案笔记）。
-    #
-    # 没有它，她的每一天都是**互不相关**的——今天改方案、明天改方案，两边没有
-    # 「还没弄完」这层，于是每段都像新任务。有它，跨天就有连续性，而且它也是
-    # social 那边最好的由头来源（比天气有意思得多）。
-    ongoing = str(template.get("ongoing", "") or "").strip()[:40]
-    if ongoing:
-        slot["ongoing"] = ongoing
-    # 「她自己想做的」——一天里可以有一两段不是工作、不是必须，是她自己挑的。
-    # 以前她的日程全是 duty（门诊接待、写记录、外出），于是她像个只有日程没有生活的人。
-    if template.get("wants"):
-        slot["wants"] = True
-    # 解析时按**完整原文**判出来的睡着标记要留下来：规范化会重建 slot，丢了它，
-    # 被截断成 24 字的事件名就再也说不清那一段是睡了还是醒着。
-    if template.get("sleep"):
-        slot["sleep"] = True
-    dreams = template.get("dreams")
-    if isinstance(dreams, (list, tuple)) and dreams:
-        slot["dreams"] = list(dreams)[:3]
-    return slot
-
-
-def _parse_entries(raw: Iterable[Any]) -> list[tuple[int, int, Mapping[str, Any]]]:
-    parsed: list[tuple[int, int, Mapping[str, Any]]] = []
-    for item in raw:
-        if not isinstance(item, Mapping):
-            continue
-        start = parse_time(item.get("start"))
-        end = parse_time(item.get("end"))
-        if start is None or end is None:
-            continue
-        if end == 0 and start > 0:
-            end = DAY_MINUTES
-        if end <= start:
-            continue
-        parsed.append((start, end, item))
-    return parsed
-
-
-def _resolve_overlaps(
-    entries: list[tuple[int, int, Mapping[str, Any]]],
-) -> list[tuple[int, int, Mapping[str, Any]]]:
-    entries.sort(key=lambda item: (item[0], item[1]))
-    out: list[tuple[int, int, Mapping[str, Any]]] = []
-    cursor = 0
-    for start, end, payload in entries:
-        start = max(start, cursor)
-        if end <= start:
-            continue
-        out.append((start, end, payload))
-        cursor = end
-    return out
-
-
-def _fill_gaps(entries: list[tuple[int, int, Mapping[str, Any]]]) -> list[Slot]:
-    slots: list[Slot] = []
-    cursor = 0
-    for start, end, payload in entries:
-        if start > cursor:
-            filler = NIGHT_FILLER_SLOT if start <= 6 * 60 else FILLER_SLOT
-            slots.append(_make_slot(cursor, start, filler))
-        slots.append(_make_slot(start, end, payload))
-        cursor = end
-    if cursor < DAY_MINUTES:
-        filler = NIGHT_FILLER_SLOT if cursor >= 21 * 60 else FILLER_SLOT
-        slots.append(_make_slot(cursor, DAY_MINUTES, filler))
-    return slots
-
-
-def _merge_neighbours(slots: list[Slot], max_slots: int) -> list[Slot]:
-    if max_slots < 1:
-        return slots
-    while len(slots) > max_slots:
-        durations = [parse_time(s["end"]) - parse_time(s["start"]) for s in slots]
-        victim = min(range(len(slots)), key=lambda i: durations[i])
-        left = victim - 1
-        right = victim + 1
-        if left < 0:
-            keeper = right
-        elif right >= len(slots):
-            keeper = left
-        else:
-            keeper = left if durations[left] >= durations[right] else right
-
-        low, high = min(victim, keeper), max(victim, keeper)
-        span_start = parse_time(slots[low]["start"])
-        span_end = parse_time(slots[high]["end"])
-        total = max(1, durations[low] + durations[high])
-        blended = (
-            slots[low]["energy_rate"] * durations[low] + slots[high]["energy_rate"] * durations[high]
-        ) / total
-        merged = dict(slots[keeper])
-        merged["start"] = format_time(span_start)
-        merged["end"] = format_time(span_end)
-        merged["energy_rate"] = clamp_rate(round(blended, 4))
-        slots[low : high + 1] = [merged]
-    return slots
-
-
-def normalize_slots(
-    raw: Any,
-    *,
-    max_slots: int = 48,
-    align_minutes: int = 0,
-) -> list[Slot] | None:
-    if not isinstance(raw, Iterable) or isinstance(raw, (str, bytes, Mapping)):
-        return None
-
-    entries = _parse_entries(raw)
-    if not entries:
-        return None
-
-    if align_minutes > 1:
-        aligned: list[tuple[int, int, Mapping[str, Any]]] = []
-        for start, end, payload in entries:
-            snapped_start = _snap(start, align_minutes)
-            snapped_end = _snap(end, align_minutes)
-            if snapped_end <= snapped_start:
-                snapped_end = min(DAY_MINUTES, snapped_start + align_minutes)
-            if snapped_end > snapped_start:
-                aligned.append((snapped_start, snapped_end, payload))
-        entries = aligned or entries
-
-    entries = _resolve_overlaps(entries)
-    if not entries:
-        return None
-
-    slots = _fill_gaps(entries)
-    slots = _merge_neighbours(slots, max(1, int(max_slots)))
-    return slots or None
 
 
 def coverage_is_complete(slots: Iterable[Slot]) -> bool:
@@ -342,18 +270,12 @@ def sleep_window_minutes(slots: Iterable[Slot]) -> tuple[int, int] | None:
         # 生物钟夜跟着退回配置窗口——soma 的昼夜低谷、睡眠债、她几点起，全按错的那一段算。
         if not slot_sleeps(slot):
             continue
-        lo, hi = parse_time(slot.get("start")), parse_time(slot.get("end"))
-        if lo is None or hi is None or hi == lo:
-            continue
-        if hi < lo:
-            # 跨午夜写法（`{'start': '23:00', 'end': '06:00'}`）：拆成当天的两段，
-            # 下面的接缝合并会把它们接回一条。旧写法在这里静默丢弃，于是得到
-            # 「她今天没睡」：起床点为空、生物钟夜退回配置、asleep 永远 False。
-            segs.append([lo, DAY_MINUTES])
-            if hi > 0:
-                segs.append([0, hi])
-            continue
-        segs.append([lo, hi])
+        # 跨午夜写法（`{'start': '23:00', 'end': '06:00'}`）拆成当天的两段，
+        # 下面的接缝合并会把它们接回一条。旧写法在这里静默丢弃，于是得到
+        # 「她今天没睡」：起床点为空、生物钟夜退回配置、asleep 永远 False。
+        # 拆分口径与 soma.slot_at / energy 共用 `iter_segments`（审核 F4）。
+        for lo, hi in iter_segments(slot):
+            segs.append([lo, hi])
     if not segs:
         return None
     segs.sort()

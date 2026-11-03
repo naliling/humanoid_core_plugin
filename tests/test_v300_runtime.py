@@ -461,8 +461,13 @@ class MemoryLastErrorDiagnosticsTest(unittest.TestCase):
         self.assertIn("不会卡住回复", text)
 
     def test_no_failure_says_so(self):
+        # v3.0.2 起 `last_error()` 是「当前故障」，成功读写就清空，不再是「最近一次
+        # 失败」。所以这里只能断言「当前没有故障」，不能断言「没有失败记录」——
+        # 后者会让人以为诊断页留了历史。
         memory_link._LAST_ERROR = ""
-        self.assertIn("没有失败记录", _memory_link_line())
+        text = _memory_link_line()
+        self.assertIn("当前没有故障", text)
+        self.assertNotIn("没有失败记录", text)
 
 
 # ────────────────────────── P1-B / P2-03 门面生命周期 ──────────────────────────
@@ -564,14 +569,22 @@ class ContractGatingTest(unittest.TestCase):
                         "persona", "time", "wake", "event", "ongoing", "wants"):
                 self.assertIn(key, contract, f"非身体块 {key} 不该因身体轴关闭而消失")
             body = contract.get("body") or {}
+            # 契约 v3（联动 契约 2）：关掉身体轴时不再拿中性值冒充真值，
+            # 而是标 available=false + 原因，8 个身体轴给 None（不知道）。
             self.assertEqual(set(body), {
+                "available", "source", "reason",
                 "energy", "energy_text", "sleep_pressure", "sleep_debt", "hunger",
                 "discomfort", "arousal", "asleep", "last_sleep_hours",
                 "social_energy", "social_desire", "cycle_day", "cycle_phase",
             })
-            self.assertEqual(body["sleep_pressure"], 0.0)
-            self.assertEqual(body["social_desire"], 50.0)
-            self.assertFalse(body["asleep"])
+            self.assertIs(body["available"], False)
+            self.assertEqual(body["reason"], "soma_disabled")
+            for key in ("sleep_pressure", "sleep_debt", "hunger", "discomfort",
+                        "arousal", "asleep", "last_sleep_hours", "social_desire"):
+                self.assertIsNone(body[key], f"{key} 关掉时必须是 None（不知道）")
+            # 与身体轴无关的几项照真值给（社交层要靠它们）。
+            self.assertIsNotNone(body["energy"])
+            self.assertIsNotNone(body["social_energy"])
         finally:
             harness.store.flush_sync()
 

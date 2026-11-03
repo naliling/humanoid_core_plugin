@@ -9,7 +9,7 @@ import unittest
 from humanoid.config import HumanoidConfig
 from humanoid.persona import Persona
 from humanoid.services.schedule import ScheduleService, segment_prompt
-from humanoid.slots import normalize_slots
+from .slot_fixtures import normalize_slots
 
 
 class _Scope:
@@ -94,6 +94,33 @@ class StateAcrossDays(unittest.TestCase):
         for i in range(6):
             s._note_ongoing({"ongoing": f"第{i}件不同的事"})
         self.assertLessEqual(len(s.ongoing_tasks()), ScheduleService.ONGOING_MAX)
+
+    def test_same_six_char_prefix_are_different_tasks(self):
+        """前六个字一样不等于同一件事（#157）：旧写法按前 6 字归一，后者会覆盖前者。"""
+        s = _svc()
+        s._note_ongoing({"ongoing": "把那份合同改完"})
+        s._note_ongoing({"ongoing": "把那份合同签了"})
+        self.assertEqual(len(s.ongoing_tasks()), 2, s.ongoing_tasks())
+
+    def test_keeps_the_most_recent_three(self):
+        """超量时留最近的几件：旧写法取列表前三个，留下的正好是最旧的三件。"""
+        s = _svc()
+        for i in range(5):
+            s._note_ongoing({"ongoing": f"第{i}件不同的事"})
+        got = s.ongoing_tasks()
+        self.assertEqual(len(got), ScheduleService.ONGOING_MAX)
+        self.assertEqual(got[0], "第4件不同的事", "最新的排在最前")
+        self.assertNotIn("第0件不同的事", got)
+
+    def test_read_path_returns_newest_first(self):
+        """读路径按 at 倒序：旧写法按存档里的顺序取前三个（= 最旧的三件）。"""
+        s = _svc()
+        now = time.time()
+        s._scope.set_self(s.ONGOING_KEY, [
+            {"what": "很久以前那件", "at": now - 3600},
+            {"what": "刚才那件", "at": now - 60},
+        ])
+        self.assertEqual(s.ongoing_tasks(), ["刚才那件", "很久以前那件"])
 
     def test_expires_after_few_days(self):
         s = _svc()

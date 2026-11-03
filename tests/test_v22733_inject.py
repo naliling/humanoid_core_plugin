@@ -145,16 +145,18 @@ class PersonalizeTest(unittest.TestCase):
         out = PromptBuilder._personalize("TA之前说过「x」，TA今天话很少", user_name="小明")
         self.assertEqual(out, "小明之前说过「x」，小明今天话很少")
 
-    def test_only_the_first_standalone_she_becomes_the_name(self):
+    def test_a_standalone_she_is_not_turned_into_the_name(self):
+        """v13：不再把「她」换成角色名——那次替换正是「角色卡」感的来源。"""
         out = PromptBuilder._personalize("她今天有点累，她说她不想出门", char_name="小雨")
-        self.assertEqual(out, "小雨今天有点累，她说她不想出门")
+        self.assertEqual(out, "她今天有点累，她说她不想出门")
 
     def test_a_she_inside_another_word_is_left_alone(self):
         self.assertEqual(PromptBuilder._personalize("其他人都走了", char_name="小雨"), "其他人都走了")
 
-    def test_the_inner_voice_line_always_gets_the_name(self):
+    def test_the_inner_voice_line_is_left_for_the_render_exit(self):
+        """第一人称化统一在 _finish 出口做；_personalize 只负责 TA→对方名字。"""
         out = PromptBuilder._personalize("她内心：心里有点堵", char_name="小雨")
-        self.assertEqual(out, "小雨内心：心里有点堵")
+        self.assertEqual(out, "她内心：心里有点堵")
 
     def test_no_names_means_no_replacement(self):
         self.assertEqual(PromptBuilder._personalize("她今天有点累"), "她今天有点累")
@@ -224,7 +226,7 @@ class FinishTest(unittest.TestCase):
         )
         head, body = block.split("\n", 1)
         self.assertTrue(head.startswith(MARK_PREFIX), head)
-        self.assertIn("小雨内心：", body)
+        self.assertIn("我内心：", body)
         self.assertIn("小明之前说过", body)
 
     # ── 预算 ──────────────────────────────────────────────
@@ -233,8 +235,14 @@ class FinishTest(unittest.TestCase):
         self.assertIn("甲", block)
         self.assertNotIn("乙", block)
 
-    def test_a_sentence_longer_than_the_whole_budget_yields_nothing(self):
-        self.assertEqual(self.finish([("甲" * 5000, 10.0)], budget=200), "")
+    def test_a_sentence_longer_than_the_whole_budget_is_kept_but_truncated(self):
+        """P-14：一句都留不下时不能交白卷——留最该被看见的那句，按预算截断。"""
+        block = self.finish([("甲" * 5000, 10.0)], budget=200)
+        self.assertNotEqual(block, "")
+        body = block.split("\n", 1)[1]
+        self.assertIn("甲", body)
+        self.assertTrue(body.endswith("…"), f"应当截断：{body[-12:]!r}")
+        self.assertLessEqual(len(body), 200, f"截断后仍要落在预算里：{len(body)}")
 
     def test_a_huge_budget_keeps_everything(self):
         block = self.finish([("甲" * 150, 1.0), ("乙" * 150, 10.0)], budget=20000)
@@ -347,7 +355,7 @@ class MemoryTextTest(unittest.TestCase):
         block = self.h.core.build_injection(
             "10001", memory_text="### 长期记忆\n- 猫叫团子\n- 她住在杭州"
         )
-        self.assertIn("关于TA以前的事：猫叫团子，她住在杭州", block)
+        self.assertIn("关于TA以前的事：猫叫团子，我住在杭州", block)
 
     def test_no_memory_text_means_no_fragment(self):
         self.assertNotIn("关于TA以前的事", self.h.core.build_injection("10001"))

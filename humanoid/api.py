@@ -21,16 +21,36 @@
   消息链路一起带崩，而对方没法区分「Core 坏了」和「我自己写错了」。
 * **不猜**：拿不到就是拿不到，不编默认值（`energy_text` 拿不到就是空串，不是「精神不错」）。
 * **字段只加不改**：`API_VERSION` 只在**破坏性**变化时才动；加字段不动它。
+
+## API_VERSION 3（v3.0.3）
+
+v2 有一条自相矛盾的承诺：`不猜`，但 `self_state.asleep` 恒为 `bool`、数值恒为数字——
+「不知道」被压成了 `false` / `0` / `50`。v3 起这些位置可以是 `null`：
+
+* `self_state.available` / `self_state.reason`：这一块可不可用、为什么（`soma_disabled`）；
+* `self_state.asleep`：`true` / `false` / `null`（`null` = 不知道，**不是**醒着）；
+* `wake.available` / `wake.source` / `wake.stale`：醒没醒这一项从哪来、是不是旧快照；
+* `intimacy.status`：`ok` / `denied`（白名单拒绝，原来与「拿不到」同为 `{}`）；
+* `user.known` / `relationship.known`：这个用户到底有没有档案（`false` 时那些数字是
+  配置初始值，不是关于他的事实）。
+
+`null` 对按算术读的旧消费方是破坏性的，所以 `API_VERSION` 抬到 3；旧消费方按
+`API_VERSION < 3` 可以继续按「数字都是真的」读。
 """
 
 from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
 from typing import Any, Dict, List, Optional
 
-API_VERSION = 2
+from . import contract as _contract
+from . import link as _link
+from .state_snapshot import aggression_default as _aggression_default
+
+API_VERSION = 3
 
 #: 门面能力清单。社交层按这个判断「要不要走门面」，不靠版本号猜。
 #: 只加不改：`dreams` / `wake` 是 v2.28.0 新增的只读能力，API_VERSION 保持 2。
@@ -40,6 +60,10 @@ API_VERSION = 2
 #: v2.28.9 再补两个只读能力（API_VERSION 仍保持 2，只加不改）：
 #: `identity`（她是谁：参照名/人设标签）与 `user`（按人一份的情境：称呼/名片名/
 #: 情绪/注意力/说过的话/亲密档案）。社交层主动开口缺的就是这两块原料。
+#: v3.0.3 起 `self_state` / `wake` / `intimacy` / `user` 里的「不知道」用 `null` +
+#: 块级 `available:false` 表达，不再压成 0/false/{}。**三态不单列为一条 capability**：
+#: 这个元组的语义是「每个名字要么是门面方法、要么有对应的 brief 块」（测试逐条断言），
+#: 三态是读法而不是接口。判「对面懂不懂三态」请看 `API_VERSION >= 3`。
 CAPABILITIES = (
     "brief", "clock", "events", "fingerprint", "dreams", "wake", "intimacy",
     "identity", "user",
@@ -58,13 +82,20 @@ def _num(value: Any, default: float = 0.0) -> float:
     return out if math.isfinite(out) else default
 
 
-def _item_id(prefix: str, text: str) -> str:
+def _item_id(prefix: str, text: str, at: float = 0.0) -> str:
     """稳定 id：同一件事跨轮、跨进程都是同一个 id。
 
     社交层要用它做「这条由头用过了」的记账。以前只能拿文本比，于是「嗯嗯」这种
     两个字的回复和另一句「嗯嗯」分不开——id 让「是不是同一件事」有确定答案。
+
+    `at` 是**这件事发生/被观察到的时刻**（epoch 秒）。只按文本算 id 时，同一句话
+    发生第二次会拿到同一个 id，社交层就以为「这条用过了」而永远不再用它——「她又
+    被同一件事逗笑了」这种重复发生的事只能当由头一次（审核 跨插件契约 14）。给了
+    时刻就把它拼进摘要；拿不到时刻（0.0）仍只按文本，保持稳定。
     """
     raw = _s(text).encode("utf-8")
+    if at and at > 0:
+        raw = f"{int(at)}|".encode("utf-8") + raw
     return f"{prefix}:" + hashlib.blake2b(raw, digest_size=6).hexdigest()
 
 
@@ -149,38 +180,87 @@ class CoreFacade:
 
         这是门面最直接的价值：契约里的 `time` 块不参与重写判定，读文件拿到的偏移
         可能静止几小时；这里每次都是现算的。
+
+        偏移带着「它是谁的」：`offset_source` 为 `zone`（她的城市）/ `host`（这台
+        机器，城市没解析出来）/ `unknown`（naive 时钟，此时 `utc_offset_minutes`
+        是 `None`）；`note` 原样带出退化原因（例如「认不出城市」）。**调用方必须
+        按 `None` 处理**，不要再 `int(x or 0)`——那等于把她的城市当成 UTC。
         """
         core = self._core(role_id)
         if core is None:
             return {}
         try:
             now = core.clock.now()
-            zone = core.clock.zone_state()
+            # 退化原因只是「附加信息」：`zone_state()` 自己抛异常时不该把整块时钟一起丢掉
+            # （旧实现它在同一个 try 里，一抛 `clock()` 就返回 `{}`，调用方连 epoch 都拿不到）。
+            try:
+                zone = core.clock.zone_state()
+            except Exception:
+                zone = None
+            # 偏移与「它是谁的」只有一份推导（`link.utc_offset`）：契约 time 块读同一个函数。
+            # 旧代码 `int(getattr(zone, "offset_minutes", 0) or 0)` 把「不知道偏移」压成 0——
+            # 门面承诺「拿不到就是拿不到」，这里却把她的城市当 UTC（审核 跨插件契约 6）。
+            offset_info = _link.utc_offset(core, now)
+            # 「她实际的夜」只有一份推导（`link.night_window`）：`is_night` / `is_deep_sleep`
+            # 与 `night_window` 读同一个窗口。以前 `is_night` 走 `clock.is_night`（配置窗口
+            # 23:00-7:00），`night_window` 走落盘的契约（日程推出来的 4:00-11:30），同一份
+            # 返回里两个答案（审核 跨插件契约 8）；而且契约快照最多旧 60 秒、被改坏就跟着错。
+            window = _link.night_window(core, getattr(core, "config", None))
+            hour_of_day = now.hour + now.minute / 60.0
             out = {
                 "epoch": float(core.now_epoch()),
-                "utc_offset_minutes": int(getattr(zone, "offset_minutes", 0) or 0),
+                # None = 不知道（naive 时钟），不是 0：调用方必须按「不知道」处理。
+                "utc_offset_minutes": offset_info["minutes"],
+                # `zone`（她的城市）/ `host`（这台机器）/ `unknown`：与契约 time 块同一份推导。
+                "offset_source": offset_info["source"],
+                # 退化原因（城市认不出 / 缺 tzdata）：以前 `clock()` 把它整个丢掉，调用方只看到
+                # 一个偏移数字，没法知道它其实是宿主机偏移（审核 跨插件契约 6）。
+                "note": _s(getattr(zone, "note", "")),
                 "city": _s(getattr(zone, "city", "")),
                 "hour": int(now.hour),
                 "minute": int(now.minute),
                 "weekday": int(now.weekday()),
-                "is_night": bool(core.clock.is_night(now)),
-                "is_deep_sleep": bool(core.clock.is_deep_sleep(now)),
+                "is_night": _link.in_night_window(hour_of_day, window),
+                "is_deep_sleep": _link.in_deep_window(
+                    hour_of_day, window,
+                    getattr(getattr(core, "config", None), "night_deep_sleep_ratio", 0.6),
+                ),
                 "date": now.strftime("%Y-%m-%d"),
+                # 她实际的作息夜（现算）：安静时段该按这个，而不是配置里写死的 23-7。
+                # `night_source` 说清这段是哪来的：`schedule`（她日程里的睡段）/
+                # `config`（还没生成日程，退回配置窗口）/ `none`（夜间模式关掉，或窗口长度为 0）。
+                "night_window": [
+                    round(float(window["start"]) % 24.0, 2),
+                    round(float(window["end"]) % 24.0, 2),
+                ],
+                "night_source": window["source"],
             }
         except Exception as exc:
             self._debug(f"clock 失败: {exc}")
             return {}
-        # 她实际的作息夜：安静时段该按这个，而不是配置里写死的 23-7
-        try:
-            routine = (core.scope.get_self("contract") or {}).get("routine") or {}
-            start, end = routine.get("night_start_hour"), routine.get("night_end_hour")
-            if start is not None and end is not None:
-                out["night_window"] = [float(start) % 24.0, float(end) % 24.0]
-        except Exception:
-            pass
         return out
 
     # ─── 情境摘要 ───────────────────────────────────────
+
+    def _contract_body(self, core: Any) -> Any:
+        """取落盘契约与它的 `body` 块；**坏形状转成不可用块**（B5 矩阵 D1/D2）。
+
+        原来 `contract.get("body") if isinstance(..., dict) else {}`：缺块、坏块、
+        空块一律变成 `{}`，而 `_self_state` 对 `{}` 判 `available: true`——「契约不存在」
+        与「身体一切正常」同形。`_wake` 也因此绕过了自己 docstring 里「身体轴没在跑就
+        不读 `wake_state()`」的承诺，读出一个上次开启时留下的 live 值。
+
+        返回 `(contract, body)`：契约本身缺失 → body 是 `missing`；契约在但 body
+        缺失/不是字典/是空字典 → `corrupt`（有东西，但读不出身体块）。
+        """
+        raw = core.scope.get_self("contract")
+        contract = raw if isinstance(raw, dict) else {}
+        if not contract:
+            return {}, _contract.as_block(None)
+        body = contract.get("body")
+        if isinstance(body, dict) and body:
+            return contract, body
+        return contract, _contract.as_block(body)
 
     def brief(
         self,
@@ -213,12 +293,12 @@ class CoreFacade:
             return None
         task = _s(task) or "chat"
         try:
-            contract = core.scope.get_self("contract") or {}
-            if not isinstance(contract, dict):
-                contract = {}
-            body = contract.get("body") if isinstance(contract.get("body"), dict) else {}
+            contract, body = self._contract_body(core)
             day = contract.get("day") if isinstance(contract.get("day"), dict) else {}
 
+            # 醒来状态先算一次：`self_state.asleep` 要复用它，否则同一份 payload 里
+            # 会出现两个互相矛盾的「是否睡着」（联动 模型与导出 10）。
+            wake = self._wake(core, contract, body)
             out: Dict[str, Any] = {
                 "v": API_VERSION,
                 "task": task,
@@ -234,7 +314,7 @@ class CoreFacade:
                 "holiday": _s(contract.get("holiday")),
                 "routine": self._routine(contract),
                 "persona_framing": self._framing(core, char_name, user_name),
-                "self_state": self._self_state(core, contract, body),
+                "self_state": self._self_state(core, contract, body, wake),
                 "day": {
                     "doing": _s(day.get("doing")),
                     "done": [_s(x) for x in (day.get("done") or []) if _s(x)],
@@ -243,8 +323,9 @@ class CoreFacade:
                     # 今天最近一段睡眠的梦（最多 3 条）：旧契约没有这个键 → 空列表。
                     "dreams": [_s(x) for x in (day.get("dreams") or []) if _s(x)][:3],
                 },
-                # 醒来状态：优先现算（门面的意义就是「不过期」），拿不到再退回契约里那份。
-                "wake": self._wake(core, contract),
+                # 醒来状态：优先现算（门面的意义就是「不过期」），拿不到再退回契约里那份；
+                # 与 self_state.asleep 同一来源，且带 available/source/stale。
+                "wake": wake,
                 "ongoing": self._ongoing(core),
             }
             if task in ("proactive", "status"):
@@ -259,7 +340,12 @@ class CoreFacade:
             # 以前只有 status 才给，而社交层只调 proactive——`turns` 等字段永远拿不到。
             # 保留旧字段名与形状（只加不改），只把「什么时候给」放宽。
             out["relationship"] = self._relationship(core, user_id)
-            out["fingerprint"] = self._fingerprint(core, out)
+            # 指纹与 `state_fingerprint()` **同一份实现**（同一个 payload 构造器）：
+            # 原来这里对整份 `out` 内联拼哈希、`state_fingerprint()` 另拼一份，
+            # 两份口径不同，同一个角色的「状态有没有变」能有两个答案（审核 模型与导出 9）。
+            out["fingerprint"] = self._fingerprint(
+                core, self._fingerprint_payload(core, contract, body)
+            )
             return out
         except Exception as exc:
             self._debug(f"brief 失败: {exc}")
@@ -281,10 +367,11 @@ class CoreFacade:
         if core is None:
             return ""
         try:
-            return self._fingerprint(core, {
-                "self_state": self._self_state(core, {}, {}),
-                "ongoing": self._ongoing(core),
-            })
+            # 与 `brief()` 同一个 payload 构造器：两份哈希必须相等，否则社交层按哪个
+            # 判缓存都是错的（审核 模型与导出 9）。以前这里传 `{}` 当契约，于是身体轴
+            # 一律按「不可用」算，与 `brief()` 里那份带真实契约的 payload 永远不等。
+            contract, body = self._contract_body(core)
+            return self._fingerprint(core, self._fingerprint_payload(core, contract, body))
         except Exception:
             return ""
 
@@ -313,6 +400,11 @@ class CoreFacade:
 
         返回 `{}` 表示「拿不到」（角色不存在 / 没有这个用户 / 超出可解释范围），
         调用方按「不知道」处理，不要当成「没发生过」。
+
+        v3.0.3（联动 模型与导出 11）：**白名单拒绝不再与「拿不到」同形**。原来两者都
+        返回 `{}`，调用方分不清「她拒绝」和「我不知道」——前者不该重试，后者可以等一会
+        再问。现在拒绝返回 `{"status": "denied"}`，拿得到时多一个 `"status": "ok"`；
+        「拿不到」仍是 `{}`（空字典 = 不知道，旧消费方 `if not intimacy` 照常成立）。
         """
         core = self._core(role_id)
         if core is None:
@@ -328,9 +420,9 @@ class CoreFacade:
         if not isinstance(snap, dict) or not snap:
             return {}
         if snap.get("allowed") is False:
-            # 白名单：这个人不在开放名单里。门面是别的插件读的窗口，返回空字典
-            # 等于「没有这份资料」——社交层就不会拿它去决定要不要主动开口。
-            return {}
+            # 白名单：这个人不在开放名单里。**不能返回空字典**——那是「拿不到」的形状，
+            # 社交层会把「她拒绝」读成「暂时问不到」，过一会又来问。
+            return {"status": "denied"}
         stage = int(_num(snap.get("stage")))
         satisfy = _num(snap.get("satisfy"))
         done = _num(snap.get("done_count"))
@@ -349,21 +441,29 @@ class CoreFacade:
         initiative_score = 0.0
         try:
             from . import ccb as _ccb
-            from .relstage import stage_of
+            from .state_snapshot import relation_of, tz_of
             # **只读**：mood.profile() 取不到会新建条目（门面读一眼不该留空壳），
             # 与 prompt_builder 同一个只读口径。
             prof = core._scope.peek_user(uid, "mood") or {}
             lib = float(prof.get("libido", snap.get("libido", 0.0)) or 0.0)
             raw_base = prof.get("base_libido", snap.get("base_libido", lib))
             base_lib = lib if raw_base in (None, "") else float(raw_base)
-            agg = float(prof.get("aggression", 25.0) or 25.0)
+            # 攻击性默认值只有一份（state_snapshot.aggression_default 读配置）：
+            # 原来这里写死 25，而面板默认是 28、prompt_builder 写 15——同一个人三个数。
+            # `or 25.0` 还会把合法的 0 读成 25（审核 跨插件契约 9）。
+            agg = _num(prof.get("aggression"), _aggression_default(getattr(core, "config", None)))
             aff = float(prof.get("affection", 0.0) or 0.0)
             try:
                 arousal = float(core.soma.snapshot().get("arousal", 50.0) or 50.0)
             except Exception:
                 arousal = 50.0
+            # 关系阶段只按好感算是旧口径：相处够久的人（聊过几百轮）在注入里
+            # 早已是「熟到可以直说」，门面却还算成「还在熟悉」（审核 状态与人设 1）。
+            # 现在走 state_snapshot 的同一份算法。
             try:
-                rel_index = int(stage_of(aff)[0])
+                rel_index = int(
+                    relation_of(prof, core.now_epoch(), tz=tz_of(core)).stage_id
+                )
             except Exception:
                 rel_index = 0
             cfg = getattr(core, "config", None)
@@ -386,11 +486,20 @@ class CoreFacade:
         if done <= 0 and last_at <= 0 and stage <= 0:
             # 一条记录都没有：不是「拿不到」，是「确实还没有」。给调用方一个能
             # 判断的确定答案，而不是让它去区分空 dict 的两种含义。
-            return {"stage": 0, "satisfy": 0.0, "done_count": 0.0,
-                    "last_at": 0.0, "want_line": "",
+            # 没有 ccb 记录 ≠ 没有这个人：情绪档案在时 `libido` 是实测值（照给），
+            # 档案也不在时它只是**配置初始值**（34.0），与 `_user`/`_relationship`
+            # 一样标 `known=false` 并置空，否则社交层会拿一个没人测过的数去做
+            # 「她这会儿想不想」的判定（B5 矩阵 D5）。
+            has_record = bool(self._read_only_profile(core, uid))
+            return {"status": "ok", "known": has_record, "stage": 0, "satisfy": 0.0,
+                    "done_count": 0.0, "last_at": 0.0, "want_line": "",
                     "initiative": round(initiative_score, 2),
-                    "initiative_label": initiative_label, **fields}
+                    "initiative_label": initiative_label, **fields,
+                    "libido": fields["libido"] if has_record else None,
+                    "base_libido": fields["base_libido"] if has_record else None}
         return {
+            "status": "ok",
+            "known": True,
             "stage": stage,
             "satisfy": round(satisfy, 1),
             "done_count": done,
@@ -410,15 +519,20 @@ class CoreFacade:
         社交层从不同接口拿到的「她在不在场景里」会对不上——那比没有这个字段更糟。
         """
         blockers = snap.get("blockers")
+        # 两个布尔走三态（B5 矩阵 D6）：`bool(snap.get(...))` 把「快照里没这个键」
+        # 读成 `False`——「不知道她在不在场景里」于是与「她明确不在」同形，社交层
+        # 会据此判定「可以开口」。缺键 = `None`，不是 `False`。
+        in_scene = _contract.tri_bool(snap, "in_scene")
+        can_enter = _contract.tri_bool(snap, "can_enter")
         return {
-            "in_scene": bool(snap.get("in_scene")),
+            "in_scene": None if in_scene is _contract.UNKNOWN else bool(in_scene),
             "stage_name": _s(snap.get("stage_name")),
             "turns_today": int(_num(snap.get("turns_today"))),
             "cooldown_left": round(max(0.0, _num(snap.get("cooldown_left"))), 1),
             "aftercare_left": round(max(0.0, _num(snap.get("aftercare_left"))), 1),
             "libido": round(_num(snap.get("libido")), 1),
             "base_libido": round(_num(snap.get("base_libido")), 1),
-            "can_enter": bool(snap.get("can_enter")),
+            "can_enter": None if can_enter is _contract.UNKNOWN else bool(can_enter),
             "blockers": (
                 [_s(item) for item in blockers if _s(item)]
                 if isinstance(blockers, list) else []
@@ -642,6 +756,10 @@ class CoreFacade:
             except (TypeError, ValueError):
                 return float(default)
 
+        # v3.0.3（联动 模型与导出 14）：模块头承诺「不猜」，但这里原来在无档案时把
+        # **配置初始值**当成这个人的好感/欲望/脾气返回，形状与真实档案完全一样。
+        # 现在标出来：`known=false` + `affection_source="config_default"`。数字照给
+        # （只加不改，旧消费方还能读），但消费方可以分清「这是他的档案」和「这是默认值」。
         if record:
             affection = round(
                 _num(record.get("affection"), cfg_num("mood_initial_affection", 50.0)), 1
@@ -651,12 +769,16 @@ class CoreFacade:
             aggression = round(
                 _num(record.get("aggression"), cfg_num("mood_initial_aggression", 15.0)), 1
             )
+            known = True
+            affection_source = "record"
         else:
-            # 没档案 = 还没聊过：给面板初始值（与 `mood.label()` 对无档案用户的口径一致），
-            # 这不是「编」——初始好感/欲望是配置里的确定事实。
+            # 没档案 = 还没聊过：给的是**配置初始值**（与 `mood.label()` 对无档案用户的
+            # 口径一致），不是关于这个人的事实。`known=false` 就是这个意思。
             affection = base_affection = round(cfg_num("mood_initial_affection", 50.0), 1)
             libido = round(cfg_num("mood_initial_libido", 25.0), 1)
             aggression = round(cfg_num("mood_initial_aggression", 15.0), 1)
+            known = False
+            affection_source = "config_default"
 
         first_met = 0.0
         try:
@@ -698,6 +820,10 @@ class CoreFacade:
 
         return {
             "user_id": uid,
+            # 有没有这个人的档案。false 时下面的好感/欲望/脾气是配置初始值，
+            # 不是关于他的事实（联动 模型与导出 14）。
+            "known": known,
+            "affection_source": affection_source,
             "nickname": _s(mood_read("nickname")),
             "nickname_source": _s(mood_read("nickname_source")),
             "display_name": _s(mood_read("display_name")),
@@ -751,15 +877,37 @@ class CoreFacade:
         }
 
     def _self_state(self, core: Any, contract: Dict[str, Any],
-                    body: Dict[str, Any]) -> Dict[str, Any]:
+                    body: Dict[str, Any],
+                    wake: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """她此刻的身体状态：**先说这一块可不可用，再说数值**。
+
+        v3.0.3（联动 跨插件契约 2 / 模型与导出 10/13）：`soma_enabled=false` 时契约里的
+        `body` 不再填中性数值，而是 `available:false` + 数值 `null`。这里如实透传：
+
+        * `available` / `reason`：整块可不可用、为什么不可用；
+        * `asleep`：`True` / `False` / `None`（不知道）。**不再把 null 压成 false**——
+          那会让社交层以为她醒着，然后在她睡着时发一条「在忙吗」；
+        * 数值键只在确实知道时才出现。
+
+        `asleep` 优先取同一份 payload 里 `wake` 的值（现算的那一份），保证「同一份
+        payload 里两个是否睡着」不可能互相矛盾——原来一个读契约快照（最多旧 60 秒）、
+        一个现算，两边可以一个说睡着、一个说醒着。
+        """
         out: Dict[str, Any] = {
+            "available": _contract.available(body),
+            "reason": _contract.unavailable_reason(body),
             "energy_text": _s(body.get("energy_text")),
-            "asleep": bool(body.get("asleep")),
+            "asleep": None,
             "feelings": [],
         }
+        asleep = _contract.tri_bool(body, "asleep")
+        if asleep is _contract.UNKNOWN and isinstance(wake, dict):
+            asleep = _contract.tri_bool(wake, "asleep")
+        out["asleep"] = None if asleep is _contract.UNKNOWN else bool(asleep)
         for key in ("energy", "social_energy", "sleep_pressure", "hunger", "discomfort"):
-            if body.get(key) is not None:
-                out[key] = _num(body.get(key))
+            value = _contract.tri_number(body, key)
+            if value is not _contract.UNKNOWN:
+                out[key] = _num(value)
         # 契约里 `feelings` 是 `list[str]`（按显著度取前几条）。这里带上 id 与显著度，
         # 让「这一条用过没有」可判定；显著度按原始顺序递减，是**近似**，不是 Core 内部
         # 那个真实分数（那个没有导出）。
@@ -775,36 +923,84 @@ class CoreFacade:
                     "text": text,
                     "kind": "body",
                     "salience": round(1.0 - idx / (total + 1), 2),
+                    # v3.0.3（联动 模型与导出 13）：这个数是**按名次推算的近似值**，
+                    # 不是 Core 内部那个真实显著度（那个没有导出）。标出来，免得
+                    # 消费方拿它做阈值判定（「只推 salience>0.8 的」会推错）。
+                    "salience_source": "rank_estimate",
                 })
         return out
 
-    def _wake(self, core: Any, contract: Dict[str, Any]) -> Dict[str, Any]:
-        """醒来状态：现算优先，拿不到退回契约那份，都没有就空 dict。"""
+    #: 契约快照的保鲜期，与 `core_instance.CONTRACT_MAX_AGE_SECONDS` 同值。
+    #: 门面只拿一个 duck-typed `core`、不 import 实现模块，所以这里独立写一份；
+    #: 它唯一的用途是给 `wake.stale` 一个判据（「这份醒没醒是不是旧快照」）。
+    CONTRACT_MAX_AGE_SECONDS = 60.0
+
+    def _wake(self, core: Any, contract: Dict[str, Any],
+              body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """醒来状态：现算优先，拿不到退回契约那份，都没有就「不知道」。
+
+        v3.0.3（联动 模型与导出 10）：同一份 payload 里**只能有一个「是否睡着」**。
+        原来 `self_state.asleep` 读契约快照（最多旧 60 秒）、这里现算，两边可以一个
+        说睡着、一个说醒着。现在 `self_state` 优先取这里的值（见 `_self_state`），
+        两者不可能再矛盾。
+
+        另外三件事如实标出来，不再让消费方猜：
+
+        * `available`：这一项知不知道（`False` 时 `asleep` 是 `None`）；
+        * `source`：`live`（现算）/ `contract`（契约快照）/ `unavailable`；
+        * `stale`：来自契约时，那份快照比 `CONTRACT_MAX_AGE_SECONDS` 旧——消费方该
+          知道「醒没醒」可能是过期事实，而不是把它当成此刻的状态。
+
+        身体轴没在跑时**不读** `wake_state()`：那是上次开启时留下的旧值，读出来就是
+        「她醒着」，与「这一项没在跑」是两回事。
+        """
+        # 块不可用（显式 false / 缺块 / 形状坏）一律不读 live：身体轴没在跑时
+        # `soma.wake_state()` 是上次开启留下的旧值，读出来就是「她醒着」。
+        if not _contract.available(body):
+            return {
+                "available": False,
+                "source": "unavailable",
+                "reason": _contract.unavailable_reason(body) or _contract.REASON_MISSING,
+                "stale": False,
+                "asleep": None,
+            }
         try:
             state = core.soma.wake_state()
         except Exception:
             state = None
-        if isinstance(state, dict) and state:
-            out: Dict[str, Any] = {
-                "asleep": bool(state.get("asleep", False)),
-                "wake_at": _num(state.get("wake_at")),
-                "inertia_until": _num(state.get("inertia_until")),
-                "inertia_minutes_left": max(0, int(_num(state.get("inertia_minutes_left")))),
-                "disturbed": bool(state.get("disturbed", False)),
-                "last_sleep_hours": _num(state.get("last_sleep_hours")),
-            }
-            return out
-        raw = contract.get("wake")
-        if isinstance(raw, dict) and raw:
+        source = "live"
+        if not (isinstance(state, dict) and state):
+            state = contract.get("wake")
+            source = "contract"
+        if not (isinstance(state, dict) and state):
             return {
-                "asleep": bool(raw.get("asleep", False)),
-                "wake_at": _num(raw.get("wake_at")),
-                "inertia_until": _num(raw.get("inertia_until")),
-                "inertia_minutes_left": max(0, int(_num(raw.get("inertia_minutes_left")))),
-                "disturbed": bool(raw.get("disturbed", False)),
-                "last_sleep_hours": _num(raw.get("last_sleep_hours")),
+                "available": False,
+                "source": "unavailable",
+                "reason": _contract.REASON_MISSING,
+                "stale": False,
+                "asleep": None,
             }
-        return {}
+        stale = False
+        if source == "contract":
+            try:
+                generated = float(contract.get("generated_at") or 0.0)
+                if generated > 0:
+                    stale = (float(core.now_epoch()) - generated) > self.CONTRACT_MAX_AGE_SECONDS
+            except Exception:
+                stale = False
+        asleep = _contract.tri_bool(state, "asleep")
+        return {
+            "available": True,
+            "source": source,
+            "reason": "",
+            "stale": bool(stale),
+            "asleep": None if asleep is _contract.UNKNOWN else bool(asleep),
+            "wake_at": _num(state.get("wake_at")),
+            "inertia_until": _num(state.get("inertia_until")),
+            "inertia_minutes_left": max(0, int(_num(state.get("inertia_minutes_left")))),
+            "disturbed": bool(state.get("disturbed", False)),
+            "last_sleep_hours": _num(state.get("last_sleep_hours")),
+        }
 
     def _ongoing(self, core: Any) -> List[Dict[str, Any]]:
         """她手上还开着的事：日程侧（`ongoing_tasks`）+ 社交侧发布（`life_log`）。
@@ -865,7 +1061,7 @@ class CoreFacade:
             if phrase:
                 at = core.now_epoch() - _num(pending.get("age_seconds"))
                 out.append({
-                    "id": _item_id("recent", phrase),
+                    "id": _item_id("recent", phrase, at),
                     "kind": "recent",
                     "text": phrase,
                     "at": round(at, 1),
@@ -900,7 +1096,8 @@ class CoreFacade:
 
         读路径全程只读（P2-21）：情绪档案走 `peek_profile`/`peek_user`（不建条目、不
         mark_dirty），用户级键也走 `peek_user`（`user_state()` 会 setdefault 给陌生人留空壳）。
-        没档案时给面板初始值——那是配置里的确定事实，不是编。
+        没档案时给面板初始值，但会标 `known=false` + `affection_source="config_default"`：
+        那是配置里的初始值，**不是关于这个人的事实**（联动 模型与导出 14）。
         """
         uid = _s(user_id)
         if not uid:
@@ -964,6 +1161,8 @@ class CoreFacade:
         if first_met <= 0 and profile:
             first_met = _num(profile.get("first_met", 0.0))
         return {
+            "known": bool(profile),
+            "affection_source": "record" if profile else "config_default",
             "affection": round(affection, 1),
             "base_affection": round(base_affection, 1),
             "nickname": _s(peek("nickname", "")),
@@ -985,21 +1184,68 @@ class CoreFacade:
             **fields,
         }
 
+    def _fingerprint_payload(self, core: Any, contract: Dict[str, Any],
+                             body: Dict[str, Any]) -> Dict[str, Any]:
+        """指纹只认这一份 payload：`brief()` 与 `state_fingerprint()` 都从这里取。
+
+        **只放角色级、且两边都拿得到的东西**。用户级（好感/关系阶段）不在里面：
+        `state_fingerprint(role_id)` 没有 `user_id`，塞进去会让两份哈希必然不等。
+        """
+        day = contract.get("day") if isinstance(contract.get("day"), dict) else {}
+        wake = self._wake(core, contract, body)
+        return {
+            "self_state": self._self_state(core, contract, body, wake),
+            "wake": wake,
+            "day": {
+                "doing": _s(day.get("doing")),
+                "done": [_s(x) for x in (day.get("done") or []) if _s(x)],
+                "next": [_s(x) for x in (day.get("next") or []) if _s(x)],
+                "dreams": [_s(x) for x in (day.get("dreams") or []) if _s(x)][:3],
+            },
+            "ongoing": self._ongoing(core),
+        }
+
     def _fingerprint(self, core: Any, payload: Dict[str, Any]) -> str:
-        """状态指纹：状态没变，社交层的缓存就不该失效。"""
+        """状态指纹：状态没变，社交层的缓存就不该失效。
+
+        **时间不是状态**。原来最后一项是 `str(int(core.now_epoch()) // 60)`，于是指纹
+        每 60 秒**必然**变一次——社交层拿它做缓存，等于每 60 秒整份失效，「状态没变就
+        不失效」这个前提从来没成立过（审核 模型与导出 8）。现在只取一组固定字段，
+        缺的按空值补齐，规范化 JSON（`sort_keys`）后取 sha256 前 16 位。
+
+        反过来，原来漏掉的字段（`asleep` / `energy` / `wake`）现在也在里面：
+        她睡着了、精力掉了一档，指纹都该跟着变。
+        """
         try:
-            parts = [
-                _s(payload.get("self_state", {}).get("energy_text")),
-                _s(payload.get("day", {}).get("doing")),
-                "|".join(_s(x) for x in payload.get("day", {}).get("done", []) or []),
-                "|".join(_s(x) for x in payload.get("day", {}).get("next", []) or []),
+            self_state = payload.get("self_state") or {}
+            wake = payload.get("wake") or {}
+            day = payload.get("day") or {}
+            ongoing = payload.get("ongoing") or []
+            facts = {
+                "self_available": self_state.get("available"),
+                "self_reason": _s(self_state.get("reason")),
+                "asleep": self_state.get("asleep"),
+                "energy": self_state.get("energy"),
+                "energy_text": _s(self_state.get("energy_text")),
+                "feelings": [
+                    _s(item.get("text") if isinstance(item, dict) else item)
+                    for item in (self_state.get("feelings") or [])
+                ],
+                "wake_available": wake.get("available"),
+                "wake_source": _s(wake.get("source")),
+                "wake_asleep": wake.get("asleep"),
+                "doing": _s(day.get("doing")),
+                "done": [_s(x) for x in (day.get("done") or [])],
+                "next": [_s(x) for x in (day.get("next") or [])],
                 # 梦变了（睡了一觉/换了日程）也是状态变化：社交层缓存该失效。
-                "|".join(_s(x) for x in payload.get("day", {}).get("dreams", []) or []),
-                "|".join(_s(i.get("text")) for i in payload.get("ongoing", []) or []),
-                str(int(core.now_epoch()) // 60),
-            ]
-            raw = "\n".join(parts).encode("utf-8")
-            return hashlib.blake2b(raw, digest_size=8).hexdigest()
+                "dreams": [_s(x) for x in (day.get("dreams") or [])],
+                "ongoing": [
+                    _s(item.get("text") if isinstance(item, dict) else item)
+                    for item in ongoing
+                ],
+            }
+            raw = json.dumps(facts, sort_keys=True, ensure_ascii=False, default=str)
+            return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
         except Exception:
             return ""
 

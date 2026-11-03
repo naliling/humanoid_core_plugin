@@ -28,15 +28,28 @@ _STRIP = re.compile(r"\s+")
 
 
 def _fresh(item: dict[str, Any], now: float, stale_hours: float = STALE_HOURS) -> bool:
-    """这条摘录还在时间窗内吗。时间戳不可信（NaN/非数值）时一律**留着**，别凭空清记忆。"""
+    """这条摘录还在时间窗内吗。**时间未知不等于过期**：留着，别凭空清记忆。
+
+    `at` 缺失或 <= 0 表示「不知道是什么时候说的」（旧存档、写坏的数据）。旧写法把
+    0 当成 epoch 起点：age 变成几十年 → 判定过期，于是 `note_said` 写回时把它们删掉、
+    `recall_lines` 也不渲染——与本文档「时间戳不可信就留着」以及 `life_log` 的
+    `until == 0`（永不过期）语义正好相反。未知时间戳的条目仍不参与「最近说过」的
+    间隔判定（`note_said` 只拿已知 `at` 求 max）。
+    """
     try:
-        age = float(now) - float(item.get("at", 0) or 0)
+        at = float(item.get("at") or 0)
+    except (TypeError, ValueError):
+        return True
+    if at != at or at <= 0:
+        return True
+    try:
+        now_v = float(now)
         window = float(stale_hours) * 3600.0
     except (TypeError, ValueError):
         return True
-    if age != age or window != window:
+    if now_v != now_v or window != window:
         return True
-    return age <= window
+    return (now_v - at) <= window
 
 
 _OPENERS = "([（［【「『"

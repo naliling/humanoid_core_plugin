@@ -22,6 +22,7 @@ from humanoid.services.schedule import (
     SOURCE_TEMPLATE,
     SEGMENT_MIN_MINUTES,
     ScheduleService,
+    _segment_minutes,
     dynamic_segment,
     parse_segment,
     segment_prompt,
@@ -31,10 +32,10 @@ from humanoid.slots import (
     coverage_is_complete,
     find_slot,
     format_time,
-    normalize_slots,
     parse_time,
     sleep_window_minutes,
 )
+from .slot_fixtures import normalize_slots
 from humanoid.state import StateStore
 
 from .fakes import FakeClock, FakeContext, FakeProvider, FrozenClock, RecordingLogger, ScopeStore
@@ -89,15 +90,20 @@ class SlotNormalizeTest(unittest.TestCase):
         self.assertEqual(len(slots), 1)
         self.assertTrue(coverage_is_complete(slots))
 
-    def test_drops_reversed_and_zero_length(self):
+    def test_splits_crossing_and_drops_zero_length(self):
+        """end < start 是「跨午夜」，不是坏数据：拆两段，别整条丢掉（审核 状态10）。"""
         raw = [
-            {"start": "10:00", "end": "09:00", "event": "倒置"},
+            {"start": "23:00", "end": "07:00", "event": "睡觉"},
             {"start": "11:00", "end": "11:00", "event": "零长"},
-            {"start": "00:00", "end": "10:00", "event": "有效"},
         ]
         slots = normalize_slots(raw)
         self.assertTrue(coverage_is_complete(slots))
-        self.assertEqual(slots[0]["event"], "有效")
+        self.assertEqual(
+            [(s["start"], s["end"], s["event"]) for s in slots],
+            [("00:00", "07:00", "睡觉"), ("07:00", "23:00", "自由活动/休息"),
+             ("23:00", "24:00", "睡觉")],
+        )
+        self.assertEqual(sleep_window_minutes(slots), (23 * 60, 7 * 60))
 
     def test_sorts_unordered_input(self):
         raw = [
@@ -921,11 +927,15 @@ class ThrottleTest(unittest.IsolatedAsyncioTestCase):
             service.seed_first_segment()
             services.append((service, clock))
 
+        # 空闲静默按角色判（审核 main.py 6）：闸门全局一份，「有人说话」必须记在
+        # 具体角色名下，否则这里模拟的对话松不开任何一个角色的静默。
+        role_ids = [str(getattr(svc._scope, "role_id", "") or "") for svc, _ in services]
         for i in range(self.TICKS_PER_DAY):
             gate._mono.advance(self.TICK)
             gate._wall.advance(self.TICK)
             if chat_every_minutes and (i * self.TICK) % (chat_every_minutes * 60) == 0:
-                gate.note_interaction()
+                for rid in role_ids:
+                    gate.note_interaction(role_id=rid)
             for service, clock in services:
                 clock.advance(seconds=self.TICK)
                 await service.ensure_fresh()
@@ -1181,6 +1191,48 @@ class TestInterruption(unittest.TestCase):
         service.note_interruption()
         self.assertFalse(service.refresh_due(), "有人发消息也不能掀被子")
 
+    def test_interrupt_baseline_survives_a_restart(self):
+        """#74：两个基准落盘；重启后的第一条私聊不该被当成「打破安静来找她」。"""
+        conf = cfg()
+        tmp = Path(tempfile.mkdtemp()) / "state.json"
+        store = ScopeStore(tmp)
+        store.load(FIXED_MOMENT.strftime("%Y-%m-%d"), conf.cycle_length)
+        clock = FrozenClock(FIXED_MOMENT)
+        first = ScheduleService(store.scope, lambda: conf, clock, monotonic=clock.timestamp)
+        first.note_interruption()
+        self.assertTrue(first._consume_interruption())
+        self.assertIsInstance(store.get("schedule_interrupt_baseline"), dict,
+                              "两个基准要随状态落盘")
+        # 重启：同一份 state、新进程（monotonic 从 0 起），墙钟只走了 5 分钟。
+        clock.advance(minutes=5)
+        reborn = ScheduleService(store.scope, lambda: conf, clock, monotonic=lambda: 0.0)
+        reborn.note_interruption()
+        self.assertFalse(reborn._consume_interruption(),
+                         "安静间隔还没过，重启不该把它清零")
+
+    def test_future_baseline_is_clamped_to_now(self):
+        """时钟被回拨时盘上的「未来」基准要夹到 now，不能留成未来。"""
+        conf = cfg()
+        tmp = Path(tempfile.mkdtemp()) / "state.json"
+        store = ScopeStore(tmp)
+        store.load(FIXED_MOMENT.strftime("%Y-%m-%d"), conf.cycle_length)
+        clock = FrozenClock(FIXED_MOMENT)
+        store.scope.update_self(schedule_interrupt_baseline={
+            "last_message_at": clock.timestamp() + 3600.0,
+            "last_interrupt_at": clock.timestamp() + 3600.0,
+        })
+        service = ScheduleService(store.scope, lambda: conf, clock, monotonic=lambda: 0.0)
+        self.assertEqual(service._last_message_at, 0.0, "未来基准要夹到 now")
+        self.assertEqual(service._last_interrupt_at, 0.0)
+        service.note_interruption()
+        self.assertFalse(service._consume_interruption(),
+                         "刚夹到 now 的基准等同于「刚刚才来过」：安静间隔未过")
+
+    def test_no_baseline_on_disk_keeps_the_old_behaviour(self):
+        service = self._service()
+        self.assertIsNone(service._last_message_at)
+        service.note_interruption()
+        self.assertTrue(service._consume_interruption(), "首条私聊照旧算来访")
     def test_prompt_says_something_was_interrupted(self):
         from humanoid.services.schedule import segment_prompt
         conf = cfg()
@@ -1279,6 +1331,23 @@ class TestInterruptionIsNotLeaked(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(slot)
         self.assertEqual(service._interrupt_at, original, "还回时不能重新计时")
         self.assertIn("插曲", gateway.last_prompt, "被打断的信息要能到 prompt")
+
+
+class SleepEndInPastTest(unittest.TestCase):
+    """睡段的 end 写在过去：不能当成「明天同一钟点」排满 12 小时（#155）。"""
+
+    def test_clock_typo_becomes_a_nap(self):
+        # 现在 14:00，模型把 end 写成 13:00（已过）。旧写法 +24h 后被 12 小时上限截断，
+        # 于是一句写错的 end 让她「睡」到第二天凌晨。
+        self.assertEqual(_segment_minutes({"end": "13:00"}, 14 * 60, True), 90)
+
+    def test_far_past_end_is_tomorrow(self):
+        # 现在 23:00，end 写 05:00：过去 18 小时，够远，只能理解成明天 05:00 → 睡 6 小时。
+        self.assertEqual(_segment_minutes({"end": "05:00"}, 23 * 60, True), 360)
+
+    def test_awake_segment_unchanged(self):
+        # 清醒段写在过去仍然按默认时长接上（原有行为，不受 #155 影响）。
+        self.assertEqual(_segment_minutes({"end": "13:00"}, 14 * 60, False), 60)
 
 
 if __name__ == "__main__":

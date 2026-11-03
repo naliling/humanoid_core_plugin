@@ -76,6 +76,8 @@ USER_KEYS = {
     # v3.0.0（联动 P2-3）：TA 说话 / 她说话分开记（只加不改）。
     "peer_said_at", "her_said_at",
     "said", "intimacy",
+    # v3.0.3（联动 模型与导出 14）：无档案时给的是配置初始值，不是关于这个人的事实。
+    "known", "affection_source",
 }
 
 
@@ -362,9 +364,10 @@ class ContractIdentityOutfitTest(unittest.TestCase):
         self.assertIn("outfit", self.contract["capabilities"])
 
     def test_schema_version_unchanged_but_fields_hash_moved(self):
-        self.assertEqual(CONTRACT_VERSION, 2)
-        self.assertEqual(CONTRACT_SCHEMA, "humanoid.contract/2")
-        self.assertEqual(self.contract["v"], 2)
+        # v3.0.3（契约 2）：身体轴可为 null，数值域变了 → 主版本 +1。
+        self.assertEqual(CONTRACT_VERSION, 3)
+        self.assertEqual(CONTRACT_SCHEMA, "humanoid.contract/3")
+        self.assertEqual(self.contract["v"], 3)
         self.assertEqual(self.contract["schema"], CONTRACT_SCHEMA)
         # 新块进了结构指纹：去掉 identity/outfit 后哈希必然不同（只加不改也得让
         # 对面的结构校验看得到变化）。
@@ -391,7 +394,7 @@ class ContractIdentityOutfitTest(unittest.TestCase):
                          {"char_name": "", "persona_label": "",
                           "species": "", "body_traits": []})
         self.assertEqual(contract["outfit"], {})
-        self.assertEqual(contract["v"], 2)
+        self.assertEqual(contract["v"], 3)
 
     def test_block_helpers_degrade(self):
         self.assertEqual(_identity_block(SimpleNamespace()),
@@ -466,7 +469,7 @@ class FacadeBriefSharedBlocksTest(unittest.TestCase):
         self.assertNotIn("user", brief)
 
     def test_capabilities_and_api_version(self):
-        self.assertEqual(API_VERSION, 2)
+        self.assertEqual(API_VERSION, 3)
         for key in ("identity", "user"):
             self.assertIn(key, CAPABILITIES)
         self.assertEqual(list(self.facade.capabilities()), list(CAPABILITIES))

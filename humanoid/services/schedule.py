@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import random
+import re
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -17,7 +19,7 @@ from typing import Any
 from ..clock import Clock
 from ..config import HumanoidConfig
 from ..jsonx import extract_json_array, extract_json_object
-from ..llm import OUTCOME_GATED, LLMGateway, LLMResult, ProviderResolver
+from ..llm import OUTCOME_GATED, OUTCOME_OK, LLMGateway, LLMResult, ProviderResolver
 from ..persona import PERSONA_PROMPT_MAX, Persona, truncate
 from ..role_scope import RoleScope
 from ..slots import (
@@ -46,6 +48,8 @@ SEGMENT_MIN_MINUTES = 15
 SEGMENT_MAX_MINUTES = 180
 SEGMENT_SLEEP_MAX_MINUTES = 720
 SEGMENT_DEFAULT_MINUTES = 60
+# 睡段的 end 写在过去、又不像「明天那个点」时，按一小觉接上（见 _segment_minutes）。
+SEGMENT_SLEEP_FALLBACK_MINUTES = 90
 # 一天最多留这么多段（超出丢最早的：三十段之前的事她自己也记不清）。
 # 这只是**硬天花板**：真正生效的是配置项 `schedule_max_slots`（面板上限就是 96）。
 # 以前这里写死 48，把用户填 96 砍成 48——面板上写着却不起作用的数比没有更糟。
@@ -215,13 +219,34 @@ def event_phrase(kind: str, seed: list[Any]) -> str:
     return pick("sched_event", seed, options)
 
 
+def night_window_minutes(cfg: HumanoidConfig) -> tuple[int, int] | None:
+    """她的夜间窗口：**唯一的一份**。
+
+    `routine_prompt`（写进分段 prompt 的作息条）与 `dynamic_segment`（模型不可用时的
+    本地兜底）都从这里取，不再各读一遍 `night_start_hour/night_end_hour`。
+
+    关掉夜间模式、或窗口长度为 0（config 校验里就是「关闭夜间窗口」）时返回 None：
+    **不再**退回 23:00-07:00 的硬编码窗口。旧兜底正是这么做的——用户关掉夜间模式，
+    兜底反而替她排一觉到早上 7 点，比配置的 23:00-06:00 还长，而同一份 prompt 里
+    写着「几点睡由她是谁决定」。
+    """
+    if not bool(getattr(cfg, "night_mode_enabled", True)):
+        return None
+    start = int(getattr(cfg, "night_start_hour", 23)) * 60
+    end = int(getattr(cfg, "night_end_hour", 6)) * 60
+    if start == end:
+        return None
+    return start, end
+
+
 def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
     """作息那一条怎么写进分段 prompt。
 
     默认让模型从人设里读她几点睡；只有用户显式打开「日程贴合夜间窗口」时，才把
     夜间窗口当成硬约束递进去（分段生成时同样生效：到了点就该排睡眠）。
     """
-    if not cfg.night_mode_enabled or not cfg.schedule_follow_night_window:
+    window = night_window_minutes(cfg)
+    if window is None or not cfg.schedule_follow_night_window:
         return (
             f"{first_index}. 几点睡、几点起由她是谁决定：从人设里读她的年纪感、工作或学业、"
             "生活习惯，结合当前的身体数值（困意、睡眠债）由你判断；"
@@ -231,9 +256,7 @@ def routine_prompt(cfg: HumanoidConfig, first_index: int = 10) -> str:
             "人设没写清楚时，按她的年纪感与生活习惯推，不要套用一套固定作息；"
             "午睡/小憩不是每天必须有的一站。\n"
         )
-    start, end = cfg.night_start_hour, cfg.night_end_hour
-    if start == end:
-        return ""
+    start, end = window[0] // 60, window[1] // 60
     span = cfg.night_span_hours
     lines = [
         f"{first_index}. 用户把她的作息锁定了：{start:02d}:00 上床，生物钟夜到 {end:02d}:00 结束。",
@@ -278,8 +301,9 @@ _PERIODS: tuple[tuple[int, int, str], ...] = (
 
 # 刚做完的事只算这个时长以内：早上八点吃过饭，晚上八点再说「刚吃完饭」就穿帮了。
 DAY_RECENT_PAST_MINUTES = 210
-# 接下来要做的事只算这个时长以内：太远的安排不算「等下」。
-DAY_UPCOMING_MINUTES = 210
+# 这里曾经还有一个 `DAY_UPCOMING_MINUTES`（「接下来要做的事只算三小时以内」）。
+# 滚动分段不预排未来（`segments()` 只返回 `start <= now` 的段），未来分支永远
+# 收不到一条数据——那个常量与它服务的分支一起删掉了（#73）。
 
 
 def period_of(minutes: int) -> str:
@@ -296,6 +320,13 @@ def period_of(minutes: int) -> str:
 _ACTION_HEADS = frozenset("在坐躺站靠趴蹲爬走跑跳吃喝做玩看读写听说聊打开学忙醒起洗梳穿等逛买煮烤拖练画唱骑划")
 
 _EVENT_PHRASE_MAX = 24
+# 事件名一律削到 24 字（对外契约不变），但**怎么削**有讲究：原来解析时是 `raw_event[:24]`
+# 硬切，切在词中间（“在厨房做红烧肉和清炒时”），后面按标点收尾也补不回来——那个字已经
+# 不在数据里了。现在存和渲染都走 `_clip_event`：先按标点断句，整句没标点才硬截（#156）。
+
+# 她睡着的时候听到的话，最多留几条：醒来那一段的 prompt 里逐条递进去。
+# 多留就成了任务清单（她得挨个回应），3 条已经够说明「那会儿有人来过」。
+ASLEEP_HEARD_MAX = 3
 
 # 梦：模型给的是自由文本，可能带空串、重复、超长、甚至非字符串。
 # 只留能说出口的一小句：每条封顶 20 字（prompt 里教的是 15 字，留一点余量），
@@ -340,25 +371,38 @@ def _clean_dreams(raw: Any) -> list[str]:
     return out
 
 
+def _clip_event(text: str, limit: int = _EVENT_PHRASE_MAX) -> str:
+    """把事件名削到 `limit` 字以内，且不留半个词、不悬空标点。
+
+    存储侧曾经在解析时就按 24 字硬切（`raw_event[:24]`），切在词中间
+    （“在厨房做红烧肉和清炒时”之后那个字已经没了），渲染侧再按标点收尾也补不回来。
+    现在解析存盘和渲染一律走这里：先看长度，超了就在最后一个标点/空格处收；
+    整句没有标点才硬截（并把尾部的悬空标点抹掉）。
+    """
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max((head.rfind(ch) for ch in "，。；、,; "), default=-1)
+    if cut >= limit // 2:
+        return head[:cut].strip(" -·、，。/~")
+    return head.rstrip(" -·、，。/~")
+
+
 def _event_phrase(event: str) -> str:
     """把时段名削成能放进一句口语里的动作。
 
     原来直接按 16 字硬截，「坐在客厅沙发看书并吃点水果」会被砍成「坐在客厅沙发看书并吃点水」
-    这种断句。改成先按标点收尾，实在没有标点才截。
+    这种断句。改成先剥掉「安排/活动/时间」这类尾巴，再交给 `_clip_event` 按标点收尾。
     """
     text = str(event or "").strip()
     for affix in ("安排", "活动", "时间", "（", "("):
         cut = text.find(affix)
         if cut > 1:
             text = text[:cut]
-    text = text.strip(" -·、，。/~")
-    if len(text) <= _EVENT_PHRASE_MAX:
-        return text
-    head = text[:_EVENT_PHRASE_MAX]
-    cut = max((head.rfind(ch) for ch in "，。；、,; "), default=-1)
-    if cut >= _EVENT_PHRASE_MAX // 2:
-        return head[:cut].strip(" -·、，。/~")
-    return head.rstrip(" -·、，。/~")
+    return _clip_event(text.strip(" -·、，。/~"))
 
 
 def _with_at(lead: str, phrase: str) -> str:
@@ -371,17 +415,36 @@ def _with_at(lead: str, phrase: str) -> str:
     return f"{lead}在{body}"
 
 
+def _at_phrase(lo: int, phrase: str, slot: Slot) -> str:
+    """把「时段 + 这件事」拼成一句，认出处境词与动作词的区别。
+
+    兜底分段（`dynamic_segment`）的 `event` 是**处境词**（“有点饿了”“肚子空着”），
+    不是动作。`_with_at()` 只认动词开头，对这类词会补一个「在」，拼出
+    「上午在有点饿了」「夜里在还没什么困意」这种病句——而这句会经 `day_phrases`
+    进入跨插件契约的 day 块，被当成她今天的既成事实。带 `status` 标记的段直接接在
+    时段词后面，不补「在」。
+    """
+    if slot.get("status"):
+        return f"{period_of(lo)}{phrase}"
+    return _with_at(period_of(lo), phrase)
+
+
 def day_phrases(
     slots: list[Slot],
     now_minutes: int,
     *,
     past_limit: int = 2,
-    future_limit: int = 1,
+    future_limit: int = 1,  # 历史参数：滚动分段下「接下来」恒为空，恒被忽略（见下）
 ) -> dict[str, Any]:
     """把日程拆成她能直接说出口的三段：刚做过什么 / 正在做什么 / 接下来做什么。
 
-    滚动分段日程里没有预排的未来，所以「接下来」通常只有正在做的这一段的自然
-    结束；她不会提前宣布等下要去哪——那本来就是排出来之前不知道的事。
+    滚动分段日程里没有预排的未来，所以「接下来」**永远是空列表**：`segments()`
+    只返回 `start <= 现在` 的段（未来段进不来），而她的下一段要等到时候看着当时
+    的身体与人设现决定——提前宣布等下要去哪，那本来就是排出来之前不知道的事。
+
+    `future_limit` 是给旧调用方（`link.py:166` 还在传 `future_limit=2`）留的兼容
+    参数：收下但不生效，返回的 `next` 恒为 `[]`。等 R1 批次把那个调用点一起清掉，
+    这个参数就可以删了（#73）。
 
     `dreams` 是当天**最近一段睡眠**的梦：契约和社交层拿它说「她昨晚梦到什么」。
     旧日程没有这个字段，所有旧 slot 读出来都是空列表——调用方不需要区分
@@ -389,7 +452,6 @@ def day_phrases(
     """
     doing = ""
     done: list[str] = []
-    upcoming: list[str] = []
     dreams: list[str] = []
     # 把 slot 本体一起带上：梦要从**同一段**里取，不能只留事件名再去反查。
     ordered: list[tuple[int, int, str, Slot]] = []
@@ -416,16 +478,8 @@ def day_phrases(
                 continue
             phrase = _event_phrase(event)
             if phrase:
-                done.insert(0, _with_at(period_of(lo), phrase))
+                done.insert(0, _at_phrase(lo, phrase, slot))
             continue
-        if lo - now_minutes <= DAY_UPCOMING_MINUTES:
-            phrase = _event_phrase(event)
-            if phrase:
-                # 说「夜里要睡了」而不是「夜里就该睡了」：后者听着像谁在管她。
-                upcoming.append(
-                    f"{period_of(lo)}要睡了" if slot_sleeps(slot)
-                    else f"{period_of(lo)}还要{phrase}"
-                )
 
     # 梦：按开始时间排序后取**最后一段睡眠**（跨午夜结转的那一截也算）。
     # 不按 end 取：23:00→24:00 与 00:00→07:00 是同一觉拆成的两段，按 end 比
@@ -445,7 +499,9 @@ def day_phrases(
     return {
         "doing": doing,
         "done": done[:max(0, int(past_limit))],
-        "next": upcoming[:max(0, int(future_limit))],
+        # 滚动分段没有预排的未来：恒为空列表。**键必须留着**——社交侧按
+        # `day.get("next")` 取，缺键会被当成契约坏了（#73）。
+        "next": [],
         # 今天想做的事。**空列表也要给这个键**——社交侧按 `day.get("wants")` 取，
         # 缺键和空列表要能分开处理（今天是合法的「没有」）。
         "wants": wants[:3],
@@ -628,6 +684,9 @@ def segment_prompt(
     suspended: Slot | dict | None = None,
     # 这次必须换一件事（`/拟人 日程打断`）：不许 continue 原地接着做。
     force_switch: bool = False,
+    # 她睡着期间发生过什么（#66）：睡着那一段不重掷，事件与来访以前就在保鲜期里
+    # 过期了。醒来这一段把那些短句递进去，听没听见由她判断。默认 None：旧调用不变。
+    heard_asleep: list[str] | None = None,
 ) -> str:
     """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
 
@@ -658,7 +717,8 @@ def segment_prompt(
             continue
         rows.append(
             f"{slot.get('start', '')}-{slot.get('end', '')} "
-            f"{slot.get('event', '')}（{slot.get('location', '')}）"
+            # 存的是 48 字以内（#156），递进 prompt 的这部分仍削到 24：一行一条，长了读不动。
+            f"{_clip_event(str(slot.get('event') or ''))}（{slot.get('location', '')}）"
         )
     history_block = ""
     if rows:
@@ -690,6 +750,20 @@ def segment_prompt(
         "也可能她压根没往心里去——看她是谁，也看这件事的分量。\n\n"
         if event_phrase else ""
     )
+    # 她睡着的时候发生过什么（#66）：睡着那段不重掷，事件与来访以前会在保鲜期里
+    # 悄悄过期，一觉醒来她什么都不知道。只递事实（谁说了什么、有人来过），
+    # 不写「所以醒来该……」——听没听见、要不要提起都由她判断。
+    _heard = [
+        str(x).strip() for x in (heard_asleep or []) if str(x or "").strip()
+    ][:ASLEEP_HEARD_MAX]
+    asleep_heard_block = ""
+    if _heard:
+        asleep_heard_block = (
+            "【她睡着的时候】\n"
+            + "\n".join(f"  - {x}" for x in _heard)
+            + "\n这些发生在她睡着期间：她可能压根没听见，也可能是被这些弄醒的——"
+            "要不要提起、要不要因此改变这一段，都由她判断。\n\n"
+        )
     # `suspended`：被打断之前她在做的那件事。以前中断之后原来在做的事没有任何
     # 记录，回不去——用户原话「所谓的保鲜期，就不是可以中途打断换一个，或在
     # 当前日程接下去的」。这里只把那段事实递进去，回不回去由她按人设决定。
@@ -701,7 +775,9 @@ def segment_prompt(
             _susp_left = max(0, int(float((_susp or {}).get("remaining_minutes", 0) or 0)))
         except (TypeError, ValueError):
             _susp_left = 0
-        _susp_lines = [f"【被打断之前她在做「{_susp_event}」（还剩 {_susp_left} 分钟）】"]
+        _susp_lines = [
+            f"【被打断之前她在做「{_clip_event(_susp_event)}」（还剩 {_susp_left} 分钟）】"
+        ]
         _susp_location = str((_susp or {}).get("location") or "").strip()
         _susp_emotion = str((_susp or {}).get("emotion") or "").strip()
         _susp_ongoing = str((_susp or {}).get("ongoing") or "").strip()
@@ -803,6 +879,7 @@ def segment_prompt(
         + night_line
         + interrupt_line
         + event_line
+        + asleep_heard_block
         + switch_block
         + suspended_block
         + "【怎么决定】\n"
@@ -962,14 +1039,31 @@ def _segment_minutes(raw: Mapping[str, Any], now_minute: int, sleeping: bool) ->
                 if not sleeping:
                     # 清醒段把结束点写在过去：没法用，按默认时长接上
                     end = now_minute + SEGMENT_DEFAULT_MINUTES
-                else:
-                    # 睡觉跨午夜：end 写的是明天醒来的时间
+                elif now_minute - end >= DAY_MINUTES // 2:
+                    # 过去得够远（比如现在是 00:30，end 写 06:00 之前的钟点），
+                    # 才可能真的是「明天那个点醒」。
                     end += DAY_MINUTES
+                else:
+                    # 钟点写错：现在 14:00，end 却写 13:00。旧写法一律 +24h，再被
+                    # 12 小时上限截断，于是一句写错的 end 能让她睡满 12 小时。
+                    end = now_minute + SEGMENT_SLEEP_FALLBACK_MINUTES
             minutes = end - now_minute
     if minutes is None:
         minutes = SEGMENT_DEFAULT_MINUTES
     cap = SEGMENT_SLEEP_MAX_MINUTES if sleeping else SEGMENT_MAX_MINUTES
     return max(SEGMENT_MIN_MINUTES, min(cap, minutes))
+
+
+def _ongoing_stem(text: str) -> str:
+    """同一件事的归一键：先剥掉「还差 4 份」这类进度数字，再取前 12 个字。
+
+    模型每次报同一件事会带进度（「还差 4 份」→「还差 2 份」），按字面比会堆成好几条；
+    但只取前 6 个字又会把「把那份合同改完」「把那份合同签了」当成一件事互相覆盖。
+    数字必须跟着量词一起剥：「第 3 件不同的事」里的 3 是任务身份，剥掉就全归一了。
+    """
+    stripped = re.sub(r"[0-9０-９]+(?:份|个|页|章|条|张|分钟|小时)", "", text)
+    stripped = re.sub(r"[一二三四五六七八九十]+(?:份|个|页|章|条|张|分钟|小时)", "", stripped)
+    return stripped.strip()[:12]
 
 
 def parse_segment(
@@ -997,7 +1091,7 @@ def parse_segment(
     prev = prev or {}
     # 回去接着做被打断之前那件事：continue 与 resume 同时出现时以 resume 优先。
     susp = suspended if isinstance(suspended, Mapping) else {}
-    suspended_event = str((susp or {}).get("event") or "").strip()[:24]
+    suspended_event = _clip_event(str((susp or {}).get("event") or ""))
     want_resume = _truthy_flag(raw.get("resume")) and bool(suspended_event)
     if want_resume:
         # 挂起记录里带着解析时的睡着判定：醒来前被打断的那件事可能没有睡词。
@@ -1008,7 +1102,7 @@ def parse_segment(
             remaining = SEGMENT_DEFAULT_MINUTES
         cap = SEGMENT_SLEEP_MAX_MINUTES if sleeping else SEGMENT_MAX_MINUTES
         minutes = max(SEGMENT_MIN_MINUTES, min(cap, remaining))
-        start = segment_start(now_minute, step)
+        start = _start_after(prev, now_minute, step)
         end = start + minutes
         slot: Slot = {
             "start": format_time(start),
@@ -1016,8 +1110,16 @@ def parse_segment(
             "event": suspended_event,
             "location": str((susp or {}).get("location") or "").strip()[:16] or "家中",
             "emotion": str((susp or {}).get("emotion") or "").strip()[:12] or "平常",
-            "energy_rate": clamp_rate(raw.get("energy_rate", 0.0)),
+            # 挂起记录里带着被截断那段的能量速率（#70）：模型 resume 时通常只回
+            # resume=true，不给 energy_rate。旧写法默认 0.0，于是「回去接着做」的
+            # 那一段对体力零消耗——接着做的是同一件事，速率该沿用。
+            "energy_rate": clamp_rate(
+                raw.get("energy_rate", (susp or {}).get("energy_rate", 0.0))
+            ),
         }
+        if (susp or {}).get("status"):
+            # 挂起的是兜底给的处境词：标记跟着 event 一起回来，否则渲染时又会被套上「在」。
+            slot["status"] = True
         ongoing = str((susp or {}).get("ongoing") or "").strip()[:40]
         if ongoing:
             slot["ongoing"] = ongoing
@@ -1037,12 +1139,13 @@ def parse_segment(
         want_continue = want_continue.strip().lower() in ("true", "1", "yes", "是", "继续")
     want_continue = bool(want_continue) and bool(str(prev.get("event") or "").strip())
 
-    # 原文留着判「是不是睡着」：截到 24 字之后，睡字常常正好被切掉。
+    # 原文留着判「是不是睡着」：截断之后，睡字常常正好被切掉（存的是 `_clip_event`
+    # 削过的 24 字，判睡一律看原文）。
     raw_event = str(raw.get("event") or "").strip()
-    event = raw_event[:24]
+    event = _clip_event(raw_event)
     if want_continue:
         raw_event = str(prev.get("event") or "").strip()
-        event = raw_event[:24]
+        event = _clip_event(raw_event)
     if not event:
         return None
 
@@ -1059,7 +1162,7 @@ def parse_segment(
 
     sleeping = is_sleep_event(raw_event)
     minutes = _segment_minutes(raw, now_minute, sleeping)
-    start = segment_start(now_minute, step)
+    start = _start_after(prev, now_minute, step)
     end = start + minutes
     rate_raw = raw.get("energy_rate", prev.get("energy_rate", 0.0) if want_continue else 0.0)
 
@@ -1071,6 +1174,9 @@ def parse_segment(
         "emotion": emotion,
         "energy_rate": clamp_rate(rate_raw),
     }
+    if want_continue and prev.get("status"):
+        # 接着上一段（兜底的处境词）继续：标记一起继承，渲染时才知道这不是动作。
+        slot["status"] = True
     if not sleeping and slot_sleeps({**slot, "event": raw_event}):
         # 关键词没命中，但整段就是一段安静的卧床休息（模型写「阖眼，呼吸渐沉」这类）。
         # 按睡着处理，并把这当成睡眠段重算时长上限——不然一夜八小时会被 180 分钟截断，
@@ -1100,6 +1206,23 @@ def segment_start(now_minute: int, step: int) -> int:
     """
     step = max(1, int(step))
     return (max(0, int(now_minute)) // step) * step
+
+
+def _start_after(prev: Slot | None, now_minute: int, step: int) -> int:
+    """这一段的起点：向下对齐到刻度，但**不早于上一段的结束**（#65）。
+
+    只看刻度会退回到上一段里：上一段 09:22–10:07（`continue_now` 按配置延长，
+    结束点不在刻度上），10:10 决定下一段时向下取整得 10:00，新段起点落进上一段
+    中间。`_append_segment` 只好把上一段的 end 收回到 10:00 并当成「被打断」——
+    其实那 7 分钟她做完了，`remaining_minutes` 还被算多了 7 分钟挂起来。
+
+    上一段的 end 在「现在」之后（理论上不该发生）时不夹：那样起点会越过此刻。
+    """
+    start = segment_start(now_minute, step)
+    prev_end = parse_time((prev or {}).get("end"))
+    if prev_end is not None and prev_end <= now_minute:
+        start = max(start, prev_end)
+    return start
 
 
 def _in_window(minutes: int, start: int, end: int) -> bool:
@@ -1151,18 +1274,25 @@ def dynamic_segment(
     seed: list[Any] | None = None,
     asleep_minutes: float = 0.0,
 ) -> Slot:
-    """没有可用模型时的兜底：**只给状态，不给事件**。
+    """没有可用模型时的兜底：给的是**处境词 + 中性地点**，不是事件。
 
-    分支的**选择**确实由身体读数决定（饿了就走饿、累了就走累）——这部分是真的。
-    但分支内曾经写着 36 条具体事件（“看书做笔记”“下楼买饭团”“叫了份外卖”）和 11 个
+    分支的**选择**确实由身体读数决定（饿了走饿、累了走累）——这部分是真的。
+    兜底曾经写着 36 条具体事件（“看书做笔记”“下楼买饭团”“叫了份外卖”）和 11 个
     地点（“工位/书房/教室”），它们会经 day_phrases 变成「她今天上午在看书做笔记」这样
     一句**第一人称事实**，而注入块开头写着“以下是她当前的**真实处境**”——等于把编出来
     的一天当成既成事实交给模型。更麻烦的是地点：工位与教室直接预设了她是上班族还是学生，
     退休的人、自由职业者会凭空多出一张工位。
 
-    现在只给状态：她饿了、在忙、到饭点了。**做什么、看到什么、经历了什么，由她自己说。**
-    同文件的 current_slot() 早就写着「拿不到段时给一个中性『自由活动』，不编造她在做什么」，
-    那是这个模块自己的标准，这里跟它对齐。
+    现在剩下的是**处境词**（“有点饿了”“小睡一会儿”“忙自己的事”“歇着”）与两个中性
+    地点（“家里/卧室”）：她饿着、困着、到饭点了、夜里还醒着。具体在做什么、看到什么、
+    经历了什么，由她自己说——同文件的 current_slot() 早就写着「拿不到段时给一个中性
+    『自由活动』，不编造她在做什么」，这里跟它对齐。
+
+    但 `event` 字段仍必须填（slot schema 与下游渲染都要求非空），填进去的是处境词，
+    所以返回的 slot 带 `"status": True`：**它读起来像动作，其实是状态**。下游渲染
+    （`day_phrases`）必须据此换成不含「在」的模板——旧代码没这个标记，一律按动作套
+    「在」，于是把“有点饿了”拼成「上午在有点饿了」。凡是把这个 event 抄到别处的地方
+    （parse_segment 的 continue/resume、`_append_segment` 的挂起记录）都要把标记一起带走。
 
     措辞仍按 (角色, 日期, 钟点) 抽签，同一时刻不会每天给出同一个答案。
 
@@ -1177,19 +1307,22 @@ def dynamic_segment(
     discomfort = float(body.get("discomfort", 0.0) or 0.0)
     asleep = float(body.get("asleep", 0.0) or 0.0) >= 1.0
 
-    night_start = int(cfg.night_start_hour) * 60
-    night_end = int(cfg.night_end_hour) * 60
-    if not cfg.night_mode_enabled or night_start == night_end:
-        night_start, night_end = 23 * 60, 7 * 60
-    in_night = _in_window(now_minute, night_start, night_end)
+    # 夜间窗口只有一份来源（`night_window_minutes`）：关掉夜间模式 / 窗口长度为 0
+    # 就是「她没有生物钟夜」，兜底不再退回 23:00-07:00 替她排一觉到早上。
+    window = night_window_minutes(cfg)
+    in_night = window is not None and _in_window(now_minute, window[0], window[1])
 
     # 睡够了就该醒。`asleep` 只由「装上的一段不是睡眠」来解（soma 记到非睡段才清
     # asleep_since），而兜底分段每被问一次就再排一段睡：睡着了 → 再排 90 分钟睡 →
     # 仍然睡着 → 再排……模型不可用（provider 冷却、抽不到调用间隔）时她能这样睡一整天，
     # 日程里除了睡觉什么都没有。所以超过该睡的量就主动给醒着的段。
-    if asleep_minutes >= _wake_up_minutes(cfg) and (
-        not in_night or asleep_minutes >= _wake_up_minutes(cfg) + 180.0
-    ):
+    # 「睡够了」只有一个口径：睡过她需要的量（`_wake_up_minutes`，下限 4 小时）。
+    # 旧写法在生物钟夜里还要求「再多睡 3 小时」（`+ 180.0`）才算够：默认窗口
+    # 23:00–06:00 只有 420 分钟，而 480+180=660 永远到不了——06:00 该醒的时候
+    # 她还在睡，兜底再补 90 分钟写到 07:30（#67）。夜里要不要接着睡由下面的
+    # `in_night and pressure` 决定（困意没消就接着睡、消了就醒），不必在这里
+    # 再加一条「夜里不准醒」。
+    if asleep_minutes >= _wake_up_minutes(cfg):
         asleep = False
 
     seed_key = list(seed or []) + [now_minute // 60]
@@ -1198,13 +1331,17 @@ def dynamic_segment(
     if asleep or (in_night and pressure >= LOCAL_NIGHT_SLEEP_PRESSURE):
         if in_night:
             # 睡到生物钟夜结束（她的自然醒点）；跨午夜的部分由结转接到明天。
+            night_end = window[1] if window is not None else now_minute
             logical_end = night_end if night_end > now_minute else night_end + DAY_MINUTES
             minutes = max(SEGMENT_MIN_MINUTES, min(SEGMENT_SLEEP_MAX_MINUTES, logical_end - now_minute))
         else:
-            # 白天（或不在生物钟夜里）已经睡着：给「睡到自然醒」的兜底，最多 90 分钟。
-            # 旧写法对不在夜里的 asleep 写死 120 分钟，一觉被排成两小时的既定事实；
-            # 滚动分段的语义是醒了再重新判断，所以收短。
-            minutes = 90
+            # 不在生物钟夜里却还睡着（白天补觉、或生物钟夜里已经睡过点）：再睡多久
+            # 按「还差多少才睡够」给，不写死 90 分钟（#67）。默认 need=480、窗口
+            # 23:00–06:00（420 分钟）时，06:00 这一觉还差 60 分钟 → 补到 07:00 醒；
+            # `sleep_need_hours=7` 的用户 06:00 准时醒。上限仍是 90：滚动分段的语义
+            # 是醒了再重新判断，不能一次排一整段白天觉。
+            short = int(_wake_up_minutes(cfg) - asleep_minutes)
+            minutes = max(SEGMENT_MIN_MINUTES, min(90, short))
         event, location, emotion, rate = "睡一觉", "卧室", "沉睡", 0.15
     elif pressure >= LOCAL_DAY_NAP_PRESSURE and not in_night:
         # 白天困到越线：不能继续排「在厨房煮饭」这种要精神的事，但也不用睡一整天。
@@ -1260,6 +1397,9 @@ def dynamic_segment(
         "location": location,
         "emotion": emotion,
         "energy_rate": clamp_rate(rate),
+        # 处境词标记：event 里放的是状态不是动作，渲染时不能套「在」（见 docstring）。
+        # 它不是模型产出的字段，parse_segment 不认它——只在抄这个 event 的路径上跟着走。
+        "status": True,
     }
     if end > DAY_MINUTES:
         slot["carry_end"] = format_time(end - DAY_MINUTES)
@@ -1303,6 +1443,10 @@ class ScheduleService:
         self._task: asyncio.Task | None = None
         self.last_error = ""
         self._retry_after = 0.0
+        # 上一次 `_generate_segment` 的结局（#75）。`ensure_fresh` 据此判断「这一段没
+        # 装上，是因为被节流挡回（事件/来访已在里面原样还回），还是生成真的失败了
+        # （取走的事件/来访必须还回去）」。空串 = 还没生成过。
+        self._last_outcome: str = ""
         # 失败退避的计时源：必须可注入，否则测试无法验证「退避窗口内不再投递」。
         self._monotonic = monotonic or time.monotonic
         # 日程得按她是谁来排：递一个 async () -> Persona 进来，不递就不读人设。
@@ -1323,6 +1467,8 @@ class ScheduleService:
         # 拿 0 当基准会把第一条来访白白挡掉。
         self._last_message_at: float | None = None
         self._last_interrupt_at: float | None = None
+        # 这两个基准跨重启要接着用（#74）：读回来再算安静间隔与冷却。
+        self._restore_interrupt_baseline()
         # 待处理的事件（别人刚说的话够重）：一次性，refresh_due 消费掉。
         self._event_at = 0.0
         self._event_phrase = ""
@@ -1330,6 +1476,12 @@ class ScheduleService:
         # 刚装上的一段是不是「回去接着做被打断之前那件事」（resume）：`_append_segment`
         # 要据此清掉挂起、并且不把这次被截断的段再挂起来。
         self._resumed_event = ""
+        # 她睡着的时候用户说过的话 / 有人来找过（#66）。睡着时 `_due` 直接返回，
+        # 事件与来访就这么在保鲜期里过期——一觉醒来，夜里那几句关心一个字都不剩。
+        # 这里把睡着期间发生的收成短句，等醒来那一段的 prompt 里递给她（见
+        # `_capture_heard_while_asleep` / `heard_while_asleep`）。只在内存里：
+        # 跨重启的「睡着时听到的话」没有意义（那时她早醒了，见 `_woke_at` 同理）。
+        self._heard_while_asleep: list[dict[str, Any]] = []
 
         self.resolver = None
         self.gateway = None
@@ -1444,9 +1596,15 @@ class ScheduleService:
     # 被打断之前她在做的那件事（只存一件）：中断之后原来在做的事要有个记录，
     # 下一次安排时可以选「回去接着做」。结构：
     # `{"event", "location", "emotion", "ongoing", "wants",
-    #   "remaining_minutes", "at", "ttl_minutes"}`
+    #   "remaining_minutes", "end_at", "at", "ttl_minutes"}`
     # 新的覆盖旧的；`schedule_pause_ttl_minutes` 之后过期作废（读取时顺手清）。
+    # `end_at` 是「原定结束时刻」的 epoch 秒（R5：盘上存时刻，不存会过期的数字）：
+    # 挂起快照里那句「还剩 N 分钟」必须按现在现算，否则 TTL 内都播报同一个数字。
     SUSPENDED_KEY = "schedule_suspended"
+    # 打断闸门的两个基准（上一条私聊 / 上一次算作来访）也落盘（#74）：只存内存的话，
+    # 每次重启后的第一条私聊都会被当成「有人打破安静来找她」。值一律 epoch 秒，
+    # 启动时换算回 monotonic 并夹到 ≤ now（时钟被回拨时盘上的时刻可能是「未来」）。
+    INTERRUPT_BASELINE_KEY = "schedule_interrupt_baseline"
     # 昨天那份日程存哪儿：跨天时 `daily_schedule` 被今天的第一段覆盖，昨天做了什么
     # 就没了着落。留一份尾部给 `_history_for_prompt` 当「昨天的收尾」。
     PREV_DAY_KEY = "prev_day_schedule"
@@ -1464,12 +1622,77 @@ class ScheduleService:
         except Exception:
             return time.time()
 
+
+    def _restore_interrupt_baseline(self) -> None:
+        """从盘上读回打断闸门的两个基准（#74）。
+
+        盘上是 epoch 秒、内存里是 monotonic 秒：同一个瞬间两套刻度差一个常量，
+        而重启后 monotonic 归零。所以存「相对现在多久以前」，读回时用现在的
+        monotonic 减掉它。盘上的时刻晚于现在（时钟被回拨）就夹到 now——未来的
+        基准会让安静间隔/冷却永远判不过去。读不到（旧存档/坏值）就当没有，
+        不拿 now 编一个基准出来。
+        """
+        try:
+            raw = self._scope.get_self(self.INTERRUPT_BASELINE_KEY)
+        except Exception:
+            return
+        if not isinstance(raw, Mapping):
+            return
+        try:
+            wall_now = float(self._wall_clock())
+            mono_now = float(self._monotonic())
+        except Exception:
+            return
+
+        def _to_mono(value: Any) -> float | None:
+            try:
+                ts = float(value)
+            except (TypeError, ValueError):
+                return None
+            if ts <= 0:
+                return None
+            ts = min(ts, wall_now)
+            return mono_now - (wall_now - ts)
+
+        message_at = _to_mono(raw.get("last_message_at"))
+        interrupt_at = _to_mono(raw.get("last_interrupt_at"))
+        if message_at is not None:
+            self._last_message_at = message_at
+        if interrupt_at is not None:
+            self._last_interrupt_at = interrupt_at
+
+    def _save_interrupt_baseline(self) -> None:
+        """把两个基准按 epoch 秒写回（#74）；写失败不该让私聊处理炸掉。"""
+        if self._last_message_at is None and self._last_interrupt_at is None:
+            return
+        try:
+            wall_now = float(self._wall_clock())
+            mono_now = float(self._monotonic())
+        except Exception:
+            return
+
+        def _to_wall(value: float | None) -> float | None:
+            if value is None:
+                return None
+            return wall_now - (mono_now - float(value))
+
+        try:
+            self._scope.set_self(
+                self.INTERRUPT_BASELINE_KEY,
+                {
+                    "last_message_at": _to_wall(self._last_message_at),
+                    "last_interrupt_at": _to_wall(self._last_interrupt_at),
+                },
+            )
+        except Exception:
+            pass
+
     def ongoing_tasks(self) -> list[str]:
         """她手上还没做完的那几件事（跨天跟着她）。"""
         raw = self._scope.get_self(self.ONGOING_KEY)
         if not isinstance(raw, list):
             return []
-        out: list[str] = []
+        items: list[tuple[float, str]] = []
         cutoff = self._wall_clock() - self.ONGOING_TTL_DAYS * 86400.0
         for item in raw:
             if not isinstance(item, dict):
@@ -1480,8 +1703,14 @@ class ScheduleService:
             except (TypeError, ValueError):
                 seen = 0.0
             if text and seen >= cutoff:
-                out.append(text)
-        return out[: self.ONGOING_MAX]
+                items.append((seen, text))
+        # 超量时留**最近**报的几件：旧写法直接取列表前三个，而列表按插入顺序排，
+        # 留下的正好是最旧的三件——最该被顶掉的反倒先喂给模型。
+        # 同一毫秒报的几件 at 相同（Windows 的 time.time 粒度约 15ms），先倒转存档顺序
+        # 再用稳定排序兜底：并列时越靠后（越新）的排前面。
+        items.reverse()
+        items.sort(key=lambda pair: pair[0], reverse=True)
+        return [text for _, text in items[: self.ONGOING_MAX]]
 
     def _note_ongoing(self, slot: Slot) -> None:
         """把这一段报的「还没做完」记下来。做完的事由模型不再报就自然过期。
@@ -1496,13 +1725,12 @@ class ScheduleService:
         raw = self._scope.get_self(self.ONGOING_KEY)
         items = [i for i in raw if isinstance(i, dict)] if isinstance(raw, list) else []
         # 同一件事模型每次报的措辞会带进度（「还差 4 份」→「还差 2 份」），按字面比会
-        # 堆成好几条同一件事。这里按**前六个字**归一：那是「整理那份/那份个案/写完那
-        # 封」这种稳定前缀，进度部分在后面。
-        stem = text[:6]
+        # 堆成好几条同一件事。归一见 _ongoing_stem：剥掉进度数字再取前 12 字。
+        stem = _ongoing_stem(text)
         kept: list[dict[str, Any]] = []
         for item in items:
             what = str(item.get("what", "") or "").strip()
-            if not what or what[:6] == stem:
+            if not what or _ongoing_stem(what) == stem:
                 continue
             try:
                 at = float(item.get("at", 0.0) or 0.0)
@@ -1510,6 +1738,8 @@ class ScheduleService:
                 at = 0.0
             kept.append({"what": what, "at": at})
         kept.append({"what": text, "at": self._wall_clock()})
+        # 列表顺序是「报告先后」，不是时间先后；超量时按 at 留最近的几件。
+        kept.sort(key=lambda item: item["at"])
         self._scope.set_self(self.ONGOING_KEY, kept[-self.ONGOING_MAX :])
         self._scope.mark_dirty()
 
@@ -1535,6 +1765,35 @@ class ScheduleService:
                 return slot
         return None
 
+    def _ordered_segments(self) -> list[Slot]:
+        """按起点升序的段。
+
+        存档会乱序：carry 拼接、旧版整表迁移、`_migrate_new_day` 的部分写入。
+        读路径原本盲取 `segs[-1]`，乱序时那可能是**更早**的一段。
+        """
+        segs = self.segments()
+        segs.sort(key=lambda item: parse_time(item.get("start")) or 0)
+        return segs
+
+    def _active_and_prev(
+        self, minutes: int, segs: list[Slot] | None = None
+    ) -> tuple[Slot | None, Slot | None]:
+        """覆盖「现在」的那一段，和「她现在正处在的那一段」（没有覆盖就是最后一段）。
+
+        读路径（prompt 里的「她这一段从 X 开始…已经 N 分钟」、continue 判定）与写路径
+        （截断/顺延）共用这一份口径：乱序存档里 `segs[-1]` 可能是**更早**的一段。
+        `segs` 传入时按已排序处理。
+        """
+        ordered = self._ordered_segments() if segs is None else segs
+        for item in ordered:
+            lo = parse_time(item.get("start"))
+            hi = parse_time(item.get("end"))
+            if lo is None or hi is None:
+                continue
+            if lo <= minutes < hi:
+                return item, item
+        return None, (ordered[-1] if ordered else None)
+
     def active_segment(self, minutes: int | None = None) -> Slot | None:
         """覆盖「现在」这一段。没决定过就是 None——她此刻在做的事还没被问出来。"""
         if minutes is None:
@@ -1543,7 +1802,7 @@ class ScheduleService:
         return self._covering(self.segments(), minutes)
 
     def last_segment(self) -> Slot | None:
-        segs = self.segments()
+        segs = self._ordered_segments()
         return segs[-1] if segs else None
 
     def current_slot(self, minutes: int | None = None) -> Slot:
@@ -1756,7 +2015,10 @@ class ScheduleService:
         gate = getattr(self.gateway, "gate", None) if self.gateway is not None else None
         if gate is None:
             return True
-        return gate.check(PURPOSE).allowed
+        # 按角色问「有没有人在看着她」：闸门全局一份，不传角色就会让别的 bot 的
+        # 对话松开这个角色的空闲静默（审核 main.py 6）。
+        role_id = str(getattr(self._scope, "role_id", "") or "")
+        return gate.check(PURPOSE, role_id=role_id).allowed
 
     def note_interruption(
         self,
@@ -1793,14 +2055,17 @@ class ScheduleService:
             and t - previous < quiet_seconds
             and not _is_call_out(text, cfg)
         ):
+            self._save_interrupt_baseline()
             return
         if (
             self._last_interrupt_at is not None
             and t - self._last_interrupt_at < _interrupt_cooldown_seconds(cfg)
         ):
+            self._save_interrupt_baseline()
             return
         self._last_interrupt_at = t
         self._interrupt_at = t
+        self._save_interrupt_baseline()
 
     # ------------------------------------------------------------------
     # 事件：一句话改写她这一天
@@ -1858,18 +2123,59 @@ class ScheduleService:
             return ""
         return self._event_phrase
 
-    def _consume_event(self) -> str:
-        """取走一次待处理事件（一次性）。返回的是原始措辞。
+    def _consume_event_stamped(self) -> tuple[str, float]:
+        """取走一次待处理事件，连同它**被记下的时刻**（单调秒）。
 
-        生成被闸门挡回时要原样还回（只把标记放回去、不重新计时），
-        否则反复被挡就能把保鲜期一次次续满——与 `_consume_interruption` 同理。
+        生成被闸门挡回时要原样还回（措辞与时间戳一起），否则反复被挡就能把
+        保鲜期一次次续满——以前归还时把 `_event_at` 重置成「现在 - 1 秒」，
+        等于每次被挡都免费续命 30 分钟，事件永远不会过期（日程 F1）。
         """
         phrase = self._fresh_event()
         if not phrase:
-            return ""
+            return "", 0.0
+        ts = self._event_at
         self._event_at = 0.0
         self._event_phrase = ""
-        return phrase
+        return phrase, ts
+
+    def _consume_event(self) -> str:
+        """取走一次待处理事件（一次性）。返回的是原始措辞。"""
+        return self._consume_event_stamped()[0]
+
+    # ------------------------------------------------------------------
+    # 睡着时听见的话
+    # ------------------------------------------------------------------
+
+    def _heard_while_asleep_add(self, phrase: str) -> None:
+        """记下一条「她睡着的时候发生的」。空串、重复都不记。"""
+        text = str(phrase or "").strip()
+        if not text:
+            return
+        if any(item.get("phrase") == text for item in self._heard_while_asleep):
+            return
+        self._heard_while_asleep.append({"phrase": text, "at": self._monotonic()})
+        del self._heard_while_asleep[:-ASLEEP_HEARD_MAX]
+
+    def _capture_heard_while_asleep(self) -> None:
+        """睡着时把待处理的事件与来访收进记忆，别让它们在保鲜期里悄悄过期。
+
+        睡着的那一段里 `_due` 一律返回 False（不重掷、不掀被子），以前它**什么都不做**：
+        `note_event` / `note_interruption` 设的标记就躺在那儿等 TTL（默认 30 / 60 分钟）
+        过期，用户夜里说的每句话都被静默丢弃，连一句记录都不留。
+
+        这里只做记账：把事件措辞与「有人来过」收成短句，等醒来那一段生成时递给她
+        （`segment_prompt(heard_asleep=...)`），醒来装上新段后清空
+        （`_append_segment`）。她听没听见、要不要提，仍由她决定——这里只说「发生过」。
+        """
+        phrase, _ts = self._consume_event_stamped()
+        if phrase:
+            self._heard_while_asleep_add(phrase)
+        if self._fresh_interruption(clear=True):
+            self._heard_while_asleep_add("有人来找过她")
+
+    def heard_while_asleep(self) -> list[str]:
+        """睡着期间听到的话（给 prompt 用）。没有就是空列表。"""
+        return [str(item.get("phrase") or "") for item in self._heard_while_asleep]
 
     def pending_event(self) -> dict[str, Any]:
         """待处理事件的一份只读快照。没有就返回空 dict。
@@ -1955,14 +2261,34 @@ class ScheduleService:
             remaining = max(0, int(float(raw.get("remaining_minutes") or 0)))
         except (TypeError, ValueError):
             remaining = 0
+        # #69：剩余时间按「原定结束时刻 - 现在」现算。旧快照没有 `end_at`，
+        # 用「挂起时刻 + 当时剩下的分钟」补出来；连 `at` 都没有才退回那个数字。
+        try:
+            end_at = float(raw.get("end_at") or 0.0)
+        except (TypeError, ValueError):
+            end_at = 0.0
+        if end_at <= 0 and at > 0:
+            end_at = at + remaining * 60.0
+        if end_at > 0:
+            left = end_at - self._wall_clock()
+            if left <= 0:
+                # 原定结束时刻已经过去：这件事已经结束了，不该再说「还剩 0 分钟」。
+                self._clear_suspended()
+                return {}
+            remaining = max(1, int(math.ceil(left / 60.0)))
         return {
-            "event": event[:24],
+            "event": _clip_event(event),
             "location": str(raw.get("location") or "").strip()[:16],
             "emotion": str(raw.get("emotion") or "").strip()[:12],
             "ongoing": str(raw.get("ongoing") or "").strip()[:40],
             "wants": bool(raw.get("wants")),
             "remaining_minutes": min(remaining, DAY_MINUTES),
+            # 被截断那段的能量速率（#70）：resume 分支拿它当默认值。快照不带上就等于
+            # 没存——模型 resume 时通常只回 resume=true，不带 energy_rate。
+            "energy_rate": clamp_rate(raw.get("energy_rate", 0.0)),
             "sleep": bool(raw.get("sleep")),
+            # 处境词标记：挂起的是兜底给的“有点饿了”，渲染与 resume 都要知道它不是动作。
+            "status": bool(raw.get("status")),
             "at": at,
             "ttl_minutes": ttl_minutes,
         }
@@ -2072,6 +2398,13 @@ class ScheduleService:
             # **消息也不算**：多用户部署里夜里总有人发消息，让消息能撕被子，
             # 她就没有一个完整的觉了（这个口子原来只按「一个话多的人」设计，
             # 没扛住「很多人」——现在只走睡觉保护，起床由这段自然结束）。
+            # 但「不掀被子」不等于「听不见」：睡着期间的这句话与这次来访要记下来，
+            # 醒来那一段的 prompt 会递给她（#66）。旧代码在这里直接返回，事件与
+            # 来访只在保鲜期里躺到过期，一觉醒来什么都不剩。
+            # 只在 `roll=True`（真的在走一次决策）时收：`_due_peek` 是每条消息都会
+            # 调的只读路径，在那里消费等于把这一轮要用的东西提前吃掉。
+            if roll:
+                self._capture_heard_while_asleep()
             return False
         body = self._body_snapshot()
         if body:
@@ -2300,9 +2633,10 @@ class ScheduleService:
             # 拿锁期间可能已被别的路径决定过：再确认一次。
             if not force and not self.refresh_due():
                 return False
-            segs = self.segments()
-            active = self._covering(segs, minutes)
-            prev = segs[-1] if segs else None
+            # 「现在这一段」和「它前面那段」与写路径同一份口径：存档乱序时盲取
+            # `segs[-1]` 会把更早的一段当成她正在做的事递给 prompt（时间跨度、
+            # 「上一段是不是睡眠」、continue 判定全跟着错）。
+            active, prev = self._active_and_prev(minutes)
             elapsed = 0
             if prev is not None:
                 lo = parse_time(prev.get("start"))
@@ -2322,7 +2656,7 @@ class ScheduleService:
                 # 原样还回（不重新计时，保鲜期才拦得住无限续命）。
                 interrupted_ts = self._consume_interruption()
                 # 同理：事件也在「真的要去生成」时才取走。被闸门挡回时还回。
-                event_phrase = self._consume_event()
+                event_phrase, event_ts = self._consume_event_stamped()
 
         slot: Slot | None = None
         if attempt_llm:
@@ -2332,8 +2666,18 @@ class ScheduleService:
                 slot = await self._generate_segment(
                     cfg, now, minutes, prev, elapsed, ignore_cooldown,
                     interrupted_ts=interrupted_ts, event_phrase=event_phrase,
-                    force_switch=force_switch,
+                    event_ts=event_ts, force_switch=force_switch,
                 )
+                # 生成真的失败了（超时/异常/解析失败/换事失败），把刚取走的事件与
+                # 「来访」**原样还回去**（#75）：它们一次提示词都没进过，就这么丢掉
+                # 等于「有人来找过她」这件事没发生。被节流挡回的分支（`OUTCOME_GATED`）
+                # 已经在 `_generate_segment` 里还过，这里不能重复还（会覆盖新事件）。
+                if slot is None and self._last_outcome != OUTCOME_GATED:
+                    if interrupted_ts > 0.0:
+                        self._interrupt_at = interrupted_ts
+                    if event_phrase:
+                        self._event_phrase = event_phrase
+                        self._event_at = event_ts
             async with self._lock:
                 if slot is None and (active is None or force or not cfg.use_llm_schedule):
                     slot = dynamic_segment(
@@ -2364,12 +2708,15 @@ class ScheduleService:
         ignore_cooldown: bool,
         interrupted_ts: float = 0.0,
         event_phrase: str = "",
+        event_ts: float = 0.0,
         force_switch: bool = False,
     ) -> Slot | None:
         interrupted = interrupted_ts > 0.0
         self._resumed_event = ""
+        self._last_outcome = ""
         if self.gateway is None:
             self.last_error = "LLM Gateway 未初始化"
+            self._last_outcome = "no_gateway"
             return None
 
         persona = await self._resolve_persona()
@@ -2409,6 +2756,8 @@ class ScheduleService:
             want_day_frame=not frame,
             suspended=suspended or None,
             force_switch=force_switch,
+            # 睡着期间听到的话（#66）：醒来这一段递给她，装上新段后清空。
+            heard_asleep=self.heard_while_asleep(),
         )
         if self._log and cfg.debug_mode:
             self._log.debug(
@@ -2431,13 +2780,18 @@ class ScheduleService:
             )
         except Exception as exc:
             self.last_error = f"生成异常：{exc}"
+            self._last_outcome = "exception"
             self._fail_backoff(cfg)
             return None
         finally:
             self._generating = False
 
+        # 结果对象可能来自替身/旧适配层，没有 outcome 字段时别炸掉整段换段流程（#75）：
+        # 少了这个字段只影响「失败原因」这一句诊断，不该让日程停摆。
+        outcome = str(getattr(result, "outcome", "") or "error")
+        self._last_outcome = outcome
         if not result.ok:
-            if result.outcome == OUTCOME_GATED:
+            if outcome == OUTCOME_GATED:
                 # 被节流跳过不是 provider 故障，不能进 30 分钟退避——那会让
                 # 「用户一说话就恢复」也一起失效。也不往 last_error 上挂：
                 # 那是给用户看的诊断位，不该长期显示一个无须处理的节流提示。
@@ -2446,9 +2800,10 @@ class ScheduleService:
                     # 保留原始时间戳，不重新计时——否则反复被挡就能一直续命、突破保鲜期。
                     self._interrupt_at = interrupted_ts
                 if event_phrase:
-                    # 同理：事件被挡回时原样还回，不重新计时。
+                    # 同理：事件被挡回时原样还回——措辞与**原始时间戳**一起还，
+                    # 不重新计时（否则反复被挡就等于永久续命）。
                     self._event_phrase = event_phrase
-                    self._event_at = self._monotonic() - 1.0
+                    self._event_at = event_ts
                 if self._log and cfg.debug_mode:
                     self._log.debug(f"[humanoid_core] 日程被节流跳过: {result.detail}")
                 return None
@@ -2469,6 +2824,7 @@ class ScheduleService:
             raw = _force_switch_raw(raw, prev)
             if raw is None:
                 self.last_error = "这次要求换一件事，但模型只说了继续、没给出新事件"
+                self._last_outcome = "force_switch_failed"
                 self._fail_backoff(cfg)
                 if self._log and cfg.debug_mode:
                     self._log.debug(f"[humanoid_core] 日程打断失败: {self.last_error}")
@@ -2482,6 +2838,7 @@ class ScheduleService:
         )
         if slot is None:
             # 解析失败同样进退避：不挡的话每个后台周期都会再砸一次模型。
+            self._last_outcome = "parse_failed"
             self.last_error = f"无法解析这一段：{result.text[:160]}"
             self._fail_backoff(cfg)
             if self._log and cfg.debug_mode:
@@ -2494,6 +2851,7 @@ class ScheduleService:
         ):
             # 换事失败：它把原来那件事又排了一遍。按失败处理（不能假装换过）。
             self.last_error = "这次要求换一件事，但模型又排回了同一件事"
+            self._last_outcome = "force_switch_failed"
             self._fail_backoff(cfg)
             if self._log and cfg.debug_mode:
                 self._log.debug(f"[humanoid_core] 日程打断失败: {self.last_error}")
@@ -2505,6 +2863,7 @@ class ScheduleService:
 
         self.last_error = ""
         self._retry_after = 0.0
+        self._last_outcome = OUTCOME_OK
         self._set_source(SOURCE_LLM)
         if self._log:
             # 带上是哪个 bot：多开时日志里分不清谁生成了谁没生成。
@@ -2532,15 +2891,13 @@ class ScheduleService:
         - 隔得太久（插件停机）：不补，那段时间她做了什么没人知道。
         - 睡觉跨午夜：今天截到 24:00，剩下的结转到明天（`segment_carry`）。
         """
-        segs = self.segments()
         now = self._clock.now()
         minutes = now.hour * 60 + now.minute
-        # 日程可能乱序（carry 拼接、旧版整表迁移、`_migrate_new_day` 的部分写入）：
-        # `_covering` 取**第一个**命中，而下面的截断原本盲取 `segs[-1]`，两者不是同一段
-        # 时会截错段、留下重叠（`active_segment`/`day_phrases` 于是看错她在做什么）。
-        # 先按起点排序，再显式定位「覆盖现在的那一段」。
-        segs.sort(key=lambda item: parse_time(item.get("start")) or 0)
-        previous = self._covering(segs, minutes) or (segs[-1] if segs else None)
+        # 排序与「覆盖现在的那一段」都走 `_ordered_segments` / `_active_and_prev`：
+        # 与读路径同一份口径（盲取 `segs[-1]` 会截错段、留下重叠，
+        # `active_segment`/`day_phrases` 于是看错她在做什么）。
+        segs = self._ordered_segments()
+        previous, _ = self._active_and_prev(minutes, segs=segs)
         target = next(
             (index for index, item in enumerate(segs) if item is previous),
             len(segs) - 1,
@@ -2558,7 +2915,12 @@ class ScheduleService:
             hi = parse_time(last.get("end"))
             lo = parse_time(last.get("start"))
             if hi is not None and lo is not None:
-                if hi > new_start:
+                # 只有「这一段本来还没到点」才算被打断（#65）：`new_start` 是向下
+                # 对齐到刻度的，比「现在」早最多一个刻度。上一段 10:05 已经做完、
+                # 现在 10:10 时，`hi > new_start`（605 > 600）照样成立，于是她把一件
+                # 已经做完的事当成「被打断，还剩 5 分钟」挂起来，下次生成还会真的
+                # 去「接着做」那件早就结束的事。
+                if hi > new_start and hi > minutes:
                     # 她提前结束去做别的：收到新段起点，不留重叠。
                     if new_start > lo:
                         # 这一件事被从中间截断了：记下它（新段换了事才挂起，见下）。
@@ -2587,7 +2949,7 @@ class ScheduleService:
                 # （「专注」→「有点累」、「还差 4 份」→「还差 2 份」）。旧写法只同步
                 # `end`/`energy_rate`，于是进度文字永远停在第一版，`_note_ongoing(installed)`
                 # 拿到的也是旧段。
-                for key in ("location", "emotion", "ongoing", "wants", "dreams"):
+                for key in ("location", "emotion", "ongoing", "wants", "dreams", "status"):
                     if key in slot:
                         last[key] = slot[key]
                 segs[-1] = last
@@ -2608,7 +2970,7 @@ class ScheduleService:
             truncated is not None
             and str(installed.get("event") or "") != str(truncated.get("event") or "")
         ):
-            truncated_event = str(truncated.get("event") or "").strip()[:24]
+            truncated_event = _clip_event(str(truncated.get("event") or ""))
             if truncated_event:
                 suspended_update = {
                     "event": truncated_event,
@@ -2617,9 +2979,18 @@ class ScheduleService:
                     "ongoing": str(truncated.get("ongoing") or "").strip()[:40],
                     "wants": bool(truncated.get("wants")),
                     "remaining_minutes": int(truncated_remaining),
+                    # 被截断那段的能量速率一起带走（#70）：resume 时用它当默认值，
+                    # 否则「回去接着做」的段按 0.0 算，等于白做不耗体力。
+                    "energy_rate": clamp_rate(truncated.get("energy_rate", 0.0)),
+                    # 渲染时按 `end_at - now` 现算剩余（#69）：只存分钟数的话，
+                    # 三小时内每次注入都念同一个数字，和她实际剩下的时间对不上。
+                    "end_at": float(self._wall_clock()) + float(truncated_remaining) * 60.0,
                     # 解析时判过的睡着标记一起带走：被打断的这事可能是段没有睡词的睡，
                     # 只看事件名会把「回去接着睡」重建成一个醒着的段。
                     "sleep": bool(slot_sleeps(truncated)),
+                    # 处境词标记也带走：挂起的是兜底给的“有点饿了”，回去接着做时
+                    # 不能又被当成动作渲染成「上午在有点饿了」。
+                    "status": bool(truncated.get("status")),
                     "at": float(self._wall_clock()),
                     "ttl_minutes": _pause_ttl_minutes(self.config),
                 }
@@ -2633,7 +3004,17 @@ class ScheduleService:
         )
         cap = max(6, min(SEGMENTS_DAY_CAP, int(self.config.schedule_max_slots)))
         if len(segs) > cap:
-            segs = segs[-cap:]
+            # 只留「最晚的 cap 段」会先把 00:00 起的跨夜觉丢掉：结转段恒为
+            # `start="00:00"`（`_migrate_new_day` / `_carry_slot`），按时间序排在
+            # 最前。丢了它，「她今天没睡」——起床点为空、`sleeping_minutes` 数不到
+            # 这一觉、asleep 永远 False。所以先保睡段，再按时间序取最晚的几段。
+            sleeps = [item for item in segs if slot_sleeps(item)]
+            rest = [item for item in segs if not slot_sleeps(item)]
+            if len(sleeps) >= cap:
+                keep = sleeps[-cap:]
+            else:
+                keep = sleeps + rest[-(cap - len(sleeps)) :]
+            segs = sorted(keep, key=lambda item: parse_time(item.get("start")) or 0)
         updates: dict[str, Any] = {
             "daily_schedule": segs,
             "today_date": today,
@@ -2661,6 +3042,16 @@ class ScheduleService:
             # 刚被从中间截断的那件事：记下来，下一次安排时可以选回去接着做。
             updates[self.SUSPENDED_KEY] = suspended_update
         self._scope.update_self(**updates)
+        # 醒来（上一段在睡、这一段不是睡）：睡着期间听到的话已经随这一段的 prompt
+        # 递进去了，装上就清空——否则下一段还会把夜里那几句当「刚刚」再说一遍（#66）。
+        # 仍然在睡就留着继续累积。
+        if (
+            self._heard_while_asleep
+            and isinstance(previous, dict)
+            and slot_sleeps(previous)
+            and not slot_sleeps(installed)
+        ):
+            self._heard_while_asleep = []
         # 一次 resume 只影响刚装上的这一段。
         self._resumed_event = ""
 

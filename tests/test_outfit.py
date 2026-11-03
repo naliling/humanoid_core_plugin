@@ -18,9 +18,10 @@ class DetectKind(unittest.TestCase):
         self.assertEqual(outfit.detect_kind("小雨", ""), "")
         self.assertEqual(outfit.detect_kind("", "   "), "")
 
-    def test_plain_persona_is_human(self):
+    def test_plain_persona_has_no_species_evidence(self):
+        """「不知道」不再兜底 human：没有物种证据就返回空串，调用方据此不注入。"""
         self.assertEqual(
-            outfit.detect_kind("小雨", "你是一个温柔的女生，喜欢看书。"), outfit.KIND_HUMAN
+            outfit.detect_kind("小雨", "你是一个温柔的女生，喜欢看书。"), ""
         )
 
     def test_beast_ear(self):
@@ -42,6 +43,10 @@ class DetectKind(unittest.TestCase):
     def test_machine_beats_beast(self):
         self.assertEqual(outfit.detect_kind("", "机械狐狸"), outfit.KIND_MACHINE)
 
+    def test_human_has_no_builtin_outfit(self):
+        """人类没有「内置默认穿着」：一句「日常便服」对谁都说一样，等于没说。"""
+        self.assertEqual(outfit.base_outfit(outfit.KIND_HUMAN), "")
+
 
 class Resolve(unittest.TestCase):
     def test_preset_wins(self):
@@ -55,14 +60,37 @@ class Resolve(unittest.TestCase):
     def test_unknown_gives_nothing(self):
         self.assertEqual(outfit.resolve(name="小雨", persona=""), "")
 
+    def test_persona_clothing_is_used_verbatim(self):
+        """人设里写了她穿什么 → 原文照抄（原来只有一句对所有人都一样的「日常便服」）。"""
+        self.assertEqual(
+            outfit.resolve(name="小雨", persona="她总穿一条白色连衣裙。"), "一条白色连衣裙"
+        )
+
+    def test_no_clothing_evidence_injects_nothing(self):
+        """人设没写穿着、也判不出物种 → 不注入，而不是塞一句「日常便服」。"""
+        self.assertEqual(outfit.resolve(name="小雨", persona="温柔女生"), "")
+
+    def test_other_peoples_clothing_is_not_hers(self):
+        """「街上穿着西装的人」写的是别人的衣服，宁缺勿错。"""
+        self.assertEqual(
+            outfit.resolve(name="", persona="她喜欢看街上穿着西装的人。"), ""
+        )
+
+    def test_chuanyue_is_not_a_clothing_verb(self):
+        """「穿越」里的穿不是穿着动词。"""
+        self.assertEqual(
+            outfit.resolve(name="", persona="她穿越到了古代，成了王妃。"), ""
+        )
+
     def test_scene_sleep(self):
-        got = outfit.resolve(name="小雨", persona="温柔女生", scene="sleep")
+        got = outfit.resolve(name="小雨", persona="她总穿一条白色连衣裙", scene="sleep")
+        self.assertIn("白色连衣裙", got)
         self.assertIn("睡衣", got)
 
-    def test_scene_bath_is_bare(self):
-        self.assertEqual(
-            outfit.resolve(name="小雨", persona="温柔女生", scene="bath"), "没穿衣服"
-        )
+    def test_scene_bath_appends_note(self):
+        got = outfit.resolve(name="小雨", persona="她总穿一条白色连衣裙", scene="bath")
+        self.assertIn("白色连衣裙", got)
+        self.assertIn("洗过澡", got)
 
     def test_beast_ignores_scene(self):
         self.assertEqual(
@@ -71,12 +99,15 @@ class Resolve(unittest.TestCase):
 
     def test_scene_variation_off(self):
         self.assertEqual(
-            outfit.resolve(name="小雨", persona="温柔女生", scene="sleep", scene_variation=False),
-            "日常便服",
+            outfit.resolve(
+                name="小雨", persona="她总穿一条白色连衣裙", scene="sleep",
+                scene_variation=False,
+            ),
+            "一条白色连衣裙",
         )
 
     def test_cold_adds_coat(self):
-        self.assertIn("外套", outfit.resolve(name="小雨", persona="温柔女生", scene="cold"))
+        self.assertIn("外套", outfit.resolve(name="小雨", persona="身穿黑色风衣", scene="cold"))
 
 
 class SceneOf(unittest.TestCase):
@@ -144,11 +175,18 @@ class EndToEnd(unittest.TestCase):
         core.clock = FrozenClock(datetime(2026, 9, 26, 23, 0))
         return core
 
-    def test_human_persona_gets_outfit(self):
+    def test_persona_clothing_is_injected(self):
+        """人设写了穿着 → 注入原文；判不出物种也不再兜底 human。"""
+        core = self._core("她总穿一条白色连衣裙，喜欢看书。")
+        self.assertEqual(core.outfit_text(), "一条白色连衣裙")
+        self.assertIn("她穿着：一条白色连衣裙", core.outfit_line())
+        self.assertEqual(core.outfit_info()["kind"], "")
+
+    def test_plain_persona_injects_no_outfit(self):
+        """判不出物种、人设也没写穿着 → 不注入（原来恒注入「日常便服」）。"""
         core = self._core("你是一个温柔的女生，喜欢看书。")
-        self.assertEqual(core.outfit_text(), "日常便服")
-        self.assertIn("她穿着", core.outfit_line())
-        self.assertEqual(core.outfit_info()["kind"], outfit.KIND_HUMAN)
+        self.assertEqual(core.outfit_text(), "")
+        self.assertEqual(core.outfit_line(), "")
 
     def test_beast_persona_is_unclothed(self):
         core = self._core("你会说话的小马，住在小马利亚。")
@@ -161,11 +199,11 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(core.outfit_info()["source"], "无（判不出她是什么，不注入）")
 
     def test_override_wins(self):
-        core = self._core("你是一个温柔的女生。")
-        core.set_outfit_override("白色连衣裙")
-        self.assertEqual(core.outfit_text(), "白色连衣裙")
+        core = self._core("她总穿一条白色连衣裙。")
+        core.set_outfit_override("红色毛衣")
+        self.assertEqual(core.outfit_text(), "红色毛衣")
         core.set_outfit_override("自动")
-        self.assertEqual(core.outfit_text(), "日常便服")
+        self.assertEqual(core.outfit_text(), "一条白色连衣裙")
 
     def test_disabled_injects_nothing(self):
         core = self._core("你是一个温柔的女生。", {"outfit_enabled": False})
@@ -213,7 +251,7 @@ class SpeciesDetectionThreeLayers(unittest.TestCase):
     def test_character_name_does_not_decide_the_species(self):
         """角色名不参与判定：名字叫「小龙女」不该让她「没穿衣服」。"""
         self.assertEqual(
-            outfit.detect_kind("小龙女", "你是一个温柔的女生，喜欢看书。"), outfit.KIND_HUMAN
+            outfit.detect_kind("小龙女", "你是一个温柔的女生，喜欢看书。"), ""
         )
         self.assertEqual(outfit.detect_kind("大灰狼", ""), "")
 
@@ -291,13 +329,19 @@ class SleepWordsAndScenePriority(unittest.TestCase):
             preset="白色蕾丝连衣裙", name="小雨", persona="温柔女生", scene="bath"
         )
         self.assertIn("白色蕾丝连衣裙", got)
-        # 内置基础穿着照旧整段替换（没人在上面写过字）
-        self.assertEqual(outfit.resolve(name="小雨", persona="温柔女生", scene="sleep"), "睡衣")
-        self.assertEqual(outfit.resolve(name="小雨", persona="温柔女生", scene="bath"), "没穿衣服")
+        # 人设里写的穿着同样是「她自己的衣服」：只追加，不替换
+        self.assertEqual(
+            outfit.resolve(name="小雨", persona="她总穿一条白色连衣裙", scene="sleep"),
+            "一条白色连衣裙（睡前换上了睡衣）",
+        )
+        # 内置基础穿着（兽形「没穿衣服」）照旧整段替换
+        self.assertEqual(
+            outfit.resolve(name="", persona="你会说话的小马", scene="bath"), "没穿衣服"
+        )
 
     def test_temp_only_call_still_gets_a_scene(self):
         """只给温度不给场景时，够冷就当冷天（旧调用方永远传场景，不受影响）。"""
-        self.assertIn("外套", outfit.resolve(name="小雨", persona="温柔女生", temp_c=2.0))
+        self.assertIn("外套", outfit.resolve(name="小雨", persona="身穿黑色风衣", temp_c=2.0))
 
 
 if __name__ == "__main__":

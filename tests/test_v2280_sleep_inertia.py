@@ -100,6 +100,9 @@ class WakeInertiaTest(unittest.TestCase):
                 # soma 的 slot_at 只认当天 00:00-24:00 的段。
                 {"start": "23:00", "end": "24:00", "event": "睡眠", "energy_rate": 0.15},
                 {"start": "00:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15},
+                # 醒点之后必须真有一段（生产里 ensure_fresh 不留白）：空窗是「不知道」，
+                # 不是「醒着」，醒来由 07:00 这一段触发（v3.0.4 审核 F3）。
+                {"start": "07:00", "end": "12:00", "event": "起床洗漱", "energy_rate": 0.0},
             ],
             datetime(2026, 9, 26, 7, 0, tzinfo=TZ),
         )
@@ -115,7 +118,10 @@ class WakeInertiaTest(unittest.TestCase):
     def test_short_sleep_has_longer_inertia(self):
         fixture = self._run_like(
             datetime(2026, 9, 26, 4, 50, tzinfo=TZ),
-            [{"start": "05:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15}],
+            [
+                {"start": "05:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15},
+                {"start": "07:00", "end": "12:00", "event": "起床洗漱", "energy_rate": 0.0},
+            ],
             datetime(2026, 9, 26, 7, 0, tzinfo=TZ),
         )
         state = fixture.soma.wake_state()
@@ -127,7 +133,10 @@ class WakeInertiaTest(unittest.TestCase):
     def test_being_disturbed_extends_inertia(self):
         fixture = SomaFixture(
             datetime(2026, 9, 26, 4, 50, tzinfo=TZ),
-            [{"start": "05:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15}],
+            [
+                {"start": "05:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15},
+                {"start": "07:00", "end": "12:00", "event": "起床洗漱", "energy_rate": 0.0},
+            ],
         )
         fixture.to(fixture.at(6, 50))
         self.assertTrue(fixture.soma.wake_state()["asleep"])
@@ -144,7 +153,10 @@ class WakeInertiaTest(unittest.TestCase):
     def test_inertia_is_capped(self):
         fixture = SomaFixture(
             datetime(2026, 9, 26, 4, 50, tzinfo=TZ),
-            [{"start": "05:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15}],
+            [
+                {"start": "05:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15},
+                {"start": "07:00", "end": "12:00", "event": "起床洗漱", "energy_rate": 0.0},
+            ],
         )
         fixture.to(fixture.at(6, 0))
         with mock.patch.object(soma_module, "WAKE_INERTIA_SHORT_MINUTES", 100):
@@ -160,7 +172,10 @@ class WakeInertiaTest(unittest.TestCase):
         """日程重排切出的 10 分钟「睡着」不是一觉：不写惯性、不改昨晚睡了多久。"""
         fixture = SomaFixture(
             datetime(2026, 9, 26, 4, 50, tzinfo=TZ),
-            [{"start": "05:00", "end": "05:10", "event": "睡眠", "energy_rate": 0.15}],
+            [
+                {"start": "05:00", "end": "05:10", "event": "睡眠", "energy_rate": 0.15},
+                {"start": "05:20", "end": "12:00", "event": "活动", "energy_rate": 0.0},
+            ],
         )
         fixture.to(fixture.at(5, 20))
         state = fixture.soma.wake_state()
@@ -250,7 +265,7 @@ def awake_core(moment: datetime, **conf) -> HumanoidCoreInstance:
 class PromptSleepStateTest(unittest.TestCase):
     def test_asleep_line(self):
         text = sleeping_core().build_injection("42", is_group=False)
-        self.assertIn("她这会儿正睡着", text)
+        self.assertIn("我这会儿正睡着", text)
 
     def test_disturbed_line_only_within_the_window(self):
         core = sleeping_core()
@@ -273,7 +288,7 @@ class PromptSleepStateTest(unittest.TestCase):
             "last_sleep_hours": 7.0,
         })
         text = core.build_injection("42", is_group=False)
-        self.assertIn("她刚醒（2 分钟前）", text)
+        self.assertIn("我刚醒（2 分钟前）", text)
         self.assertIn("人还没完全缓过来", text)
         self.assertIn("被消息吵醒的", text)
 
@@ -315,7 +330,7 @@ class PromptSleepStateTest(unittest.TestCase):
             "last_sleep_hours": 7.0,
         })
         text = core.build_injection("42", is_group=False)
-        self.assertIn("她刚从梦里醒过来", text)
+        self.assertIn("我刚从梦里醒过来", text)
         self.assertIn("一片海", text)
         self.assertEqual(text.count("一片海"), 1, "梦说了一遍以上")
         self.assertIn("（梦到一片海）", text)

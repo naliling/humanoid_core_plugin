@@ -98,6 +98,10 @@ class ResolverTest(unittest.TestCase):
         self.assertEqual(ProviderResolver(ctx).available_ids(), [])
 
 
+class _UnknownShape:
+    """既没有 completion_text 也没有 result_chain 的响应对象。"""
+
+
 class ExtractTextTest(unittest.TestCase):
     def test_prefers_completion_text(self):
         self.assertEqual(extract_text(FakeProvider("x") and _resp("hello")), "hello")
@@ -107,6 +111,13 @@ class ExtractTextTest(unittest.TestCase):
 
     def test_none_is_empty(self):
         self.assertEqual(extract_text(None), "")
+
+    def test_unknown_shape_is_none_not_repr(self):
+        """认不出的响应形状返回 None，不再把 repr 当模型输出。"""
+        self.assertIsNone(extract_text(_UnknownShape()))
+
+    def test_blank_completion_text_without_chain_is_empty_string(self):
+        self.assertEqual(extract_text(_resp("   ")), "   ")
 
 
 def _resp(text: str):
@@ -225,6 +236,24 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.ok)
         self.assertEqual(res.attempts[0].outcome, OUTCOME_EMPTY)
 
+    async def test_unrecognized_response_counts_as_failure(self):
+        """响应形状认不出 = 失败，不再把对象 repr 当模型输出算成功。"""
+        weird = FakeProvider("weird", response_factory=lambda _reply: _UnknownShape())
+        good = FakeProvider("good", reply="OK")
+        ctx = FakeContext(chat_providers=[weird, good])
+        gw, log = self.build(ctx)
+        res = await gw.generate(
+            prompt="hi",
+            chain=(("首选模型", "weird"), ("备用模型", "good")),
+            allow_global=False,
+            timeout=5,
+        )
+        self.assertTrue(res.ok)
+        self.assertEqual(res.provider_id, "good")
+        self.assertEqual(res.attempts[0].outcome, OUTCOME_ERROR)
+        self.assertIn("_UnknownShape", res.attempts[0].detail)
+        self.assertIn("_UnknownShape", log.text("warning"))
+
     async def test_both_fail_then_global(self):
         glob = FakeProvider("global_one", reply="OK-GLOBAL")
         ctx = FakeContext(chat_providers=[], global_provider=glob)
@@ -295,6 +324,85 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
         third = await gw.generate(prompt="c", chain=chain, allow_global=False, timeout=5)
         self.assertTrue(third.ok)
         self.assertEqual(broken.calls, 2)
+
+    async def test_cooldown_key_is_configured_id_even_after_case_fold_match(self):
+        """配置里写的名字与真实 provider id 大小写不同时，冷却仍必须生效。
+
+        回归（审核 t4d-llm 第 3 条）：冷却写入曾用解析后的 actual_id、读取却用
+        configured_id。`resolve()` 的忽略大小写兜底一命中，两者就分叉，写进去的
+        冷却永远读不到，坏 provider 每一轮都被重新打一次。
+        """
+        clock = FakeClock()
+        broken = FakeProvider("broken", error=RuntimeError("down"))
+        gw, _ = self.build(
+            FakeContext(chat_providers=[broken]),
+            cfg(schedule_provider_cooldown_minutes=30),
+            clock,
+        )
+        chain = (("首选模型", "BROKEN"),)  # 靠 casefold 兜底命中真实的 broken
+
+        first = await gw.generate(prompt="a", chain=chain, allow_global=False, timeout=5)
+        self.assertFalse(first.ok)
+        self.assertEqual(broken.calls, 1)
+        self.assertIn("BROKEN", gw.cooldowns(), "冷却要记在配置里写的名字上")
+
+        second = await gw.generate(prompt="b", chain=chain, allow_global=False, timeout=5)
+        self.assertFalse(second.ok)
+        self.assertEqual(broken.calls, 1, "冷却期内不该再打向同一个坏 provider")
+        self.assertEqual(second.attempts[0].outcome, OUTCOME_COOLDOWN)
+
+    async def test_failure_attribution_is_first_real_failure(self):
+        """归因取第一个真实失败：后面的候选「冷却中已跳过」不能覆盖它。
+
+        回归（审核 #139）：结果取 attempts[-1]，于是「首选模型 401 失败、备用
+        模型还在冷却」时，面板只显示「冷却中已跳过」，坏 provider 的真实症状
+        （超时 / 401 / 空回复）被永久掩盖。
+        """
+        clock = FakeClock()
+        broken = FakeProvider("broken", error=RuntimeError("boom 401"))
+        standby = FakeProvider("standby", error=RuntimeError("down"))
+        gw, _ = self.build(
+            FakeContext(chat_providers=[broken, standby]),
+            cfg(schedule_provider_cooldown_minutes=30),
+            clock,
+        )
+        # 先让备用模型进冷却
+        first = await gw.generate(
+            prompt="a", chain=(("备用模型", "standby"),), allow_global=False, timeout=5
+        )
+        self.assertEqual(first.outcome, OUTCOME_ERROR)
+
+        res = await gw.generate(
+            prompt="b",
+            chain=(("首选模型", "broken"), ("备用模型", "standby")),
+            allow_global=False,
+            timeout=5,
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(
+            [a.outcome for a in res.attempts], [OUTCOME_ERROR, OUTCOME_COOLDOWN]
+        )
+        self.assertEqual(res.outcome, OUTCOME_ERROR, "冷却跳过不能覆盖真实失败原因")
+        self.assertEqual(res.label, "首选模型")
+        self.assertIn("boom 401", res.detail)
+
+    async def test_attribution_falls_back_to_cooldown_when_nothing_was_tried(self):
+        """全部候选都在冷却 → 没有真实失败可取，归因仍是冷却。"""
+        clock = FakeClock()
+        a = FakeProvider("a", error=RuntimeError("down"))
+        b = FakeProvider("b", error=RuntimeError("down"))
+        gw, _ = self.build(
+            FakeContext(chat_providers=[a, b]),
+            cfg(schedule_provider_cooldown_minutes=30),
+            clock,
+        )
+        await gw.generate(prompt="x", chain=(("甲", "a"),), allow_global=False, timeout=5)
+        await gw.generate(prompt="x", chain=(("乙", "b"),), allow_global=False, timeout=5)
+        res = await gw.generate(
+            prompt="y", chain=(("甲", "a"), ("乙", "b")), allow_global=False, timeout=5
+        )
+        self.assertEqual([x.outcome for x in res.attempts], [OUTCOME_COOLDOWN, OUTCOME_COOLDOWN])
+        self.assertEqual(res.outcome, OUTCOME_COOLDOWN)
 
     async def test_cooldown_disabled_when_zero(self):
         broken = FakeProvider("broken", error=RuntimeError("down"))
@@ -507,6 +615,42 @@ class SystemPromptProbeTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.ok, "不支持 system_prompt 的旧 provider 应自动降级")
         self.assertEqual(res.text, "OK-OLD")
         self.assertEqual(old.calls, 1)
+        self.assertNotIn("system_prompt", old.last_kwargs, "旧 provider 的签名收不了它")
+        self.assertEqual(
+            old.last_kwargs["prompt"],
+            "你是小雨\n\nhi",
+            "降级不能把指令丢掉：system 文本要并进首条 user 消息",
+        )
+
+    async def test_empty_prompt_is_carried_by_system_text(self):
+        """prompt 为空时指令自己就是那条 user 消息——仍然只有一次调用、不丢内容。"""
+
+        class OldProvider:
+            def __init__(self, provider_id):
+                self._id = provider_id
+                self.calls = 0
+                self.last_kwargs = {}
+
+            def meta(self):
+                return FakeMeta(self._id)
+
+            async def text_chat(self, prompt=None):
+                self.calls += 1
+                self.last_kwargs = {"prompt": prompt}
+                return FakeResponse("OK-OLD")
+
+        old = OldProvider("old")
+        gw, _ = self.build(FakeContext(chat_providers=[old]))
+        res = await gw.generate(
+            prompt="",
+            chain=(("首选模型", "old"),),
+            allow_global=False,
+            timeout=5,
+            system_prompt="你是小雨",
+        )
+        self.assertTrue(res.ok)
+        self.assertEqual(old.calls, 1)
+        self.assertEqual(old.last_kwargs["prompt"], "你是小雨", "空 prompt 时指令就是 user 消息")
 
 
 class RetryPolicyTest(unittest.IsolatedAsyncioTestCase):
@@ -607,6 +751,29 @@ class CallGateTest(unittest.TestCase):
         wall.advance(60 * 60)
         self.assertFalse(gate.check(PURPOSE_SCHEDULE).allowed)
 
+    def test_legacy_global_interaction_releases_a_role_scoped_check(self):
+        """老的记账方式（不传角色）不能被按角色的判定读成「没人说过话」。
+
+        判定侧传 role_id 之后，记账侧如果还是旧的全局键（空串），`interaction_at(role)`
+        曾经只认那个角色自己的键，于是返回 None、闸门永久静默——2026-11 的
+        test_schedule.ThrottleTest::test_talking_releases_the_throttle 就是这样红的。
+        """
+        gate, _conf, wall, _mono = self.build(llm_idle_silence_minutes=60)
+        wall.advance(3600 * 24)
+        gate.note_interaction()  # 不传角色 = 旧调用方
+        self.assertTrue(gate.check(PURPOSE_SCHEDULE, role_id="bot-1").allowed)
+        self.assertTrue(gate.check(PURPOSE_SCHEDULE, role_id="bot-2").allowed)
+        wall.advance(61 * 60)
+        self.assertFalse(gate.check(PURPOSE_SCHEDULE, role_id="bot-1").allowed)
+
+    def test_role_scoped_interaction_does_not_leak_to_other_roles(self):
+        """按角色记账之后，A 说过话不能把 B 的空转闸门也松开。"""
+        gate, _conf, wall, _mono = self.build(llm_idle_silence_minutes=60)
+        wall.advance(3600 * 24)
+        gate.note_interaction(role_id="bot-a")
+        self.assertTrue(gate.check(PURPOSE_SCHEDULE, role_id="bot-a").allowed)
+        self.assertFalse(gate.check(PURPOSE_SCHEDULE, role_id="bot-b").allowed)
+
     def test_idle_disabled_never_blocks(self):
         gate, _conf, wall, _mono = self.build(llm_idle_silence_minutes=0)
         wall.advance(3600 * 24 * 30)
@@ -639,17 +806,26 @@ class CallGateTest(unittest.TestCase):
         self.assertEqual(gate.used_today, 0)
         self.assertTrue(gate.check(PURPOSE_SCHEDULE).allowed)
 
-    def test_mood_is_exempt_from_every_rule(self):
-        """情绪分析整条豁免：没人说话时它本来就不会被触发。"""
+    def test_mood_skips_idle_and_interval_but_still_counts_budget(self):
+        """情绪分析不参与空闲/间隔节流，但它花的同样是真实请求，必须计入每日预算。
+
+        以前这里整条豁免：一个 30 秒一轮的群只要有人说话，情绪分析就能无限调用，
+        日预算形同虚设。
+        """
         gate, _conf, wall, _mono = self.build(
             llm_idle_silence_minutes=1, schedule_min_interval_minutes=1,
             llm_daily_call_budget=1,
         )
         wall.advance(86400)
-        for _ in range(5):
-            self.assertTrue(gate.check(PURPOSE_MOOD).allowed)
-            gate.consume(PURPOSE_MOOD)
-        self.assertEqual(gate.used_today, 0, "情绪不计入每日预算")
+        # 空闲/间隔都没满足，但情绪分析照旧放行
+        self.assertTrue(gate.check(PURPOSE_MOOD).allowed)
+        gate.consume(PURPOSE_MOOD)
+        self.assertEqual(gate.used_today, 1, "情绪分析必须计入每日预算")
+        # 预算用完之后同样要挡住
+        verdict = gate.check(PURPOSE_MOOD)
+        self.assertFalse(verdict.allowed)
+        self.assertEqual(verdict.reason, "budget")
+        self.assertIn("情绪分析", verdict.detail)
 
     def test_zero_everything_disables_gating(self):
         gate, _conf, wall, mono = self.build(
@@ -844,6 +1020,56 @@ class DailyBudgetSurvivesRestart(unittest.TestCase):
         g = self._gate(ledger)
         self.assertEqual(g.used_today, 0)
         self.assertTrue(g.check("schedule").allowed)
+
+    def test_two_instances_do_not_erase_each_others_usage(self):
+        """两个实例共用一个账本：谁后写都不能把对方抹掉。
+
+        旧实现每次整文件覆盖写 {"day":…, "used": 自己}，于是热重载/多开时
+        「一天 N 次」变成 N × 实例数，而诊断页里每个实例都只显示自己那一半。
+        """
+        import tempfile
+        from pathlib import Path
+        ledger = Path(tempfile.mkdtemp()) / "llm_usage.json"
+        a = self._gate(ledger)
+        b = self._gate(ledger)
+        for _ in range(3):
+            a.consume("schedule")
+        for _ in range(2):
+            b.consume("schedule")
+        self.assertEqual(a.used_today, 5, "A 应该看到 A+B 的合计")
+        self.assertEqual(b.used_today, 5, "B 应该看到 A+B 的合计")
+        self.assertEqual(self._gate(ledger).used_today, 5,
+                         "账本里只剩一个实例的数 = 另一个被覆盖了")
+
+    def test_two_instances_merge_purpose_breakdown(self):
+        """按用途的明细也要合并，不能只看总数。"""
+        import tempfile
+        from pathlib import Path
+        ledger = Path(tempfile.mkdtemp()) / "llm_usage.json"
+        a = self._gate(ledger)
+        b = self._gate(ledger)
+        a.consume("schedule")
+        b.consume("mood")
+        b.consume("schedule")
+        self.assertEqual(self._gate(ledger).snapshot()["used_by_purpose"],
+                         {"schedule": 2, "mood": 1})
+
+    def test_other_instances_usage_counts_against_the_budget(self):
+        """B 启动之后 A 又用掉的额度，B 判预算时必须算进去。
+
+        只在启动时读一次账本，等于两个实例各拿一份预算，一起把上限撞穿。
+        """
+        import tempfile
+        from pathlib import Path
+        ledger = Path(tempfile.mkdtemp()) / "llm_usage.json"
+        a = self._gate(ledger)
+        for _ in range(4):
+            a.consume("schedule")
+        b = self._gate(ledger)
+        self.assertTrue(b.check("schedule").allowed)
+        a.consume("schedule")
+        self.assertFalse(b.check("schedule").allowed,
+                         "B 只在启动时读过一次账本 = A 之后用的那次不算数")
 
 
 class RetryableJudgementTest(unittest.TestCase):

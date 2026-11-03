@@ -21,6 +21,8 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any
 
+from .injection import Fact, select
+
 # ── 词表 ──────────────────────────────────────────────────────────────
 # 每张表都只放**明确指向这种生活状态**的词。宁可漏（顶多回到默认语气），
 # 不要误伤（把「认真工作」的角色认成懒散，或反过来）。
@@ -32,7 +34,7 @@ _EARLY_BIRD_WORDS = ("早起", "早睡早起", "清晨", "晨跑", "作息规律
 _DILIGENT_WORDS = ("勤快", "自律", "努力", "认真", "闲不住", "上进", "工作狂")
 # 「懒」单字会命中「偷懒」「懒得」等，但人设里出现「懒」几乎都在说这个人的状态，
 # 且它比「懒散/拖延」更常出现在短人设里，所以保留，只靠否定词挡「不懒」。
-_LAZY_WORDS = ("懒", "懒散", "摸鱼", "拖延", "躺平", "宅", "不爱动", "随性", "拖延症")
+_LAZY_WORDS = ("懒", "懒散", "摸鱼", "拖延", "躺平", "不爱动", "随性", "拖延症")
 _HOMEBODY_WORDS = ("宅", "家里蹲", "不爱出门", "社恐", "内向")
 _OUTGOING_WORDS = ("外向", "爱出门", "爱社交", "朋友多", "热闹")
 _STUDENT_WORDS = ("学生", "上课", "大学")
@@ -101,35 +103,99 @@ def _hits(text: str, words: tuple[str, ...]) -> int:
 
 
 def _hints(traits: PersonaTraits, lazy_hits: int, diligent_hits: int) -> tuple[str, ...]:
-    """把特质翻成给模型看的中文线索。
+    """把特质翻成给模型看的「她的状态」，不是给模型的指令。
 
-    同一条线索只说一次；互相矛盾的组合只留一条（勤快 × 懒散按命中词数取更明确的，
-    打平算勤快——「工作狂/自律」这类多字词比单字「懒」更像在描述她的日常）。
+    两条纪律（审核 #46 / #55）：
+
+    1. **同组只留一条**：倒班、夜猫子、早起型说的是同一个「作息」事实，各自成句
+       会互相重叠（「夜班」人设原来同时拿到「夜猫子」「倒班/夜班」「上班族」三行）。
+       互斥交给 injection.select() 的 group，不在这里写 if/elif 拼装。
+    2. **只陈述，不命令**：这里递的是「她是什么样的人」，渲染进 prompt 的是背景。
+       出现「请 / 要 / 应该 / 记得 / 别 / 可以」就把背景变成了指令——模型会照着
+       执行而不是按她这个人生成，且用户改人设也改不动这几句。
     """
-    hints: list[str] = []
-    if traits.night_owl:
-        # 用户原话：「日程不包括凌晨，夜猫子凌晨活动被砍」。这条线索就是那件事的解法：
-        # 把 00:00-06:00 从「天然睡觉时段」里摘出来，但保留早起型凌晨睡觉的正常情况。
-        hints.append("夜猫子：凌晨更清醒，白天补觉，别把 00:00-06:00 默认当睡觉时段。")
-    elif traits.early_bird:
-        hints.append("早起型：清晨清醒，晚上容易困，凌晨不是她的活动时间。")
+    facts: list[Fact] = []
+    # 作息组：倒班最强（它同时解释「白天补觉」和「凌晨清醒」），其次夜猫子，再次早起型。
     if traits.shift_worker:
-        hints.append("倒班/夜班：作息不按常见的白天走，睡眠常常在白天补。")
+        facts.append(
+            Fact(
+                "sleep.shift",
+                "倒班/夜班：作息不按白天走，睡眠常在白天补，00:00-06:00 也可能是她清醒的时间。",
+                group="sleep",
+                priority=8.0,
+            )
+        )
+    if traits.night_owl:
+        facts.append(
+            Fact(
+                "sleep.night_owl",
+                "夜猫子：凌晨 00:00-06:00 反而更清醒，白天补觉是常态。",
+                group="sleep",
+                priority=7.0,
+            )
+        )
+    if traits.early_bird:
+        facts.append(
+            Fact(
+                "sleep.early_bird",
+                "早起型：清晨最清醒，晚上容易困，凌晨在睡是正常的。",
+                group="sleep",
+                priority=6.0,
+            )
+        )
     # 勤快与懒散互斥：只给一条，否则 prompt 自己打架。
     prefer_lazy = traits.lazy and (not traits.diligent or lazy_hits > diligent_hits)
     if prefer_lazy:
-        hints.append("不算勤快：允许赖床、拖延、发呆、躺一天，别把一天排满。")
-    elif traits.diligent:
-        hints.append("勤快自律：可以安排工作/学习，但别排成打卡表。")
+        facts.append(
+            Fact(
+                "diligence.lazy",
+                "不算勤快：赖床、拖延、发呆、躺一整天都是她会有的日子。",
+                group="diligence",
+                priority=6.0,
+            )
+        )
+    if traits.diligent:
+        facts.append(
+            Fact(
+                "diligence.diligent",
+                "勤快自律：工作与学习占得比较多，日子过得有条理。",
+                group="diligence",
+                priority=5.0,
+            )
+        )
     if traits.homebody:
-        hints.append("偏宅：更常待在家里或附近，出门少。")
-    elif traits.outgoing:
-        hints.append("外向爱出门：更常出门见人、去热闹的地方。")
+        facts.append(
+            Fact("social.homebody", "偏宅：更常待在家里或附近，出门少。", group="social", priority=6.0)
+        )
+    if traits.outgoing:
+        facts.append(
+            Fact(
+                "social.outgoing",
+                "外向爱出门：常出门见人，喜欢热闹的地方。",
+                group="social",
+                priority=5.0,
+            )
+        )
     if traits.student:
-        hints.append("学生：上课、自习、作业是真实的生活内容，但别排成一张课程表。")
-    if traits.worker:
-        hints.append("上班族：有工作和通勤，但别排成打卡表。")
-    return tuple(hints)
+        facts.append(
+            Fact(
+                "job.student",
+                "学生：上课、自习、作业是她日常的一部分。",
+                group="job",
+                priority=6.0,
+            )
+        )
+    # 倒班本身就是工作状态：再递一句「上班族」只是同一件事换个说法。
+    if traits.worker and not traits.shift_worker:
+        facts.append(
+            Fact(
+                "job.worker",
+                "上班族：有工作和通勤，日子按上班的节奏走。",
+                group="job",
+                priority=5.0,
+            )
+        )
+    return tuple(fact.text for fact in select(facts))
 
 
 def detect(text: Any) -> PersonaTraits:

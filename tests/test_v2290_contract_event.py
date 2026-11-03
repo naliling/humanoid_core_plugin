@@ -161,9 +161,10 @@ class ContractCapabilitiesTest(unittest.TestCase):
         self.assertIn("event", CONTRACT_CAPABILITIES)
 
     def test_api_version_unchanged(self):
-        """只加不改：新能力不动 API_VERSION。"""
+        """只加不改：新增**能力**不动 API_VERSION（v3.0.3 抬版本是因为取值域变了：
+        `self_state.asleep` 可以是 null，那是类型层面的破坏性变更，与加能力无关）。"""
         from humanoid.api import API_VERSION
-        self.assertEqual(API_VERSION, 2)
+        self.assertEqual(API_VERSION, 3)
 
 
 class RefreshContractKeysTest(unittest.TestCase):

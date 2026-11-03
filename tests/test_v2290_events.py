@@ -170,13 +170,26 @@ class NoteEventTest(unittest.TestCase):
         self.assertEqual(self.svc._fresh_event(clear=False), "")
 
     def test_restore_after_gate_keeps_phrase(self):
-        """被闸门挡回时原样还回——否则反复被挡就能把保鲜期一次次续满。"""
+        """被闸门挡回时原样还回（措辞 + 原始时间戳）——否则反复被挡就能续命。"""
         self.svc.note_event(kind="很敷衍", seed=["r"])
-        phrase = self.svc._consume_event()
+        phrase, ts = self.svc._consume_event_stamped()
+        self.assertTrue(phrase)
         # 模拟 _generate_segment 里 OUTCOME_GATED 的归还路径
         self.svc._event_phrase = phrase
-        self.svc._event_at = self.svc._monotonic() - 1.0
+        self.svc._event_at = ts
         self.assertEqual(self.svc._fresh_event(clear=False), phrase)
+
+    def test_restored_event_still_expires(self):
+        """连续被闸门挡回不能让事件永生：过了保鲜期照样过期。"""
+        self.svc.note_event(kind="很敷衍", seed=["r"])
+        for _ in range(3):
+            phrase, ts = self.svc._consume_event_stamped()
+            self.assertTrue(phrase)
+            self.svc._event_phrase = phrase
+            self.svc._event_at = ts
+            self.clock.advance(EVENT_TTL_SECONDS // 4)
+        self.clock.advance(EVENT_TTL_SECONDS)
+        self.assertEqual(self.svc._fresh_event(clear=False), "")
 
     def test_refresh_due_triggered_by_event(self):
         """事件够重时，该有一次决定下一段的机会。"""

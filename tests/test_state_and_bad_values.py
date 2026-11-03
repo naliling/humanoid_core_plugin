@@ -238,22 +238,42 @@ class _CoolingCore:
         return self._record
 
 
+class _CoolingMood:
+    """真的 `MoodService.cooling_line`——注入模板只有一份（审核 F1/F2）。
+
+    替身只补 `profile`，句子仍由生产代码渲染：以前这里手写一个假 mood 就行，
+    现在 `_cooling_line` 会把 record 交给 `cooling_line`，所以替身也要转发过去，
+    否则测试验的是替身而不是模板。
+    """
+
+    def __init__(self, record: dict) -> None:
+        self._record = record
+
+    def profile(self, user_id: str) -> dict:
+        return self._record
+
+    def cooling_line(self, record: dict, inner: bool = False) -> str:
+        from humanoid.services.mood import MoodService
+
+        return MoodService.cooling_line(self, record, inner=inner)
+
+
 class NonFiniteCoolUntilDoesNotFreezeHerMood(unittest.TestCase):
     def _layer(self, record: dict) -> EmotionLayer:
         core = _CoolingCore(record)
-        core.mood = type("M", (), {"profile": staticmethod(lambda uid: record)})()
+        core.mood = _CoolingMood(record)
         return EmotionLayer(core)
 
     def test_nan_until_is_treated_as_no_cooling(self):
         layer = self._layer({"affection": 46.0, "cool_until": float("nan"), "cool_reason": "上次"})
         self.assertIsNone(
-            layer._cooling_line("42", 0), "NaN 的 cool_until 让她永远冷着、盖掉所有别的情绪"
+            layer._cooling_line("42"), "NaN 的 cool_until 让她永远冷着、盖掉所有别的情绪"
         )
 
     def test_valid_until_still_cools(self):
         """反向控制：真的在冷静期里必须照样返回那一条。"""
         layer = self._layer({"affection": 46.0, "cool_until": 1_000_600.0, "cool_reason": "上次"})
-        got = layer._cooling_line("42", 0)
+        got = layer._cooling_line("42")
         self.assertIsNotNone(got)
         self.assertEqual(got[0], 0.95)
         self.assertIn("上次", got[1])

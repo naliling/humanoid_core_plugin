@@ -35,6 +35,7 @@ MASTER_SWITCHES = (
     "social_energy_enabled",
     "night_mode_enabled",
     "soma_enabled",
+    "contract_enabled",
     "enable_cycle",
     "enable_energy_natural_recovery",
 )

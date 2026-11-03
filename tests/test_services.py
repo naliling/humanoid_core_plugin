@@ -7,15 +7,17 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 from humanoid.config import HumanoidConfig
+from humanoid.data.cities import DEFAULT_CITY_PLACEHOLDER
 from humanoid.llm import LLMGateway, ProviderResolver
 from humanoid.services.energy import EnergyService, describe_energy
 from humanoid.services.mood import Delta, MoodService, local_delta
 from humanoid.services.social import SocialEnergyService
 from humanoid.services.weather import WeatherService, build_url, parse_payload
-from humanoid.slots import normalize_slots
+from .slot_fixtures import normalize_slots
 
 from .fakes import FakeContext, FakeProvider, RecordingLogger, ScopeStore
 
@@ -424,10 +426,20 @@ class MoodTest(unittest.IsolatedAsyncioTestCase):
         service, _, _ = self.build(cfg(mood_sensitivity=100))
         service.profile("1")["last_interaction"] = self.time_value
         await service.update_from_message("1", "你好棒", 90.0, 8)
-        # 同一档多条等价说法随机抽，断言得认全该档的词。
-        high_energy = ("精力充沛", "精神饱满", "状态在线", "劲头很足")
+        # 精力档位只有一份真源（B3/F13）：标签里的那个词必须落在 ENERGY_WORDS 给
+        # 当前精力抽的那一档里。旧断言认的是 mood_map 自己那张 70/40 两刀梯子——
+        # 于是 88 在面板是「精力充沛」、在注入里是「状态挺好」，测试把这个错固化了。
+        from humanoid.services.energy import ENERGY_WORDS
+        from humanoid.wording import band_index
+
+        energy = float(service._scope.get_self("energy", 80.0))
+        ladder = sorted(ENERGY_WORDS, key=lambda item: item[0])
+        words = ladder[band_index(energy, ENERGY_WORDS)][1]
         tag = service.tag("1")
-        self.assertTrue(any(w in tag for w in high_energy), tag)
+        self.assertTrue(any(w in tag for w in words), f"{tag} @ energy={energy}")
+        if energy < 90:
+            self.assertFalse(any(w in tag for w in ladder[-1][1]),
+                             f"没到 90 却说她「{ladder[-1][1][0]}」：{tag} @ energy={energy}")
 
     async def test_admin_operations(self):
         service, _, _ = self.build()
@@ -665,11 +677,55 @@ class WeatherTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_weather_city_configured_is_reported_not_guessed(self):
         """城市没配好时直接说没配，不能拿另一个城市的天气冒充。"""
-        service, _, _ = self.build(cfg(weather_api_key="0123456789abcdef", weather_location=""))
+        service, _, _ = self.build(
+            cfg(
+                weather_api_key="0123456789abcdef",
+                weather_location="",
+                timezone_city=DEFAULT_CITY_PLACEHOLDER,
+            )
+        )
         snap = service.snapshot()
         self.assertIn("没配天气城市", snap["env"])
         self.assertEqual(snap["weather"], "")
         self.assertFalse(service.is_stale(), "没有城市就不该发起请求")
+
+    async def test_iana_timezone_becomes_english_city(self):
+        """schema 让用户填 IANA 时区名，天气就得把它换成 OpenWeather 认得的英文城市。"""
+        service, _, _ = self.build(
+            cfg(weather_api_key="0123456789abcdef", weather_location="Asia/Shanghai")
+        )
+        self.assertEqual(service.effective_location(), "Shanghai,CN")
+
+    async def test_chinese_city_name_becomes_english_city(self):
+        """表内中文城市（如默认配置的北京）不是「没配」，应换成对应时区的英文城市。"""
+        service, _, _ = self.build(
+            cfg(weather_api_key="0123456789abcdef", weather_location="北京")
+        )
+        self.assertEqual(service.effective_location(), "Shanghai,CN")
+
+    async def test_explicit_english_city_is_kept(self):
+        service, _, _ = self.build(
+            cfg(weather_api_key="0123456789abcdef", weather_location="Tokyo,JP")
+        )
+        self.assertEqual(service.effective_location(), "Tokyo,JP")
+
+    async def test_clock_city_is_normalized_too(self):
+        service, _, clock = self.build(
+            cfg(weather_api_key="0123456789abcdef", weather_location="")
+        )
+        clock.city = "Asia/Tokyo"
+        self.assertEqual(service.effective_location(), "Tokyo,JP")
+
+    async def test_unrecognized_city_is_reported_not_guessed(self):
+        """认不出的城市不能猜一个顶上，也不能悄悄不取天气。"""
+        service, _, _ = self.build(
+            cfg(weather_api_key="0123456789abcdef", weather_location="火星")
+        )
+        self.assertEqual(service.effective_location(), "")
+        snap = service.snapshot()
+        self.assertIn("认不出英文名", snap["env"])
+        self.assertTrue(snap["notice"])
+        self.assertEqual(snap["weather"], "")
 
     async def test_refresh_caches_result(self):
         calls: list[str] = []
@@ -740,6 +796,22 @@ class WeatherTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(parsed)
         self.assertNotIn("湿度", parsed["env"])
 
+    def test_missing_description_does_not_leave_a_dangling_comma(self):
+        """描述缺失时只能说气温：不能拼出「外头，气温 8℃」（审核 注入取舍 #87）。"""
+        for payload in (
+            {"weather": [{"description": ""}], "main": {"temp": 8}},
+            {"weather": [{"description": "   "}], "main": {"temp": 8}},
+            {"weather": [{}], "main": {"temp": 8}},
+        ):
+            parsed = parse_payload(payload)
+            self.assertIsNotNone(parsed, payload)
+            self.assertEqual(parsed["env"], "天气：气温 8℃", payload)
+            self.assertEqual(parsed["weather"], "8°C", payload)
+            # 消费端（prompt_builder）把 env 去掉前缀后拼成「外头…」
+            spoken = "外头" + parsed["env"].replace("天气：", "", 1)
+            self.assertEqual(spoken, "外头气温 8℃", payload)
+            self.assertNotIn("外头，", spoken, payload)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -759,6 +831,18 @@ class AffectionIsALedgerNotAnAccumulator(unittest.TestCase):
       · 设定的值是起点不是天花板
       · 她能说得出「你最近老是敷衍我」，因为她知道那件事
     """
+
+    def setUp(self) -> None:
+        # local_delta 用无种子的 random.uniform 取幅度（mood.py:657-683）。这个类
+        # 断言的是「账本方向对不对」，不是「这一笔恰好抽到多少」——不钉住随机数，
+        # 阈值附近的断言（跌回 50 以下）会随抽样结果偶发失败（实测约 1/5 概率）。
+        # 取区间中点：幅度固定，方向仍由消息文本决定。
+        self._rng = mock.patch(
+            "humanoid.services.mood.random.uniform",
+            side_effect=lambda low, high: (low + high) / 2.0,
+        )
+        self._rng.start()
+        self.addCleanup(self._rng.stop)
 
     def build(self, **kw):
         t = MoodTest("test_profile_uses_configured_initials")
@@ -879,7 +963,14 @@ class ColdnessIsNotInsults(unittest.TestCase):
                         f"冷淡里混进了中性值：{sorted(seen)[:5]}")
 
     def test_repeated_dismissal_eventually_shows(self):
-        """单句几乎不推好感，靠账本累积。"""
+        """单句几乎不推好感，靠账本累积。
+
+        幅度由 `mood.local_delta` 里的 `random.uniform` 决定，这里固定成区间中点：
+        断言的是「攒得下来」这个方向，不是某一次随机抽到的具体数值（不固定时
+        30 句之后的好感在 25 上下抖动，整包跑会偶发失败）。
+        """
+        from unittest import mock
+
         t = MoodTest("test_profile_uses_configured_initials")
         t.setUp()
         svc, _s, _l = t.build(cfg(mood_initial_affection=50, mood_sensitivity=100))
@@ -890,16 +981,18 @@ class ColdnessIsNotInsults(unittest.TestCase):
                 await svc.update_from_message("1", w, 60.0, 14)
                 t.time_value += hours * 3600
 
-        asyncio.run(spam(["嗯"] * 3))
-        few = svc.profile("1")["affection"]
-        asyncio.run(spam(["嗯", "哦", "随你"] * 10))
-        many = svc.profile("1")["affection"]
-        self.assertLess(few, 50.0)
-        self.assertGreater(few, 40.0, f"三句就掉了 {50 - few:.1f}，太重了")
-        self.assertLess(many, 25.0, "连着两周敷衍该把好感拉下来")
-        kinds = [k for k, _ in svc.recent_events("1", 5)]
-        self.assertTrue(all(k in ("有点冷", "很敷衍") for k in kinds),
-                        f"账本记的是 {kinds}")
+        with mock.patch("humanoid.services.mood.random.uniform",
+                        side_effect=lambda low, high: (low + high) / 2.0):
+            asyncio.run(spam(["嗯"] * 3))
+            few = svc.profile("1")["affection"]
+            asyncio.run(spam(["嗯", "哦", "随你"] * 10))
+            many = svc.profile("1")["affection"]
+            self.assertLess(few, 50.0)
+            self.assertGreater(few, 40.0, f"三句就掉了 {50 - few:.1f}，太重了")
+            self.assertLess(many, 25.0, "连着两周敷衍该把好感拉下来")
+            kinds = [k for k, _ in svc.recent_events("1", 5)]
+            self.assertTrue(all(k in ("有点冷", "很敷衍") for k in kinds),
+                            f"账本记的是 {kinds}")
 
 
 class ProactiveSilenceCostsAffection(unittest.TestCase):
@@ -991,3 +1084,78 @@ class ProactiveSilenceCostsAffection(unittest.TestCase):
         self.assertTrue(kinds, "账本里该留下这一笔")
         self.assertTrue(all(k in ("温和", "有点冷", "一直没被理") for k in kinds),
                         f"被不回不该记成 {kinds}——「很敷衍」是骂人的分量")
+
+class EnergySettledOnceTest(unittest.TestCase):
+    """同一段时段在存档里出现两次时，精力只能结算一次。
+
+    v3.0.2 之前的存档会出现「结转段既物化进 daily_schedule、又留在
+    segment_carry 里」，`current_slots()` 因此给出两段完全相同的时段。旧写法
+    对每段各累加一遍，那一觉的消耗/恢复被算两遍（实测 7 小时睡眠段多掉 19.1 点）。
+    """
+
+    MOMENT = datetime(2026, 11, 4, 8, 0, tzinfo=TZ)
+    LAST = "2026-11-04 00:00:00"
+
+    def advance_with(self, slots, conf=None, moment=None):
+        conf = conf or cfg()
+        store = build_store(conf)
+        clock = FrozenClock(moment or self.MOMENT)
+        store.data["energy"] = 50.0
+        store.data["last_update"] = self.LAST
+        service = EnergyService(store.scope, lambda: conf, clock, lambda: slots)
+        return service.advance()
+
+    def test_duplicate_slot_is_settled_once(self):
+        slot = {"start": "00:00", "end": "07:00", "event": "熬夜", "energy_rate": -0.1}
+        once = self.advance_with([dict(slot)])
+        twice = self.advance_with([dict(slot), dict(slot)])
+        self.assertAlmostEqual(twice, once, places=6,
+                               msg=f"同一段结算了两遍：单段 {once}，重复段 {twice}")
+
+    def test_duplicate_recovery_slot_keeps_natural_recovery_rounding(self):
+        slot = {"start": "00:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15}
+        once = self.advance_with([dict(slot)])
+        twice = self.advance_with([dict(slot), dict(slot)])
+        self.assertAlmostEqual(twice, once, places=6)
+
+    def test_adjacent_slots_equal_one_merged_slot(self):
+        left = {"start": "00:00", "end": "03:30", "event": "睡眠", "energy_rate": 0.15}
+        right = {"start": "03:30", "end": "07:00", "event": "睡眠", "energy_rate": 0.15}
+        merged = {"start": "00:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15}
+        self.assertAlmostEqual(
+            self.advance_with([dict(left), dict(right)]),
+            self.advance_with([dict(merged)]),
+            places=6,
+        )
+
+    def test_legacy_archive_through_current_slots_counts_once(self):
+        """daily_schedule 里物化的结转段 + segment_carry 仍在 → 两段同一时段。"""
+        from humanoid.services.schedule import ScheduleService
+        from .fakes import FrozenClock as FakesClock
+
+        conf = cfg()
+        moment = self.MOMENT
+        store = ScopeStore(Path(tempfile.mkdtemp()) / "state.json")
+        store.load(moment.strftime("%Y-%m-%d"), conf.cycle_length)
+        clock = FakesClock(moment)
+        schedule = ScheduleService(
+            store.scope,
+            lambda: conf,
+            clock,
+            logger=RecordingLogger(),
+            monotonic=clock.timestamp,
+        )
+        sleep = {"start": "00:00", "end": "07:00", "event": "睡眠", "energy_rate": 0.15, "sleep": True}
+        store.scope.update_self(
+            today_date=moment.strftime("%Y-%m-%d"),
+            daily_schedule=[dict(sleep)],
+            segment_carry={"end": "07:00", "event": "睡眠", "energy_rate": 0.15},
+        )
+        slots = schedule.current_slots()
+        self.assertEqual(len(slots), 2, f"前提：历史存档给出两段同一时段，实际 {slots}")
+        self.assertAlmostEqual(
+            self.advance_with(slots, conf, moment),
+            self.advance_with([dict(sleep)], conf, moment),
+            places=6,
+            msg="历史存档的两段同一时段被结算了两遍",
+        )

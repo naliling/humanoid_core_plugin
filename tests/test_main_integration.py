@@ -441,7 +441,7 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         req = FakeProviderRequest("你是一个助手。")
         await self.star.inject_context(FakeEvent("你好", private=False), req)
         self.assertIn("你是一个助手。", req.system_prompt)
-        self.assertIn("【她的身体与生活】", req.system_prompt)
+        self.assertIn("【我现在的身体】", req.system_prompt)
         self.assertIn("群聊", injected_text(req))
 
     async def test_injection_creates_prompt_when_empty(self):
@@ -466,7 +466,7 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
             "临时块必须标 _no_save，否则会落进会话历史",
         )
         self.assertNotIn("私聊", req.system_prompt, "变化的事实不该再进 system_prompt")
-        self.assertNotIn("【此刻的她】", req.system_prompt, "变化的状态段不该再进 system_prompt")
+        self.assertNotIn("【我现在的情况】", req.system_prompt, "变化的状态段不该再进 system_prompt")
 
     async def test_injection_is_fast_even_with_slow_provider(self):
         self.provider.delay = 5.0

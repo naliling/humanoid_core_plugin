@@ -42,6 +42,10 @@ TZ = ZoneInfo("Asia/Shanghai")
 FROZEN = datetime(2026, 8, 22, 15, 0, tzinfo=TZ)
 NOW = FROZEN.timestamp()
 
+
+def _boom_name_of(uid):
+    raise RuntimeError("查名字炸了")
+
 # 指令词：这一层是**事实**，不是对模型的要求（`test_v2151_freedom` 盯的是同一个口径）。
 FORBIDDEN = ("不要", "必须", "别", "务必", "别忘了", "记得")
 
@@ -67,9 +71,15 @@ class LifeLogTest(unittest.TestCase):
         )
         self.assertEqual([e["text"] for e in merged], ["有效"], "认不出的元素与字段一律丢掉")
 
-    def test_not_a_list_is_empty(self):
+    def test_not_a_list_is_unknown(self):
+        """不是 list 不是「空账本」，是「读不懂」：调用方必须能区分这两件事。"""
         for junk in (None, {}, "文本", 3, {"open_items": "x"}):
-            self.assertEqual(life_log.parse_open(junk), [])
+            self.assertIsNone(life_log.parse_open(junk))
+
+    def test_garbage_incoming_keeps_the_existing_ledger(self):
+        existing = [item("还没做完的事")]
+        merged = life_log.merge_open(existing, "不是列表", NOW)
+        self.assertEqual([e["text"] for e in merged], ["还没做完的事"])
 
     def test_capped_and_truncated(self):
         many = [item(f"第{i}件") for i in range(10)]
@@ -164,14 +174,17 @@ class LifeLogTest(unittest.TestCase):
             self.assertNotIn("【", line)
             self.assertNotIn("】", line)
 
-    def test_who_falls_back_to_ta(self):
-        self.assertIn("TA", life_log.render_lines([item("甲")], NOW, name_of=lambda u: "")[0])
-        self.assertIn("TA", life_log.render_lines([item("甲")], NOW, name_of=lambda u: None)[0])
+    def test_unknown_name_does_not_invent_ta(self):
+        """认不出名字就不指名——**不能退回「TA」**。
 
-        def boom(uid):
-            raise RuntimeError("查名字炸了")
-
-        self.assertIn("TA", life_log.render_lines([item("甲")], NOW, name_of=boom)[0])
+        `prompt_builder._personalize` 的约定是「TA 指玩家」，它会把每个独立成词的
+        TA 换成**当前说话人**的名字。这里退回 TA，等于把 A 的私事写成
+        「和当前说话人之间还有件事没完」（审核 注入取舍 #88）。
+        """
+        for name_of in (lambda u: "", lambda u: None, _boom_name_of):
+            line = life_log.render_lines([item("甲")], NOW, name_of=name_of)[0]
+            self.assertNotIn("TA", line)
+            self.assertTrue(line.startswith("她手上"), line)
 
     def test_no_uid_does_not_invent_a_person(self):
         line = life_log.render_lines([{"text": "甲", "uid": "", "at": NOW}], NOW)[0]
@@ -197,7 +210,7 @@ class NoTitledSectionTest(unittest.TestCase):
 
         self.assertFalse(hasattr(pb, "LIFE_MARK"), "不许再给这一段单独起标题")
         self.assertFalse(hasattr(pb, "build_life_note"), "不许再单独成段")
-        self.assertEqual(pb.MARK_VERSION, "v12", "事实块的格式没变，版本号不该跟着动")
+        self.assertEqual(pb.MARK_VERSION, "v13", "第一人称抬头是格式变更，版本号必须跟着动")
 
     def test_main_has_no_append_life(self):
         self.assertFalse(hasattr(main_module, "_append_life"), "不许再往 system_prompt 追加这一段")

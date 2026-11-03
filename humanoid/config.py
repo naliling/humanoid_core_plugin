@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from astrbot.api import logger
@@ -105,6 +105,18 @@ def _as_str(value: Any, default: str = "") -> str:
     return text if text else default
 
 
+def _clip_text(key: str, text: str, limit: int) -> str:
+    """自由文本项的超长部分会被截断：**必须留一条日志**。
+
+    面板没有 maxLength，用户写进去的东西在解析层被无声砍掉一截，
+    面板回显的仍是全文——「配置面板显示的字」与「真正进 prompt 的字」是两份。
+    """
+    if len(text) <= limit:
+        return text
+    logger.warning("%s 长度 %d 超过上限 %d：已截断（面板回显的仍是全文）", key, len(text), limit)
+    return text[:limit]
+
+
 def _as_choice(value: Any, options: tuple[str, ...], default: str) -> str:
     """枚举项：认不出来就退回默认值，但**必须留一条日志**。
 
@@ -147,24 +159,27 @@ def _as_float_tuple(value: Any, default: tuple[float, ...]) -> tuple[float, ...]
 
 
 def _phase_multipliers(value: Any, default: tuple[float, ...]) -> tuple[float, ...]:
-    """周期恢复倍率：长度不等于阶段数（8）时按默认值走。
+    """周期恢复倍率：按位置对齐到阶段数（8），多退少补。
 
-    老版本是 6 段（v2.14 之前），阶段数已改成 8 段。
-    旧列表留着会**静默错位**：面板显示 8 段顺序，代码却按旧顺序取值，
-    中间几段的恢复倍率对不上。长度对不上就整体用新默认（6 个数本来就写不出 8 段）。
+    老版本是 6 段（v2.14 之前），阶段数已改成 8 段。以前长度对不上就**整表**
+    退回默认：用户填了 4 个倍率，前 4 档明明有明确含义，却一个都不生效，而面板
+    回显的仍是他填的那 4 个数。现在按位置取前 N 项，缺的用默认补，多的丢掉并喊一声。
     """
     out = _as_float_tuple(value, default)
-    if len(out) != len(default):
-        # 整表退回默认是**必须**的（6 个数写不出 8 段，留着会静默错位），但静默
-        # 退回让用户以为自己的 6 个倍率还在生效。面板不拦、代码丢，只能在这里喊。
-        logger.warning(
-            "energy_recovery_phase_multipliers 需要恰好 %d 个数，收到 %d 个："
-            "已整表退回默认值（旧版是 6 段，写不出现在的 8 个阶段）",
-            len(default),
-            len(out),
-        )
+    if len(out) == len(default):
+        return out
+    if not out:
         return default
-    return out
+    logger.warning(
+        "energy_recovery_phase_multipliers 需要 %d 个数，收到 %d 个："
+        "已按位置对齐（前 %d 项生效，其余用默认值）",
+        len(default),
+        len(out),
+        min(len(out), len(default)),
+    )
+    aligned = list(out[: len(default)])
+    aligned.extend(default[len(aligned):])
+    return tuple(aligned)
 
 
 def _date_entry(item: Any) -> dict[str, str] | None:
@@ -339,7 +354,9 @@ class HumanoidConfig:
     # 他的长度是**每个用户各一份**，这里给的是第一次的初值。
     ccb_body_depth_cap_cm: float = 14.0
     ccb_body_sensitivity: int = 60
-    ccb_partner_length_cm: float = 13.0
+    # 必须大于 ccb_body_depth_cap_cm（默认 14），否则「过深」这一档在出厂配置下
+    # 永远触发不到：13 <= 14，判定过深的那个比较恒假。
+    ccb_partner_length_cm: float = 15.0
     # (B 表现层）：场景内要不要多给那段姿势/位置/深度/阶段。
     # 关掉就退回纯单行注入，与 2.28.6 完全一致。
     ccb_scene_detail: bool = True
@@ -461,6 +478,10 @@ class HumanoidConfig:
     state_flush_interval_seconds: int = 60
     last_interaction_threshold_minutes: int = 5
     last_interaction_mode: str = "with_last_msg"
+    # 兄弟 bot 互聊护栏（humanoid/sibling_chat.py）：同一对角色在窗口内最多连续放行
+    # N 次。以前这两个值是硬编码 600 秒 / 3 次，部署里改不了。
+    sibling_window_seconds: float = 600.0
+    sibling_max_turns: int = 3
 
     # v2.14 生理层（soma）
     soma_enabled: bool = True
@@ -519,6 +540,29 @@ class HumanoidConfig:
             v = pick(key)
             return getattr(d, key) if v is _MISSING else _as_float(v, getattr(d, key), low, high)
 
+        def f_warn(key: str, low: float, high: float) -> float:
+            """数值项越界/读不出时按边界或默认值生效，但**必须留一条日志**。
+
+            这些项的 schema 曾没有 minimum/maximum：面板放行任意值并原样回显，
+            代码却用 max()/min() 静默夹住——用户看到的是自己填的数，生效的是边界值。
+            """
+            v = pick(key)
+            default = getattr(d, key)
+            if v is _MISSING:
+                return default
+            try:
+                out = float(v)
+            except (TypeError, ValueError):
+                logger.warning("%s=%r 无法解析为数值：用默认值 %g", key, v, default)
+                return default
+            if out != out:
+                logger.warning("%s=%r 不是有限数：用默认值 %g", key, v, default)
+                return default
+            if not (low <= out <= high):
+                logger.warning("%s=%r 超出 [%g, %g]：按边界值生效", key, out, low, high)
+                out = min(max(out, low), high)
+            return out
+
         def s(key: str) -> str:
             v = pick(key)
             return getattr(d, key) if v is _MISSING else _as_str(v, getattr(d, key))
@@ -532,10 +576,11 @@ class HumanoidConfig:
             return getattr(d, key) if v is _MISSING else ("" if v is None else str(v).strip())
 
         cfg = cls(
-            max_energy=f("max_energy", 1.0, 10_000.0),
+            max_energy=f_warn("max_energy", 1.0, 10_000.0),
             enable_cycle=b("enable_cycle"),
             cycle_length=i("cycle_length", 1, 365),
-            energy_decay_rate=f("energy_decay_rate", 0.0, 100.0),
+            # 面板 v3.0.2 起是数值项（旧存档里是 4 档字符串，float() 照样能读）。
+            energy_decay_rate=f_warn("energy_decay_rate", 0.0, 3.0),
             cycle_description_style=c("cycle_description_style", CYCLE_STYLES),
             enable_energy_natural_recovery=b("enable_energy_natural_recovery"),
             energy_natural_recovery_per_minute=f("energy_natural_recovery_per_minute", 0.0, 0.9),
@@ -569,9 +614,11 @@ class HumanoidConfig:
             llm_daily_call_budget=i(
                 "llm_daily_call_budget", *INT_SETTING_RANGES["llm_daily_call_budget"]
             ),
-            schedule_prompt_extra=s_opt("schedule_prompt_extra")[
-                : cls.SCHEDULE_PROMPT_EXTRA_MAX
-            ],
+            schedule_prompt_extra=_clip_text(
+                "schedule_prompt_extra",
+                s_opt("schedule_prompt_extra"),
+                cls.SCHEDULE_PROMPT_EXTRA_MAX,
+            ),
             schedule_time_granularity=c("schedule_time_granularity", tuple(GRANULARITY_MINUTES)),
             schedule_use_persona=b("schedule_use_persona"),
             admin_qq=_as_str_tuple(pick("admin_qq")),
@@ -595,7 +642,7 @@ class HumanoidConfig:
             show_city_time_in_low_intrusion=b("show_city_time_in_low_intrusion"),
             timezone_city=s("timezone_city"),
             outfit_enabled=b("outfit_enabled"),
-            outfit_preset=s_opt("outfit_preset")[:200],
+            outfit_preset=_clip_text("outfit_preset", s_opt("outfit_preset"), 200),
             outfit_scene_variation=b("outfit_scene_variation"),
             mood_enabled=b("mood_enabled"),
             mood_provider_name=s_opt("mood_provider_name"),
@@ -605,11 +652,11 @@ class HumanoidConfig:
             mood_sensitivity=i("mood_sensitivity", 1, 100),
             mood_decay_hours=f("mood_decay_hours", 0.1, 720.0),
             mood_initial_affection=i("mood_initial_affection", 0, 100),
-            ccb_libido_min=f("ccb_libido_min", 0.0, 50.0),
-            ccb_libido_rise=f("ccb_libido_rise", 0.0, 20.0),
-            ccb_affection_min=f("ccb_affection_min", 0.0, 100.0),
-            ccb_affection_rise=f("ccb_affection_rise", 0.0, 50.0),
-            ccb_affection_deep=f("ccb_affection_deep", 0.0, 100.0),
+            ccb_libido_min=f_warn("ccb_libido_min", 0.0, 50.0),
+            ccb_libido_rise=f_warn("ccb_libido_rise", 0.0, 20.0),
+            ccb_affection_min=f_warn("ccb_affection_min", 0.0, 100.0),
+            ccb_affection_rise=f_warn("ccb_affection_rise", 0.0, 50.0),
+            ccb_affection_deep=f_warn("ccb_affection_deep", 0.0, 100.0),
             ccb_use_arousal=b("ccb_use_arousal"),
             ccb_proactive=b("ccb_proactive"),
             ccb_body_depth_cap_cm=f("ccb_body_depth_cap_cm", 1.0, 18.0),
@@ -675,6 +722,8 @@ class HumanoidConfig:
             state_flush_interval_seconds=i("state_flush_interval_seconds", 1, 60),
             last_interaction_threshold_minutes=i("last_interaction_threshold_minutes", 0, 1440),
             last_interaction_mode=c("last_interaction_mode", LAST_INTERACTION_MODES),
+            sibling_window_seconds=f("sibling_window_seconds", 1.0, 86400.0),
+            sibling_max_turns=i("sibling_max_turns", 1, 50),
             soma_enabled=b("soma_enabled"),
             body_tick_seconds=i("body_tick_seconds", 15, 600),
             sleep_need_hours=f("sleep_need_hours", 3.0, 14.0),
@@ -701,6 +750,26 @@ class HumanoidConfig:
                 "等于关闭夜间窗口（不攒睡眠债、昼夜低谷不锚定）。要关夜间请用 night_mode_enabled",
                 cfg.night_start_hour,
             )
+        # 间隔是 min≤max 的一对，而面板/命令行都只能改其中一项：只改下限会造出
+        # 「120~60」的倒置区间，抽随机时 hi<=lo 静默退化成固定值，诊断还按自己的口径
+        # 打印。钳制放在解析层（面板与命令行都经过这里），只在内存里改，不回写面板。
+        # 只在「上限是真实上限」时钳：max=0 是合法档（不随机，固定按 min），把它抬到
+        # min 会让面板写 0 变成 30~30，与 INT_SETTING_RANGES 的 0 下限冲突。
+        if (
+            cfg.schedule_max_interval_minutes > 0
+            and cfg.schedule_min_interval_minutes > cfg.schedule_max_interval_minutes
+        ):
+            logger.warning(
+                "schedule_min_interval_minutes=%d 大于 schedule_max_interval_minutes=%d："
+                "已把上限钳到 %d，避免倒置区间",
+                cfg.schedule_min_interval_minutes,
+                cfg.schedule_max_interval_minutes,
+                cfg.schedule_min_interval_minutes,
+            )
+            # 配置是 frozen dataclass：只能换一个新实例，不能就地赋值。
+            cfg = replace(
+                cfg, schedule_max_interval_minutes=cfg.schedule_min_interval_minutes
+            )
         return cfg
 
     # ------------------------------------------------------------------
@@ -717,17 +786,9 @@ class HumanoidConfig:
             return 0.0
         return float((end - start) % 24)
 
-    @property
-    def night_mid_hour(self) -> float:
-        """夜间窗口的中点时刻。
-
-        跨午夜时绝不能取算术平均：23→5 的平均是 14（下午两点），真实中点是凌晨 2 点。
-        昼夜低谷的位置由它推出来，算错会把整条节律曲线摆到白天去。
-        """
-        start, end = self.night_start_hour, self.night_end_hour
-        if start == end:
-            return float(start)
-        return ((start + (end + 24.0 if end < start else end)) / 2.0) % 24.0
+    # 「夜间窗口的中点」曾经也在这里实现过一份（night_mid_hour），生产代码零引用、
+    # 且 start==end 时返回 start 而 night_span_hours 返回 0，同族属性互相矛盾。
+    # 唯一真实来源是 soma._night_mid_hour()（它按**生物钟夜**算，见 services/soma.py）。
 
     @property
     def sleep_relief_per_hour(self) -> float:
@@ -881,8 +942,11 @@ _USER_CHOICE_LEGACY_DEFAULTS: dict[str, Any] = {
     "mood_initial_affection": LEGACY_MOOD_INITIAL_AFFECTION,
     "schedule_max_slots": LEGACY_SCHEDULE_MAX_SLOTS,
     "schedule_prompt_extra": LEGACY_SCHEDULE_PROMPT_EXTRA,
-    "inject_activity_context": "low",
 }
+# **不收枚举项**：`inject_activity_context` 的 `"low"` 不在 `INJECT_MODES` 里，
+# `from_raw` 会把它判成非法值并退回 `"medium"`；把它列在「用户合法选择」里，等于
+# 同一个值在一处非法、在另一处被当作正当选择（配置 F1）。这里只收「旧默认值本身
+# 也是当前合法取值」的数值项。
 
 
 def _phase_multiplier_count(value: Any) -> int:
@@ -937,14 +1001,17 @@ def plan_default_migrations(
 
     因此这里分两类处理（P2-10）：
 
-    1. **可判定**：`weather_location` 与 `timezone_city` 的组合、6 段的周期恢复倍率
-       （结构上已经不是现在能用的格式）→ 自动迁移；
-    2. **用户合法选择**：初始好感 46、时段数 16、旧偏好文案、注入档位 low、作息
-       窗口 23/6 且跟随开着 → **不自动改**，只 INFO 说明。这些值无法与「没动过的旧
-       默认」区分，以前的实现会静默覆盖用户的显式选择。
+    1. **可判定**：6 段的周期恢复倍率（结构上已经不是现在能用的格式）→ 自动迁移；
+       `weather_location` 与 `timezone_city` 对不上**只提醒、不改值**（见下方说明）；
+    2. **用户合法选择**：初始好感 46、时段数 16、旧偏好文案、作息窗口 23/6 且跟随
+       开着 → **不自动改**，只 INFO 说明。这些值无法与「没动过的旧默认」区分，以前的
+       实现会静默覆盖用户的显式选择。（枚举项不收：非法枚举值由 `from_raw` 退回默认，
+       不能同时又当作「合法的旧选择」。）
 
     `applied` / `explicit_keys` 是调用方可选传入的：前者来自 `.defaults-migrated`
     标记（已应用过的键），后者是能证明用户显式设置过的键；命中的键一律跳过。
+    `explicit_keys` 目前**只有测试会传**（生产调用点 `main.py` 不传）——它是给
+    「用户明确改过这个键」留的口子，不是现役逻辑。
     """
     src: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
     skip = {str(key) for key in (applied or ())} | {
@@ -961,9 +1028,16 @@ def plan_default_migrations(
         and city
         and city != DEFAULT_CITY_PLACEHOLDER
     ):
-        # 她改了所在城市却没改天气城市（也改不了，以前没人提示这两处要对上）：
-        # 清空天气城市，让它跟着所在城市走。
-        changes["weather_location"] = ""
+        # 她改了所在城市却没改天气城市：以前这里直接把 weather_location 清空。
+        # 那是一次**不可逆的数据丢失**——`""` 落盘后旧值就没了，而「清空」本身
+        # 也不保证天气能用（天气服务对空值的处理是"用 IP 定位"，与她所在城市无关）。
+        # 用户填过的值只能由用户自己改：保留原值，只提醒两处要对上。
+        logger.warning(
+            "weather_location=%r 与当前所在城市 %r 不一致：已保留原值。"
+            "天气会按这个城市取；要改成所在城市请在面板里手动修改",
+            weather,
+            city,
+        )
     if (
         "energy_recovery_phase_multipliers" not in skip
         and _phase_multiplier_count(src.get("energy_recovery_phase_multipliers"))

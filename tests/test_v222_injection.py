@@ -30,7 +30,7 @@ TODAY = MOMENT.strftime("%Y-%m-%d")
 
 # 心气这一维的全部措辞：同一时刻只该出现其中一种。
 HEART_WORDS = (
-    "拧巴", "念头抣着", "又气又想靠近",
+    "拧巴", "念头拧着", "又气又想靠近",
     "压着火", "一股气没处发",
     "惦记TA", "心思飘过去",
 )
@@ -383,24 +383,24 @@ class InjectionLayerTest(unittest.TestCase):
         )
         self.assertNotIn("小雨的身体与生活", text, "标题被改名了")
 
-    def test_names_replace_first_mention_only(self):
-        """名字只锚定一次：每句都以名字开头就成了流水账。"""
+    def test_names_are_not_used_to_replace_the_third_person(self):
+        """v13：不再把「她」换成角色名（名字每句开头 = 流水账，也是角色卡感的来源）。"""
         from humanoid.prompt_builder import PromptBuilder
 
         out = PromptBuilder._personalize(
             "私聊，只有她和阿明。她今天有点累。她对阿明还算熟。", "小雨", "阿明"
         )
         self.assertEqual(
-            out, "私聊，只有小雨和阿明。她今天有点累。她对阿明还算熟。",
-            "名字只该锚定第一次，之后继续用「她」",
+            out, "私聊，只有她和阿明。她今天有点累。她对阿明还算熟。",
+            "_personalize 现在只负责 TA→对方名字",
         )
 
-    def test_emotion_line_carries_the_name(self):
-        """情绪句是独立的内心独白，每次都要叫得出名字。"""
+    def test_emotion_line_is_left_for_the_render_exit(self):
+        """情绪句的第一人称化在 _finish 出口统一做，_personalize 不再动「她」。"""
         from humanoid.prompt_builder import PromptBuilder
 
         out = PromptBuilder._personalize("她内心：心里有点堵", "小雨", "阿明")
-        self.assertEqual(out, "小雨内心：心里有点堵")
+        self.assertEqual(out, "她内心：心里有点堵")
 
     def test_names_with_pronouns_are_rejected(self):
         """名字里混进代词会替换出「小小雨今天…」这种句子，直接弃用。"""
@@ -435,7 +435,7 @@ class InjectionLayerTest(unittest.TestCase):
         core = self.core()
         core.mood.profile("42").update({"aggression": 52.0, "base_aggression": 28.0})
         text = core.build_injection("42", is_group=False, text="在吗")
-        for clinical in ("压着火", "气没处发", "拧巴", "抣着"):
+        for clinical in ("压着火", "气没处发", "拧巴", "拧着"):
             self.assertNotIn(clinical, text, f"病历腔又回来了「{clinical}」：\n{text}")
         self.assertIn("内心", text, f"该给情绪：\n{text}")
 
@@ -499,7 +499,7 @@ class InjectionLayerTest(unittest.TestCase):
         # 情绪归零后关系位置退回中性——她不记得你们有多熟，但她还记得你叫什么。
         text = core.build_injection("42", is_group=False, text="好久不见")
         self.assertIn("对TA的称呼是「小明」", text)
-        self.assertIn("她对TA", text, f"关系位置仍要给（中性那档）：\n{text}")
+        self.assertIn("我对TA", text, f"关系位置仍要给（中性那档）：\n{text}")
         self.assertNotIn("关系亲密", text, f"情绪都清零了还说她亲密：\n{text}")
         panel = "\n".join(core.status_lines("42"))
         self.assertIn("认识 1 年", panel, f"面板上仍然知道认识多久：\n{panel}")

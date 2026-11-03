@@ -83,6 +83,42 @@ class NotifierTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(n._tasks), 1)
         await n.stop_all()
 
+    async def test_unknown_chat_type_is_skipped(self):
+        """拿不准是不是私聊就不发（fail-closed）。
+
+        以前 `_is_private` 认不出来返回 True，于是「is_private_chat 抛异常」这类
+        边缘事件会被当成私聊，用群成员的 id 往群里报「正在输入」。
+        """
+
+        class Unknown(FakeNapcatEvent):
+            def is_private_chat(self):
+                raise RuntimeError("拿不到会话类型")
+
+        n = InputStateNotifier(_Log(), interval=0.01, timeout=5.0)
+        ev = Unknown()
+        await n.start("umo-u", ev)
+        self.assertEqual(ev.bot.api.calls, [])
+        self.assertEqual(n._tasks, {})
+
+    async def test_event_without_any_chat_type_checker_is_skipped(self):
+        """两个判据都拿不到时同样不发，而不是默认当私聊。"""
+
+        class Bare:
+            def __init__(self):
+                self.bot = FakeBot()
+
+            def get_platform_name(self):
+                return "aiocqhttp"
+
+            def get_sender_id(self):
+                return "10001"
+
+        n = InputStateNotifier(_Log(), interval=0.01, timeout=5.0)
+        ev = Bare()
+        await n.start("umo-b", ev)
+        self.assertEqual(ev.bot.api.calls, [])
+        self.assertEqual(n._tasks, {})
+
     async def test_group_and_other_platform_are_skipped(self):
         n = InputStateNotifier(_Log(), interval=0.01, timeout=5.0)
         group = FakeNapcatEvent(private=False)

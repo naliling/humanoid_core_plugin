@@ -135,13 +135,14 @@ class DesiredButNotYet(unittest.TestCase):
         text = _desire(_conf(), affection=35.0, base_affection=35.0)
         self.assertNotIn(CLAIM, text, text)
         self.assertIn("她此刻的欲望", text)
-        self.assertIn("好感 35/100", text, text)
         self.assertIn("关系还没到那一步", text, text)
+        self.assertNotRegex(text, r"\d+/\d+")
 
     def test_low_energy_says_so(self):
         text = _desire(_conf(), energy=20.0)
         self.assertNotIn(CLAIM, text, text)
-        self.assertIn("精力见底（20/100）", text, text)
+        self.assertIn("她累坏了", text, text)
+        self.assertNotRegex(text, r"\d+/\d+")
 
     def test_cooldown_says_so(self):
         text = _desire(_conf(), cooldown_left=1500.0)
@@ -154,15 +155,16 @@ class DesiredButNotYet(unittest.TestCase):
         self.assertNotIn(CLAIM, text, text)
         self.assertIn("这份亲近还没攒够", text, text)
 
-    def test_the_old_text_is_unchanged_when_every_gate_is_met(self):
-        # 好感 92 已在深入档、亲近欲 41/34 过 38/Δ4：与 v2.28.x 的句子逐字一致。
+    def test_every_gate_met_still_says_she_is_wanting(self):
+        # 好感 92 已在深入档、亲近欲 41/34 过 38/Δ4：方向留着，读数不给。
         text = _desire(_conf())
-        self.assertIn("她此刻的欲望：亲近欲 41/50（比平常高 7）", text, text)
+        self.assertIn("她此刻的欲望：比平常想要", text, text)
+        self.assertNotRegex(text, r"\d+/\d+")
         self.assertIn(CLAIM, text, text)
 
     def test_below_baseline_keeps_the_plain_conclusion(self):
         text = _desire(_conf(), libido=22.0, base_libido=34.0)
-        self.assertEqual(text, "她此刻没有那个心思（亲近欲 22/50，比平常低 12）")
+        self.assertEqual(text, "她此刻没有那个心思，亲近的念头比平常还淡")
 
 
 class ClaimImpliesTheSceneWouldOpen(unittest.TestCase):
@@ -201,14 +203,15 @@ class PresenceLineWiring(unittest.TestCase):
         _mood(core, affection=35.0, base_affection=35.0,
               libido=41.0, base_libido=34.0)
         text = core.build_injection("u1")
-        self.assertIn("好感 35/100", text)
+        self.assertIn("关系还没到那一步", text)
+        self.assertNotRegex(text, r"\d+/\d+")
         self.assertNotIn(CLAIM, text)
 
-    def test_with_deep_affection_it_still_reads_as_before(self):
+    def test_with_deep_affection_it_still_says_she_is_at_the_line(self):
         core = _core()
         _mood(core)
         text = core.build_injection("u1")
-        self.assertIn("亲近欲 41/50", text)
+        self.assertIn("我此刻的欲望：比平常想要", text)
         self.assertIn(CLAIM, text)
 
 

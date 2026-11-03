@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from astrbot.api import logger
@@ -9,6 +10,7 @@ from astrbot.api import logger
 from . import memory_link
 from .config import HumanoidConfig
 from .clock import DEFAULT_CITY_PLACEHOLDER, weekday_cn, format_offset
+from .services.weather import effective_location as _weather_effective_location
 from .slots import parse_time
 from .llm import (
     GLOBAL_LABEL,
@@ -95,6 +97,30 @@ def _signals_line(signals: dict) -> str:
     return f"- 社交层信号：读不到（拿不到 data 目录）{tail}"
 
 
+def _loop_failure_lines(failed: dict[str, float] | None, now: float | None = None) -> list[str]:
+    """后台循环启动失败的角色：以前这件事只在日志里有一行 WARN。
+
+    症状是「功能看起来存在但不运行」：日程不再换段、情绪不再分析、天气不再刷新、
+    社交信号不再读——而面板与聊天里一切正常，用户没有任何线索。这里把它摊开，
+    并说明「消息仍然能用」（失败实例留在缓存里正是为了读状态）。
+    """
+    if not failed:
+        return []
+    stamp = time.time() if now is None else float(now)
+    parts: list[str] = []
+    for role_id, at in failed.items():
+        try:
+            age = max(0.0, stamp - float(at))
+        except (TypeError, ValueError):
+            age = 0.0
+        parts.append(f"{role_id}（{age:.0f}s 前失败）")
+    return [
+        f"{WARN_MARK} 后台循环启动失败：{'、'.join(parts)}——"
+        "日程换段 / 情绪分析 / 天气刷新 / 社交信号都不会自己跑（消息仍能读到她的状态）；"
+        "插件会每 30 秒重试一次，持续失败请看日志里那行启动异常"
+    ]
+
+
 def _memory_link_line() -> str:
     """长期记忆桥接的状态行（v3.0.0，P2-24）。
 
@@ -107,9 +133,12 @@ def _memory_link_line() -> str:
     except Exception:
         error = ""
     if not error:
+        # 这一栏只显示**此刻**的故障：`last_error()` 在成功读写后会清空（v3.0.2 起
+        # 语义从「最近一次失败」改成「当前故障」）。所以「没有」不能写成「没有失败
+        # 记录」——那会让人以为这里留着历史，实际恢复之后什么都看不到。
         return (
-            "- 长期记忆联动（memory_companion）：没有失败记录"
-            "（没装 / 对面关了桥接时是静默降级，不报错）"
+            "- 长期记忆联动（memory_companion）：当前没有故障"
+            "（没装 / 对面关了桥接时是静默降级，不报错；过去失败过但已恢复不会留痕）"
         )
     kind = error.split(":", 1)[0].strip()
     hint = {
@@ -219,7 +248,9 @@ def _timezone_lines(cfg: HumanoidConfig, zone: Any, moment: Any) -> list[str]:
             f"- 机器本地时间 {host.strftime('%H:%M')}（{format_offset(host)}）："
             f"{OK_MARK} 两者差 {diff:+g} 小时，这是预期的（她过的不是机器时间）"
         )
-    else:
+    elif not degraded:
+        # 降级时她的钟就是机器时间，上面那句已经说清「按这台机器的时间过日子」；
+        # 再说一句「一致」等于把「没拿到时区」和「时区正常」说成同一件事。
         lines.append(f"- 机器本地时间与她的钟一致（{format_offset(host)}）")
     if zone.note:
         lines.append(f"  {WARN_MARK} {zone.note}")
@@ -230,11 +261,19 @@ def _timezone_lines(cfg: HumanoidConfig, zone: Any, moment: Any) -> list[str]:
             f"  {WARN_MARK} 还没定所在城市（`timezone_city` 仍是默认的「{DEFAULT_CITY_PLACEHOLDER}」）："
             "她住在哪个城市会直接改变她说出口的时间、作息、天气与日程"
         )
-    weather_city = (cfg.weather_location or "").strip() or city
+    # 天气城市**只问天气子系统自己的判定**（模块级 effective_location，与 snapshot()
+    # 同一套归一化）。以前这里自己写「weather_location or 时间城市」，于是面板说
+    # 「天气城市：河源（记得改~）」而天气模块判定「未配置」——同一件事两处各算一遍，
+    # 结论就不一样（审核 引擎与诊断 M3）。zone 有 .city，正是 clock.city。
+    weather_city = _weather_effective_location(zone, cfg)
     if not cfg.weather_enabled:
         lines.append("- 天气：已关闭")
-    elif not weather_city or weather_city == DEFAULT_CITY_PLACEHOLDER:
-        lines.append(f"  {WARN_MARK} 天气城市没配（weather_location 为空且所在城市未定）：她不会报天气")
+    elif not weather_city:
+        configured = (cfg.weather_location or "").strip()
+        detail = f"（weather_location 填的「{configured}」认不出英文城市名）" if configured else ""
+        lines.append(
+            f"  {WARN_MARK} 天气城市：未配置（天气子系统判定）{detail}：她不会报天气"
+        )
     else:
         same = "与时间城市同一处" if not (cfg.weather_location or "").strip() else "单独指定"
         lines.append(f"- 天气城市：{weather_city}（{same}）")
@@ -297,10 +336,12 @@ def build_report(
     activity_status: dict[str, Any],
     version: str,
     body_status: dict[str, Any] | None = None,
-    inject_estimate: dict[str, int] | None = None,
+    inject_estimate: dict[str, Any] | None = None,
     zone_status: dict[str, Any] | None = None,
     state_size_lines: list[str] | None = None,
     config_load_error: str = "",
+    role_id: str = "",
+    failed_loops: dict[str, float] | None = None,
 ) -> str:
     """诊断报告。**任何一处取值/格式化炸了都不能让这条命令整体报错**。
 
@@ -321,6 +362,8 @@ def build_report(
             zone_status=zone_status,
             state_size_lines=state_size_lines,
             config_load_error=config_load_error,
+            role_id=role_id,
+            failed_loops=failed_loops,
         )
     except Exception as exc:  # noqa: BLE001 - 兜底就是为了诊断页还能打开
         logger.exception("诊断报告生成失败")
@@ -340,14 +383,17 @@ def _build_report_body(
     activity_status: dict[str, Any],
     version: str,
     body_status: dict[str, Any] | None = None,
-    inject_estimate: dict[str, int] | None = None,
+    inject_estimate: dict[str, Any] | None = None,
     zone_status: dict[str, Any] | None = None,
     state_size_lines: list[str] | None = None,
     config_load_error: str = "",
+    role_id: str = "",
+    failed_loops: dict[str, float] | None = None,
 ) -> str:
     available = resolver.available_ids()
     lines = [f"〖拟人诊断〗v{version}", ""]
     lines += config_error_banner(config_load_error)
+    lines += _loop_failure_lines(failed_loops)
     lines.append("【AstrBot 可用对话模型 id】")
     lines.append(f"  {available}" if available else "  （空 —— AstrBot 还没有配置任何对话模型）")
 
@@ -508,9 +554,19 @@ def _build_report_body(
     lines.append(_memory_link_line())
 
     lines += ["", "【Token 预算】"]
-    if inject_estimate:
-        parts = "，".join(f"{mode} ≈ {tok}" for mode, tok in inject_estimate.items())
-        lines.append(f"- 聊天时追加的上下文：{parts} token")
+    # 探针失败也要说话：以前返回空 dict，这一节只剩一个标题，用户看不出是「没算」
+    # 还是「算失败了」。
+    if not inject_estimate:
+        lines.append("- 注入估算：没算（还没有角色实例）")
+    elif inject_estimate.get("error"):
+        lines.append(f"- 注入估算：测不出来：{inject_estimate['error']}")
+    else:
+        scene = str(inject_estimate.get("scene") or "探针")
+        lines.append(
+            f"- {scene}（一次假用户私聊，群聊注入另计）："
+            f"≈ {inject_estimate.get('tokens')} token，"
+            f"预算 {int(cfg.inject_token_budget)} token"
+        )
     if state_size_lines:
         # v3.0.0（P2-32）：状态落盘本身的可观测性单独成节——Windows 上 state.json
         # 被占用时落盘会连续失败，以前只有日志里一条 WARN，用户在诊断页看不到。
@@ -542,7 +598,9 @@ def _build_report_body(
 
     gate = gateway.gate
     if gate is not None:
-        snap = gate.snapshot()
+        # 空闲静默按角色判（闸门全局一份）：诊断要看的是**这个角色**多久没人理，
+        # 拿全局最近一次会在多角色时把真正被静默的那个藏起来。
+        snap = gate.snapshot(role_id=role_id)
         lines += ["", "【调用节流】"]
         idle_limit = snap["idle_limit_minutes"]
         if idle_limit <= 0:
@@ -608,6 +666,38 @@ def _build_report_body(
 
     return "\n".join(lines)
 
+def _user_entries(scope: Any) -> dict[str, Any] | None:
+    """只读地拿 `users` 映射；拿不到返回 None。
+
+    `RoleScope` 没有公开的 entries 视图（只有 `all_user_ids()` 与单键 `peek_user()`），
+    而诊断要数「只剩称呼的空壳」必须看到每个条目的键集合。这里直接读它的 `_root`：
+    **不建条目、不标脏**——诊断是只读入口，不能因为看一眼就让 state.json 变脏。
+    """
+    try:
+        root = getattr(scope, "_root", None)
+        if isinstance(root, dict):
+            users = root.get("users")
+            if isinstance(users, dict):
+                return users
+    except Exception:
+        pass
+    return None
+
+
+def _shell_fields() -> tuple[str, ...]:
+    """「只剩称呼、没有任何用户数据」的字段名单。
+
+    **唯一真源在 `services.mood` 的 `_STALE_SHELL_FIELDS`**（整条删除判定用的就是它）；
+    这里只读，不另写一份——否则「空壳」在诊断与清理里各算一遍，数出来又不一样。
+    """
+    try:
+        from .services.mood import _STALE_SHELL_FIELDS
+
+        return tuple(_STALE_SHELL_FIELDS)
+    except Exception:
+        return ("nickname",)
+
+
 def state_size_lines(core) -> list[str]:
     """状态文件有多大、有多少用户条目——写盘成本全看这两项。
 
@@ -624,7 +714,13 @@ def state_size_lines(core) -> list[str]:
             size_kb = path.stat().st_size / 1024.0
             hint = ""
             if size_kb > 512:
-                hint = "（已经偏大：写盘是默认每 60 秒整份重写，可调小「情绪数据保留」）"
+                # 旧 hint 让用户调小「情绪数据保留」，但体积的主要来源是每用户空壳
+                # （只有称呼、没有任何可清理字段），调小保留天数对它完全无效——
+                # 那句处置方向指向了一个清不掉的东西（审核 引擎与诊断 M4）。
+                hint = (
+                    "（已经偏大：写盘是默认每 60 秒整份重写；主要来源是每用户空壳，"
+                    "见「整条用户记录保留(天)」，空壳按静默期清掉后会回落）"
+                )
             out.append(f"状态文件：{size_kb:.0f} KB{hint}")
     except Exception:
         pass
@@ -684,8 +780,21 @@ def state_size_lines(core) -> list[str]:
     except Exception:
         pass
     try:
-        users = core.scope.all_user_ids()
-        out.append(f"记录在案的用户：{len(users)} 人")
+        ids = core.scope.all_user_ids()
+        entries = _user_entries(getattr(core, "scope", None))
+        if entries is None:
+            # 拿不到条目内容（测试替身 / 换过存储实现）：只报人数，不猜空壳数。
+            out.append(f"记录在案的用户：{len(ids)} 人")
+        else:
+            shell_fields = set(_shell_fields())
+            shells = sum(
+                1
+                for entry in entries.values()
+                if isinstance(entry, dict) and entry and set(entry) <= shell_fields
+            )
+            # 同一行给两个数：让用户能判断「人真的多」还是「空壳多」——空壳会随
+            # 「整条用户记录保留(天)」清掉，真实用户不会（审核 引擎与诊断 M4）。
+            out.append(f"记录在案的用户：{len(ids)} 人（其中只剩称呼的空壳 {shells} 条）")
     except Exception:
         pass
     return out

@@ -10,6 +10,29 @@ from ..role_scope import RoleScope
 
 FULL = 100.0
 
+# 停机 / 事件循环阻塞之后，一次最多补多少秒的恢复。
+#
+# 「按真实经过时间补」不能没有上限：停机一周回来按 1.0/分钟补 10080 点，等于
+# 「社交能量」这个机制不存在（任何停机都等价于满血复活）。取 1 小时：默认速度下
+# 最多 +60 点（FULL 的 60%），足够覆盖一次重启、卡顿、机器睡眠，又不至于让
+# 「她累了」永远不出现（审核 时钟与天气 10）。
+MAX_SETTLE_SECONDS = 3600.0
+# 上次结算时刻（epoch 秒）。落在 state 里，跨重启才能补上停机那段。
+SETTLE_ANCHOR_KEY = "_social_energy_settled_at"
+
+
+def settle_seconds(now_ts: float, last_settle: float) -> float:
+    """这一轮该结算多少秒：真实经过时间，夹在 [0, MAX_SETTLE_SECONDS]。"""
+    return max(0.0, min(float(now_ts) - float(last_settle), MAX_SETTLE_SECONDS))
+
+
+def _now_epoch(clock) -> float:
+    """当前时刻的 epoch 秒。`Clock.timestamp()` 是唯一口径；只实现 `now()` 的测试替身也走得通。"""
+    ts = getattr(clock, "timestamp", None)
+    if callable(ts):
+        return float(ts())
+    return clock.now().timestamp()
+
 
 class SocialEnergyService:
     def __init__(self, scope: RoleScope, config_provider, clock, logger=None):
@@ -88,13 +111,34 @@ class SocialEnergyService:
     def reset(self) -> float:
         return self._write(FULL)
 
-    async def run_recovery_loop(self, stop_event: asyncio.Event):
-        """恢复循环：**先结算，再等下一个间隔**。
+    def _settle_anchor(self) -> float | None:
+        """上次结算时刻（epoch 秒）；没有锚点或坏值返回 None。"""
+        raw = self._scope.get_self(SETTLE_ANCHOR_KEY)
+        try:
+            out = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return out if out == out and out > 0 else None
 
-        原来是先 `wait_for(stop_event.wait(), timeout=interval)` 才做第一次恢复：刚启动
-        （或刚从一次长时间停机里恢复）的那一整个间隔内社交能量纹丝不动。生产走的
-        `core_instance._social_loop` 与这里本来是两份复制品，现在共用这一份。
+    async def run_recovery_loop(self, stop_event: asyncio.Event):
+        """恢复循环：**先结算，再等下一个间隔**，结算量取真实经过的时间。
+
+        原实现每轮固定 `recover(interval)`：事件循环被一段同步代码卡住 10 分钟、
+        或进程停机 8 小时后重启，都只补一个间隔的量——「恢复速度」于是取决于循环
+        醒来的次数，而不是时间（审核 时钟与天气 10）。现在按 epoch 差结算。
+
+        锚点落在 state 里（`_social_energy_settled_at`），所以跨重启也能补上停机
+        那一段；补的上限见 `MAX_SETTLE_SECONDS`（停机一周不该等于满血复活）。
         """
+        last_settle = self._settle_anchor()
+        if last_settle is None:
+            # 没有锚点（新装 / 旧存档）：不知道上次结算是什么时候，就按**一个间隔**
+            # 算，与旧行为一致——不能凭空补出一段没发生过的恢复。
+            try:
+                first_interval = max(1.0, float(self.config.social_energy_recovery_interval_seconds))
+            except Exception:
+                first_interval = 60.0
+            last_settle = _now_epoch(self._clock) - first_interval
         while not stop_event.is_set():
             # 下限 1 秒：配置里出现 0/负数时（手改 JSON、旧配置）`wait_for(..., timeout=0)`
             # 会立刻超时 → 循环变成忙循环，把一个核烧满。
@@ -105,8 +149,13 @@ class SocialEnergyService:
                 interval = 60.0
             try:
                 if self.config.social_energy_enabled:
-                    self.recover(interval)
+                    now_ts = _now_epoch(self._clock)
+                    self.recover(settle_seconds(now_ts, last_settle))
                     self.maybe_daily_reset()
+                    # 只有这一轮真的跑完才推进锚点：`recover()` 抛异常时这一段留到
+                    # 下一轮再补，不会凭空丢掉。
+                    last_settle = now_ts
+                    self._scope.update_self(**{SETTLE_ANCHOR_KEY: now_ts})
             except Exception as exc:
                 # 与其它后台循环一致：单轮出错只记一条，别让任务静默死掉。
                 self._warn(f"社交能量恢复出错: {exc}")

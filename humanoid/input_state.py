@@ -96,15 +96,17 @@ class InputStateNotifier:
             self.timeout = 120.0
 
     def is_supported(self, event: Any) -> Tuple[bool, str]:
-        """这个事件能不能上报：只有 NapCat 的私聊才做。
+        """这个事件能不能上报：只有 NapCat 的**确定是私聊**才做。
 
         返回 (能不能, 对方 ID)。判断刻意用「有没有 event.bot」+ 平台名，而不是
         isinstance：core 要跑在 aiocqhttp / qq_official 等各种部署上，拿不到就直接跳过。
+        会话类型拿不准时（`_is_private` 返回 None）也跳过：这是纯装饰性上报，
+        少发一次没有损失，发错地方（群聊里用群成员 id 报「正在输入」）才有。
         """
         try:
             if getattr(event, "get_platform_name", lambda: "")() != "aiocqhttp":
                 return False, ""
-            if not _is_private(event):
+            if _is_private(event) is not True:
                 return False, ""
             bot = getattr(event, "bot", None)
             api = getattr(bot, "api", None)
@@ -260,17 +262,23 @@ class InputStateNotifier:
             raise
 
 
-def _is_private(event: Any) -> bool:
+def _is_private(event: Any) -> bool | None:
+    """这条事件是不是私聊：True / False / None（认不出来）。
+
+    三态是刻意的。以前认不出来就返回 True（fail-open），于是「群聊里拿不到
+    `is_private_chat`」这类边缘事件会被当成私聊，用群成员的 id 去报「正在输入」
+    ——私聊语义的状态发到了群里。调用方只在 `is True` 时放行。
+    """
     checker = getattr(event, "is_private_chat", None)
     if callable(checker):
         try:
             return bool(checker())
         except Exception:
-            return True
+            return None
     getter = getattr(event, "get_group_id", None)
     if callable(getter):
         try:
             return not bool(getter())
         except Exception:
-            return True
-    return True
+            return None
+    return None

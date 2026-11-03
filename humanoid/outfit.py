@@ -55,17 +55,62 @@ _MASK_WORDS: tuple[str, ...] = (
 # 层②：身份位置里的动物词。锚点（是 / 为 / 种族 / 物种 / 设定 …）之后 0~6 个字内出现
 # 一只 / 一头 / 一条 … 再跟动物词，才算「她在声明自己是什么」。
 # 没有锚点的裸词一律不算：`喜欢猫` / `喜欢骑马` / `我家养了条狗` 都不是物种声明。
-_IDENTITY_RE = re.compile(
-    r"(?:是|为|乃|变成|化身|身为|属于|作为一个|种族|物种|原型|本体|化形|设定)"
-    r"[^，。！？；\n]{0,6}"
-    r"(?:一只|一头|一条|一匹|一尾|一个|只|头|条|匹|尾)?\s*"
+# 主语绑定：系动词的主语必须是**她/你/我**本身，中间只许隔几个副词。
+# 「她的好朋友是一只猫」里系动词的主语是「好朋友」，不是她——以前裸扫「是…猫」
+# 会把她判成兽形，于是注入「她穿着：没穿衣服」。
+_SUBJECT = r"(?:她|你|我|他|它|本人|自己)"
+_ADVERB = r"(?:现在|就|其实|也|都|真的|本来|确实|已经)?"
+_COPULA = r"(?:是|为|乃|变成|化身|身为|属于)"
+_ANIMAL = (
     r"(?:狼|马|龙|狐|虎|熊|兔|蛇|鹰|狮|象|鹿|鲸|猫|犬|豹|"
     r"兽人|半兽人|人鱼|独角兽|恐龙|龙娘|龙女)"
+)
+_IDENTITY_RE = re.compile(
+    r"(?:"
+    # ① 主语 + 系动词：「你是一只猫」「她其实是狼」
+    + _SUBJECT + _ADVERB + _COPULA
+    # ② 声明式锚点：本来就没有主语（「种族：狼」「作为一个兽人」）
+    + r"|(?:作为一个|身为|种族|物种|原型|本体|化形|设定|身份)[:：]?"
+    + r")"
+    r"[^，。！？；\n]{0,6}"
+    r"(?:一只|一头|一条|一匹|一尾|一个|只|头|条|匹|尾)?\s*"
+    + _ANIMAL
 )
 
 # 层③：身份区 = 前 600 字 + 含下面这些词的行。人形非人只在身份区里判。
 _IDENTITY_HINT_RE = re.compile(r"(你是|我叫|种族|物种|设定|外貌|身份|本体|原型)")
 _IDENTITY_ZONE_CHARS = 600
+
+# ── 人设里写了她穿什么：直接抄原文 ──
+#
+# 判不出物种时，原来会兜底 human、注入一句对所有人都一样的「日常便服」。
+# 人设里如果写了「她总穿一条白色连衣裙」，那句原文才是她此刻的穿着——比内置默认贴她。
+# 只认**带穿着动词**的短语（穿 / 身穿 / 身着 / 一身 / 打扮 …），截到标点为止。
+# 裸「穿」要排除「穿越 / 穿梭 / 穿行」：人设里这些词远比「穿某件衣服」常见。
+_CLOTHING_RE = re.compile(
+    r"(?:总是|经常|习惯|平时|通常|大多)?"
+    r"(?:穿着|身穿|身着|套着|一身|打扮成|打扮|穿(?!梭|越|插|透|过|行|戴))"
+    r"([^，。；！？\n]{2,24})"
+)
+# 这些开头说明抓到的不是衣服（「穿得很随意」「穿着得体」），跳过继续找。
+_CLOTHING_BAD_LEAD = ("得", "很", "非常", "太", "比较", "不", "起来", "着", "了")
+# 这些字样说明抓到的多半是**别人**的穿着（「街上穿着西装的人」），不是她的。
+_CLOTHING_BAD_TAIL = ("的人", "人们", "身影", "自己")
+
+
+def persona_clothing(persona: str) -> str:
+    """从人设里抽一句「她穿什么」的原文；抽不到返回空串（= 不注入）。"""
+    body = str(persona or "")
+    if not body:
+        return ""
+    for match in _CLOTHING_RE.finditer(body):
+        text = match.group(1).strip().lstrip("着上了")
+        if len(text) < 2 or text.startswith(_CLOTHING_BAD_LEAD):
+            continue
+        if any(bad in text for bad in _CLOTHING_BAD_TAIL):
+            continue
+        return text
+    return ""
 
 # **物理兽征**（耳朵 / 尾巴 / 毛茸茸）：人形 + 兽征，照常穿衣服，所以判定优先级最高。
 # 「有兽耳的人形角色穿衣」是安全侧：判错成 beast 会让她「没穿衣服」，那才是事故。
@@ -105,8 +150,9 @@ _MACHINE_WORDS: tuple[str, ...] = (
 #
 # 只给**一句够用的默认**，不写细（细节交给人设和模型）。手写预设（配置）会盖过它。
 # 注意 beast 类是「不穿衣服」——那也是一种「符合」，不是「没有」。
+# **人类不设默认**：KIND_HUMAN 已不由 detect_kind 返回（判不出来 = 不知道），
+# 所以「日常便服」这句对所有人都一样的文本没有出处了——宁缺勿错，不注入。
 _BASE: dict[str, str] = {
-    KIND_HUMAN: "日常便服",
     KIND_BEAST_EAR: "日常便服",
     KIND_SPIRIT: "一身轻盈的长袍",
     KIND_MACHINE: "简洁的机能装",
@@ -168,15 +214,37 @@ def _identity_zone(masked: str) -> str:
     return head + "\n" + "\n".join(lines)
 
 
+# 否定词：命中词**前面**几个字里有它就不算数（「她没有兽耳」「不是精灵」）。
+_NEG_WORDS = ("没有", "没", "无", "不是", "并非", "而不是", "不带", "不长", "不算")
+_NEG_WINDOW = 4
+
+
+def _negated(text: str, pos: int) -> bool:
+    return any(word in text[max(0, pos - _NEG_WINDOW):pos] for word in _NEG_WORDS)
+
+
+def _hit(text: str, word: str) -> bool:
+    """这个词有没有**非否定**的出现。"""
+    start = 0
+    while True:
+        idx = text.find(word, start)
+        if idx < 0:
+            return False
+        if not _negated(text, idx):
+            return True
+        start = idx + len(word)
+
+
 def _first_hit(zone: str, words: tuple[str, ...]) -> bool:
-    return any(word in zone for word in words)
+    return any(_hit(zone, word) for word in words)
 
 
 def detect_kind(name: str, persona: str) -> str:
     """从人设正文里判她是什么种类。
 
-    返回 KIND_*；**人设空时返回空串**（没有任何依据 → 不注入）。
-    人设非空但没有任何强信号 → human（绝大多数角色是人）。
+    返回 KIND_*；**判不出来就返回空串**（没有任何依据 → 不注入，调用方据此决定）。
+    以前判不出来兜底 KIND_HUMAN，于是「不知道」和「确实是人」分不开：
+    每个角色都被塞一句对所有人都一样的「日常便服」。
 
     `name` 只保留在签名里（调用方与面板都要用同一个入口），**不参与判定**：
     角色名是别人随手填的字段，不该决定她穿不穿衣服（原来它会被裸扫，
@@ -191,8 +259,8 @@ def detect_kind(name: str, persona: str) -> str:
     # ① 人形 + 兽征（耳朵 / 尾巴）：穿衣是安全侧，优先级最高。
     if _first_hit(zone, _BEAST_EAR_FEATURES):
         return KIND_BEAST_EAR
-    # ② 身份位置上的动物词 → 兽形。
-    if _IDENTITY_RE.search(masked):
+    # ② 身份位置上的动物词 → 兽形（只扫身份区，且要求主语是她自己）。
+    if _IDENTITY_RE.search(zone):
         return KIND_BEAST
     # ③ 人形兽词（猫娘 / 兽娘 …）→ 还是人形，穿衣。
     if _first_hit(zone, _BEAST_EAR_WORDS):
@@ -204,7 +272,8 @@ def detect_kind(name: str, persona: str) -> str:
         return KIND_SPIRIT
     if _first_hit(zone, _BEAST_STRONG):
         return KIND_BEAST
-    return KIND_HUMAN
+    # 没有物种证据 = 不知道，不是「人类」：不注入比注入一句无信息的话好。
+    return ""
 
 
 def base_outfit(kind: str) -> str:
@@ -294,14 +363,19 @@ def resolve(
 ) -> str:
     """算出此刻的穿着。
 
-    手写预设优先；没有就按识别到的种类取内置默认。两者都没有 → 返回空串（不注入）。
+    手写预设优先；其次是人设里写的穿着短语（原文照抄）；再其次是按识别到的种类取
+    内置默认。三者都没有 → 返回空串（不注入）。
     返回空串还表示「不要给这一条」，调用方据此决定注入不注入。
 
     `temp_c` 是温度入口（数值优先，见 `coerce_temp_c`）：调用方可以只给温度不给场景，
     这时数值够冷就按冷天处理；给了场景时以场景为准（场景由 `scene_of` 算）。
     """
     text = str(preset or "").strip()
-    has_preset = bool(text)
+    if not text:
+        # 人设里写了她穿什么，就用那句原文——比内置默认贴她。
+        text = persona_clothing(persona)
+    # 手写预设 / 人设原文都是「她自己的衣服」：睡觉 / 洗澡只能追加说明，不能整段替换。
+    has_own_text = bool(text)
     kind = ""
     if not text:
         kind = detect_kind(name, persona)
@@ -321,8 +395,8 @@ def resolve(
         if temp is not None and temp <= _COLD_INDOOR_C:
             scene = "cold"
     if scene in _SCENE_BARE:
-        if has_preset:
-            # 用户手写的衣服只能**追加**，不能整段替换掉（那是用户写的东西）。
+        if has_own_text:
+            # 用户写下的衣服只能**追加**，不能整段替换掉（那是用户写的东西）。
             note = _SCENE_PRESET_NOTE.get(scene, "")
             if note and note not in text:
                 return text + note
@@ -338,9 +412,18 @@ def resolve(
     return text
 
 
+# 这些是「状态」不是「衣服」：接在「她穿着：」后面会变成病句「她穿着：没穿衣服」。
+_BARE_STATES = frozenset({"没穿衣服"})
+
+
 def line(text: str) -> str:
-    """注入用的一句话。空串 → 空串（调用方据此不注入）。"""
+    """注入用的一句话。空串 → 空串（调用方据此不注入）。
+
+    「没穿衣服」这类状态型 body 走另一模板（「她没穿衣服」），其余仍是「她穿着：X」。
+    """
     body = str(text or "").strip()
     if not body:
         return ""
+    if body in _BARE_STATES:
+        return f"她{body}"
     return f"她穿着：{body}"

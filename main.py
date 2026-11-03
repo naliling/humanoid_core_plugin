@@ -99,6 +99,10 @@ LOG_PREFIX = "[humanoid_core] "
 # （第 2 轮就被自己挡下）。结果按 event 缓存，复用框架的 extra 通道。
 _SIBLING_DECISION_KEY = "_hcore_sibling_chat_allowed"
 
+# 每个会话记住「最近一次出现的兄弟 bot id」的条数上限。真人开口时只清这一对
+# 的互聊额度（见 SiblingChatGuard.note_human）；记不住就退回清该角色全部 peer。
+_SIBLING_PEER_CACHE_MAX = 64
+
 # -------------------- 跨插件门面（契约 v2 主路径） --------------------
 #
 # 别的插件怎么找到这里：宿主注册表 → `meta.star_cls.__module__` → `sys.modules[模块]`
@@ -346,6 +350,60 @@ def _append_injected_parts(req: Any, blocks: list[str]) -> str:
     return ""
 
 
+def _inject_mark(req: Any) -> str:
+    """这次请求的注入标记键。绑 id(req)：宿主换了请求对象就该重新注入。"""
+    return f"_hc_injected_req_{id(req)}"
+
+
+def _event_extra(event: Any, key: str, default: Any = None) -> Any:
+    """读 event 的 extra；宿主/替身没有这个 API 时给默认值，别把钩子炸掉。"""
+    getter = getattr(event, "get_extra", None)
+    if not callable(getter):
+        return default
+    try:
+        return getter(key, default)
+    except Exception:
+        return default
+
+
+def _set_event_extra(event: Any, key: str, value: Any) -> None:
+    setter = getattr(event, "set_extra", None)
+    if not callable(setter):
+        return
+    try:
+        setter(key, value)
+    except Exception:
+        pass
+
+
+def _request_holds_blocks(req: Any, blocks: Any) -> bool:
+    """这几块文本是不是**真的还在**这个请求里（临时块 / contexts / system_prompt 任一处）。
+
+    光看 id(req) 不够：宿主可能复用同一个请求对象、却在重试前清空
+    `extra_user_content_parts`。那时标记还在、文本已经没了，只信标记会让这一轮
+    一句背景都注入不进去。所以标记里存的是上次追加的原文，重放时逐块核对。
+    """
+    if not isinstance(blocks, (list, tuple)):
+        return False
+    wanted = [str(block) for block in blocks if str(block or "").strip()]
+    if not wanted:
+        return True
+    haystack = ""
+    parts = getattr(req, "extra_user_content_parts", None)
+    if isinstance(parts, list):
+        for part in parts:
+            haystack += str(getattr(part, "text", "") or "")
+    contexts = getattr(req, "contexts", None)
+    if isinstance(contexts, list):
+        for item in contexts:
+            if isinstance(item, dict):
+                haystack += str(item.get("content", "") or "")
+    prompt = getattr(req, "system_prompt", None)
+    if isinstance(prompt, str):
+        haystack += prompt
+    return all(block in haystack for block in wanted)
+
+
 def _resolve_data_root(context: Any = None) -> Path:
     """AstrBot 数据目录（data/）：官方 API → context 的插件数据目录 → 相对 data/。
 
@@ -374,19 +432,29 @@ def _resolve_data_root(context: Any = None) -> Path:
             logger.debug(f"{LOG_PREFIX} context.get_plugin_data_dir() 失败: {exc}")
     return Path("data").resolve()
 
-# 「你在干嘛 / 在忙什么」这类问法：只有被问到，才把「她这会儿正在X」写进去。
-# 为什么不一贯写：这句话每轮都在，而 X 一挂就是几个小时，模型就每一条都提一句
-# 「我在忙」「正在热餐」——用户的原话是「忙就忙呗，人家忙着关我啥事」。
-# 不问就不说；问了答得出（`/查看日程` 也照常有）。
-_ASK_ACTIVITY = (
-    "干嘛", "干啥", "干什么", "做什么", "在忙", "忙什么", "忙啥", "忙吗", "忙不忙",
-    "在做什么", "在干什么", "干啥呢", "忙完了", "忙完了吗",
+# 「她这会儿在过什么」不再由用户这句话里有没有某个词决定（审核 注入生成 P-06 / #39）。
+#
+# 旧写法是一张「干嘛 / 干啥 / 在忙」的子串表：用户换个说法（「你这会儿忙不忙呀」
+# 里的「忙不忙」命中，「最近在忙什么项目」也命中，但「今天累不累」不命中）就答不出来，
+# 不问又完全不提——同一个事实的可见性由关键词表决定，而不是由它该不该出现决定。
+# v2.29.0 曾因为「她每条回复都说我在忙」把它改成「问了才说」，但病根是**日程事件一挂
+# 几个小时、每轮原样重发**，不是「说了」这件事本身；现在由 injection.select 的预算
+# 决定说不说（这一段是每轮重发的临时块，token 预算见 _state_note 尾部）。
+
+
+# 「她这会儿正在X」里的 X 是**日程事件原文**，不是名词短语：日程兜底模板从 B1 起就
+# 写「动词短语、不带主语」（「窝在沙发上把攒的两集看完」「坐在窗边发会儿呆」）。
+# 旧模板一律加「正在」，于是拼出「她这会儿正在坐在窗边」「正在窝在沙发上」——
+# 双重「在」的病句直接进了模型上下文。这里只加前缀、不改写动词：
+# 事件本身已经是动作开头就原样用，否则才补一个「在」。
+_ACT_HEADS = (
+    "在", "正", "窝", "坐", "躺", "趴", "靠", "蹲", "啃", "刷", "看", "听", "写",
+    "读", "玩", "做", "忙", "收拾", "等", "吃", "喝", "洗", "整理", "翻", "拐",
+    "出门", "回", "煮", "跟", "把", "去", "接着", "认真", "挑", "睡",
 )
-
-
-def _asked_about_activity(text: str) -> bool:
-    body = (text or "").strip()
-    return bool(body) and any(word in body for word in _ASK_ACTIVITY)
+# 例外：SLEEP_EVENT = "睡眠" 是代码里唯一写死的名词事件，加「在」不通
+# （「她这会儿在睡眠」）。只给它一个说法，其余名词事件不猜。
+_NOUN_EVENTS = {"睡眠": "睡着了"}
 
 
 def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "",
@@ -398,7 +466,8 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
     单独成段只当她「知道」，要不要提由她自己定。
     """
     try:
-        from .humanoid import relstage
+        from .humanoid import injection as _injection
+        from .humanoid import state_snapshot
         from .humanoid.prompt_builder import build_state_note
         # 关系阶段/心境只在 mood 可读时才算：mood_enabled_in_group=False 时，群聊里的
         # 陌生人直接 mood.profile() 会现建一份档案（并 mark_dirty），绕过「群里不给
@@ -411,24 +480,20 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
             )
         except Exception:
             readable = False
-        affection = 0.0
         stage = tone = style = ""
         if readable:
-            _profile = core.mood.profile(user_id) or {}
-            affection = float(_profile.get("affection", 0.0) or 0.0)
-            # 档位不只看好感：相处够久的人不该被写成「还在互相认识」（见 relstage 顶部）。
-            # `first_met` 在没有情绪档案时也可能存在（称呼是故意保留的），所以这里两条
-            # 都从同一个 profile 取，取不到就当 0（退回纯好感判定，与改前一致）。
+            # 关系阶段走 state_snapshot 的唯一一份（好感 + 相处时长），门面 / 情绪 /
+            # 里程碑读的也是它——原来每处各算一遍，同一轮能算出两个档位
+            # （审核 状态与人设 1 / 注入生成 P-01）。
             try:
-                _turns = int(_profile.get("turn_count") or 0)
-            except (TypeError, ValueError):
-                _turns = 0
-            try:
-                _first = float(_profile.get("first_met") or 0.0)
-                _days = max(0.0, (core.now_epoch() - _first) / 86400.0) if _first > 0 else 0.0
-            except (TypeError, ValueError, AttributeError):
-                _days = 0.0
-            stage = relstage.line_for(affection, turns=_turns, days=_days)
+                _relation = state_snapshot.relation_of(
+                    core.mood.profile(user_id) or {},
+                    core.now_epoch(),
+                    tz=state_snapshot.tz_of(core),
+                )
+                stage = _relation.stage_phrase if _relation.available else ""
+            except Exception:
+                stage = ""
             tone = core.mood.current_tone(user_id)
             style = core.mood.style_tendency(user_id)
         day = ""
@@ -436,8 +501,11 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
             slot = core.schedule.current_slot() or {}
             event = str(slot.get("event", "") or "").strip()
             loc = str(slot.get("location", "") or "").strip()
-            if event and _asked_about_activity(said):
-                day = f"她这会儿正在{event}" + (f"（{loc}）" if loc else "")
+            if event:
+                head = _NOUN_EVENTS.get(event) or (
+                    event if event.startswith(_ACT_HEADS) else "在" + event
+                )
+                day = f"她这会儿{head}" + (f"（{loc}）" if loc else "")
         except Exception:
             day = ""
         # 她手上还没做完的那几件事（`ongoing_tasks`，跨天跟着她）也进这一段。
@@ -462,7 +530,10 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
         # 单独成段、只当她「知道」，要不要提由她自己定。
         world = ""
         try:
-            world = core.prompt_builder.background_note()
+            # 按会话分桶（审核 P-08 #41）：天气那句的去重状态以前是整个角色一份，
+            # 一个会话把「阴，气温 8℃」讲过之后，另一个会话 4 小时内再也拿不到它。
+            # user_id 在私聊/群聊都非空，正好当桶键。
+            world = core.prompt_builder.background_note(key=user_id)
         except Exception:
             world = ""
         # 穿搭：与天气/季节同一类背景——她只「知道」自己穿着什么，要不要提由她自己定。
@@ -472,7 +543,37 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
             outfit_note = ""
         if outfit_note:
             world = "；".join(p for p in (world, outfit_note) if p)
-        return build_state_note(char_name, user_name, stage, tone, day, style, world)
+        # 取舍与预算（R7 / 审核 注入生成 P-05 #38）：这一段以前**没有任何上限**，而事实块
+        # 走严格预算——「背景」比「事实」还长，且同一件事可以在两处各说一遍。现在两处都走
+        # injection 的 select/render：字数红线取最窄的 mood_only 档（这一段本来就是几个短句），
+        # token 预算给配置总额的一半，另一半留给事实块。
+        facts = [
+            _injection.Fact(key, text, priority=prio)
+            for key, text, prio in (
+                ("state_stage", stage, 9.0),
+                ("state_tone", tone, 8.0),
+                ("state_day", day, 7.0),
+                ("state_style", style, 6.0),
+                ("state_world", world, 3.0),
+            )
+            if text
+        ]
+        if not facts:
+            return ""
+        try:
+            budget = int(getattr(cfg, "inject_token_budget", 3500) or 3500)
+        except Exception:
+            budget = 3500
+        body = _injection.render(
+            _injection.select(
+                facts,
+                budget_tokens=max(64, budget // 2),
+                max_chars=_injection.INJECT_MAX_CHARS["mood_only"],
+            )
+        )
+        if not body:
+            return ""
+        return build_state_note(char_name, user_name, body)
     except Exception:
         return ""
 
@@ -587,16 +688,37 @@ class HumanoidCore(Star):
         # 注入通道（temp_parts/contexts/system_prompt/空）：给 /拟人 诊断 与测试看。
         self._inject_channel = ""
         self._inject_fallback_warned = False
+        # 只提示一次的失败（注入两段各自降级用）：每轮重放都刷同一条 warning 没有意义。
+        self._warned_once: set[str] = set()
         # 写回侧：每个角色最近一次**已经写过**的过程名，以及最近 24 小时写了几条。
         # 进程内内存即可——重启后第一次只记账不写（见 `_write_finished_process`）。
         self._last_written_process: dict[str, str] = {}
         self._life_write_stamps: dict[str, list[float]] = {}
+        # 最近一次**写失败**的时刻（按角色）。见 LIFE_WRITE_RETRY_BACKOFF。
+        self._life_write_failed_at: dict[str, float] = {}
+        # 这一次「过程结束」被看见的时刻（按角色）：它进幂等键，所以同一件事在额度/
+        # 退避/失败重试之间必须保持不变，写成功后才清（见 _write_finished_process）。
+        self._life_event_seen_at: dict[str, float] = {}
         # 兄弟 bot 互聊护栏：同平台另一个 bot 可以聊，但同一对角色在窗口内最多连续
-        # 放行 3 次；真人一开口清零（见 `humanoid/sibling_chat.py`）。
-        self._sibling_guard = SiblingChatGuard()
+        # 放行 N 次；真人一开口清零（见 `humanoid/sibling_chat.py`）。窗口与次数以前
+        # 是硬编码 600 秒 / 3 次，部署里改不了，现在走配置。
+        self._sibling_guard = SiblingChatGuard(
+            window_seconds=getattr(self._config, "sibling_window_seconds", 600.0),
+            max_turns=getattr(self._config, "sibling_max_turns", 3),
+        )
+        # 会话 → 这个会话里最近一次出现的兄弟 bot id。额度是按 (role, peer) 记的，
+        # 真人开口只该清「刚刚还在说话的那条链」；没有这份记录就只能清该角色名下
+        # 全部 peer，A 群有人说话会把 B 群那对 bot 的额度一起放开。
+        self._sibling_peer_by_umo: dict[str, str] = {}
 
         state_path = data_dir / "state.json"
-        self._state_store = StateStore(state_path, lambda: self._config.state_flush_interval_seconds, logger)
+        # 精力上限的唯一来源是配置 max_energy：存档层只负责把坏值钳回合法区间。
+        self._state_store = StateStore(
+            state_path,
+            lambda: self._config.state_flush_interval_seconds,
+            logger,
+            energy_cap_provider=lambda: getattr(self._config, "max_energy", 100.0),
+        )
 
         clock = Clock(lambda: self._config)
         today = clock.today_str()
@@ -876,7 +998,7 @@ class HumanoidCore(Star):
             return
         core = self._core(event)
         if not bool(getattr(self._config, "ccb", False)):
-            yield event.plain_result("亲密场景未开启（ccb=false）。")
+            yield event.plain_result("亲密场景没有开启。")
             return
         yield event.plain_result(core.intimacy_text(self._sender(event)))
 
@@ -1029,7 +1151,6 @@ class HumanoidCore(Star):
 
     # -------------------- 管理员指令 --------------------
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("诊断")
     async def cmd_diagnose(self, event: AstrMessageEvent):
         """诊断模型链配置、冷却状态、日程生成情况等。"""
@@ -1075,7 +1196,6 @@ class HumanoidCore(Star):
         "调试": "debug_mode",
     }
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("时间")
     async def cmd_set_city(self, event: AstrMessageEvent):
         """`/拟人 时间 大阪`：设置她所在的城市（时区），只改当前这个机器人。
@@ -1109,7 +1229,6 @@ class HumanoidCore(Star):
                 f"✅ 已取消当前机器人的单独城市，回到跟随全局配置（{effective!r}）。"
             )
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("设置")
     async def cmd_settings(self, event: AstrMessageEvent):
         """`/拟人 设置` 看常用项；`/拟人 设置 城市 大阪` 改一项，改完立即生效。"""
@@ -1337,7 +1456,6 @@ class HumanoidCore(Star):
         lines.append("自查：/拟人 诊断 顶部会显示配置解析错误；上面一行是本次读取的配置文件。")
         yield event.plain_result("\n".join(lines))
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("重置日程")
     async def cmd_reset_schedule(self, event: AstrMessageEvent):
         """立即强制重新决定当前这一段（绕过冷却）。"""
@@ -1364,7 +1482,6 @@ class HumanoidCore(Star):
                 f"❌ 生成失败：{core.schedule.last_error}（可用 /拟人 诊断 查看模型配置）"
             )
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("日程打断")
     async def cmd_schedule_interrupt(self, event: AstrMessageEvent):
         """让她立刻放下手上的事，重新决定现在做什么（换一件，不是继续）。"""
@@ -1388,7 +1505,6 @@ class HumanoidCore(Star):
                 "⏳ 这会儿已经有一轮日程生成在跑了，等它落定再看 /查看日程。"
             )
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("日程继续")
     async def cmd_schedule_continue(self, event: AstrMessageEvent):
         """让她把手上的事接着做下去（把当前这一段往后延长，不另外生成）。"""
@@ -1411,7 +1527,6 @@ class HumanoidCore(Star):
         detail = f"：{what}（到 {until}）" if what else ""
         yield event.plain_result(f"✅ 让她接着做下去了{detail}。")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("重置状态")
     async def cmd_reset_state(self, event: AstrMessageEvent):
         """重置精力、社交能量和生理周期至初始值。"""
@@ -1422,7 +1537,6 @@ class HumanoidCore(Star):
         energy, social, cycle = core.engine_compat.reset_state()
         yield event.plain_result(f"✅ 已重置：精力 {int(energy)}，社交 {int(social)}，周期第 {cycle} 天。")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("重置情绪")
     async def cmd_reset_mood(self, event: AstrMessageEvent):
         """重置当前用户的情绪至初始值。"""
@@ -1433,7 +1547,6 @@ class HumanoidCore(Star):
         r = core.mood.reset(self._sender(event))
         yield event.plain_result(f"✅ 好感度 {r['affection']:.0f}，亲近欲 {r['libido']:.0f}，攻击性 {r['aggression']:.0f}")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("设置好感度")
     async def cmd_set_affection(self, event: AstrMessageEvent):
         """手动设置当前用户的好感度（0-100）。"""
@@ -1452,7 +1565,6 @@ class HumanoidCore(Star):
         core.mood.set_affection(self._sender(event), v)
         yield event.plain_result(f"✅ 好感度已设为 {v:.0f}")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("批量好感度")
     async def cmd_batch_affection(self, event: AstrMessageEvent):
         """批量导入好感度（格式：QQ:数值, QQ:数值）。"""
@@ -1474,7 +1586,6 @@ class HumanoidCore(Star):
         else:
             yield event.plain_result(f"✅ 已批量设置 {applied} 个用户。")
 
-    @filter.permission_type(filter.PermissionType.ADMIN)
     @humanoid_group.command("查看昵称")
     async def cmd_list_nicknames(self, event: AstrMessageEvent):
         """列出所有用户设置的昵称。"""
@@ -1611,6 +1722,8 @@ class HumanoidCore(Star):
     # 流水账淹掉——那些事在**聊天里看不见**，本来就不该占掉「关于这个人」的位置。
     LIFE_WRITE_PER_DAY = 3
     LIFE_WRITE_WINDOW_SECONDS = 86400.0
+    # 写失败后的退避：记忆插件不在/超时的时候，每条消息都再试一次既没用又会刷日志。
+    LIFE_WRITE_RETRY_BACKOFF = 60.0
 
     async def _write_finished_process(self, core, umo: str, user_id: str) -> None:
         """她做完一件事之后，往长期记忆里补一条。
@@ -1634,10 +1747,31 @@ class HumanoidCore(Star):
             return
         bid = str(getattr(core, "role_id", "") or "")
         previous = self._last_written_process.get(bid)
-        self._last_written_process[bid] = name
-        if previous is None or previous == name:
+        if previous is None:
+            # 第一次看到只记账（见 docstring）：重启后 process_history 里躺着旧事，不重写。
+            self._last_written_process[bid] = name
             return
+        if previous == name:
+            return
+        # 有界清理：这张表的键是 role_id（数量级=角色数），但角色被删掉后死键会留着。
+        # 表最多只有「角色数」条，逐条比一遍比算阈值更简单，也不会漏。
+        # 角色表还没建起来（单测里的裸实例）时不动手：那时谁都不在表里，清空等于丢账。
+        known = set(getattr(self, "_known_roles", None) or ())
+        if known:
+            known.add(bid)
+            for stale in [r for r in self._life_event_seen_at if r not in known]:
+                self._life_event_seen_at.pop(stale, None)
         now = time.time()
+        # 这一次「过程结束」被看见的时刻：同一件事在额度/退避/失败重试之间必须用同一个
+        # 幂等键，所以按角色记下来、写成功后才清。它只是**观察时刻**——过程真正结束
+        # 可能更早（见下面「不写刚刚」那段），误差上界是她两条消息之间的间隔。
+        seen_at = self._life_event_seen_at.get(bid)
+        if seen_at is None:
+            seen_at = now
+            self._life_event_seen_at[bid] = seen_at
+        # 刚失败过就先等一会儿，别每条消息都撞一次。
+        if now - self._life_write_failed_at.get(bid, 0.0) < self.LIFE_WRITE_RETRY_BACKOFF:
+            return
         stamps = [
             t
             for t in self._life_write_stamps.get(bid, [])
@@ -1645,23 +1779,46 @@ class HumanoidCore(Star):
         ]
         self._life_write_stamps[bid] = stamps
         if len(stamps) >= self.LIFE_WRITE_PER_DAY:
+            # 额度满：**不落标记**。标记落在判额度之前的话，额度用完后这条生活事件
+            # 就永久丢失（下一轮 previous 已经是新名字，永远不再重试）。
             return
         try:
-            await memory_link.write_life_event(
+            wrote = await memory_link.write_life_event(
                 bridge,
                 user_id,
                 # 不写「刚刚」：过程是 Core 按自己的节拍推进的，这边只在她下一条消息
                 # 到达时才发现它结束了，中间可能隔了几个小时。写死时间就是写错。
                 f"她做完了{name}",
                 umo=umo,
-                # 幂等键按内容算：同一件事重放不会写两条（时刻参与的话每次都是新键）。
+                # 幂等键要能区分「同一件事的不同次」：以前只用内容（proc:名字），同一个
+                # 名字的过程第二次结束就被记忆插件当成重放丢掉，永远写不进去。现在带上
+                # 这一次被看见的时刻——同一次重放（时刻不变）仍然幂等。
                 key=f"proc:{name}",
+                occurred_at=seen_at,
                 # 写回也限时：它被注入链路 await，对面卡住不能连带把回复挂住。
                 timeout=self._memory_timeout(memory_link.WRITE_TIMEOUT_SECONDS),
             )
         except Exception:
+            # 写失败同样不落标记：退避期过后还能补写。
+            self._life_write_failed_at[bid] = now
+            return
+        if not wrote:
+            # 桥接层把异常吞了（写记忆失败不该影响聊天），只能靠返回值判断：
+            # 它返回 False 说明这条没写进去，同样不落标记。
+            self._life_write_failed_at[bid] = now
             return
         stamps.append(now)
+        # 只有真的写成功才记账：标记落在判额度/写成功之前，等于「试过就算写过」。
+        self._last_written_process[bid] = name
+        # 这一件事已经写进去了：下一次「看见结束」是另一件事，重新取观察时刻。
+        self._life_event_seen_at.pop(bid, None)
+
+    def _warn_once(self, key: str, message: str) -> None:
+        """同一种失败只 WARN 一次：钩子会被工具循环/重试重放，逐轮刷同一条日志没用。"""
+        if key in self._warned_once:
+            return
+        self._warned_once.add(key)
+        logger.warning(f"{LOG_PREFIX} {message}")
 
     # -------------------- LLM 请求注入钩子 --------------------
 
@@ -1706,6 +1863,18 @@ class HumanoidCore(Star):
                     )
                     return
                 logger.debug(f"{LOG_PREFIX} 兄弟 bot {user_id} 互聊放行")
+            # 同一条消息的这次请求会被**重放**：工具循环每跑一轮工具都会再进这个钩子，
+            # 失败重试也会。宿主不会替我们清掉上次追加的临时块，于是「此刻的她」与身体
+            # 事实会在同一轮上下文里叠成两份，模型看到两遍同一段背景。判据：
+            #   键 = id(req)（换请求对象就该重新注入），值 = 上次追加的那几块原文；
+            #   重放时先核对这几块**是否真的还在**这个请求里（临时块 / contexts /
+            #   system_prompt 任一处），还在就跳过，被宿主清掉过就照常重注入。
+            # 只绑 event 会把「重试时新建请求」误挡成不注入；只信 id(req) 又会漏掉
+            # 「同一个请求被清空后重放」这一种。
+            mark = _inject_mark(req)
+            if _request_holds_blocks(req, _event_extra(event, mark)):
+                logger.debug(f"{LOG_PREFIX} 同一请求重放且注入还在，跳过重复注入")
+                return
             said = text
             # 对话对方的名字：开关开着才用真名（默认关=写「TA」）。取的是**这条消息的
             # 发送者名**——群聊是群名片、私聊是 QQ 昵称，不依赖 AstrBot 的任何配置开关。
@@ -1722,13 +1891,22 @@ class HumanoidCore(Star):
                 is_group,
             )
             # 时间间隔由 Core.on_message 统一记账，这里只读。
-            injection = core.build_injection(
-                user_id,
-                is_group=is_group,
-                text=said,
-                user_name=user_name,
-                memory_text=memory_text,
-            )
+            # 事实块算不出来（内部抛异常）不该连带把「此刻的她」一起丢掉，
+            # 反过来也一样——两段各自降级，见下面 blocks 的拼法。
+            try:
+                injection = core.build_injection(
+                    user_id,
+                    is_group=is_group,
+                    text=said,
+                    user_name=user_name,
+                    memory_text=memory_text,
+                )
+            except Exception as exc:
+                injection = ""
+                self._warn_once(
+                    "build_injection",
+                    f"身体与生活事实块生成失败，本轮只注入「此刻的她」: {exc}",
+                )
             # 长期记忆：写。她刚做完一件事的话，交一条给记忆库——这件事只有她知道。
             # 只在过程真的换了名字时写，所以不在回复的热路径上多出一次 IO。
             await self._write_finished_process(
@@ -1743,26 +1921,41 @@ class HumanoidCore(Star):
                     f" ≈{estimate_tokens(injection)} token（{self._config.inject_activity_context} 档）:\n{injection}"
                 )
 
-            if injection:
-                # 框架句在 system_prompt 里说的是「以下是她当前的**真实处境**」。
-                # 注入为空时（预算卡太小、构建抛异常）留着它，模型收下一句宣告却一条事实都
-                # 拿不到——它会自己编。所以没有事实就不要宣告。
-                _append_framing(req, char_name, user_name)
-                # 「此刻的她」与身体事实优先走临时内容块：只发给模型、不落会话历史。
-                # 老框架没有这个 API 时退到 contexts/system_prompt（P1-1），不再静默丢注入。
+            # 「此刻的她」与身体事实是**两块独立的降级单元**：旧代码把 state_note 写在
+            # `if injection:` 里面，于是两块共用一条命——事实块被预算裁空或构建抛异常时，
+            # 关系阶段、心境、她这会儿在做什么、手头未完的事、时间天气穿搭（全是 _state_note
+            # 里算的）会一起静默消失，模型只剩一条空背景。现在各算各的，谁空谁不出现。
+            try:
                 state_note = _state_note(
                     core, user_id, char_name, user_name, is_group=is_group, said=said
                 )
-                channel = _append_injected_parts(
-                    req, [block for block in (state_note, injection) if block]
+            except Exception as exc:
+                state_note = ""
+                self._warn_once(
+                    "state_note",
+                    f"「此刻的她」生成失败，本轮只注入身体事实: {exc}",
                 )
+            blocks = [block for block in (state_note, injection) if block]
+            if blocks:
+                # 框架句在 system_prompt 里说的是「以下是她当前的**真实处境**」。
+                # 两块都空时留着它，模型收下一句宣告却一条事实都拿不到——它会自己编。
+                # 所以没有事实就不要宣告。
+                _append_framing(req, char_name, user_name)
+                # 「此刻的她」与身体事实优先走临时内容块：只发给模型、不落会话历史。
+                # 老框架没有这个 API 时退到 contexts/system_prompt（P1-1），不再静默丢注入。
+                channel = _append_injected_parts(req, blocks)
                 self._inject_channel = channel
                 if not channel:
-                    logger.warning(
-                        f"{LOG_PREFIX} 本轮注入没有可用通道（既无临时块也无 contexts/system_prompt），"
-                        "事实未进入上下文"
+                    self._warn_once(
+                        "no_channel",
+                        "本轮注入没有可用通道（既无临时块也无 contexts/system_prompt），"
+                        "事实未进入上下文",
                     )
-                elif channel != "temp_parts" and not self._inject_fallback_warned:
+                else:
+                    # 只有真的塞进去了才记「这个请求已经注入过」：没塞进去的话
+                    # 下一次重放还该再试一次。
+                    _set_event_extra(event, mark, blocks)
+                if channel and channel != "temp_parts" and not self._inject_fallback_warned:
                     # 只提示一次：每轮回执会刷屏，但这说明宿主的 AstrBot 版本偏低。
                     self._inject_fallback_warned = True
                     logger.warning(
@@ -1799,13 +1992,19 @@ class HumanoidCore(Star):
             cfg = self._config
             core = self._core(event)
             user_id = self._sender(event)
+            # 兄弟 bot 的回复不进她的情绪与好感账：入站有护栏、出站也得有同一道判据，
+            # 否则跨 bot 互聊的每句话都在改她的关系数值（审核 跨插件契约 12）。
+            if self._is_sibling_peer(event):
+                return
+            # P1：她**自己说出口**的话也进 ccb 的账。原来只有用户那一路
+            # （`core.on_message`），她先开口或她在场景里说的，一条都不算。
+            # 这一笔同时也是社交层「她多久前开过口」的唯一来源，所以放在情绪闸门
+            # 之前：mood 关掉时它照样要记（core_instance.py 里这笔也在 ccb 闸前）。
+            core.note_her_words(user_id, text, is_group=is_group)
             if not core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
                                       in_group=cfg.mood_enabled_in_group):
                 return
             core.mood.note_spoke(user_id, text)
-            # P1：她**自己说出口**的话也进 ccb 的账。原来只有用户那一路
-            # （`core.on_message`），她先开口或她在场景里说的，一条都不算。
-            core.note_her_words(user_id, text, is_group=is_group)
             # 给发送前兜底留一个「这轮已记过」的标记：本地 runner 两条路径都会经过，
             # 没有它的时候，若框架给回复加了前缀（先发设置里有「回复前缀」），
             # 兜底看到的文本与 completion_text 不同、去重拦不住，同一句话会被记两遍。
@@ -1859,14 +2058,18 @@ class HumanoidCore(Star):
             cfg = self._config
             core = self._core(event)
             user_id = self._sender(event)
+            # 与 on_llm_response 同一道出站判据：兄弟 bot 的回复不进情绪/好感账。
+            if self._is_sibling_peer(event):
+                return
+            # P1：与 on_llm_response 同一条口径。note_occurrence 自带 60 秒去重，
+            # 两条路径都走到时只算一次。它也是「她多久前开过口」的唯一来源，
+            # 所以放在情绪闸门之前（mood 关掉时照样要记）。
+            core.note_her_words(user_id, text, is_group=is_group)
             if not core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
                                       in_group=cfg.mood_enabled_in_group):
                 return
             # note_spoke 带 90 秒同文去重：on_llm_response 已经记过时这一步是空操作。
             core.mood.note_spoke(user_id, text)
-            # P1：与 on_llm_response 同一条口径。note_occurrence 自带 60 秒去重，
-            # 两条路径都走到时只算一次。
-            core.note_her_words(user_id, text, is_group=is_group)
         except Exception as e:
             logger.debug(f"{LOG_PREFIX} 发送前记录她的发言失败: {e}")
 
@@ -1889,6 +2092,57 @@ class HumanoidCore(Star):
         skip = {"default", str(exclude or "")}
         return {rid for rid in self._known_roles if rid and rid not in skip}
 
+    def _is_sibling_peer(self, event: AstrMessageEvent, exclude: str = "") -> bool:
+        """这条消息是不是另一台 bot 说的。**唯一判据**，入站与出站记账共用。
+
+        以前只有入站（`on_message` 的 `_known_role_ids`）挡着兄弟 bot，出站
+        `note_her_reply` / `capture_reply_on_send` 照记不误：跨 bot 互聊的每一句
+        都在改她的情绪、好感与「她说过什么」，而契约的 paths 里还写着这不是人类
+        （审核 跨插件契约 12）。两处各判一次必然漂移，所以收成这一个方法。
+
+        判据是「本进程见过的角色 id」∪「护栏见过的 peer id」：前者覆盖同进程
+        多角色，后者覆盖跨进程/被回灌的 bot（它们只以 peer 的身份出现过）。
+        """
+        try:
+            uid = str(event.get_sender_id() or "")
+        except Exception:
+            return False
+        if not uid:
+            return False
+        if uid in self._known_role_ids(exclude=exclude):
+            return True
+        checker = getattr(self._sibling_guard, "is_known_peer", None)
+        return bool(checker(uid)) if callable(checker) else False
+
+    def _remember_sibling_peer(self, event: AstrMessageEvent, peer_id: str) -> None:
+        """记下这个会话里最近一次出现的兄弟 bot id（进程内、有界）。
+
+        为什么需要：SiblingChatGuard 的额度键是 (role, peer)，而真人开口那条消息
+        里没有 peer 信息。只传 role 就只能清该角色名下**所有** peer 的额度——A 群
+        有人说句话，B 群那对 bot 的额度也被放开。这里记「这个会话刚刚在和哪台 bot
+        说话」，人一开口就精确清掉那一条链。
+        """
+        umo = self._umo_of(event)
+        peer = str(peer_id or "").strip()
+        if not umo or not peer:
+            return
+        self._sibling_peer_by_umo[umo] = peer
+        while len(self._sibling_peer_by_umo) > _SIBLING_PEER_CACHE_MAX:
+            # dict 保持插入顺序：先丢最久没更新的那个会话。
+            self._sibling_peer_by_umo.pop(next(iter(self._sibling_peer_by_umo)), None)
+
+    def _umo_of(self, event: AstrMessageEvent) -> str:
+        """会话标识（umo）；读不到就是空串（额度退回全局一份）。"""
+        try:
+            return str(getattr(event, "unified_msg_origin", "") or "")
+        except Exception:
+            return ""
+
+    def _sibling_peer_of(self, event: AstrMessageEvent) -> str:
+        """这个会话里最近一次出现的兄弟 bot id；没记录过（或读不到会话）→ 空串。"""
+        umo = self._umo_of(event)
+        return self._sibling_peer_by_umo.get(umo, "") if umo else ""
+
     def _sibling_chat_allowed(
         self, role_id: str, peer_id: str, event: AstrMessageEvent
     ) -> bool:
@@ -1900,6 +2154,7 @@ class HumanoidCore(Star):
 
         读缓存。取不到 / 框架没有 extra 通道时退回现算——宁可多判一次，也不能不判。
         """
+        self._remember_sibling_peer(event, peer_id)
         reader = getattr(event, "get_extra", None)
         if callable(reader):
             try:
@@ -1908,7 +2163,10 @@ class HumanoidCore(Star):
                 cached = None
             if cached is not None:
                 return bool(cached)
-        allowed = self._sibling_guard.allow(role_id, peer_id, time.time())
+        # 单调时钟：墙钟被回拨后 `now - stamp < window` 会恒真，护栏永久卡死。
+        allowed = self._sibling_guard.allow(
+            role_id, peer_id, time.monotonic(), self._umo_of(event)
+        )
         writer = getattr(event, "set_extra", None)
         if callable(writer):
             try:
@@ -1925,6 +2183,9 @@ class HumanoidCore(Star):
         """
         监听所有消息，用于更新精力、社交能量、情绪衰减、过程 tick 以及记录 last_message。
         """
+        # 每一步单独标注：全部压成一条「消息记账失败」时，情绪没结算、身体没 tick、
+        # 过程没推进在日志里长得一模一样，线上根本看不出坏在哪一环（审核 main.py 10）。
+        step = "识别消息"
         try:
             role_id = self._self_id(event)
             user_id = self._sender(event)
@@ -1937,26 +2198,46 @@ class HumanoidCore(Star):
             # 注意分工：**回复与否**由 `inject_context` 里的 `_sibling_chat_allowed`
             # 决定（放行时主链路照常回它）；这里只做记账隔离，不让 bot 的发言进
             # 情绪/身体账本——她会因为另一个 bot 的话改心情，那才是真串台。
-            if user_id and user_id in self._known_role_ids(exclude=role_id):
+            # 判据与出站记账共用 `_is_sibling_peer`，两边不再各判一次。
+            if self._is_sibling_peer(event, exclude=role_id):
                 return
-            # 真人一开口，机器对机器那条链就该结束：清掉本角色名下所有 peer 的互聊额度。
+            # 真人一开口，机器对机器那条链就该结束：清掉**这一对**的互聊额度。
+            # 额度按 (role, peer) 记，而人类消息里没有 peer，所以取「这个会话里
+            # 刚刚还在说话的兄弟 bot」。只传 role 的话，A 群有人说话会把 B 群那对
+            # bot 的额度一起放开（一条人类消息重开一轮互刷）；传 sender 则什么也
+            # 清不到（sender 是人，不是 peer）。
             # 放在空文本/指令早退之前：一条「嗯」或一条指令也是人回来了。
-            self._sibling_guard.note_human(role_id)
-            # 任何一条真实用户消息都算「有人在用」：松开空闲静默，让日程重新跟上。
-            # 放在后续所有早退之前，否则「被过滤的环境」会把静默一直吊着。
-            self.call_gate.note_interaction()
+            self._sibling_guard.note_human(
+                role_id, self._sibling_peer_of(event), self._umo_of(event)
+            )
             is_group = not _is_private_chat(event)
             if not self.engine.environment_allows(not is_group):
                 return
+            # 「有人在用」要按角色记：闸门全局只有一份，标量会让 A 角色的一句群消息
+            # 松开 B 角色的空闲静默，安静的那个角色永远等不到日程（审核 main.py 6）。
+            # 位置也从 environment_allows 之前挪到之后：被本插件自己拒答的环境里
+            # 来的消息不算「有人跟她说话」，否则这道闸被它自己重置。
+            self.call_gate.note_interaction(role_id=role_id)
             core = self._core(event)
             # 自动认定称呼：只在这个人还没有任何称呼时填一次，之后换名片也不会改口；
             # 用户 /叫我 设过的更碰不到。纯图片消息也带名字，所以放在正文判空之前。
-            if self._config.auto_nickname:
+            #
+            # 但「认定称呼」本身也是**建档**：auto_nickname 会 set_user 写下昵称与来源。
+            # 群聊里情绪层对该用户不可读时（默认 mood_enabled_in_group=false）不写——
+            # 否则每个在群里说过话的陌生人都在 state.json 里留一条永久条目，与注入侧
+            # 「群里不给陌生人建档」是两条相反的纪律（审核 main.py 4）。
+            step = "认定称呼"
+            cfg = self._config
+            if cfg.auto_nickname and core.mood.readable(
+                user_id, is_group, enabled=cfg.mood_enabled,
+                in_group=cfg.mood_enabled_in_group,
+            ):
                 core.mood.auto_nickname(user_id, _sender_name(event))
             # 跨插件联动要知道「TA 叫什么」：`auto_nickname` 是**认定称呼**，名字里
             # 带数字/emoji/装饰的名片过不了校验，于是 Core 什么都留不下，主动消息
             # 那边就永远不知道怎么叫人。这里另存一份「名片名」，只用于称呼参考，
             # 不参与身份认定、也不进聊天注入。
+            step = "名片名"
             sender_name = _sender_name(event)
             if sender_name:
                 try:
@@ -1978,6 +2259,7 @@ class HumanoidCore(Star):
             # 记下这个角色最近在哪个会话说话，并预热一次人设：日程要靠 umo 挑生效人格，
             # 注入要用**角色名**（`char_name`，同步读缓存）。解析是 await 且有 10 分钟
             # 缓存，正常只第一次真的跑。
+            step = "人设预热"
             try:
                 source = getattr(core, "persona_source", None)
                 if source is not None and umo:
@@ -1986,9 +2268,12 @@ class HumanoidCore(Star):
                         await source.persona(core.role_id)
             except Exception:
                 pass
+            step = "记账（情绪/身体/过程）"
             core.on_message(
                 user_id, text, is_group=is_group, umo=umo, is_command=is_command,
                 user_name=sender_name,
             )
         except Exception as e:
-            logger.warning(f"{LOG_PREFIX} 消息记账失败: {e}")
+            logger.warning(f"{LOG_PREFIX} 消息记账失败（{step}）: {e}")
+            # 现场只在 debug 里留：warning 已经说了坏在哪一环，堆栈给要排查的人。
+            logger.debug(f"{LOG_PREFIX} 消息记账失败的堆栈", exc_info=True)

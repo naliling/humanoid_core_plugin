@@ -149,9 +149,19 @@ class OpenItemsArePerPersonTest(unittest.TestCase):
         # 来源不明的那条留着：不知道是谁的，但确实是她的待办
         self.assertIn("不知道跟谁的事", joined)
 
-    def test_group_keeps_everything(self) -> None:
+    def test_group_also_filters_by_speaker(self) -> None:
+        """群聊也只给**当前说话人**自己的事 + 无归属项（审核 #89）。
+
+        旧行为是群聊一律不筛，理由是「一群人的事混着说是正常的，而且这里拿不到
+        在场名单」。但账本是角色级的：A 私下说的「我猫今天吐了」会以「和A之间还有
+        件事没完」出现在 B、C 也在的群聊上下文里——隐私边界被按会话类型划了。
+        过滤只需要说话人的 user_id，它就在参数里。
+        """
         joined = "\n".join(self._builder(self._items())._open_lines("u1", is_group=True))
-        self.assertIn("关于星辰的事", joined)
+        self.assertIn("关于我的事", joined)
+        self.assertNotIn("关于星辰的事", joined)
+        # 来源不明的那条留着：不知道是谁的，但确实是她的待办。
+        self.assertIn("不知道跟谁的事", joined)
 
     def test_empty_user_keeps_everything(self) -> None:
         """调用方没传 user_id（旧用法）时退回不筛，行为与改前一致。"""

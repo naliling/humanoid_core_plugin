@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
+from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import HumanoidConfig
@@ -139,22 +140,46 @@ def now_in_city(city: str) -> datetime:
     return datetime.now(tz)
 
 
-def system_timezone_city() -> str:
-    """宿主机时区对应的城市名（`resolve_zone_name` 认得出的那种）。
-
-    认不出来时返回 `SYSTEM_TIMEZONE_LABEL` 这个哨兵，而**不是**一个会被当成城市名
-    继续解析的字符串：`resolve_zone` 认得它，直接返回「没有时区、也没有问题」。
-    """
+def _host_zone_name() -> str:
+    """宿主机时区的 IANA 名；拿不到（Windows 上 tzinfo 常常没有 `key`）时返回空串。"""
     try:
-        local_tz = datetime.now().astimezone().tzinfo
-        tz_name = getattr(local_tz, "key", None)
-        if tz_name:
-            for city, name in CITY_TO_TIMEZONE.items():
-                if name == tz_name:
-                    return city
+        return str(getattr(datetime.now().astimezone().tzinfo, "key", None) or "")
     except Exception:
-        pass
-    return SYSTEM_TIMEZONE_LABEL
+        return ""
+
+
+def system_timezone_city() -> str:
+    """宿主机时区**唯一**对应的城市名；不能唯一确定时返回空串。
+
+    一个 IANA 名往往对应表里几十个城市（`Asia/Shanghai` 下面有整个中国的地名）。
+    旧写法返回字典里第一个命中的城市，于是默认配置下她自称的城市是任意的、用户从未
+    选择过——「你在河源」这种无依据陈述就是这么来的。现在只在恰好一个候选时才说，
+    否则返回空串（再由 `display_city` 转 None，注入层省略「你在…」）。
+
+    也不再把 `SYSTEM_TIMEZONE_LABEL` 当返回值：它是给 `resolve_zone` 认的哨兵，
+    不是城市名。空串就是「说不出来」。
+    """
+    tz_name = _host_zone_name()
+    if not tz_name:
+        return ""
+    hits = [city for city, name in CITY_TO_TIMEZONE.items() if name == tz_name]
+    return hits[0] if len(hits) == 1 else ""
+
+
+# 「你在…」只能接地名。IANA_DISPLAY_NAMES 里除了城市名，还有时区标签（北京时间、
+# UTC+08:00）和带注解的说明（乌鲁木齐（当地作息））：那些是给 /时间 面板看的标签，
+# 塞进「你在北京时间」就是病句。判断不出来时按「说不出来」处理。
+_NON_PLACE_MARKERS = ("时间", "（", "(", "UTC", "GMT")
+
+
+def _speakable_city(name: str) -> str | None:
+    """能当「你在…」说的地名；时区标签、带注解的说明一律返回 None。"""
+    text = (name or "").strip()
+    if not text:
+        return None
+    if any(marker in text for marker in _NON_PLACE_MARKERS):
+        return None
+    return text
 
 
 def format_offset(moment: datetime) -> str | None:
@@ -200,12 +225,24 @@ class Clock:
         return self._config().timezone_city
 
     @property
-    def display_city(self) -> str:
+    def display_city(self) -> str | None:
+        """能说出口的城市名；**说不出来时返回 None，调用方必须省略整句**。
+
+        返回值直接进「你在{city}」这类句子，所以不能有哨兵、原始 IANA 名、拼错的
+        地名或「按宿主机时间过日子」的降级说明——那些都不是城市名。三种情况返回 None：
+        没定城市（placeholder）、城市/时区认不出（resolve_zone 有 note）、表里没有
+        中文显示名。
+        """
         city = self.city
         if city == DEFAULT_CITY_PLACEHOLDER:
-            return system_timezone_city()
+            return system_timezone_city() or None
+        _, note = resolve_zone(city)
+        if note:
+            # 时间按宿主机走（缺 tzdata / 名字拼错）：再说「你在东京」就是两处打架。
+            return None
         # 填的是 IANA 名时翻成中文城市名：「你在雷克雅未克」，不是「你在Atlantic/Reykjavik」。
-        return display_city_name(city, resolve_zone_name(city))
+        # 翻出来的是时区标签（北京时间、UTC）就还是说不出口，返回 None 让调用方省略整句。
+        return _speakable_city(display_city_name(city, resolve_zone_name(city)))
 
     def now(self) -> datetime:
         return now_in_city(self.city)
@@ -233,6 +270,25 @@ class Clock:
             note=note,
         )
 
+    @property
+    def tz(self) -> tzinfo | None:
+        """当前生效的时区；None = 按宿主机（城市认不出或缺 tzdata 时的退化）。"""
+        return resolve_tzinfo(self.city)
+
+    def local(self, ts: float) -> datetime:
+        """epoch 秒 → 她的墙钟时间（按角色城市，不是宿主时区）。"""
+        return local(ts, self.tz)
+
+    def day_key(self, ts: float | None = None) -> str:
+        """`ts` 落在她时区的哪一天（`YYYY-MM-DD`）；默认取现在。"""
+        return day_key(self.timestamp() if ts is None else ts, self.tz)
+
+    def day_ordinal(self, ts: float | None = None) -> int:
+        return day_ordinal(self.timestamp() if ts is None else ts, self.tz)
+
+    def day_gap(self, then: float, now: float | None = None) -> int:
+        return day_gap(then, self.timestamp() if now is None else now, self.tz)
+
     def today_str(self) -> str:
         return self.now().strftime("%Y-%m-%d")
 
@@ -246,7 +302,26 @@ class Clock:
     def holiday(self, moment: datetime | None = None) -> str:
         return resolve_holiday(moment or self.now(), self._config().holidays)
 
+    def is_night_hour(self, moment: datetime | None = None) -> bool:
+        """这个钟点落在配置的夜间窗口里吗——**只问钟点**，不看夜间模式开关。
+
+        与 `is_night()` 的分工：`is_night()` 回答「夜间模式现在生效吗」（开关 AND
+        钟点），而契约与面板里给出的 `night_window` 只说窗口。两个条件 AND 在一起
+        之后，同一个 23:00 在「夜间模式关着」时会得到 `is_night=False`、而
+        `night_window` 仍写着 23-7——同一条 payload 里两个字段互相矛盾
+        （审核 模型与导出 7）。要问「算不算夜里」用这个方法，要问「夜间模式开没开」
+        直接读 `cfg.night_mode_enabled`。
+        """
+        return bool(self._config().is_night_hour((moment or self.now()).hour))
+
     def is_night(self, moment: datetime | None = None) -> bool:
+        """【已弃用】夜间模式**生效中**：开关打开 且 钟点在窗口里。
+
+        名字读作「现在是不是夜里」，实际多了一个开关条件（`night_mode_enabled`
+        关掉时恒 False），于是它和 `night_window` 对「23 点算不算夜」给出不同答案。
+        新代码请用 `is_night_hour()` + `cfg.night_mode_enabled` 分别表达这两件事；
+        本方法保留原行为只为不静默改变旧调用方。
+        """
         cfg = self._config()
         if not cfg.night_mode_enabled:
             return False
@@ -257,6 +332,120 @@ class Clock:
         if not cfg.night_mode_enabled:
             return False
         return cfg.is_deep_sleep((moment or self.now()).hour)
+
+
+# ---------------------------------------------------------------------------
+# 时间戳 → 墙钟 / 日键（R5 唯一口径）
+# ---------------------------------------------------------------------------
+# 落盘一律存 epoch 秒（不带时区、不带格式），渲染时再换成本地墙钟。这样换城市、
+# 系统时区被改、机器时钟回拨，都不会让盘上的旧字符串突然指到别的时刻。
+# 「哪一天」也必须按**角色所在时区**算：同一个 epoch 秒在东京与洛杉矶不是同一天。
+
+
+def local(ts: float, tz: tzinfo | None = None) -> datetime:
+    """epoch 秒 → 该时区的墙钟时间；tz 为 None 时用宿主机时区。
+
+    渲染（给人看的字符串）一律走这里，不要自己 `datetime.fromtimestamp`：那个用
+    宿主机时区，角色设了城市就会差出一整天。
+    """
+    return datetime.fromtimestamp(float(ts), tz)
+
+
+def day_key(ts: float, tz: tzinfo | None = None) -> str:
+    """epoch 秒 → 角色时区里的「YYYY-MM-DD」。每日额度/每日衰减的日闸用它。"""
+    return local(ts, tz).strftime("%Y-%m-%d")
+
+
+def day_ordinal(ts: float, tz: tzinfo | None = None) -> int:
+    """epoch 秒 → 角色时区里的日期序数（同一天相等，差一天差 1）。"""
+    return local(ts, tz).date().toordinal()
+
+
+def day_gap(then: float, now: float, tz: tzinfo | None = None) -> int:
+    """`now` 比 `then` 晚几个**日历天**（0=今天，1=昨天，-1=明天）。
+
+    「认识 N 天」「昨晚」这类说法必须按日历天算：`(now-then)/86400` 会把 23:59
+    到次日 00:01 算成 0 天，也会把「三天前的中午」算成 3 天前的夜里。
+    """
+    return day_ordinal(now, tz) - day_ordinal(then, tz)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if out == out else default
+
+
+def night_window(cfg: Any, scheduled: Optional[tuple[float, float]] = None) -> dict:
+    """她的「夜」：**唯一一份推导**。契约 / 门面 / 注入 / 状态快照都读这里。
+
+    优先级：日程里推出来的睡段（`scheduled`，由调用方从 `soma.scheduled_night()` 取）
+    → 配置窗口（`cfg.night_start_hour/night_end_hour`）。夜间模式关掉、或窗口长度为 0
+    （起止设成同一时刻 = 关掉这个窗口）时就是**没有夜**：`span` 为 0、`source` 为 "none"。
+
+    返回 `{"start", "end", "span", "source"}`，`source` ∈ `schedule`/`config`/`none`。
+
+    为什么要有这一个函数：在这之前「现在是不是夜里」有四个答案——`Clock.is_night`
+    （开关 AND 配置窗口）、`soma.in_scheduled_night`（只看日程）、契约 `routine` 块
+    （日程 → 配置兜底）、门面 `clock()`（读落盘契约）。夜猫子人格的日程是 4:00-11:30，
+    同一条 payload 里 `is_night` 却按配置的 23:00-6:00 判（审核 跨插件契约 8）。
+    """
+    start = _as_float(getattr(cfg, "night_start_hour", 0.0))
+    end = _as_float(getattr(cfg, "night_end_hour", 0.0))
+    if not bool(getattr(cfg, "night_mode_enabled", True)):
+        # 关掉夜间模式 = 不再有生物钟夜这一层（与 `soma.biological_night()` 同口径）。
+        return {"start": start, "end": end, "span": 0.0, "source": "none"}
+
+    if scheduled:
+        try:
+            start_h, end_h = float(scheduled[0]), float(scheduled[1])
+        except (TypeError, ValueError, IndexError):
+            start_h, end_h = 0.0, 0.0
+        span = (end_h - start_h) % 24.0
+        # 跨度不足半小时的「夜」是退化值（`(0.0, 0.0)` 会算出 24 小时），不采信。
+        if span > 0.5:
+            return {"start": start_h, "end": end_h, "span": span, "source": "schedule"}
+
+    span = _as_float(getattr(cfg, "night_span_hours", 0.0))
+    if span <= 0.0:
+        return {"start": start, "end": end, "span": 0.0, "source": "none"}
+    return {"start": start, "end": end, "span": span, "source": "config"}
+
+
+def in_night_window(hour: float, window: Any) -> bool:
+    """给定钟点（0~24 的浮点小时）在不在 `night_window()` 那段里。"""
+    if not isinstance(window, dict) or window.get("source") == "none":
+        return False
+    try:
+        start = float(window.get("start", 0.0)) % 24.0
+        end = float(window.get("end", 0.0)) % 24.0
+        moment = float(hour) % 24.0
+    except (TypeError, ValueError):
+        return False
+    if start == end:
+        return False
+    if start < end:
+        return start <= moment < end
+    return moment >= start or moment < end
+
+
+def in_deep_window(hour: float, window: Any, ratio: Any) -> bool:
+    """给定钟点是不是在「夜的前 `ratio` 那一段」（深睡段），与 `night_window()` 同源。"""
+    if not isinstance(window, dict) or window.get("source") == "none":
+        return False
+    try:
+        start = float(window.get("start", 0.0)) % 24.0
+        span = float(window.get("span", 0.0))
+        moment = float(hour) % 24.0
+        keep = max(0.1, min(1.0, float(ratio)))
+    except (TypeError, ValueError):
+        return False
+    if span <= 0.0:
+        return False
+    offset = (moment - start) % 24.0
+    return 0.0 <= offset < span * keep
 
 
 def parse_state_timestamp(raw: str, reference: datetime) -> datetime | None:

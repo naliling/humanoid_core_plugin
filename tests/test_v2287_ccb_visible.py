@@ -268,7 +268,7 @@ class Snapshot(unittest.TestCase):
         self.assertTrue(snap["in_scene"])
         self.assertFalse(snap["expired"])
         self.assertEqual(snap["stage"], 2)
-        self.assertEqual(snap["stage_name"], "平台")
+        self.assertEqual(snap["stage_name"], "沉醉")
         self.assertEqual(snap["satisfy"], 50.0)
         self.assertEqual(snap["satisfy_phase"], 2)
         self.assertEqual(snap["turns_today"], 3)
@@ -407,7 +407,7 @@ class StatusPage(unittest.TestCase):
         snap = core.intimacy_status("u1")
         self.assertFalse(snap["enabled"])
         self.assertFalse(snap["can_enter"])
-        self.assertTrue(any("未开启" in b for b in snap["blockers"]), snap["blockers"])
+        self.assertTrue(any("没有开启" in b for b in snap["blockers"]), snap["blockers"])
         self.assertEqual(snap["libido"], 47.0, "亲近欲是情绪层的真实读数，关掉 ccb 也照给")
 
 
@@ -437,7 +437,7 @@ class IntimacyText(unittest.TestCase):
     def test_text_when_ccb_off(self):
         core = _core(False)
         _mood(core)
-        self.assertIn("未开启", core.intimacy_text("u1"))
+        self.assertIn("没有开启", core.intimacy_text("u1"))
 
 
 class MoodText(unittest.TestCase):
@@ -463,7 +463,8 @@ class MoodText(unittest.TestCase):
         text = core.mood.intimacy_summary("u1")
         self.assertTrue(text.startswith("亲密："), text)
         self.assertIn("在场景里", text)
-        self.assertIn("平台", text)
+        # F4：阶段名只有一个来源（满足度相位）。satisfy=80 → 临界。
+        self.assertIn("临界", text)
         self.assertIn("今日 2/8", text)
         self.assertIn("门槛", text)
 
@@ -517,7 +518,8 @@ class Facade(unittest.TestCase):
             self.assertIn(key, got, f"门面少了 {key}")
         self.assertEqual(got["stage"], 2)
         self.assertTrue(got["in_scene"])
-        self.assertEqual(got["stage_name"], "平台")
+        # F4：stage_name 不再是「libido 档位名」，而是满足度相位名（80 → 临界）。
+        self.assertEqual(got["stage_name"], "临界")
         self.assertEqual(got["turns_today"], 2)
         self.assertEqual(got["libido"], 47.0)
         self.assertEqual(got["base_libido"], 34.0)
@@ -564,7 +566,7 @@ class Facade(unittest.TestCase):
         _mood(core)
         got = self._facade(core).intimacy("bot1", "u1")
         self.assertFalse(got["can_enter"])
-        self.assertTrue(any("未开启" in b for b in got["blockers"]), got["blockers"])
+        self.assertTrue(any("没有开启" in b for b in got["blockers"]), got["blockers"])
 
 
 try:  # 真实环境里 AstrBot 会把这些模块准备好；缺框架时整组跳过。
@@ -614,7 +616,7 @@ class Command(unittest.IsolatedAsyncioTestCase):
         star = await self._star(False)
         try:
             out = await collect(star.cmd_intimacy_status(FakeEvent("/亲密状态")))
-            self.assertIn("未开启", out[0])
+            self.assertIn("没有开启", out[0])
         finally:
             await star.terminate()
 

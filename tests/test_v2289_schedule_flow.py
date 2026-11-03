@@ -497,6 +497,56 @@ class SuspendedStateTest(unittest.TestCase):
         self.assertEqual(service.suspended_info()["event"], "改海报")
 
 
+    def test_remaining_minutes_decays_instead_of_freezing(self):
+        """#69：挂起快照里的「还剩 N 分钟」按现在现算，不能一直播报打断那一刻的数字。"""
+        service, store, clock = self._service([{
+            "start": "09:00", "end": "10:30", "event": "改海报",
+            "location": "书桌", "emotion": "专注",
+        }])
+        slot = parse_segment({"event": "下楼取快递", "minutes": 30},
+                             now_minute=9 * 60 + 30, step=15)
+        service._append_segment(slot, FIXED_TODAY)
+        self.assertEqual(
+            store.get("schedule_suspended")["end_at"],
+            clock.timestamp() + 60 * 60,
+            "挂起时落的是原定结束时刻（epoch），不是会过期的分钟数",
+        )
+        clock.advance(minutes=25)
+        self.assertEqual(service.suspended_info()["remaining_minutes"], 35,
+                         "过了 25 分钟，剩余必须跟着少 25 分钟")
+        prompt = segment_prompt(cfg(), now_text="09:55", weekday="六",
+                                suspended=service.suspended_info())
+        self.assertIn("还剩 35 分钟", prompt)
+        self.assertNotIn("还剩 60 分钟", prompt)
+
+    def test_suspended_ends_when_its_end_time_passes(self):
+        """原定结束时刻已过：按已结束处理，不播报「还剩 0 分钟」。"""
+        service, store, clock = self._service([{
+            "start": "09:00", "end": "10:30", "event": "改海报",
+            "location": "书桌", "emotion": "专注",
+        }])
+        slot = parse_segment({"event": "下楼取快递", "minutes": 30},
+                             now_minute=9 * 60 + 30, step=15)
+        service._append_segment(slot, FIXED_TODAY)
+        clock.advance(minutes=61)   # 10:31 晚于原定结束 10:30，但还在 180 分钟保留期内
+        self.assertEqual(service.suspended_info(), {},
+                         "原定结束时刻过了就该当它结束了")
+        self.assertIsNone(store.get("schedule_suspended"), "结束后顺手清掉")
+
+    def test_old_snapshot_without_end_at_still_decays(self):
+        """旧存档只有 remaining_minutes + at：按「at + 剩余」补出结束点，照样衰减。"""
+        service, store, clock = self._service([{
+            "start": "09:00", "end": "10:00", "event": "改海报",
+            "location": "书桌", "emotion": "专注",
+        }])
+        store.scope.update_self(schedule_suspended={
+            "event": "改海报", "location": "书桌", "emotion": "专注", "ongoing": "",
+            "wants": False, "remaining_minutes": 60,
+            "at": clock.timestamp(), "ttl_minutes": 180,
+        })
+        clock.advance(minutes=20)
+        self.assertEqual(service.suspended_info()["remaining_minutes"], 40)
+
 class SuspendedPromptTest(unittest.TestCase):
     def test_prompt_carries_the_interrupted_thing(self):
         suspended = {

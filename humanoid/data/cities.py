@@ -535,6 +535,24 @@ IANA_DISPLAY_NAMES = {
     "Africa/Johannesburg": "约翰内斯堡", "Africa/Nairobi": "内罗毕", "Africa/Casablanca": "卡萨布兰卡",
 }
 
+# 天气接口只认英文城市名：配置按文档填 IANA 时区名（如 Asia/Shanghai）时，靠这张小表
+# 翻成 OpenWeather 查得到的写法。表里没有的时区**不猜**——`services/weather.py` 的
+# `effective_location` 返回空串，`snapshot` 给一条可读的「认不出英文城市名」说明。
+# 这不是时区表：时区仍以 CITY_TO_TIMEZONE 为准，这里只解决「天气该查哪个英文城市」。
+WEATHER_ZONE_CITY = {
+    "Asia/Shanghai": "Shanghai,CN", "Asia/Urumqi": "Urumqi,CN",
+    "Asia/Hong_Kong": "Hong Kong,HK", "Asia/Macau": "Macau,MO", "Asia/Taipei": "Taipei,TW",
+    "Asia/Tokyo": "Tokyo,JP", "Asia/Seoul": "Seoul,KR", "Asia/Singapore": "Singapore,SG",
+    "Asia/Bangkok": "Bangkok,TH", "Asia/Ho_Chi_Minh": "Ho Chi Minh City,VN",
+    "Asia/Manila": "Manila,PH", "Asia/Jakarta": "Jakarta,ID", "Asia/Kolkata": "Mumbai,IN",
+    "Asia/Dubai": "Dubai,AE", "Europe/London": "London,GB", "Europe/Paris": "Paris,FR",
+    "Europe/Berlin": "Berlin,DE", "Europe/Moscow": "Moscow,RU", "Europe/Madrid": "Madrid,ES",
+    "Europe/Rome": "Rome,IT", "America/New_York": "New York,US", "America/Chicago": "Chicago,US",
+    "America/Los_Angeles": "Los Angeles,US", "America/Toronto": "Toronto,CA",
+    "America/Sao_Paulo": "Sao Paulo,BR", "Australia/Sydney": "Sydney,AU",
+    "Pacific/Auckland": "Auckland,NZ",
+}
+
 CITY_TO_TIMEZONE: dict[str, str] = {}
 
 # 先铺 GeoNames 批量表（县级以上的中国地名、日本市町村、有中文名的俄罗斯居民点），
@@ -629,8 +647,13 @@ def display_city_name(city: str, zone_name: str | None) -> str:
         for key in _candidates(raw):
             if key in CITY_TO_TIMEZONE:
                 return key
-        return IANA_DISPLAY_NAMES.get(zone_name, raw)
-    return raw
+        # 表里没有这个时区的中文显示名时**不拿原始 IANA 名充数**：注入里出现
+        # 「你在Atlantic/Reykjavik」或「你在Etc/GMT-8」都不是人话。空串 = 说不出来，
+        # 由 `clock.display_city` 转成 None，注入层整句省略。
+        return IANA_DISPLAY_NAMES.get(zone_name, "")
+    # 认不出时区的名字同样不往外递：调用方据此省略「你在…」，而不是把用户填错的
+    # 字原样塞进上下文（她不该说「你在火星」）。
+    return raw if raw in CITY_TO_TIMEZONE else ""
 
 
 @dataclass(frozen=True, slots=True)

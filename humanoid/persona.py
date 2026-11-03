@@ -61,7 +61,14 @@ EMPTY = Persona()
 
 
 def truncate(text: str, limit: int = PERSONA_PROMPT_MAX) -> str:
-    """按行边界截断人设，避免把一句话切成半截。"""
+    """按行边界截断人设，避免把一句话切成半截。
+
+    **只返回正文，不追加任何元说明**：以前这里会补一句「（以上是完整人设的开头
+    部分。）」。那句是写给读者看的编辑说明，但它拼在人设正文末尾就一起进了
+    日程/人格注入——模型读到的是「人设到这里为止，后面还有」这种**关于文本本身的
+    指令**，而不是角色是谁。人设正文是「她是谁」，不该夹带「这份文档被截过」的
+    元信息（审核 注入取舍 #132）。
+    """
     body = str(text or "").strip()
     if len(body) <= limit:
         return body
@@ -69,7 +76,7 @@ def truncate(text: str, limit: int = PERSONA_PROMPT_MAX) -> str:
     idx = cut.rfind("\n")
     if idx >= limit // 2:
         cut = cut[:idx]
-    return cut.rstrip() + "\n（以上是完整人设的开头部分。）"
+    return cut.rstrip()
 
 
 def _field(persona: Any, key: str) -> str:
@@ -86,9 +93,14 @@ def _to_persona(persona: Any, source: str) -> Persona:
         return EMPTY
     name = _field(persona, "name")
     prompt = truncate(_field(persona, "prompt"))
+    if not prompt and not name:
+        # 名字和正文都空 = 没有可用人设，返回**单例**。旧写法会新建一个等值 Persona，
+        # 而 `persona()` 用 `is EMPTY` 判空，于是这个「空人设」被当成正常结果缓存
+        # 600 秒——一次读盘抖动会让日程在这 10 分钟里全按通用模板排。
+        return EMPTY
     if not prompt:
         # 人设存在但正文为空：给个名字用于展示，日程仍按「没有人设」来排。
-        return Persona(name=name, prompt="", source=source if name else FALLBACK_SOURCE)
+        return Persona(name=name, prompt="", source=source)
     return Persona(name=name or "（未命名人设）", prompt=prompt, source=source)
 
 
@@ -216,11 +228,11 @@ class PersonaSource:
                 self._log.warning(f"[humanoid_core] 人格设定读取失败，日程按无设 persona 排: {exc}")
             # **失败不写缓存**：一次瞬时故障不该变成接下来 10 分钟的「没有人设」。
             return EMPTY
-        if persona is EMPTY:
+        if persona == EMPTY:
             # 解析**没拿到任何人设**（管理器还没就绪、读盘抖动、返回形状变了）——
-            # `resolve_persona` 自己把异常吞了、返回这个单例，所以这里必须按同一个
-            # 口径识别它，否则一次瞬时故障会被缓存 10 分钟：那 10 分钟里排出来的
-            # 全是通用模板日程。显式「不用人格」有自己的 source，是成功结果，照常缓存。
+            # 这里必须按**值**比较，不能按对象身份：任何等值的空人设（别的路径新建的
+            # `Persona()`）都不该被缓存 600 秒，否则一次瞬时故障会变成 10 分钟的
+            # 通用模板日程。显式「不用人格」有自己的 source，是成功结果，照常缓存。
             return EMPTY
         self._cache[key] = _Entry(persona=persona, at=self._time(), umo=umo)
         return persona

@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import __version__
+from . import contract as _contract
+from . import state_snapshot as _snapshot
+from .clock import in_deep_window, in_night_window
 from .life_log import parse_open
 from .services.schedule import (
     day_phrases,
@@ -30,17 +33,25 @@ from .services.schedule import (
     sleep_spans,
 )
 
-CONTRACT_VERSION = 2
+#: v3.0.3 起为 3：`body` 里的身体轴数值可以是 `null`（`available:false` 表示「这一项
+#: 没在跑/不知道」，而不是「不困、不饿、醒着」）。数值域新增 null 对按算术读的下游是
+#: **破坏性**变更，所以必须抬版本——社交层看到 v<3 就还按「数字都是真的」读。
+CONTRACT_VERSION = 3
 #: 结构标识。**现状要说实**：截至 autonomous_social v1.28.17，社交层并不校验它、也不读
 #: `fields_hash`（它的 core_bridge.py 自认没有校验方）——这三键目前是 Core 侧导出的死数据，
 #: 保留是为了「只加不改」：以后对方接上校验时不必再动 Core。
-CONTRACT_SCHEMA = "humanoid.contract/2"
+CONTRACT_SCHEMA = "humanoid.contract/3"
 #: 这一版契约提供的能力。社交层按能力判断走哪条路，不靠版本号猜。
 #: 只加不改：`dreams`（她昨晚做的梦）与 `wake`（醒来状态/睡眠惯性）是 v2.28.0 新增的；
 #: `event`（刚刚发生的事够重）**v2.28.5 起就有**（旧注释误写成 v2.29.0——那是个从未发布
 #: 过的版本号，联动 P2-28），3.0.0 起继续提供只读能力。API_VERSION 保持 2。
 #: v2.28.9 再补 `identity`（她是谁：参照名/人设标签）与 `outfit`（她此刻穿着）——
 #: 社交层主动开口时终于能「以她的身份、说她当下的事」说话。
+#: v3.0.3 起 `body.*` / `wake.asleep` 可能是 null，读之前先看 `body.available`
+#: （false = 这一块不可用，原因在 `body.reason`）。**三态不是一条 capability**：
+#: 这个元组的语义是「每个名字在契约里有一个对应的块」（测试逐条断言），而三态是一种
+#: 读法，没有自己的块。要判「对面懂不懂三态」，看 `v >= 3` 或 `schema` 结尾的版本号；
+#: 旧契约里数字恒为真值，不能把 null 当 0。
 CONTRACT_CAPABILITIES = (
     "body", "feelings", "form", "activity", "day", "ongoing", "routine",
     "dreams", "wake", "event", "identity", "outfit",
@@ -67,6 +78,76 @@ SIGNALS_FILE_NAME = "humanoid_signals.json"
 SIGNALS_MAX_BYTES = 1 << 20
 
 
+#: 偏移来源：她的城市解析出了 IANA 时区（偏移是**她的**）。
+OFFSET_SOURCE_ZONE = "zone"
+#: 偏移来源：退回宿主机时间（城市认不出 / 缺 tzdata / 明确跟随系统）——偏移是**这台机器的**。
+OFFSET_SOURCE_HOST = "host"
+#: 偏移来源：连宿主偏移都拿不到（naive 时钟）。此时 `minutes` 必为 None。
+OFFSET_SOURCE_UNKNOWN = "unknown"
+
+
+def utc_offset(core: Any, moment: Any = None) -> dict[str, Any]:
+    """她此刻的 UTC 偏移，以及**这个偏移是哪来的**：契约 `time` 块与门面 `clock()` 的唯一一份。
+
+    为什么需要来源：`Clock.now()` 在城市认不出 / 缺 tzdata 时退回宿主机时间
+    （clock.py:136-140），此时 `now.utcoffset()` 给的是这台机器的偏移。旧代码把它当成
+    「她的偏移」导出，而契约注释自己写着「算不出来时必须是 None 而不是 0：当成 0 等于把
+    她的城市当 UTC」（审核 跨插件契约 5）。现在偏移照给（宿主机偏移并非无用——同机消费方
+    拿它换算 epoch 仍然正确），但用 `source` 说清它不是她的：`zone` / `host` / `unknown`。
+
+    返回 `{"minutes": int|None, "source": str, "tz": str}`：
+    * `minutes` 为 None 只在 naive 时钟（连宿主偏移都没有）时出现；
+    * `tz` 只在 `zone` 时非空——宿主机时区**不是**她的城市，导出去会让消费方以为她在那里。
+    """
+    if moment is None:
+        try:
+            moment = core.clock.now()
+        except Exception:
+            moment = None
+
+    minutes: Optional[int] = None
+    try:
+        delta = moment.utcoffset() if moment is not None else None
+    except Exception:
+        delta = None
+    if delta is not None:
+        minutes = int(delta.total_seconds() // 60)
+    if minutes is None:
+        return {"minutes": None, "source": OFFSET_SOURCE_UNKNOWN, "tz": ""}
+
+    clock = getattr(core, "clock", None)
+    try:
+        resolved: Any = getattr(clock, "tz", None)
+    except Exception:
+        resolved = None
+    if resolved is not None:
+        # 真 Clock：`tz` 是解析出来的 ZoneInfo（None = 退回宿主机）。
+        return {
+            "minutes": minutes,
+            "source": OFFSET_SOURCE_ZONE,
+            "tz": str(getattr(resolved, "key", "") or ""),
+        }
+
+    # 桩 / 老 Core 没有 `tz`：退回 `zone_state()` 的 zone_name 与 note（两者都为空 = 没解析出来）。
+    state = None
+    try:
+        state = clock.zone_state()
+    except Exception:
+        state = None
+    if state is not None:
+        zone_name = str(getattr(state, "zone_name", "") or "")
+        note = str(getattr(state, "note", "") or "")
+        if zone_name and not note:
+            return {"minutes": minutes, "source": OFFSET_SOURCE_ZONE, "tz": zone_name}
+        return {"minutes": minutes, "source": OFFSET_SOURCE_HOST, "tz": ""}
+
+    # 连 zone_state 都没有（极端替身）：只认 moment 自带的 IANA 名。
+    key = str(getattr(getattr(moment, "tzinfo", None), "key", "") or "")
+    if key:
+        return {"minutes": minutes, "source": OFFSET_SOURCE_ZONE, "tz": key}
+    return {"minutes": minutes, "source": OFFSET_SOURCE_HOST, "tz": ""}
+
+
 def build_contract(core: Any) -> dict[str, Any]:
     """导出这份角色的身体快照。只读，不推进任何状态。"""
     cfg = core.config
@@ -77,6 +158,9 @@ def build_contract(core: Any) -> dict[str, Any]:
     slot = core.schedule.current_slot() or {}
     slots = core.schedule.current_slots()
     now_minutes = now.hour * 60 + now.minute
+    # 她实际的夜只算一次，`time` 块与 `routine` 块共用（同一份契约里不该有两个答案）。
+    window = night_window(core, cfg)
+    hour_of_day = now.hour + now.minute / 60.0
     try:
         # 社交层拿这个去说「我刚从X回来」，不拿它就只能说「我在休息」。
         day = day_phrases(slots, now_minutes, past_limit=3, future_limit=2)
@@ -97,8 +181,7 @@ def build_contract(core: Any) -> dict[str, Any]:
             feelings = [text for _, text in ranked[:3]]
         except Exception:
             feelings = []
-    offset = now.utcoffset()
-    zone = getattr(now.tzinfo, "key", "") or ""
+    offset_info = utc_offset(core, now)
     contract = {
         "v": CONTRACT_VERSION,
         # 版本自述只认真实包版本（humanoid.__version__）：拿不到实例属性时退回导入值，
@@ -109,21 +192,25 @@ def build_contract(core: Any) -> dict[str, Any]:
             "local": now.strftime("%Y-%m-%d %H:%M"),
             "hour": now.hour,
             "weekday": snap.get("weekday", ""),
-            "city": snap.get("city", ""),
-            "is_night": bool(
-                cfg.night_mode_enabled
-                and core.soma.in_scheduled_night(now.hour + now.minute / 60.0)
-            ),
-            "is_deep_sleep": bool(
-                cfg.night_mode_enabled
-                and core.soma.in_scheduled_deep_sleep(now.hour + now.minute / 60.0)
-            ),
+            # 地名可能不知道（display_city 现在可以是 None）：契约里"不知道"写成空串，
+            # 不写成 null——下游按字符串读的地方很多，null 会让它们炸。
+            "city": snap.get("city") or "",
+            # 与 `routine.night_start_hour / night_end_hour` **同一个窗口**：以前这里按日程
+            # （`in_scheduled_night`）、`routine` 块按生物钟夜（日程 → 配置兜底），同一份
+            # 契约里「现在是不是夜里」能有两个答案（审核 跨插件契约 8）。
+            "is_night": in_night_window(hour_of_day, window),
+            "is_deep_sleep": in_deep_window(hour_of_day, window, cfg.night_deep_sleep_ratio),
             # 社交层跟 Core 跑在同一台机器上，但它自己的时段判断用的是本机时钟。
             # 给出偏移量比给出一个时刻更可靠：拿它把 epoch 换算成她的本地小时即可。
             # 算不出来时必须是 None 而不是 0：当成 0 等于把她的城市当 UTC，错得静悄悄。
-            "utc_offset_minutes": int(offset.total_seconds() // 60) if offset is not None else None,
-            # 生效的 IANA 名；空串意味着她其实没拿到真时区（缺 tzdata 或城市认不出）。
-            "tz": zone,
+            "utc_offset_minutes": offset_info["minutes"],
+            # 这个偏移是谁的：`zone`（她的城市）/ `host`（这台机器，城市没解析出来）/
+            # `unknown`（naive 时钟）。旧代码把宿主机偏移当成她的偏移导出——「算不出来时
+            # 必须是 None」这句承诺在退化路径上从来没成立过（审核 跨插件契约 5）。
+            "utc_offset_source": offset_info["source"],
+            # 生效的 IANA 名；空串意味着她其实没拿到真时区（缺 tzdata / 城市认不出 / 跟随系统）。
+            # `source=host` 时这里**必须**是空串：宿主机时区不是她的城市。
+            "tz": offset_info["tz"],
         },
         "body": _body_block(core, cfg, snap, soma),
         "feelings": feelings,
@@ -161,7 +248,7 @@ def build_contract(core: Any) -> dict[str, Any]:
         },
         # 醒来状态：睡着没有、醒来多久、睡眠惯性还剩几分钟、是不是被消息吵醒的。
         # 社交层可以用它避免「明明在睡却像生龙活虎」；拿不到时是空 dict（旧 Core 也一样）。
-        "wake": _wake_block(core),
+        "wake": _wake_block(core, cfg),
         # 日程是按哪个 AstrBot 人设排的：社交层靠它确认两边用的是同一个人。
         "persona": str(core.schedule.status().get("persona", "") or ""),
         # 她是谁（v2.28.9，只加不改）：社交层主动开口前要知道「用哪个名字/哪副人设说话」。
@@ -172,7 +259,7 @@ def build_contract(core: Any) -> dict[str, Any]:
         # 拿不到（旧 Core / 穿搭关 / 判不出物种）→ 空 dict，社交层按「不知道」处理。
         "outfit": _outfit_block(core),
         # 作息：社交层靠它知道她睡够没睡够，诊断靠它提示两套时间不一致。
-        "routine": _routine_block(core, cfg, slots),
+        "routine": _routine_block(core, cfg, slots, window),
         # 天气只递真天气：没配 Key 时那句「为什么没有」是给她主人看的，社交层拿到只会照着说。
         "weather": _contract_weather(snap.get("weather")),
         # 今天是什么节日（没有则空串）。社交层拿它派「节日」由头/破冰话题——
@@ -234,48 +321,67 @@ def build_contract(core: Any) -> dict[str, Any]:
 
 
 def _body_block(core: Any, cfg: Any, snap: dict[str, Any], soma: dict[str, Any]) -> dict[str, Any]:
-    """身体块：13 个键一个不改（社交层按这些键读），但**关掉身体轴时不再让整份契约消失**。
+    """身体块：13 个键一个不改（社交层按这些键读），但**「没在跑」与「不困」必须分得开**。
 
     v3.0.0 之前 `refresh_contract` 只要 `soma_enabled=false` 就整份停发，连带停掉
     identity/日程/天气/节日/事件/作息这些**与身体无关**的块；社交层把「没读到契约」
-    误诊成「旧版 Core，升级到 v2.14+」（联动 P1-C/P2-26）。现在契约照发，只有这一块
-    给**中性表示**：
+    误诊成「旧版 Core，升级到 v2.14+」（联动 P1-C/P2-26）。现在契约照发。
 
-    * 精力 / 社交能量 / 周期这三项与身体轴开关无关，照给真实值；
-    * 六个身体轴与「睡着」给中性值（不困、不饿、不难受、唤醒度居中、不想说话、醒着），
-      意思不是「她一点也不困」，而是「这一项没在跑」——社交层据此最多少一条由头，
-      不会拿到一个假的「她刚聊完不想说话」。
+    v3.0.3（联动 跨插件契约 2）：关掉身体轴时**不再给中性数值**。以前这一块填的是
+    `hunger=0.0 / arousal=50.0 / asleep=False / social_desire=50.0`——这些值与「她真的
+    不饿、唤醒度居中、醒着、不想说话」**完全同形**，接收方按算术读，读出来是「她状态
+    正常」。事实是「这一项我不知道」。现在的表达是：
+
+    * `available`：这一块可不可用；`source`：值从哪来（`soma` / `disabled`）；
+      `reason`：不可用的原因（可用时是空串）；
+    * 不可用时，八个身体轴与「睡着」一律给 `null`，**不给 0/50/false**；
+    * 精力 / 社交能量 / 周期这三项与身体轴开关无关，照给真实值（它们从来不是「没在跑」）。
+
+    消费方必须按 `available` 分支：false 时不能把这些键当数字算，也不能当「不困」。
     """
+    energy = round(float(snap["energy"]["value"]), 1)
+    social_energy = round(float(snap["social_energy"]["value"]), 1)
+    cycle_day = int(core.energy.cycle_day)
+    cycle_phase = (snap.get("cycle") or "").strip()
     if cfg.soma_enabled and soma:
+        asleep = soma.get("asleep")
         return {
-            "energy": round(float(snap["energy"]["value"]), 1),
+            "available": True,
+            "source": "soma",
+            "reason": "",
+            "energy": energy,
             "energy_text": snap["energy"]["text"],
             "sleep_pressure": soma.get("sleep_pressure"),
             "sleep_debt": soma.get("sleep_debt"),
             "hunger": soma.get("hunger"),
             "discomfort": soma.get("discomfort"),
             "arousal": soma.get("arousal"),
-            "asleep": bool(soma.get("asleep")),
+            # 三态：身体轴自己在说「不知道」时（空窗、睡眠窗口判不出）也传 None，
+            # 不要 bool(None) 把它压成「醒着」。
+            "asleep": None if asleep is None else bool(asleep),
             "last_sleep_hours": soma.get("last_sleep_hours"),
-            "social_energy": round(float(snap["social_energy"]["value"]), 1),
+            "social_energy": social_energy,
             "social_desire": soma.get("social_desire"),
-            "cycle_day": int(core.energy.cycle_day),
-            "cycle_phase": (snap.get("cycle") or "").strip(),
+            "cycle_day": cycle_day,
+            "cycle_phase": cycle_phase,
         }
     return {
-        "energy": round(float(snap["energy"]["value"]), 1),
+        "available": False,
+        "source": "disabled",
+        "reason": "soma_disabled",
+        "energy": energy,
         "energy_text": snap["energy"]["text"],
-        "sleep_pressure": 0.0,
-        "sleep_debt": 0.0,
-        "hunger": 0.0,
-        "discomfort": 0.0,
-        "arousal": 50.0,
-        "asleep": False,
-        "last_sleep_hours": 0.0,
-        "social_energy": round(float(snap["social_energy"]["value"]), 1),
-        "social_desire": 50.0,
-        "cycle_day": int(core.energy.cycle_day),
-        "cycle_phase": (snap.get("cycle") or "").strip(),
+        "sleep_pressure": None,
+        "sleep_debt": None,
+        "hunger": None,
+        "discomfort": None,
+        "arousal": None,
+        "asleep": None,
+        "last_sleep_hours": None,
+        "social_energy": social_energy,
+        "social_desire": None,
+        "cycle_day": cycle_day,
+        "cycle_phase": cycle_phase,
     }
 
 
@@ -393,12 +499,22 @@ def _fields_hash(contract: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()[:16]
 
 
-def _wake_block(core: Any) -> dict[str, Any]:
+def _wake_block(core: Any, cfg: Any = None) -> dict[str, Any]:
     """醒来状态：`soma.wake_state()` 的安全导出（拿不到 / 坏数据 → 空 dict）。
 
     只导出固定六个键并做类型清洗：契约是跨插件接口，对面不该因为 Core 内部换了
     一个字段形状就拿到一个藏着 None/NaN 的字典。
+
+    **身体轴没在跑时不导出**（B5 矩阵 D4）：`soma_enabled=false` 时 `body` 块是
+    `available:false / asleep:null`，而 `wake_state()` 会吐出上次开启时留下的
+    `asleep:false`——同一份契约里于是有两个「是否睡着」。这里改成不可用块。
+    `cfg` 缺省时从 `core.config` 取；两者都没有（老 Core / 单测直接喂 SimpleNamespace）
+    时保持旧行为，只做形状清洗。
     """
+    if cfg is None:
+        cfg = getattr(core, "config", None)
+    if cfg is not None and not getattr(cfg, "soma_enabled", True):
+        return _contract.unavailable("soma_disabled")
     try:
         state = core.soma.wake_state()
     except Exception:
@@ -447,37 +563,39 @@ def _contract_holiday(core) -> str:
         return ""
 
 
-def _routine_block(core, cfg, slots) -> dict:
+def night_window(core: Any, cfg: Any = None) -> dict:
+    """她的夜窗口：**唯一一份推导**，实现在 `state_snapshot.night()` → `clock.night_window()`。
+
+    优先级：日程里推出来的睡段（`soma.scheduled_night()`，老 Core 退回
+    `biological_night()`）→ 配置窗口；夜间模式关掉、或窗口长度为 0（`start == end`）
+    就是**没有夜**：`span` 为 0、`source` 为 "none"。
+
+    旧实现在这里自己算 `span = end - start if end > start else (24.0 - start) + end`：
+    `start == end`（面板上把起止设成同一时刻 = 关掉这个窗口）会算出 **24 小时**，
+    于是社交层收到「她一天 24 小时都在夜里」（审核 跨插件契约 7）；`max(1.0, span)`
+    又把「没有夜」抬成 1 小时。现在直接用 `cfg.night_span_hours`（它把这两种情况都算成 0）。
+
+    这层薄壳留着只为不改调用方（`api.clock()` 与既有测试都调 `link.night_window`）；
+    推导本身只有一份，见 `state_snapshot.night()` 的 docstring（四处答案收敛的那段历史）。
+    """
+    return _snapshot.night(core, cfg)
+
+
+def _routine_block(core, cfg, slots, window: Optional[dict] = None) -> dict:
     """作息：导出的是**她实际的**生物钟夜，不是配置里那个写死的窗口。
 
     社交层读的就是 `night_start_hour` / `night_end_hour` 判断「她这会儿该不该睡」。字段名
-    不动、契约版本不动，值改成从她今天的日程推出来的窗口（`soma.biological_night()`）——
-    夜猫子人格凌晨四点睡，社交层就该按凌晨四点算，而不是按配置里的 23:00 硬判。
-    日程还没生成或没排睡眠段时才退回配置窗口，并用 `night_source` 说清是哪来的。
+    不动、契约版本不动，值改成从她今天的日程推出来的窗口——夜猫子人格凌晨四点睡，社交层
+    就该按凌晨四点算，而不是按配置里的 23:00 硬判。日程还没生成或没排睡眠段时才退回配置
+    窗口，并用 `night_source` 说清是哪来的（`schedule` / `config` / `none`）。
     """
-    night = None
-    try:
-        candidate = core.soma.biological_night()
-    except Exception:
-        candidate = None
-    if candidate:
-        # `(0.0, 0.0)` 这种退化返回值以前会被当成有效的夜：start = end = 0，
-        # 跨度算出 24 小时，于是社交层收到「她一天 24 小时都在夜里」。
-        # 跨度不足半小时就退回配置窗口（`night_source` 也会如实写 config）。
-        try:
-            start_h, end_h = float(candidate[0]), float(candidate[1])
-        except (TypeError, ValueError, IndexError):
-            start_h, end_h = 0.0, 0.0
-        if (end_h - start_h) % 24.0 > 0.5:
-            night = (start_h, end_h)
-    source = "schedule" if night else "config"
-    start, end = night if night else (float(cfg.night_start_hour), float(cfg.night_end_hour))
-    span = end - start if end > start else (24.0 - start) + end
+    if window is None:
+        window = night_window(core, cfg)
     return {
-        "night_start_hour": round(start % 24.0, 2),
-        "night_end_hour": round(end % 24.0, 2),
-        "night_span_hours": round(max(1.0, span), 2),
-        "night_source": source,
+        "night_start_hour": round(float(window["start"]) % 24.0, 2),
+        "night_end_hour": round(float(window["end"]) % 24.0, 2),
+        "night_span_hours": round(float(window["span"]), 2),
+        "night_source": window["source"],
         "configured_night": [cfg.night_start_hour, cfg.night_end_hour],
         "sleep_need_hours": cfg.sleep_need_hours,
         "wake_at": schedule_wake_text(slots),
@@ -505,7 +623,15 @@ def social_data_dir(data_root: str | os.PathLike[str] | None) -> Path | None:
 
 
 class SocialSignals:
-    """只读社交层写回的信号。文件不存在或过期时一切返回空。"""
+    """只读社交层写回的信号。
+
+    v3.0.3（联动 跨插件契约 2）：**「读不到」不再伪装成「没有」**。以前文件不存在、
+    过期、坏 JSON 一律返回空字典，调用方分不清「写方说没有了」和「我不知道」——
+    两者对 `open_items` 是相反的结论（前者该清账，后者绝不能清）。现在读不到时返回
+    一个带标记的块：`{"available": False, "reason": "stale"|"corrupt"|"missing"|
+    "no_data_root"}`；读得到时就是写方原本那份字典（没有 `available` 键，与旧版同形）。
+    `status()` 与各 accessor 都按这个标记分支。
+    """
 
     def __init__(self, data_root_provider: Callable[[], Any], time_source: Callable[[], float] = time.time) -> None:
         self._root = data_root_provider
@@ -547,22 +673,36 @@ class SocialSignals:
         self._fingerprint = None
         self._payload = {}
 
+    def _stale_fallback(self, now: float, mtime: float) -> dict[str, Any]:
+        """读坏了 / 超大：**一律不可用**（B5 矩阵 D3）。
+
+        原来保鲜期内会 `return self._payload`——同一份坏文件，`read()` 返回上一次的
+        好数据（不带任何标记，消费方看起来与新鲜数据一样），而 `status()` 因为
+        `_unreadable` 报 `unreadable`：同一个对象对同一份文件给出两个答案。
+        「上一次的事实」不是「这一次的读取结果」，沿用等于把过期值伪装成当前值。
+
+        返回的是**带标记的不可用块**，不是空字典：空字典在 `open_items` 那里等于
+        「写方说全结了」，会把她的未完事项整本清空。
+        """
+        self._invalidate()
+        return _contract.unavailable(_contract.REASON_CORRUPT)
+
     def read(self) -> dict[str, Any]:
         now = self._time()
         try:
             path = signals_path(self._root())
         except Exception:
-            # 获取 data_root 失败时返回空，避免抛出异常中断调用方
-            return {}
+            # 获取 data_root 失败：这是「不知道」，不是「没有」。
+            return _contract.unavailable(_contract.REASON_NO_DATA_ROOT)
         if path is None:
             self._invalidate()
-            return {}
+            return _contract.unavailable(_contract.REASON_NO_DATA_ROOT)
         try:
             stat = path.stat()
         except OSError:
-            # 文件不存在或无法访问时返回空
+            # 文件不存在或无法访问（exists() 与 stat() 之间被删掉也走这里）。
             self._unreadable = True
-            return {}
+            return _contract.unavailable(_contract.REASON_MISSING)
         fingerprint = (stat.st_mtime_ns, stat.st_size)
         if fingerprint == self._fingerprint:
             payload = self._payload
@@ -570,20 +710,20 @@ class SocialSignals:
             if stat.st_size > SIGNALS_MAX_BYTES:
                 # 读到一半才炸不如根本不读：见 `SIGNALS_MAX_BYTES`。
                 self._unreadable = True
-                return self._payload or {}
+                return self._stale_fallback(now, stat.st_mtime)
             try:
                 parsed = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                # JSON 解析失败或读取错误时保持上一次的有效数据
+                # JSON 解析失败或读取错误：报不可用（B5 矩阵 D3，不再沿用上一次的值）
                 self._unreadable = True
-                return self._payload or {}
+                return self._stale_fallback(now, stat.st_mtime)
             except Exception:
-                # 其他未预期异常也返回上一次的有效数据
+                # 其他未预期异常同样报不可用，理由同上
                 self._unreadable = True
-                return self._payload or {}
+                return self._stale_fallback(now, stat.st_mtime)
             if not isinstance(parsed, dict):
                 self._unreadable = True
-                return self._payload or {}
+                return self._stale_fallback(now, stat.st_mtime)
             self._fingerprint = fingerprint
             self._payload = parsed
             self._unreadable = False
@@ -603,7 +743,7 @@ class SocialSignals:
             # 与「新鲜」逐次交替，写方声明的保鲜期实际只在第一次生效——社交层停了以后
             # Core 还会断断续续拿它那份「刚主动找过谁」去改自己的好感。
             self._invalidate()
-            return {}
+            return _contract.unavailable(_contract.REASON_STALE)
         return payload
 
     def _scope_of(self, payload: dict[str, Any], role_id: str = "") -> dict[str, Any]:
@@ -823,8 +963,15 @@ class SocialSignals:
             age = max(0.0, now - path.stat().st_mtime)
         except OSError:
             age = None
-        if self._unreadable:
+        # v3.0.3：判据从「payload 空不空」改成读 `read()` 带回来的标记。空字典不再
+        # 是「读不到」的同义词——它是写方明确写的空表（fresh 的空表）。
+        reason = _contract.unavailable_reason(payload)
+        if reason in (_contract.REASON_CORRUPT, _contract.REASON_UNREADABLE) or self._unreadable:
             return {"state": "unreadable", "path": str(path), "age": age, "payload": {}}
-        if not payload and age is not None and age > self._ttl():
+        if reason == _contract.REASON_STALE:
             return {"state": "stale", "path": str(path), "age": age, "payload": {}}
+        if reason == _contract.REASON_MISSING:
+            return {"state": "never_written", "path": str(path), "age": age, "payload": {}}
+        if reason == _contract.REASON_NO_DATA_ROOT:
+            return {"state": "no_data_root", "path": "", "age": None, "payload": {}}
         return {"state": "fresh", "path": str(path), "age": age, "payload": payload}

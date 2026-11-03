@@ -87,12 +87,13 @@ class ContractDreamsAndWakeTest(unittest.TestCase):
         self.assertEqual(wake["inertia_minutes_left"], 5)
 
     def test_capabilities_only_added(self):
-        self.assertEqual(CONTRACT_VERSION, 2)
+        # v3.0.3（契约 2）：身体轴可以是 null（「这项没在跑」），数值域变了 → 主版本 +1。
+        self.assertEqual(CONTRACT_VERSION, 3)
         for legacy in ("body", "feelings", "form", "activity", "day", "ongoing", "routine"):
             self.assertIn(legacy, CONTRACT_CAPABILITIES)
         self.assertIn("dreams", CONTRACT_CAPABILITIES)
         self.assertIn("wake", CONTRACT_CAPABILITIES)
-        self.assertEqual(API_VERSION, 2)
+        self.assertEqual(API_VERSION, 3)
         for legacy in ("brief", "clock", "events", "fingerprint"):
             self.assertIn(legacy, CAPABILITIES)
         self.assertIn("dreams", CAPABILITIES)

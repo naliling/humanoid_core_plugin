@@ -1,7 +1,7 @@
 {
   "timezone_city": {
     "description": "她所在的城市",
-    "hint": "IANA 时区名，决定几点算白天",
+    "hint": "城市名（河源/北京/大阪…）或 IANA 时区名（Asia/Shanghai），决定她的钟点、天气与季节",
     "type": "string",
     "default": "河源（记得改~）"
   },
@@ -132,7 +132,7 @@
   },
   "schedule_prompt_extra": {
     "description": "日程补充偏好",
-    "hint": "以「仅供参考」递给模型，与人设、身体状态一起权衡，不是必须执行的指令",
+    "hint": "以「仅供参考」递给模型，与人设、身体状态一起权衡，不是必须执行的指令。超过 300 字会被截断",
     "type": "string",
     "default": "劳逸结合，有动有静，节奏均衡。",
     "condition": {
@@ -260,7 +260,14 @@
     "description": "【进阶】精力上限",
     "hint": "她的精力条顶格值，默认 100。",
     "type": "float",
-    "default": 100
+    "default": 100,
+    "minimum": 1,
+    "maximum": 10000,
+    "slider": {
+      "min": 1,
+      "max": 10000,
+      "step": 100
+    }
   },
   "enable_cycle": {
     "description": "【进阶】生理周期",
@@ -286,15 +293,16 @@
   },
   "energy_decay_rate": {
     "description": "【进阶】精力变化倍率",
-    "hint": "所有精力涨落速度的总乘数：越大越容易累、歇起来也快。",
-    "type": "string",
-    "default": "0.5",
-    "options": [
-      "0.5",
-      "1.0",
-      "2.0",
-      "3.0"
-    ]
+    "hint": "所有精力涨落速度的总乘数：越大越容易累、歇起来也快。0~3，默认 0.5（旧版四档 0.5/1.0/2.0/3.0 仍然等价）。",
+    "type": "float",
+    "default": 0.5,
+    "minimum": 0,
+    "maximum": 3,
+    "slider": {
+      "min": 0,
+      "max": 3,
+      "step": 0.1
+    }
   },
   "cycle_description_style": {
     "description": "【进阶】周期描述风格",
@@ -504,8 +512,8 @@
     }
   },
   "weather_location": {
-    "description": "天气城市(英文)",
-    "hint": "天气取哪个城市（英文名，如 Beijing,CN）",
+    "description": "天气城市",
+    "hint": "天气取哪个城市：英文名+国家码（如 Beijing,CN），也可填 IANA 时区名（如 Asia/Shanghai）或表里的中文地名",
     "type": "string",
     "default": "",
     "condition": {
@@ -542,13 +550,13 @@
   },
   "outfit_enabled": {
     "description": "穿搭",
-    "hint": "给她一件贴身的衣服（她知道自己在穿什么）。按名字/人设/物种挑；判不准就不给",
+    "hint": "给她一件贴身的衣服（她知道自己在穿什么）。按人设原文/物种挑（判不出就不给）",
     "type": "bool",
     "default": true
   },
   "outfit_preset": {
     "description": "【进阶】手写穿搭预设",
-    "hint": "留空 = 按人设自动判物种取默认；填了就优先用它（也可用 /拟人 设置 穿搭 单独给某个角色设）",
+    "hint": "留空 = 先读人设里写的穿着，没写再按物种取默认；填了就优先用它（也可用 /拟人 设置 穿搭 单独给某个角色设）。超过 200 字会被截断",
     "type": "string",
     "default": "",
     "condition": {
@@ -946,7 +954,7 @@
   },
   "mood_data_retention_days": {
     "description": "【进阶】情绪数据保留(天)",
-    "hint": "超过这么多天没说话的人，情绪档案清回初始值（称呼与来源保留）",
+    "hint": "超过这么多天没说话的人，情绪档案清回初始值（称呼与来源保留）。填 0 = 永不清理（不是「保留 0 天立刻清」），并会让下面的「久未联系归档」完全失效",
     "type": "int",
     "default": 7,
     "minimum": 0,
@@ -1134,12 +1142,9 @@
   },
   "show_sleep_window": {
     "description": "【进阶】提不提睡眠这件事",
-    "hint": "要不要说她什么时候睡",
+    "hint": "要不要说她什么时候睡。关掉「生物钟夜」时睡眠句本来就不出，这个开关只管「夜开着的时候提不提」",
     "type": "bool",
-    "default": true,
-    "condition": {
-      "night_mode_enabled": true
-    }
+    "default": true
   },
   "night_deep_sleep_ratio": {
     "description": "【进阶】深睡占比",
@@ -1171,7 +1176,7 @@
   },
   "energy_natural_recovery_per_minute": {
     "description": "【进阶】每分钟恢复量",
-    "hint": "休息时段每分钟涨多少精力，0.05~0.9。",
+    "hint": "休息时段每分钟涨多少精力，0~0.9（0 = 关闭自然恢复）。",
     "type": "float",
     "default": 0.15,
     "minimum": 0,
@@ -1203,7 +1208,7 @@
   },
   "energy_consumption_per_msg": {
     "description": "【进阶】聊天耗精力",
-    "hint": "每来一条消息掉多少精力，0.01~0.9。",
+    "hint": "每来一条消息掉多少精力，0~0.9（0 = 关闭按条消耗）。",
     "type": "float",
     "default": 0.04,
     "minimum": 0,
@@ -1228,6 +1233,8 @@
       0.9,
       0.7
     ],
+    "minItems": 8,
+    "maxItems": 8,
     "condition": {
       "enable_cycle": true
     }
@@ -1268,9 +1275,35 @@
       "with_last_msg"
     ]
   },
+  "sibling_window_seconds": {
+    "description": "【进阶】兄弟 bot 互聊窗口(秒)",
+    "hint": "同平台另一个 bot 与她的对话，在这么多秒内最多连续放行「兄弟 bot 互聊上限」次；真人一开口清零。默认 600。",
+    "type": "float",
+    "default": 600.0,
+    "minimum": 1,
+    "maximum": 86400,
+    "slider": {
+      "min": 1,
+      "max": 86400,
+      "step": 60
+    }
+  },
+  "sibling_max_turns": {
+    "description": "【进阶】兄弟 bot 互聊上限(次)",
+    "hint": "同一对角色在窗口内最多连续放行几次机器对机器的对话。默认 3。",
+    "type": "int",
+    "default": 3,
+    "minimum": 1,
+    "maximum": 50,
+    "slider": {
+      "min": 1,
+      "max": 50,
+      "step": 1
+    }
+  },
   "soma_enabled": {
     "description": "多轴身体",
-    "hint": "要不要维护身体状态（精力/饥饿/困意）。v3.0.0 起关闭身体轴不再连带停发跨插件契约：identity/日程/天气/节日等非身体块照常导出，身体块给中性表示",
+    "hint": "要不要维护身体状态（精力/饥饿/困意）。v3.0.0 起关闭身体轴不再连带停发跨插件契约：identity/日程/天气/节日等非身体块照常导出，身体块标不可用（available:false），数值给 null（不是 0/50/false）",
     "type": "bool",
     "default": true
   },
@@ -1374,13 +1407,10 @@
     }
   },
   "contract_enabled": {
-    "description": "【进阶】导出契约给社交层",
+    "description": "【进阶】导出契约给社交层（与身体层无关，关掉身体层不影响它）",
     "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度。总开关：false 时整份跨插件契约（含 identity/日程/天气/节日等非身体块）都不导出，自主拟人社交会退回旧字段；只关身体请用 soma_enabled",
     "type": "bool",
-    "default": true,
-    "condition": {
-      "soma_enabled": true
-    }
+    "default": true
   },
   "schedule_persona_max_chars": {
     "type": "int",
@@ -1444,6 +1474,13 @@
   "ccb_libido_min": {
     "type": "float",
     "default": 38,
+    "minimum": 0,
+    "maximum": 50,
+    "slider": {
+      "min": 0,
+      "max": 50,
+      "step": 1
+    },
     "description": "亲近欲达到多少才可能进入情境（0~50）。",
     "hint": "越低越容易被触发。",
     "condition": {
@@ -1453,6 +1490,13 @@
   "ccb_libido_rise": {
     "type": "float",
     "default": 4,
+    "minimum": 0,
+    "maximum": 20,
+    "slider": {
+      "min": 0,
+      "max": 20,
+      "step": 1
+    },
     "description": "比自己的基线高出多少才算「明显想要」（0~20）。",
     "condition": {
       "ccb": true
@@ -1461,6 +1505,13 @@
   "ccb_affection_min": {
     "type": "float",
     "default": 50,
+    "minimum": 0,
+    "maximum": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 1
+    },
     "description": "好感达到多少才可能进入情境（0~100）。",
     "hint": "线上用户好感多在 35~60，设太高会永远触发不到。",
     "condition": {
@@ -1470,6 +1521,13 @@
   "ccb_affection_rise": {
     "type": "float",
     "default": 8,
+    "minimum": 0,
+    "maximum": 50,
+    "slider": {
+      "min": 0,
+      "max": 50,
+      "step": 1
+    },
     "description": "比基线高出多少才算「明显亲近」（0~50）。",
     "condition": {
       "ccb": true
@@ -1478,6 +1536,13 @@
   "ccb_affection_deep": {
     "type": "float",
     "default": 75,
+    "minimum": 0,
+    "maximum": 100,
+    "slider": {
+      "min": 0,
+      "max": 100,
+      "step": 1
+    },
     "description": "好感达到这条线进入更亲密的一档（0~100）。",
     "condition": {
       "ccb": true
@@ -1535,7 +1600,7 @@
   },
   "ccb_partner_length_cm": {
     "type": "float",
-    "default": 13,
+    "default": 15,
     "minimum": 0,
     "maximum": 30,
     "slider": {
@@ -1543,8 +1608,8 @@
       "max": 30,
       "step": 0.5
     },
-    "description": "对方尺寸的初值（cm）。0 表示不判定深度。",
-    "hint": "每个用户各存一份初值，第一次进入场景时定下，之后不再变。",
+    "description": "对方尺寸的初值（cm）。0 表示不判定深度；必须大于上面的「身体深度上限」，否则「过深」这一档永不触发。",
+    "hint": "每个用户各存一份初值，第一次进入场景时定下，之后不再变。默认 15，大于出厂的身体深度上限 14。",
     "condition": {
       "ccb": true
     }

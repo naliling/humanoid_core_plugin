@@ -109,12 +109,12 @@ class PresenceHidden(unittest.TestCase):
         core = _core(True, ccb_allowed_users=["10001"])
         _mood(core, affection=92.0, libido=41.0)
         text = core.build_injection("u1")
-        self.assertNotIn("她此刻的欲望", text)
+        self.assertNotIn("我此刻的欲望", text)
 
     def test_listed_user_still_sees_it(self):
         core = _core(True, ccb_allowed_users=["u1"])
         _mood(core, affection=92.0, libido=41.0)
-        self.assertIn("她此刻的欲望", core.build_injection("u1"))
+        self.assertIn("我此刻的欲望", core.build_injection("u1"))
 
 
 class EmotionGate(unittest.TestCase):
@@ -146,9 +146,14 @@ class FacadeHidden(unittest.TestCase):
         return api.CoreFacade(roles, None)
 
     def test_intimacy_returns_nothing(self):
+        """名单外 = 明确拒绝，不是「没有这份资料」。
+
+        v3.0.3（联动 模型与导出 11）：拒绝返回 `{"status": "denied"}`，
+        与「拿不到」的空字典 `{}` 区分开——消费方要能分清「不给」和「没有」。
+        """
         core = _core(True, ccb_allowed_users=["10001"])
         _mood(core, affection=92.0)
-        self.assertEqual(self._facade(core).intimacy("bot1", "u1"), {})
+        self.assertEqual(self._facade(core).intimacy("bot1", "u1"), {"status": "denied"})
 
     def test_relationship_zeroes_the_intimacy_fields(self):
         core = _core(True, ccb_allowed_users=["10001"])

@@ -112,6 +112,24 @@ class FalsePositives(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(ccb.detect_occurrence(text))
 
+    def test_subject_is_not_required(self):
+        """#172：同一件事有没有主语，结论必须一样。
+
+        原来 `detect_occurrence` 前面还有一道「句中有没有你/我/她…」的门槛，
+        于是「昨晚我们做爱了」记一次、「昨晚做爱了」一次都不记——而她的话
+        （`_ccb_note_scene_text`）本来就常省略主语。
+        """
+        for text in ("昨晚做爱了", "做过了", "已经做爱了"):
+            with self.subTest(text=text):
+                self.assertTrue(ccb.detect_occurrence(text), f"「{text}」该记一次")
+
+    def test_question_without_subject_still_blocks(self):
+        """门槛拿掉后，没有主语的疑问/提议不能变成「发生过」。"""
+        for text in ("做爱了吗", "做过了吧", "做爱什么感觉"):
+            with self.subTest(text=text):
+                self.assertFalse(ccb.detect_occurrence(text), f"「{text}」不该记")
+
+
 
 class KeySplit(unittest.TestCase):
     """P0-3 / P0-4：三个时间键语义不同，不许互相覆盖。"""
@@ -151,18 +169,21 @@ class KeySplit(unittest.TestCase):
         self.assertEqual(u["ccb_done_count"], 2.0)
 
     def test_one_event_is_counted_once_across_both_paths(self):
-        """场景渲染与文本命中是**同一件事**，不该各记一次。"""
+        """场景推进不记账；文本命中只记一次，且重复渲染不再加。"""
         core = _core()
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
-        # 先在场景里渲染一轮
+        # 场景里渲染一轮：推进是「这一场还在」，不是「发生过」
         core.build_injection("u1")
         first = float(state.get("ccb_done_count", 0.0) or 0.0)
-        self.assertEqual(first, 1.0)
-        # 同一分钟里她再说到这件事 → 不重复计
+        self.assertEqual(first, 0.0, "推进场景不该改一辈子的次数")
+        # 她说到这件事 → 记一次
         core.note_her_words("u1", "我们做过了")
-        self.assertEqual(float(state.get("ccb_done_count", 0.0) or 0.0), first)
+        self.assertEqual(float(state.get("ccb_done_count", 0.0) or 0.0), 1.0)
+        # 同一分钟里再渲染一轮 → 不重复计
+        core.build_injection("u1")
+        self.assertEqual(float(state.get("ccb_done_count", 0.0) or 0.0), 1.0)
 
 
 class GroupSilence(unittest.TestCase):

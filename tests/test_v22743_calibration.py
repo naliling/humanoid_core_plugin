@@ -117,7 +117,7 @@ class WeatherRepeatTest(unittest.TestCase):
     def _builder(self, now):
         b = PromptBuilder.__new__(PromptBuilder)
         b._core = SimpleNamespace(now_epoch=lambda: now)
-        b._weather_seen = None
+        b._weather_gate = None
         return b
 
     def test_first_time_is_written(self) -> None:
@@ -140,6 +140,71 @@ class WeatherRepeatTest(unittest.TestCase):
         b._weather_worth_saying("阴，气温 8℃")
         b._core = SimpleNamespace(now_epoch=lambda: 1000.0 + 4 * 3600 + 1)
         self.assertTrue(b._weather_worth_saying("阴，气温 8℃"))
+
+    def test_another_session_still_gets_the_weather(self) -> None:
+        """审核 P-08 #41：去重状态不能是角色级单值。
+
+        旧写法是 PromptBuilder 上一个 (文本, 时刻)，整个角色共用一份——A 会话把
+        「阴，气温 8℃」讲过后，B 会话 4 小时内再也拿不到天气句（各看各的窗外，
+        天气对谁都是同一句，但「刚说过」是对**每个会话**分别成立的）。
+        """
+        b = self._builder(1000.0)
+        self.assertTrue(b._weather_worth_saying("阴，气温 8℃", key="umo:a"))
+        self.assertFalse(b._weather_worth_saying("阴，气温 8℃", key="umo:a"))
+        self.assertTrue(b._weather_worth_saying("阴，气温 8℃", key="umo:b"))
+
+    def test_empty_key_keeps_the_old_single_bucket(self) -> None:
+        """key 为空时退化成旧行为：没接线也不炸、也不会突然每轮复读。"""
+        b = self._builder(1000.0)
+        self.assertTrue(b._weather_worth_saying("阴，气温 8℃"))
+        self.assertFalse(b._weather_worth_saying("阴，气温 8℃"))
+
+    def test_city_is_part_of_the_fingerprint(self) -> None:
+        """换了城市就是天气变了，该说——指纹里带城市。"""
+        b = self._builder(1000.0)
+        self.assertTrue(b._weather_worth_saying("阴，气温 8℃", key="umo:a", city="河源"))
+        self.assertTrue(b._weather_worth_saying("阴，气温 8℃", key="umo:a", city="北京"))
+
+    def test_gate_buckets_are_bounded(self) -> None:
+        """桶上限 64、淘汰最旧：只放内存，但不能无界增长。"""
+        from humanoid.services.weather import WEATHER_SEEN_LIMIT, WeatherSayGate
+
+        gate = WeatherSayGate()
+        for i in range(WEATHER_SEEN_LIMIT + 10):
+            gate.worth_saying("阴，气温 8℃", key="umo:%d" % i, now=1000.0 + i)
+        self.assertEqual(len(gate._seen), WEATHER_SEEN_LIMIT)
+        # 最旧的桶被淘汰了：它再问一次算「第一次」，该说。
+        self.assertTrue(gate.worth_saying("阴，气温 8℃", key="umo:0", now=2000.0))
+
+    def _full_builder(self, now):
+        import datetime
+
+        b = PromptBuilder.__new__(PromptBuilder)
+        clock = SimpleNamespace(
+            now=lambda: datetime.datetime(2024, 3, 1, 15, 20, 33),
+            holiday=lambda *a, **k: "",
+            weekday=lambda: "五",
+            city="河源",
+        )
+        b._core = SimpleNamespace(
+            config=SimpleNamespace(show_city_time_in_low_intrusion=True),
+            clock=clock,
+            now_epoch=lambda: now,
+            snapshot=lambda refresh=False: {
+                "today": "3月1日",
+                "city": "河源",
+                "weather": {"env": "天气：阴，气温 8℃"},
+            },
+        )
+        b._weather_gate = None
+        return b
+
+    def test_background_note_is_per_session(self) -> None:
+        """整条链路：A 会话讲过天气，B 会话的【此刻的她】里照样有（#41）。"""
+        b = self._full_builder(1000.0)
+        self.assertIn("外头阴，气温 8℃", b.background_note(key="umo:a"))
+        self.assertNotIn("外头阴，气温 8℃", b.background_note(key="umo:a"))
+        self.assertIn("外头阴，气温 8℃", b.background_note(key="umo:b"))
 
 
 if __name__ == "__main__":

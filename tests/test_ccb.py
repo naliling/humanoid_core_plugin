@@ -266,16 +266,35 @@ class EndToEnd(unittest.TestCase):
         core = self._core(True)
         self._mood(core)
         us = core._scope.user_state("u1")
-        # 第一次：条件全中 → 触发，写记录
+        # 第一次：条件全中 → 进场景。进场景只记「今天第 1 场」，不是「发生过」。
         self._line(core)
-        self.assertEqual(us.get("ccb_done_count"), 1.0)
+        self.assertEqual(us.get("ccb_turns"), 1.0, "进一场 = 当日 1 次")
+        self.assertEqual(us.get("ccb_done_count", 0.0), 0.0, "推进场景不是发生")
+        # 记一次「真的发生过」（记录层唯一入口），再验证冷却不会把它清掉。
+        ccb.note_occurrence(us, float(us["ccb_activity_at"]))
         first_at = us.get("ccb_last_at")
         self.assertGreater(first_at, 0.0)
         # 第二次：同一个人、数值不变、时间没走 → 落在冷却里 → 返回 None
         self._line(core)
         self.assertEqual(us.get("ccb_done_count"), 1.0, "冷却不该把一辈子的次数清掉")
-        self.assertEqual(us.get("ccb_last_at"), first_at, "冷却不该把上次时间清掉")
-        self.assertGreaterEqual(us.get("ccb_turns"), 1.0, "冷却不该把当日次数清掉")
+        self.assertEqual(us.get("ccb_last_at"), first_at, "冷却不该把上次发生的时间清掉")
+        self.assertEqual(us.get("ccb_turns"), 1.0, "冷却不该把当日次数清掉")
+
+    def test_idle_scene_ends_instead_of_resuming(self):
+        """F8：6 小时没人碰过的那一场，状态机也要结束它，而不是隔夜续场。"""
+        core = self._core(True)
+        # 门槛不满足：结束之后不该立刻又开一场，否则断言分不清「重置」和「续场」。
+        self._mood(core, libido=35.0, base_libido=34.0)
+        us = core._scope.user_state("u1")
+        now = core.now_epoch()
+        us.update({"ccb_stage": 2.0, "ccb_satisfy": 40.0, "ccb_pose": 2.0,
+                   "ccb_activity_at": now - 7 * 3600.0,
+                   "ccb_last_at": now - 7 * 3600.0})
+        self.assertFalse(ccb.scene_active(us, now), "7 小时没动静，与面板同口径已过期")
+        core.build_injection("u1")
+        self.assertEqual(float(us.get("ccb_stage", 0.0) or 0.0), 0.0,
+                         "状态机该真的结束这一场，不能隔夜续着姿势与满足度")
+        self.assertEqual(float(us.get("ccb_satisfy", 0.0) or 0.0), 0.0, "满足度随场景结束清掉")
 
 
 class State(unittest.TestCase):
@@ -475,3 +494,189 @@ class ThresholdsAreConfigurable(unittest.TestCase):
 def ccb_default(name: str) -> float:
     from humanoid import ccb
     return float(getattr(ccb, name))
+
+class CcbDayTimezoneTest(unittest.TestCase):
+    """#29/#79：ccb 的按天账按**她的日历**算，不能按宿主本地日。
+
+    同一 epoch 秒在东京与洛杉矶不是同一天：日键写死宿主日，跨日时刻就会在
+    她那边的半夜翻页——「当天 8 次」与按天回落都跟着错。
+    """
+
+    @staticmethod
+    def _tz(hours: int):
+        from datetime import timedelta, timezone
+        return timezone(timedelta(hours=hours))
+
+    def test_day_index_follows_the_injected_timezone(self):
+        from datetime import timezone
+        moment = datetime(2026, 1, 1, 23, 30, tzinfo=timezone.utc).timestamp()
+        tokyo, la = self._tz(9), self._tz(-8)
+        self.assertEqual(ccb._day_index(moment, tokyo) - ccb._day_index(moment, la), 1,
+                         "UTC 23:30 时东京已是 1 月 2 日、洛杉矶还是 1 月 1 日")
+        # 不传 tz 时保持旧口径（宿主本地日），注入不改变默认行为。
+        self.assertEqual(ccb._day_index(moment), ccb._day_index(moment, None))
+
+    def test_decay_follows_her_midnight(self):
+        from datetime import timezone
+        moment = datetime(2026, 1, 1, 15, 30, tzinfo=timezone.utc).timestamp()
+        tokyo, la = self._tz(9), self._tz(-8)
+        # 东京那边已经是 1 月 2 日 00:30（账记在 3 小时前的 1 月 1 日）；
+        # 洛杉矶那边还是 1 月 1 日 07:30。
+        state = {"ccb_day": float(ccb._day_index(moment - 3 * 3600, tokyo)),
+                 "ccb_satisfy": 100.0, "ccb_turns": 3.0}
+        ccb.decay_satisfy(state, moment, tz=tokyo)
+        self.assertLess(state["ccb_satisfy"], 100.0, "她那边已翻页，必须回落")
+        self.assertEqual(state["ccb_turns"], 0.0)
+        state2 = {"ccb_day": float(ccb._day_index(moment, la)),
+                  "ccb_satisfy": 100.0, "ccb_turns": 3.0}
+        ccb.decay_satisfy(state2, moment, tz=la)
+        self.assertEqual(state2["ccb_satisfy"], 100.0, "洛杉矶还没翻页，不该动账")
+        self.assertEqual(state2["ccb_turns"], 3.0)
+
+    def test_roll_day_and_pending_days_take_the_same_tz(self):
+        from datetime import timezone
+        moment = datetime(2026, 1, 1, 15, 30, tzinfo=timezone.utc).timestamp()
+        tokyo = self._tz(9)
+        state = {"ccb_day": float(ccb._day_index(moment - 3 * 3600, tokyo)),
+                 "ccb_satisfy": 100.0, "ccb_turns": 8.0}
+        self.assertEqual(ccb.pending_days(state, moment, tokyo), 1)
+        self.assertTrue(ccb.roll_day(state, moment, tokyo))
+        self.assertEqual(state["ccb_turns"], 0.0, "新的一天：当日次数归零")
+
+
+class ThresholdHasOneStory(unittest.TestCase):
+    """#158：同一个门槛在注释里有三套互相矛盾的说法（38/50、45/50、「收到 10」）。
+
+    改门槛的人只能靠猜哪套是真的；更糟的是「涨 10」是配 45/50 那套的历史值，
+    绝对值降到 38 之后它让门槛永远够不着。这里钉住两件事：常量就是唯一说法，
+    注入层/面板读的是同一组常量（`prompt_builder` 与 `scene_status` 都引用它们）。
+    """
+
+    def test_the_floor_is_38_out_of_50(self):
+        from humanoid import ccb
+        self.assertEqual(ccb.CCB_LIBIDO_MIN, 38.0)
+        self.assertEqual(ccb.LIBIDO_MAX, 50.0)
+
+    def test_the_rise_is_paired_with_the_floor(self):
+        """默认基线 34 + 涨幅 4 = 38，正好够到绝对门槛；涨 10 就永远过不去。"""
+        from humanoid import ccb
+        self.assertEqual(ccb.CCB_LIBIDO_RISE, 4.0)
+        self.assertEqual(34.0 + ccb.CCB_LIBIDO_RISE, ccb.CCB_LIBIDO_MIN)
+
+    def test_no_second_version_of_the_threshold_in_the_source(self):
+        """源码里不许再出现「45/50」「收到 10」这类历史说法。"""
+        import inspect
+        from humanoid import ccb
+        src = inspect.getsource(ccb)
+        for stale in ("45/50", "收到 10"):
+            self.assertNotIn(stale, src, f"ccb.py 里还留着「{stale}」这套说法")
+
+    def test_the_floor_is_the_same_one_the_injection_uses(self):
+        """注入层与面板读常量，不各自抄一份数字。"""
+        import inspect
+        from humanoid import ccb, prompt_builder
+        src = inspect.getsource(prompt_builder)
+        self.assertIn("CCB_LIBIDO_MIN", src)
+        self.assertIn("CCB_LIBIDO_RISE", src)
+
+
+class PhaseNamesAreFeelings(unittest.TestCase):
+    """#12：阶段名必须是**她的感受**，不是临床分期。
+
+    第 2 档原来写「平台」——Masters & Johnson 四阶段模型里 plateau 的直译，混在
+    动情/临界/爆发/余韵 里语域不一致（其余四档都是感受，唯独这个是教科书术语），
+    中文里「平台」还首先指产品/场所。改名不能只改一处字符串：注入（scene_note、
+    prompt_builder）与面板（scene_status.stage_name）都读 PHASE_NAMES 这一份词表，
+    所以这里钉住词表本身，而不是某一条注入句子。
+    """
+
+    def test_no_clinical_term_in_the_phase_names(self):
+        from humanoid import ccb
+        self.assertNotIn("平台", ccb.PHASE_NAMES)
+        self.assertEqual(ccb.PHASE_NAMES[2], "沉醉")
+
+    def test_every_phase_name_has_the_same_register_and_length(self):
+        """五档同语域：都是两字感受词，空档 0 例外。"""
+        from humanoid import ccb
+        self.assertEqual(ccb.PHASE_NAMES[0], "")
+        for i, name in enumerate(ccb.PHASE_NAMES[1:], 1):
+            with self.subTest(phase=i):
+                self.assertEqual(len(name), 2, f"第 {i} 档「{name}」长度与邻居不一致")
+
+    def test_injection_never_carries_stage_names(self):
+        """注入里不出现状态机档位名（#62，与 #12 改名的分工）。
+
+        面板 / `/状态` / API 仍然读 `PHASE_NAMES` 这一份词表（运营看档位），但**注入侧
+        不许**把档位名拼给模型：README 承诺「只把背景递给她」，而「临界/爆发」是状态机
+        档位名，模型会当成事实复述。注入侧的措辞由 emotion 的感受表给出，而感受表的
+        阈值仍从 ccb 的相位常量推导——是同一份事实的两种受众，不是两套数字（#158 的教训
+        是「同一个数字写两遍」，不是「同一个事实换个说法」）。
+        """
+        import inspect
+        from humanoid import ccb, emotion, prompt_builder
+        # 面板 / API 侧照旧：档位名给运营看。
+        self.assertIn("沉醉", ccb.scene_note(pose=-1, site=-1, phase=2, over=None))
+        # 注入侧不许自己拼档位名。
+        self.assertNotIn("PHASE_NAMES", inspect.getsource(prompt_builder),
+                         "注入侧不许直接拼档位名，感受词由 emotion 的感受表给出")
+        # 注入侧唯一取 scene_note 的地方必须把 phase 钉成 0（档位由感受表翻词）。
+        # 查的是**调用参数**，不是源码里有没有出现过「余韵」二字——注释和 docstring
+        # 里讲这套分工是应该的，按全文子串查会把说明文字也判成违规。
+        self.assertIn("phase=0", inspect.getsource(emotion.EmotionLayer._with_scene_note),
+                      "注入侧调 scene_note 时必须 phase=0，否则档位名会漏进上下文")
+        # 感受词表与档位名表必须同长（索引对齐），且一条都不含档位名。
+        self.assertEqual(len(emotion._SCENE_FEELINGS), len(ccb.PHASE_NAMES))
+        for name in ccb.PHASE_NAMES[1:]:
+            for feeling in emotion._SCENE_FEELINGS:
+                self.assertNotIn(name, feeling, f"感受词「{feeling}」里含档位名「{name}」")
+
+class RefusalIsNotSwallowedByAJoke(unittest.TestCase):
+    """#80/#127：玩笑词只在命中词附近豁免，不能整句否决拒绝判定。
+
+    旧实现是 `if any(j in s for j in _CCB_JOKE): return False`：只要句子里出现
+    「哼 / 才不 / 哈哈 / 讨厌啦」，整句就不是拒绝。于是一条「住手，哈哈」在结算里
+    被判成没拒绝——好感 +2 而不是 -4，攻击性还往下走。
+    """
+
+    def test_hard_refusal_survives_filler_words(self):
+        for text in ("住手，哈哈", "哼，住手！", "放开我，哼", "我不愿意，哈哈"):
+            with self.subTest(text=text):
+                self.assertTrue(ccb.detect_refusal_hard(text))
+                self.assertTrue(ccb.detect_refusal(text))
+
+    def test_joke_exempts_only_near_the_refusal_word(self):
+        # 玩笑词紧贴拒绝词 → 当玩笑（欲拒还迎），不判拒绝。
+        self.assertFalse(ccb.detect_refusal("不要，逗你玩的"))
+        # 玩笑词离得远 → 后半句是真拒绝；硬拒绝也一样，只豁免命中处附近。
+        self.assertTrue(ccb.detect_refusal("开玩笑的啦，不过我真的不要了"))
+        self.assertTrue(ccb.detect_refusal_hard("笑死，你居然让我住手"))
+
+    def test_filler_words_are_no_longer_joke_words(self):
+        for word in ("哼", "才不", "哈哈"):
+            self.assertNotIn(word, ccb._CCB_JOKE, f"「{word}」是语气词，不是开玩笑的信号")
+        self.assertFalse(ccb.detect_refusal("才不呢"))
+        self.assertTrue(ccb.detect_refusal("不行，哈哈"))
+
+    def test_coquettish_tao_yan_la_is_not_a_refusal(self):
+        """撒娇「讨厌啦」是玩笑词（lead 拍板），但裸「讨厌」仍算拒绝。"""
+        self.assertIn("讨厌啦", ccb._CCB_JOKE)
+        self.assertNotIn("讨厌", ccb._CCB_JOKE)
+        self.assertFalse(ccb.detect_refusal("讨厌啦"))
+        self.assertFalse(ccb.detect_refusal_hard("讨厌啦"))
+        # 硬拒绝先查：同一句里带「讨厌啦」也吞不掉「住手」。
+        self.assertTrue(ccb.detect_refusal_hard("住手，讨厌啦"))
+        self.assertTrue(ccb.detect_refusal("住手，讨厌啦"))
+        self.assertTrue(ccb.detect_refusal("真讨厌"))
+
+    def test_a_refused_occurrence_settles_as_refused(self):
+        """同一条消息只该有一个结论：判成拒绝 → 好感掉 4，不是涨 2。"""
+        profile = {"affection": 50.0, "libido": 34.0, "aggression": 10.0, "base_affection": 46.0}
+        state = {"ccb_done_count": 3.0}
+        refused = ccb.detect_refusal("住手，哈哈")
+        out = ccb.occurrence_effects(state, profile, refused=refused)
+        self.assertEqual(out["affection"], 46.0)
+        self.assertEqual(out["aggression"], 16.0)
+        # 对照：真的在开玩笑时仍按「没拒绝」结算（非第一次且已到基线 → +2+3）。
+        joke = ccb.occurrence_effects(state, profile, refused=ccb.detect_refusal("不要，逗你玩的"))
+        self.assertEqual(joke["affection"], 55.0)
+

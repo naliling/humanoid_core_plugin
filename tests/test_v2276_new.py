@@ -163,15 +163,17 @@ class PhaseMultipliersTest(unittest.TestCase):
         cfg = HumanoidConfig.from_raw({"energy_recovery_phase_multipliers": custom})
         self.assertEqual(list(cfg.energy_recovery_phase_multipliers), custom)
 
-    def test_legacy_six_values_fall_back_to_default(self):
-        """旧版是 6 段，索引语义已改成 8 段——长度对不上就整体用新默认，
-        否则中间几段的恢复倍率会静默错位（面板显 8 段，代码按旧顺序取）。"""
+    def test_legacy_six_values_keep_their_slots_and_are_padded(self):
+        """旧版是 6 段，索引语义已改成 8 段：前 6 项按位置保留，缺的尾巴补默认，
+        既不错位也不把用户自己填的倍率整表丢掉。"""
         legacy = [0.5, 1.0, 2.0, 1.0, 0.8, 0.7]
         cfg = HumanoidConfig.from_raw({"energy_recovery_phase_multipliers": legacy})
         default = HumanoidConfig().energy_recovery_phase_multipliers
         self.assertEqual(len(default), 8)
-        self.assertEqual(cfg.energy_recovery_phase_multipliers, default)
-        self.assertNotEqual(list(cfg.energy_recovery_phase_multipliers), legacy)
+        self.assertEqual(
+            list(cfg.energy_recovery_phase_multipliers),
+            legacy + list(default[6:]),
+        )
 
     def test_every_phase_index_stays_in_range(self):
         """任一周期日都落在 0..7，且两张 8 项表都取得到。"""
@@ -288,12 +290,15 @@ class ConfigLayerGuardsTest(unittest.TestCase):
             self.assertIn(bad, text)
 
     def test_phase_multiplier_length_mismatch_logs_a_warning(self):
-        """长度不符会整表退回默认：静默退回等于用户以为自己的倍率还在生效。"""
+        """长度不符要出声：静默补齐等于用户以为自己的倍率原样生效。"""
         with self.assertLogs("humanoid.config", level="WARNING") as caught:
             cfg = HumanoidConfig.from_raw(
                 {"energy_recovery_phase_multipliers": [1.0] * 6}
             )
-        self.assertEqual(cfg.energy_recovery_phase_multipliers, HumanoidConfig().energy_recovery_phase_multipliers)
+        self.assertEqual(
+            list(cfg.energy_recovery_phase_multipliers),
+            [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.7],
+        )
         self.assertIn("8", "\n".join(caught.output))
 
     def test_affection_override_tolerates_comma_separated_entries(self):
@@ -495,14 +500,18 @@ class _WritableConfig(dict):
 class DefaultsMigrationMarkerTest(unittest.TestCase):
     """标记只在**真正落盘成功**后写，且记的是「已应用过哪些迁移项」而不是版本号。"""
 
-    LEGACY = {"timezone_city": "北京", "weather_location": "Heyuan,CN"}
+    # 6 段周期倍率是唯一还能「从结构上判定为旧格式」的迁移项：8 段语义与 6 个数
+    # 严格冲突，可以安全迁移。weather_location 已改成「只提醒、不改值」。
+    LEGACY = {"energy_recovery_phase_multipliers": [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]}
 
     def test_unwritable_config_never_writes_the_marker(self):
         """普通 dict 没有 save_config：改动只在内存，写标记会让迁移**永远**不再重试。"""
         data_dir = Path(tempfile.mkdtemp())
         raw = dict(self.LEGACY)
         main_module.HumanoidCore._migrate_defaults(raw, data_dir)
-        self.assertEqual(raw["weather_location"], "", "内存里该改还是改")
+        self.assertEqual(
+            len(raw["energy_recovery_phase_multipliers"]), 8, "内存里该改还是改"
+        )
         self.assertFalse(
             (data_dir / main_module.DEFAULTS_MIGRATION_MARK).exists(),
             "没落盘却写了标记：下次启动读回旧值，而迁移再也不会跑",
@@ -516,7 +525,7 @@ class DefaultsMigrationMarkerTest(unittest.TestCase):
         marker = data_dir / main_module.DEFAULTS_MIGRATION_MARK
         self.assertTrue(marker.exists())
         applied = json.loads(marker.read_text(encoding="utf-8"))
-        self.assertIn("weather_location", applied)
+        self.assertIn("energy_recovery_phase_multipliers", applied)
         # 再跑一次：这一项已记录，不重复落盘
         again = _WritableConfig(self.LEGACY)
         main_module.HumanoidCore._migrate_defaults(again, data_dir)
@@ -531,7 +540,7 @@ class DefaultsMigrationMarkerTest(unittest.TestCase):
         raw = _WritableConfig(self.LEGACY)
         main_module.HumanoidCore._migrate_defaults(raw, data_dir)
         self.assertEqual(raw.saved, 1, "标记里没记录的迁移没生效")
-        self.assertEqual(raw["weather_location"], "")
+        self.assertEqual(len(raw["energy_recovery_phase_multipliers"]), 8)
 
 
 @unittest.skipIf(main_module is None, "main.py 加载失败（缺少 astrbot 或 aiohttp）")
@@ -809,12 +818,67 @@ class PromptBuilderGuardsTest(unittest.TestCase):
         )
         self.assertEqual(builder._feelings_lines(5, 50.0), ["她很困"])
 
-    def test_night_lines_survive_a_broken_snapshot(self):
+    def test_feelings_lines_drops_sleep_entry_when_asked(self):
+        """P-15：睡眠体感由调用方按结构化事实排除，不再按正文文案过滤。"""
         builder = self._builder(
             SimpleNamespace(
+                energy=SimpleNamespace(energy=50.0),
+                soma=SimpleNamespace(
+                    snapshot=lambda: {"asleep": 1.0},
+                    feelings=lambda energy: [(0.9, "这会儿在睡"), (0.5, "有点饿")],
+                ),
+            ),
+            SimpleNamespace(soma_enabled=True, show_sleep_window=True),
+        )
+        self.assertEqual(
+            builder._feelings_lines(5, 0.0), ["她这会儿在睡", "她有点饿"]
+        )
+        self.assertEqual(
+            builder._feelings_lines(5, 0.0, include_sleep=False), ["她有点饿"]
+        )
+
+    def test_feelings_lines_hides_sleep_text_when_window_off_even_if_awake(self):
+        """用户关掉睡眠窗口时按「别出现」处理，不因结构化状态说她醒着就放行。"""
+        builder = self._builder(
+            SimpleNamespace(
+                energy=SimpleNamespace(energy=50.0),
+                soma=SimpleNamespace(
+                    snapshot=lambda: {"asleep": 0.0},
+                    feelings=lambda energy: [(0.9, "这会儿在睡"), (0.5, "有点饿")],
+                ),
+            ),
+            SimpleNamespace(soma_enabled=True, show_sleep_window=False),
+        )
+        self.assertEqual(builder._feelings_lines(5, 0.0), ["她有点饿"])
+
+    def test_echo_lines_suppresses_wake_echo_when_asked(self):
+        """P-15：睡眠惯性句在时，「她刚睡醒」由调用方按结构化事实抑制。"""
+        now = 1_800_000_000.0
+        builder = self._builder(
+            SimpleNamespace(
+                now_epoch=lambda: now,
+                soma=SimpleNamespace(
+                    snapshot=lambda: {"asleep": 0.0, "last_sleep_hours": 7.0},
+                    data={"last_wake_at": now - 600.0},
+                    wake_state=lambda: {"wake_at": now - 600.0},
+                ),
+            ),
+            SimpleNamespace(),
+        )
+        self.assertEqual(builder._echo_lines(), ["她刚睡醒，睡了7小时"])
+        self.assertEqual(builder._echo_lines(suppress_wake_echo=True), [])
+
+    def test_night_lines_survive_a_broken_snapshot(self):
+        # 「现在是不是她的夜里」现在只有一份推导（state_snapshot.night → clock.night_window）：
+        # 读核心的 config 与日程推出来的睡段，不再调 soma.in_scheduled_night。
+        builder = self._builder(
+            SimpleNamespace(
+                config=SimpleNamespace(
+                    night_mode_enabled=True, night_start_hour=23.0, night_end_hour=6.0
+                ),
                 clock=SimpleNamespace(now=lambda: SimpleNamespace(hour=23, minute=0)),
                 soma=SimpleNamespace(
-                    in_scheduled_night=lambda hour: True, snapshot=lambda: "boom"
+                    scheduled_night=lambda: (23.0, 6.0), snapshot=lambda: "boom"
                 ),
             ),
             SimpleNamespace(night_mode_enabled=True, show_sleep_window=True, soma_enabled=True),
@@ -869,8 +933,9 @@ class PromptBuilderGuardsTest(unittest.TestCase):
         got = PromptBuilder._personalize("其他人都说她温柔", "小雨", "阿哲")
         self.assertIn("其他", got)
         self.assertNotIn("其小雨", got)
+        # v13：不再把「她」换成角色名——那次替换正是「角色卡」感的来源。
         self.assertEqual(
-            PromptBuilder._personalize("她今天有点累", "小雨", "阿哲"), "小雨今天有点累"
+            PromptBuilder._personalize("她今天有点累", "小雨", "阿哲"), "她今天有点累"
         )
 
 

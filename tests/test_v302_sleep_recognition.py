@@ -111,9 +111,15 @@ class DynamicSegmentWakeUpTest(unittest.TestCase):
         self.assertFalse(slot_sleeps(slot), f"睡满 10 小时还在卧室里睡：{slot}")
         self.assertNotIn("睡", str(slot.get("event", "")))
 
-    def test_the_night_allows_a_little_oversleep(self):
+    def test_the_night_no_longer_grants_extra_hours_past_the_need(self):
+        """#67：删掉夜里的 +180 分钟豁免——睡过需要的量就醒，不再一律赖到天亮。"""
         slot = self.build(4 * 60, {"asleep": 1.0, "sleep_pressure": 60.0}, asleep_minutes=600.0)
-        self.assertTrue(slot_sleeps(slot), "凌晨还早，睡过头一点是正常的")
+        self.assertFalse(slot_sleeps(slot), f"睡满 10 小时还在夜里睡：{slot}")
+
+    def test_a_normal_night_still_keeps_her_asleep(self):
+        """同一钟点、只睡了 5 小时：没睡够，凌晨不该被叫醒。"""
+        slot = self.build(4 * 60, {"asleep": 1.0, "sleep_pressure": 60.0}, asleep_minutes=300.0)
+        self.assertTrue(slot_sleeps(slot), "只睡了 5 小时，凌晨该继续睡")
 
     def test_oversleeping_deep_into_the_night_ends(self):
         slot = self.build(4 * 60, {"asleep": 1.0, "sleep_pressure": 40.0}, asleep_minutes=700.0)

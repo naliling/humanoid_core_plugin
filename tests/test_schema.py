@@ -87,13 +87,13 @@ class SchemaTest(unittest.TestCase):
             self.assertIn(key, self.schema)
 
     def test_field_count_is_pinned(self):
-        """字段数变化必须同步改这里（v3.0.2 = 135：新增 CCB 白名单）。
+        """字段数变化必须同步改这里（v3.0.2 = 137：新增兄弟 bot 护栏两键）。
 
         面板项数在 README / main.py 的帮助文案里也被引用，字段增删时一并对齐，
         否则用户看到的「共 N 项」与面板实际数量对不上。
         """
-        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 135)
-        self.assertEqual(len(self.schema), 135)
+        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 137)
+        self.assertEqual(len(self.schema), 137)
 
     def test_input_state_throttle_keys_are_consistent(self):
         """v3.0.0 新增的两个「正在输入」节流项：类型/区间/默认值三处一致。"""
@@ -188,14 +188,21 @@ class SliderKeyTest(unittest.TestCase):
 class DefaultMigrationTest(unittest.TestCase):
     """AstrBot 只补缺不覆盖，所以旧默认值必须靠插件自己提升一次。"""
 
-    def test_legacy_weather_location_is_dropped_when_city_changed(self):
+    def test_legacy_weather_location_is_kept_with_a_warning(self):
+        """天气城市对不上时只提醒，绝不把用户填的值清空。
+
+        以前这里把 weather_location 写成 ""：默认配置 + 改了城市的人，天气会静默
+        退回按城市名猜，而原来的 "Heyuan,CN" 已经被抹掉、找不回来。
+        """
         from humanoid.config import plan_default_migrations
 
-        changes = plan_default_migrations({
-            "timezone_city": "北京",
-            "weather_location": "Heyuan,CN",
-        })
-        self.assertEqual(changes, {"weather_location": ""})
+        with self.assertLogs("humanoid.config", level="WARNING") as captured:
+            changes = plan_default_migrations({
+                "timezone_city": "北京",
+                "weather_location": "Heyuan,CN",
+            })
+        self.assertEqual(changes, {}, "迁移不能动 weather_location")
+        self.assertIn("weather_location", "\n".join(captured.output))
 
     def test_user_chosen_values_are_never_touched(self):
         from humanoid.config import plan_default_migrations
@@ -321,3 +328,52 @@ class SchemaHintsAndBoundsTest(unittest.TestCase):
         hint = self.schema["mood_affection_override"]["hint"]
         self.assertIn("每个条目", hint)
         self.assertNotIn("逗号分隔", hint)
+
+
+class IntervalOrderTest(unittest.TestCase):
+    """「间隔下限不得大于上限」必须对面板与命令行都成立。
+
+    旧实现只在 `/拟人 设置 间隔` 这一条路径上校验：面板把上限改小，照样能造出
+    `120~60` 的倒置区间——抽随机时 `hi<=lo` 静默退化成固定值，而诊断页还按
+    自己的口径显示「120~60 随机」，事后查不出来。
+    """
+
+    def test_inverted_interval_is_clamped_at_parse_time(self):
+        cfg = HumanoidConfig.from_raw({
+            "schedule_min_interval_minutes": 120,
+            "schedule_max_interval_minutes": 60,
+        })
+        self.assertEqual(cfg.schedule_max_interval_minutes, 120,
+                         "面板造出的倒置区间必须被钳成 120~120")
+        self.assertEqual(cfg.schedule_min_interval_minutes, 120)
+
+    def test_zero_max_is_a_real_choice_not_an_inversion(self):
+        """上限 0 = 「不随机，固定按下限」是合法档，不能被钳成 30~30。"""
+        cfg = HumanoidConfig.from_raw({
+            "schedule_min_interval_minutes": 30,
+            "schedule_max_interval_minutes": 0,
+        })
+        self.assertEqual(cfg.schedule_max_interval_minutes, 0)
+
+    def test_ordered_interval_is_untouched(self):
+        cfg = HumanoidConfig.from_raw({
+            "schedule_min_interval_minutes": 30,
+            "schedule_max_interval_minutes": 90,
+        })
+        self.assertEqual(
+            (cfg.schedule_min_interval_minutes, cfg.schedule_max_interval_minutes),
+            (30, 90),
+        )
+
+    def test_draw_gap_degrades_to_fixed_value(self):
+        """绕过解析层直接拿到倒置区间时，抽间隔退回固定值而不是报错。"""
+        from humanoid.llm import CallGate
+
+        class Cfg:
+            llm_daily_call_budget = 10
+            schedule_min_interval_minutes = 120
+            schedule_max_interval_minutes = 60
+            llm_idle_silence_minutes = 0
+
+        gate = CallGate(lambda: Cfg(), None)
+        self.assertEqual(gate._draw_gap(), 120 * 60.0)

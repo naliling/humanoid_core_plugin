@@ -141,6 +141,51 @@ class SpeciesCorpusTest(unittest.TestCase):
         self.assertEqual(profile["label"], "小马")
 
 
+class DeclaredAbsenceTest(unittest.TestCase):
+    """人设明写「没有兽耳/无角」时，物种的隐含结构不能把它补回来。"""
+
+    def test_elf_without_beast_ears(self):
+        profile = species.detect("她是精灵，没有兽耳，也没有尾巴。")
+        self.assertEqual(profile["label"], "精灵")
+        self.assertNotIn("兽耳", profile["traits"])
+        self.assertNotIn("尾巴", profile["traits"])
+        self.assertEqual(species.body_line(profile), "精灵")
+
+    def test_dragon_without_horns_or_scales(self):
+        profile = species.detect("她是一条龙，但绝对无角，也没有鳞片。")
+        self.assertEqual(profile["label"], "龙")
+        self.assertNotIn("角", profile["traits"])
+        self.assertNotIn("鳞片", profile["traits"])
+
+    def test_angel_without_wings(self):
+        profile = species.detect("她是天使，但没有翅膀。")
+        self.assertEqual(profile["label"], "天使")
+        self.assertNotIn("翅膀", profile["traits"])
+
+
+class HumanStructureNeedsHerTest(unittest.TestCase):
+    """人类的旁路结构词必须是「她的身体」，不是标本/别人的/收藏。"""
+
+    def test_someone_elses_wings_are_not_hers(self):
+        for text in ("她喜欢蝴蝶翅膀的标本。", "她收藏了一对蝴蝶翅膀标本。"):
+            with self.subTest(text=text):
+                self.assertEqual(species.body_line(species.detect(text)), "", text)
+
+    def test_body_mention_outside_identity_zone_is_not_hers(self):
+        persona = (
+            "她是一个普通女孩，喜欢看书。"
+            + ("今天也去了图书馆。" * 80)
+            + "她喜欢蝴蝶翅膀的标本。"
+        )
+        self.assertEqual(species.body_line(species.detect(persona)), "")
+
+    def test_her_own_tentacles_still_count(self):
+        profile = species.detect("她背后有触手，能自主活动。")
+        self.assertEqual(profile["kind"], "human")
+        self.assertIn("触手", profile["traits"])
+        self.assertEqual(species.body_line(profile), "人类（触手）")
+
+
 class SpeciesFalsePositiveTest(unittest.TestCase):
     """误判源：这些必须一句都不注入。"""
 

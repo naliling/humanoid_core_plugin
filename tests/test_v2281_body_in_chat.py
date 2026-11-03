@@ -69,7 +69,7 @@ class BodyFactsReachThePromptTest(unittest.TestCase):
         core.soma._set("discomfort", 88.0)
         core.soma._set("sleep_pressure", 90.0)
         injection = core.build_injection("42", is_group=False, text="在吗")
-        self.assertIn("〔她的身体与生活", injection)
+        self.assertIn("〔我现在的身体", injection)
         self.assertTrue(
             any(word in injection for word in BODY_WORDS),
             f"身体事实没进每轮注入：{injection}",
@@ -118,7 +118,7 @@ class BodyFactsReachThePromptTest(unittest.TestCase):
 
         core.soma = _Boom()
         note = state_note_for(core)
-        self.assertIn("【此刻的她】", note)
+        self.assertIn("【我现在的情况】", note)
 
 
 class StillBackgroundNotContentTest(unittest.TestCase):

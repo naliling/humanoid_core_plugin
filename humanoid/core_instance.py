@@ -45,6 +45,26 @@ def _status_row(label: str, value: str, note: str = "") -> str:
     base = f"  {label.ljust(STATUS_LABEL_WIDTH)}{value}"
     return f"{base}  {note}" if note else base
 
+# 「自主拟人社交」对接状态的**唯一**词表。`link.SocialSignals.status()` 只会给出这五种，
+# 而原来 `body_lines()` 与 `status_lines()` 各写一份：一份漏了 no_data_root（落到「状态未知」），
+# 另一份措辞完全不同（「已装，正在联动」vs「已对接（信号在读）」）。同一个事实在两个面板上
+# 说两句话，用户没法判断哪个是真的。改词只改这一处。
+_SOCIAL_STATE_LINES = {
+    "fresh": "已对接（信号在读）",
+    "stale": "信号超时未刷新，暂不采信",
+    "never_written": "装了但还没写过信号（等它跑一轮）",
+    "no_data_root": "未装 / 没有数据目录",
+    "not_installed": "未安装（本插件单独也能跑）",
+}
+
+
+def _social_state_line(state: Any) -> str:
+    """对接状态的一句话说法。认不出的状态说「状态未知」，不把英文原文吐到中文面板上。"""
+    key = ""
+    if isinstance(state, dict):
+        key = str(state.get("state", "") or "").strip("-")
+    return _SOCIAL_STATE_LINES.get(key, "状态未知")
+
 # 过期用户数据清理的扫描间隔。只需每小时一次：retention 以天为单位，扫得更勤没有收益。
 MAINTENANCE_INTERVAL_SECONDS = 3600.0
 
@@ -490,9 +510,14 @@ class HumanoidCoreInstance:
         if not cfg.outfit_enabled:
             return {"enabled": False, "kind": "", "source": "关", "text": ""}
         preset = self.outfit_override() or cfg.outfit_preset
-        kind = outfit.detect_kind(self.char_name(), self._persona_text())
+        persona = self._persona_text()
+        kind = outfit.detect_kind(self.char_name(), persona)
         if preset:
             source = "手写（本角色）" if self.outfit_override() else "手写（全局）"
+        elif outfit.persona_clothing(persona):
+            # 面板要说实话：这句话是**人设里写的**，不是按物种自动挑的
+            # （联动 状态与人设 7：以前一律显示「不注入」，而实际注入了）。
+            source = "人设（原文）"
         elif kind:
             source = f"自动（按物种：{kind}）"
         else:
@@ -786,8 +811,15 @@ class HumanoidCoreInstance:
             return False
         self._scope.set_self("last_umo", text)
         if self.persona_source is not None:
+            # 多会话部署里 umo 每条消息都可能变，而「要不要重排」只跟「人设是谁 + 今天」
+            # 有关（见 `_realign_persona` 里的 stamp）。今天这份人设已经重排过就不再 spawn：
+            # 否则每个群各说一句就解析一次人格（真 IO）、起一个任务，全部白跑。
+            # 缓存必须**先读**——`note_umo` 一改 umo 就把人格缓存丢了（persona.py:205）。
+            label = self._persona_label_cached()
             self.persona_source.note_umo(self.role_id, text)
-            self._spawn_background(self._realign_persona(), "persona-realign")
+            stamp = f"{self.clock.today_str()}:{label}" if label else ""
+            if not stamp or str(self._scope.get_self("persona_realigned", "") or "") != stamp:
+                self._spawn_background(self._realign_persona(), "persona-realign")
         return True
 
     async def _realign_persona(self):
@@ -814,11 +846,13 @@ class HumanoidCoreInstance:
             return
         if str(self._scope.get_self("schedule_persona", "") or "") == persona.label:
             return
-        self._scope.set_self("persona_realigned", stamp)
         if self.schedule.source != "llm":
             # 日程现在只由“按身体现算”的兼底撑着（它只给状态、不编具体事件）。
             # 人设变了也换不出更多东西来——等模型排出的那一版接手时再重排。
+            # **标记不能落**：落在前面的话，这一天都被当成「已重排」，等模型排的那版
+            # 接手时反倒不重排了——正是这个函数要修的那个坑。
             return
+        self._scope.set_self("persona_realigned", stamp)
         self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 认出了人设「{persona.label}」，重排今日日程")
         self.schedule.request_refresh(force=True, ignore_cooldown=True)
 
@@ -908,47 +942,42 @@ class HumanoidCoreInstance:
         # 原来没有同一条闸——群里一句「你做了什么」照样 +1 次、照样结算好感/亲近欲/
         # 攻击性。状态机说"这里绝不可能发生"，账上却在加，规矩自己破了。
         # `readable()` 与 main.py 的同款判断一致：情绪层关着时她根本没有"这段关系"。
-        if (not is_command and not is_group and getattr(cfg, 'ccb', False)
-                and _ccb.allowed_for(cfg, user_id)):
+        if not is_command and not is_group and self._ccb_gate_ok(user_id):
             try:
-                # (P3）：安全闸。未成年 / 血缘人设**连账都不记**——
+                # (P3）：安全闸已收进 `_ccb_gate_ok`。未成年 / 血缘人设**连账都不记**——
                 # 状态机那边已经拦了，这边不同口径的话，账上会留下"发生过 N 次"
                 # 而场景一次都没出过，比不拦更糟。
-                if not self.ccb_safety() and self.mood.readable(
-                    user_id, False, enabled=cfg.mood_enabled,
-                    in_group=cfg.mood_enabled_in_group,
-                ):
-                    if _ccb.detect_occurrence(text):
-                        _us = self._scope.user_state(user_id)
-                        # v3.0.0（审核 P2-22 / B 的实现）：纯聊天文本命中必须在真实场景
-                        # 内才入账。以前任何私聊一句「我们做爱了」就能 +1 并写档案，
-                        # 绕过 38/50 门槛、场景分与冷却；社交层又拿 ccb_done_count 判断
-                        # 「是否发生过」。场景外直接返回 False，下面结算不会执行。
-                        if _ccb.note_occurrence_in_scene(_us, now):
-                            # 结算：明确拒绝 → 掉好感；到基线且不是第一次 → 多涨并降攻击。
-                            # P1：拒绝有两个来源——**他**这条消息在拒绝（他不想），
-                            # 或者**她**刚刚明确说过不要（她不想要）却仍然发生了。
-                            # 后者才是真正该扣好感的那种，所以两处都要看。
-                            _prof = self.mood.profile(user_id) or {}
-                            _eff = _ccb.occurrence_effects(
-                                _us, _prof,
-                                refused=_ccb.detect_refusal(text)
-                                or _ccb.refused_within(_us, now),
-                            )
-                            # 只走已有的公开 setter：好感一个、其余三个直接写档案。
-                            if "affection" in _eff:
-                                self.mood.set_affection(user_id, _eff["affection"])
-                            for _k in ("libido", "aggression"):
-                                if _k in _eff:
-                                    _prof[_k] = _eff[_k]
-                            if _eff:
-                                self.mood.mark_dirty() if hasattr(self.mood, "mark_dirty") else None
+                if _ccb.detect_occurrence(text):
+                    _us = self._scope.user_state(user_id)
+                    # v3.0.0（审核 P2-22 / B 的实现）：纯聊天文本命中必须在真实场景
+                    # 内才入账。以前任何私聊一句「我们做爱了」就能 +1 并写档案，
+                    # 绕过 38/50 门槛、场景分与冷却；社交层又拿 ccb_done_count 判断
+                    # 「是否发生过」。场景外直接返回 False，下面结算不会执行。
+                    if _ccb.note_occurrence_in_scene(_us, now):
+                        # 结算：明确拒绝 → 掉好感；到基线且不是第一次 → 多涨并降攻击。
+                        # P1：拒绝有两个来源——**他**这条消息在拒绝（他不想），
+                        # 或者**她**刚刚明确说过不要（她不想要）却仍然发生了。
+                        # 后者才是真正该扣好感的那种，所以两处都要看。
+                        _prof = self.mood.profile(user_id) or {}
+                        _eff = _ccb.occurrence_effects(
+                            _us, _prof,
+                            refused=_ccb.detect_refusal(text)
+                            or _ccb.refused_within(_us, now),
+                        )
+                        # 只走已有的公开 setter：好感一个、其余三个直接写档案。
+                        if "affection" in _eff:
+                            self.mood.set_affection(user_id, _eff["affection"])
+                        for _k in ("libido", "aggression"):
+                            if _k in _eff:
+                                _prof[_k] = _eff[_k]
+                        if _eff:
+                            self.mood.mark_dirty() if hasattr(self.mood, "mark_dirty") else None
             except Exception:
                 pass
 
         # (B + D）：场景内的姿势/位置感知与强制收场。
         # 只在私聊——群里没有场景（`evaluate` 的 is_group 是硬闸）。
-        if not is_command and not is_group and getattr(cfg, "ccb", False):
+        if not is_command and not is_group and self._ccb_gate_ok(user_id):
             self._ccb_end_if_stale(user_id, now)
             self._ccb_note_intimacy(user_id, text, now)
             self._ccb_note_scene_text(user_id, text, now, source="user")
@@ -1025,7 +1054,12 @@ class HumanoidCoreInstance:
         if cfg.social_energy_enabled and not is_command:
             self.social.consume_for_message()
 
-        self.mood.decay_user(user_id)
+        # 衰减只对**已有档案**的人做。decay_user 以前无条件执行，而它内部第一步是
+        # `user_state()`（读就建条目），于是群里每条消息、每条指令都给发言者留一条
+        # 永久条目——读一眼就建档，和注入侧「群里不给陌生人建档」相反（审核 F2）。
+        # 情绪层关掉时也不该有档案可衰减。
+        if cfg.mood_enabled and self._scope.peek_user(user_id, "mood", None) is not None:
+            self.mood.decay_user(user_id)
         if cfg.soma_enabled and not is_group and not is_command:
             # 私聊算「有人陪」，把想说话的程度泄掉；群聊里潜水不等于被陪。
             # 指令不算陪伴。
@@ -1307,8 +1341,6 @@ class HumanoidCoreInstance:
                 and age < self.CONTRACT_MAX_AGE_SECONDS
             ):
                 return self._scope.get_self("contract")
-            self._contract_digest = digest
-            self._contract_built_at = time.monotonic()
         try:
             contract = build_contract(self)
         except Exception as exc:
@@ -1319,6 +1351,12 @@ class HumanoidCoreInstance:
             if self._log:
                 self._log.warning(f"{LOG_PREFIX} 契约生成返回空字典")
             return None
+        if digest is not None:
+            # 记账必须落在「真的算出来了」之后：写在 build_contract 之前的话，一次失败
+            # 就把摘要与时间戳推进到新值，接着 CONTRACT_MAX_AGE_SECONDS 内这里直接返回
+            # 盘上的旧契约——既不重试、也不再告警，社交层读到的还是那份过期快照。
+            self._contract_digest = digest
+            self._contract_built_at = time.monotonic()
         previous = self._scope.get_self("contract")
         # 比较时排除「随时间自己走」的字段（generated_at/time 每分钟都在动，拿它们参与
         # 比较会让这个方法本身变成常驻写盘源）；其余字段变了就该重写——尤其 weather/
@@ -1424,17 +1462,25 @@ class HumanoidCoreInstance:
             return
         try:
             last_at = float(self._scope.get_self("_last_signal_spoke_at", 0.0) or 0.0)
-            if at <= last_at:
-                return
-            # 先落去重时间戳再取文本：旧版社交插件永远没有文本，不该每轮重读 + 重试。
+        except Exception:
+            return
+        if at <= last_at:
+            return
+        # 先取文本、取到了再落去重时间戳：顺序反过来（v2.29.0 之前的写法）时，
+        # 取文本抛一次异常就把这一次「她主动开口」永久吞掉——时间戳已经前进了，
+        # 下一轮 at <= last_at 直接返回，账本里永远缺这一笔，且没有一行日志。
+        try:
+            text = str(self.signals.last_proactive_text(self.role_id) or "").strip()
+        except Exception as exc:
+            if self._log:
+                self._log.debug(f"{LOG_PREFIX} 取主动消息文本失败，下轮重试: {exc}")
+            return
+        try:
+            # 取到了（或确定旧版插件没有文本）才算处理过：旧版社交插件永远没有文本，
+            # 不该每轮重读 + 重试。
             self._scope.set_self("_last_signal_spoke_at", at)
         except Exception:
             return
-        text = ""
-        try:
-            text = str(self.signals.last_proactive_text(self.role_id) or "").strip()
-        except Exception:
-            text = ""
         if not text:
             return
         try:
@@ -1540,30 +1586,58 @@ class HumanoidCoreInstance:
     def ccb_body(self) -> dict:
         """她的静态身体档案（**角色级**，所有用户共享）。
 
-        初始化一次就固定：之后改配置**不会**动已经定下的值——这是用户明确要的
-        「不管多久以后」。存 `self` 而不是 `users.*`，否则 10 个用户就存 10 份
-        一模一样的她的身体数据。
+        建好之后不再随每轮变化——这是用户明确要的「不管多久以后」。存 `self` 而不是
+        `users.*`，否则 10 个用户就存 10 份一模一样的她的身体数据。
+
+        v3.0.3（联动 main.py F6）：固定下来的判据是**配置值没变**，不是「键在不在」。
+        原来用 `float(getattr(...) or 60)` 读敏感度，面板允许的 0 被 `or` 静默换成 60，
+        而第一次写进档案之后永远不会再读配置——用户把敏感度改成 0、或改回别的值，
+        档案都不动（改了个寂寞）。现在 0 是合法值（走 `_cfg_num`），配置和档案对不上
+        就重算一次（纯计算，不动已经记下的账）。
         """
+        cap_cm = self._cfg_num("ccb_body_depth_cap_cm", 14.0)
+        sensitivity = self._cfg_num("ccb_body_sensitivity", 60.0)
         state = self._scope.self_state
         current = state.get(_ccb.BODY_KEY)
         if isinstance(current, dict) and "depth_cap_cm" in current:
-            return current
-        profile = _ccb.body_profile(
-            depth_cap_cm=float(getattr(self.config, "ccb_body_depth_cap_cm", 14.0) or 14.0),
-            sensitivity=float(getattr(self.config, "ccb_body_sensitivity", 60) or 60),
-        )
+            # 与 `body_profile` 同一个取整口径（上限夹 [1,18] 留 1 位、敏感度夹 [0,100] 取整），
+            # 否则每轮都会因为 0.1 的浮点差判成「配置变了」而重建。
+            want_cap = round(max(1.0, min(18.0, cap_cm)), 1)
+            want_sens = int(max(0.0, min(100.0, sensitivity)))
+            if (
+                current.get("depth_cap_cm") == want_cap
+                and current.get("sensitivity") == want_sens
+            ):
+                return current
+            if self._log:
+                self._log.info(
+                    f"{LOG_PREFIX} 身体档案按新配置重建：深度上限 "
+                    f"{current.get('depth_cap_cm')}→{want_cap}cm，敏感度 "
+                    f"{current.get('sensitivity')}→{want_sens}"
+                )
+        profile = _ccb.body_profile(depth_cap_cm=cap_cm, sensitivity=sensitivity)
         self._scope.set_self(_ccb.BODY_KEY, profile)
         return profile
 
     def ccb_partner(self, user_id: str) -> dict:
         """对方（这个用户）的静态档案，**按人各一份**。同样初始化一次就固定。"""
         state = self._scope.user_state(user_id)
+        length_cm = float(getattr(self.config, "ccb_partner_length_cm", 15.0) or 0.0)
+        cap_cm = float(getattr(self.config, "ccb_body_depth_cap_cm", 14.0) or 14.0)
+        # 「过深」是阈值判定，不参与动态计算：长度 × 最深阶段比例 <= 上限时，这一档
+        # 永远不可达。以前默认值 13 < 14 就是这种情况，而配置面板里看不出来——
+        # 只能靠一行启动日志说清楚。
+        if not getattr(self, "_ccb_depth_warned", False) and not _ccb.depth_reachable(length_cm, cap_cm):
+            self._ccb_depth_warned = True
+            if self._log:
+                self._log.warning(
+                    f"{LOG_PREFIX} ccb_partner_length_cm={length_cm:g} 在身体上限 "
+                    f"{cap_cm:g}cm 下永远到不了「过深」这一档；要恢复请调大长度或调小上限"
+                )
         current = state.get(_ccb.BODY_LENGTH_KEY)
         if isinstance(current, dict) and "length_cm" in current:
             return current
-        profile = _ccb.partner_profile(
-            length_cm=float(getattr(self.config, "ccb_partner_length_cm", 13.0) or 0.0)
-        )
+        profile = _ccb.partner_profile(length_cm=length_cm)
         state[_ccb.BODY_LENGTH_KEY] = profile
         self._scope.mark_dirty()
         return profile
@@ -1685,11 +1759,13 @@ class HumanoidCoreInstance:
         `occurrence_effects` 还会 +2/+3 —— 等于每做一次都自己给自己续火，
         下一次触发更近。那不成立。
 
-        这里做两件事：
-        1. 亲近欲按 `ccb_refractory_libido` 回落（默认 12，可配，0 = 不回落）；
-        2. 记一笔 `peak` 进账本，让余韵有据可依。
+        这里**只做一件事**：亲近欲按 `ccb_refractory_libido` 回落（默认 12，可配，
+        0 = 不回落）。`peak` 不在这里记——由调用方（`emotion.py` 拿到 moment 之后）
+        写账本，因为峰值只有那边看得到。
 
         只动 libido，不动好感——好感是长线，不该被一次性事件拉下来。
+
+        `now` 只为兼容既有调用签名保留（调用方按位置传），本函数不用它。
         """
         drop = 0.0
         try:
@@ -1756,7 +1832,7 @@ class HumanoidCoreInstance:
             self._scope.peek_user(uid, key) is not None for key in _ccb.STATE_KEYS
         )
         state = self._scope.user_state(uid) if exists else {}
-        if exists and _ccb.roll_day(state, now):
+        if exists and _ccb.roll_day(state, now, tz=self.clock.tz):
             self._scope.mark_dirty()
 
         mood = self._scope.peek_user(uid, "mood", None)
@@ -1823,6 +1899,7 @@ class HumanoidCoreInstance:
             # 每日封顶没有配置项（`CCB_DAILY_MAX` 是常量），但状态页要说「今日 n/8」，
             # 所以照样走同一个参数，值来自模块常量。
             daily_max=_ccb.CCB_DAILY_MAX,
+            tz=self.clock.tz,
         )
         enabled = bool(getattr(cfg, "ccb", False))
         allowed = _ccb.allowed_for(cfg, user_id)
@@ -1836,7 +1913,9 @@ class HumanoidCoreInstance:
             snap["cooldown_left"] = 0.0
             snap["aftercare_left"] = 0.0
             snap["can_enter"] = False
-            snap["blockers"] = ["亲密场景未开启（ccb=false）"]
+            # 用户看的文案不带配置键名：`ccb=false` 是面板里的变量名，
+            # 对读状态页的人（可能就是这个用户）没有意义（联动 main.py F12）。
+            snap["blockers"] = ["亲密场景没有开启。"]
         elif not allowed:
             # 名单外的人：历史数字照给（那是真发生过的），但「能不能进」与
             # 原因一律不谈——把亲近欲和差多少摆给朋友看，是这套名单要避免的事。
@@ -1955,13 +2034,42 @@ class HumanoidCoreInstance:
         指令与面板说的就是两件事。
         """
         if not bool(getattr(self.config, "ccb", False)):
-            return "亲密场景未开启（ccb=false）。"
+            # 不带配置键名（联动 main.py F12）：读这句话的是用户，不是维护者。
+            return "亲密场景没有开启。"
         if not _ccb.allowed_for(self.config, user_id):
             return "这部分没有对你开放。"
         rows = self.intimacy_rows(user_id)
         if not rows:
-            return "亲密场景未开启，或没有可显示的数据。"
+            return "亲密场景没有开启，或没有可显示的数据。"
         return "\n".join([f"亲密 · {user_id}", *rows])
+
+    def _ccb_gate_ok(self, user_id: str) -> bool:
+        """亲密层的总闸：开关 + 白名单 + 安全闸 + 情绪层可读。
+
+        以前这条判断在两处各写了一遍（记账一处、场景一处），而且两处**都不一样**：
+        记账那处有白名单/安全闸/readable，场景那处只有 `cfg.ccb`。于是：
+        白名单外的用户、未成年/血缘人设、情绪层关掉的角色，都能照样触发
+        「场景内的姿势/位置感知与强制收场」——一边说"这里绝不可能发生"，
+        一边在推进场景状态。这里收成一个入口，两边共用。
+        """
+        cfg = self.config
+        if not bool(getattr(cfg, "ccb", False)):
+            return False
+        if not _ccb.allowed_for(cfg, user_id):
+            return False
+        if self.ccb_safety():
+            return False
+        try:
+            return bool(
+                self.mood.readable(
+                    user_id,
+                    False,
+                    enabled=cfg.mood_enabled,
+                    in_group=cfg.mood_enabled_in_group,
+                )
+            )
+        except Exception:
+            return False
 
     def _ccb_note_intimacy(self, user_id: str, text: str, now: float) -> None:
         """记一次"这句话有亲密意图"的时刻。
@@ -2164,11 +2272,43 @@ class HumanoidCoreInstance:
             return []
         return life_log.prune(raw, self.now_epoch())
 
+    def _drop_life_items_of(self, removed: set[str]) -> int:
+        """把已经删掉的人从「她手上还开着的事」里一并抹掉。
+
+        `delete_user()` 只删 `users` 那一格，而 life_log 是 `self` 状态里另一本账：
+        条目里记着 uid，渲染时靠 uid 认名字。人被清掉之后条目还在，`_who()` 认不出
+        名字只会让那行少个称呼——可一旦这个 uid 以后被重新用上（换号、同一 QQ 换了人），
+        那条旧事就会被安到新来的人头上，说成「她手上还有件事没完：<新人的名字>」。
+        所以删人时连账本一起清。
+
+        只按 uid 精确匹配，不动形状（不用 `parse_open` 往返一遍：那会把畸形条目也一起
+        洗掉，而这里只想删人）。返回删掉的条数。
+        """
+        if not removed:
+            return 0
+        try:
+            raw = self._scope.get_self(life_log.LIFE_KEY)
+        except Exception:
+            return 0
+        if not isinstance(raw, list):
+            return 0
+        kept = [
+            item for item in raw
+            if not (isinstance(item, dict) and str(item.get("uid", "") or "") in removed)
+        ]
+        dropped = len(raw) - len(kept)
+        if dropped:
+            self._scope.set_self(life_log.LIFE_KEY, kept)
+        return dropped
+
     def snapshot(self, user_id: Optional[str] = None, refresh: bool = True) -> dict:
+        # refresh=False 的契约是「只读」：注入路径一轮要问 5 次快照，每次都推进
+        # 身体的话，光是「看一眼」就把睡意/饥饿改掉，而那一轮真正的推进只有一次。
+        # 现在推进收敛到 refresh=True（以及 build_injection 开头那次 tick）。
         if refresh:
             self.energy.advance()
-        if self.config.soma_enabled:
-            self.soma.advance()
+            if self.config.soma_enabled:
+                self.soma.advance()
 
         now = self.clock.now()
         result = {
@@ -2206,7 +2346,10 @@ class HumanoidCoreInstance:
             process = {}
         if process:
             result["process"] = process
-        if user_id:
+        # 读路径不建档：`mood.profile()` 会给没有条目的人现建一条（含初始好感/亲近欲），
+        # 于是任何调用方（面板、跨插件门面、`/你的状态`）问一句「TA 怎么样」
+        # 就在 state.json 里给陌生人留一条永久条目（审核 F3）。条目不存在就省略这一段。
+        if user_id and self._scope.peek_user(user_id, "mood", None) is not None:
             m = self.mood.profile(user_id)
             result["mood"] = {
                 "affection": m["affection"],
@@ -2258,13 +2401,8 @@ class HumanoidCoreInstance:
             state = self.signals.status()
         except Exception:
             state = {}
-        # 对接成不成在这就能看出来：没装、没写过、过期、在用，四种说法不一样。
-        lines.append({
-            "fresh": "- 自主拟人社交：已对接（信号在读）",
-            "stale": "- 自主拟人社交：信号超时未刷新，暂不采信",
-            "never_written": "- 自主拟人社交：装了但还没写过信号（等它跑一轮）",
-            "not_installed": "- 自主拟人社交：未安装（本插件单独也能跑）",
-        }.get(str(state.get("state")), "- 自主拟人社交：状态未知"))
+        # 对接成不成在这就能看出来：没装、没写过、过期、在用，说法不一样（词表只一份）。
+        lines.append("- 自主拟人社交：" + _social_state_line(state))
         return lines
 
     def status_lines(self, user_id: str, is_group: bool = False) -> list[str]:
@@ -2284,7 +2422,11 @@ class HumanoidCoreInstance:
         row = _status_row
 
         out: list[str] = [f"Humanoid Core · {self.role_id}"]
-        out.append(f"{now.strftime('%Y-%m-%d %H:%M')} 星期{s['weekday']}  ·  {s['city']}")
+        # 地名可能真的不知道（联动 时钟 15：display_city 现在返回 str|None）——
+        # 不知道就整段省掉，不能印一个 "None" 出来。
+        _city = str(s.get("city") or "").strip()
+        _head = f"{now.strftime('%Y-%m-%d %H:%M')} 星期{s['weekday']}"
+        out.append(f"{_head}  ·  {_city}" if _city else _head)
         # 参照名称从哪来的：手动设的、人设里的、还是自动补的。补的也要看得见，
         # 不然「她怎么知道我叫她什么」这种事只能靠猜。
         info = self.char_name_info()
@@ -2331,7 +2473,9 @@ class HumanoidCoreInstance:
             history = [str(x) for x in (proc.get("history") or []) if str(x)]
             if history:
                 out.append(row("刚做完", "、".join(history[:2])))
-        if user_id:
+        # 读路径不建档：`interest_state` 内部会 `mood.profile()`（读就建一条），
+        # 而状态页只是「看一眼」。没有档案就当没有这三轴可看（审核 F3）。
+        if user_id and self._scope.peek_user(user_id, "mood", None) is not None:
             try:
                 axes = self.behavior.interest_state(user_id, self.now_epoch()) or {}
             except Exception:
@@ -2358,7 +2502,8 @@ class HumanoidCoreInstance:
             out.append("")
             out.append(f"关系 · {user_id}")
             out.append(row("好感度", f"{s['mood']['affection']:.1f}/100", str(s['mood']['label'])))
-            mood_raw = self.scope.user_state(user_id).get("mood") or {}
+            # 只读：`user_state()` 读就建条目，状态页是读路径（审核 F3）。
+            mood_raw = self.scope.peek_user(user_id, "mood", None) or {}
             if mood_raw:
                 # ccb 开着时亲近欲由下面「亲密」段给（带基线/涨幅/门槛）。同一屏出现
                 # 两个「亲近欲」而数字口径不同时，用户只会当成又一个 bug。
@@ -2372,7 +2517,12 @@ class HumanoidCoreInstance:
                     out.append(row("亲近欲", f"{float(mood_raw.get('libido', 0)):.0f}/50"))
                 out.append(row("攻击性", f"{float(mood_raw.get('aggression', 0)):.0f}/50"))
             try:
-                first_met = self.mood.first_met(user_id)
+                # first_met 内部走 profile()（会建档），这里先确认条目存在。
+                first_met = (
+                    self.mood.first_met(user_id)
+                    if self.scope.peek_user(user_id, "mood", None) is not None
+                    else 0.0
+                )
             except Exception:
                 first_met = 0.0
             if first_met > 0:
@@ -2420,18 +2570,9 @@ class HumanoidCoreInstance:
             state = dict(self.signals.status() or {})
         except Exception:
             state = {}
-        link_state = str(state.get("state", "") or "").strip("-")
-        # 与 link.SocialSignals.status() 真实会给出的五种状态一一对应：
-        # no_data_root / not_installed / never_written / stale / fresh。
-        # 以前这里漏了中间两种，会把英文原文直接吐到中文状态页上。
-        friendly = {
-            "no_data_root": "未装 / 没有数据目录",
-            "not_installed": "未安装（本插件单独也能跑）",
-            "never_written": "已装，还没写过信号（等它跑一轮）",
-            "stale": "已装，信号超时未刷新",
-            "fresh": "已装，正在联动",
-        }.get(link_state, link_state or "状态未知")
-        out.append(row("社交插件", friendly))
+        # 五种状态的说法统一在 `_social_state_line` 里（以前这里与 body_lines 各写一份，
+        # 措辞不同、还漏了 no_data_root；认不出的状态也不再吐英文原文）。
+        out.append(row("社交插件", _social_state_line(state)))
         return out
 
     def schedule_text(self) -> str:
@@ -2481,15 +2622,38 @@ class HumanoidCoreInstance:
                 f"{LOG_PREFIX} 角色 {self.role_id} 已收到停止信号，start() 不会起任何后台循环"
             )
             return False
+        # 启动是**原子**的：`_started` 先落，再起循环/初始化日程。任何一步抛异常
+        # 都必须把 `_started` 退回 False 再抛——否则实例永久停在「_started=True
+        # 但一个循环都没跑」，调用方（role_manager 的失败重试）再调 start() 会被
+        # 开头那句 `if self._started: return True` 直接挡掉，重试等于没重试。
+        #
+        # 失败时只回收**本次**起的任务，**不调 stop()**：`stop()` 第一件事就是置
+        # `_stop_event`，而本函数开头看到它已置就 return False——用 stop() 清理等于
+        # 把重试机制自己废掉。这里 cancel + gather 完，`_tasks` 由 `_on_task_done`
+        # 自己摘干净，重试时不会出现两份同名循环（两个 social_loop 会双倍写 state）。
         self._started = True
-        self._spawn_background(self._social_loop(), "social-recovery")
-        self._spawn_background(self._weather_loop(), "weather-refresh")
-        self._spawn_background(self._schedule_loop(), "schedule-refresh")
-        self._spawn_background(self._body_loop(), "body-tick")
-        self._spawn_background(self._process_loop(), "process-tick")
-        self._spawn_background(self._maintenance_loop(), "data-maintenance")
-        self.schedule.current_slots()
-        self.schedule.seed_first_segment()
+        spawned: list[asyncio.Task] = []
+        try:
+            for coro, name in (
+                (self._social_loop(), "social-recovery"),
+                (self._weather_loop(), "weather-refresh"),
+                (self._schedule_loop(), "schedule-refresh"),
+                (self._body_loop(), "body-tick"),
+                (self._process_loop(), "process-tick"),
+                (self._maintenance_loop(), "data-maintenance"),
+            ):
+                task = self._spawn_background(coro, name)
+                if task is not None:  # 停止信号竞态窗口里会返回 None
+                    spawned.append(task)
+            self.schedule.current_slots()
+            self.schedule.seed_first_segment()
+        except BaseException:
+            self._started = False
+            for task in spawned:
+                task.cancel()
+            if spawned:
+                await asyncio.gather(*spawned, return_exceptions=True)
+            raise
         self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 已启动")
         return True
 
@@ -2522,7 +2686,18 @@ class HumanoidCoreInstance:
         """
         while not self._stop_event.is_set():
             try:
+                # 删人之前先记下名册：`prune_expired()` 内部会 `delete_user()`，而它只
+                # 删 users 那一格，`self.life_log` 里记着同一个人 uid 的未完事项还留着。
+                # 这里用前后差集求出「这一轮被删掉的人」，再把账本里他们的条目一并清掉。
+                before = set(self._scope.all_user_ids())
                 pruned = self.mood.prune_expired()
+                removed = before - set(self._scope.all_user_ids())
+                dropped = self._drop_life_items_of(removed)
+                if dropped:
+                    self._log.info(
+                        f"{LOG_PREFIX} 角色 {self.role_id} 删掉 {len(removed)} 个用户，"
+                        f"连带清掉 {dropped} 条他们的未完事项"
+                    )
                 if pruned:
                     self._log.info(
                         f"{LOG_PREFIX} 角色 {self.role_id} 清理了 {pruned} 个过期用户的情绪数据"

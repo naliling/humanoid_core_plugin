@@ -18,7 +18,7 @@ from humanoid.data.holidays import (
     BUILTIN_HOLIDAYS,
     LUNAR_FESTIVAL_DATES,
     LUNAR_FESTIVAL_NAMES,
-    SOLAR_TERMS,
+    SOLAR_TERMS_BY_YEAR,
     lunar_holiday,
     resolve_holiday,
     solar_term,
@@ -68,19 +68,41 @@ class LunarFestivalTableTest(unittest.TestCase):
 
 
 class SolarTermTableTest(unittest.TestCase):
-    """二十四节气：24 个、名字齐全、日期真实且互不相同。"""
+    """二十四节气：按年查表，每年 24 个、名字齐全、日期真实且互不相同。
 
-    def test_has_all_24_terms(self):
-        self.assertEqual(len(SOLAR_TERMS), 24)
-        self.assertEqual(set(SOLAR_TERMS.values()), ALL_SOLAR_TERMS)
-        # 每个节气只出现在一个日子上（同一个名字不该有两行）
-        self.assertEqual(len(set(SOLAR_TERMS.values())), 24)
+    为什么按年：节气是太阳视黄经交节时刻，每年漂 1 天左右（2025 立春 02-03、
+    2026 立春 02-04）。一张固定 MM-DD 表会在偏差年份说错一天。
+    """
+
+    def test_covers_2025_to_2035(self):
+        self.assertEqual(set(SOLAR_TERMS_BY_YEAR), set(range(2025, 2036)))
+
+    def test_each_year_has_all_24_terms(self):
+        for year, table in SOLAR_TERMS_BY_YEAR.items():
+            with self.subTest(year=year):
+                self.assertEqual(len(table), 24)
+                self.assertEqual(set(table.values()), ALL_SOLAR_TERMS)
+                # 每个节气只出现在一个日子上（同一个名字不该有两行）
+                self.assertEqual(len(set(table.values())), 24)
 
     def test_term_dates_are_real_days(self):
-        for month_day, name in SOLAR_TERMS.items():
-            with self.subTest(name=name):
-                self.assertRegex(month_day, r"^\d{2}-\d{2}$")
-                datetime.strptime(f"2026-{month_day}", "%Y-%m-%d")
+        for year, table in SOLAR_TERMS_BY_YEAR.items():
+            for month_day, name in table.items():
+                with self.subTest(year=year, name=name):
+                    self.assertRegex(month_day, r"^\d{2}-\d{2}$")
+                    datetime.strptime(f"{year}-{month_day}", "%Y-%m-%d")
+
+    def test_terms_stay_in_calendar_order(self):
+        """一年之内节气必须按日期递增（漏抄/串行会立刻露出来）。"""
+        for year, table in SOLAR_TERMS_BY_YEAR.items():
+            with self.subTest(year=year):
+                self.assertEqual(list(table), sorted(table))
+
+    def test_lichun_drifts_between_years(self):
+        """立春在 2025 是 02-03、2026 是 02-04：这正是固定表做不到的事。"""
+        self.assertEqual(SOLAR_TERMS_BY_YEAR[2025].get("02-03"), "立春")
+        self.assertEqual(SOLAR_TERMS_BY_YEAR[2026].get("02-04"), "立春")
+        self.assertEqual(SOLAR_TERMS_BY_YEAR[2026].get("02-03"), None)
 
 
 class ResolveHolidayTest(unittest.TestCase):
@@ -124,8 +146,8 @@ class ResolveHolidayTest(unittest.TestCase):
 
     def test_lunar_wins_over_solar_term_on_the_same_day(self):
         """2027-08-08 七夕撞立秋、2027-10-08 重阳撞寒露：她该说过节，不该说节气。"""
-        self.assertEqual(SOLAR_TERMS.get("08-08"), "立秋")
-        self.assertEqual(SOLAR_TERMS.get("10-08"), "寒露")
+        self.assertEqual(SOLAR_TERMS_BY_YEAR[2027].get("08-08"), "立秋")
+        self.assertEqual(SOLAR_TERMS_BY_YEAR[2027].get("10-08"), "寒露")
         self.assertEqual(resolve_holiday(day(2027, 8, 8)), "七夕节")
         self.assertEqual(resolve_holiday(day(2027, 10, 8)), "重阳节")
 

@@ -150,9 +150,12 @@ def _pony_conf(masked: str) -> Tuple[float, List[str]]:
     #: 「物种名」本身就是身份声明（独角兽/天角兽/陆马/夜骐…），不需要系动词锚点；
     #: 「小马 / 马娘 / pony」这类才需要锚点或身体信号，否则「喜欢小马」也会命中。
     species_names = ("独角兽", "天角兽", "陆马", "夜骐", "幻形灵", "麒麟", "斑马", "马驹")
+    word_hits: List[str] = []
     for word in _PONY_WORDS:
-        if word in masked:
+        # 走 _hit（否定感知）：「她不是小马，是人类」不该判成小马。
+        if _hit(masked, word):
             hits.append(word)
+            word_hits.append(word)
             if word in species_names:
                 conf = max(conf, 0.82)
             else:
@@ -163,13 +166,17 @@ def _pony_conf(masked: str) -> Tuple[float, List[str]]:
         if "可爱标志" in body_hits or "cutie mark" in low:
             conf = max(conf, 0.85)
         conf = max(conf, 0.82 if len(body_hits) >= 2 else 0.62)
-    if any(w in masked for w in _PONY_WORDS) and body_hits:
+    if word_hits and body_hits:
         conf = max(conf, 0.92)
     return conf, hits
 
 
 #: 否定词：命中词**前面**几个字里有它就不算数（「没有翅膀」的陆马不能判成天马）。
-_NEG_WORDS = ("没有", "没", "无", "不带", "不长", "不算")
+_NEG_WORDS = (
+    "没有", "没", "无", "不带", "不长", "不算",
+    # 否定判断句：「她不是小马」「她并非精灵」「是人类，而不是龙」。
+    "不是", "并非", "而不是",
+)
 _NEG_WINDOW = 4
 
 
@@ -195,6 +202,38 @@ _POSSESS_HORN_RE = re.compile(
 )
 
 
+#: 裸「角」的否认（「无角」「没有角」）：_TRAITS 里的角类词都不含单字「角」，
+#: 只靠 _hit 认不出这种写法。
+_ABSENT_HORN_RE = re.compile(r"(?:没有|没|无|不长|不带)[^，。！？；\n]{0,3}(?:角|犄角)")
+
+
+def _absent_terms(masked: str) -> set:
+    """人设里**明确否认**过的结构标签（「没有兽耳」「无角」「不长翅膀」）。
+
+    否认优先：只要这个词有一次出现在否定窗口里，这个结构就不注入——「没有兽耳」
+    之后别处再提一次「兽耳」也不能把它补回来（那多半是在讲别人或举例）。
+    """
+    absent: set = set()
+    for label, words in _TRAITS:
+        for word in words:
+            start = 0
+            denied = False
+            while True:
+                idx = masked.find(word, start)
+                if idx < 0:
+                    break
+                if _negated(masked, idx):
+                    denied = True
+                    break
+                start = idx + len(word)
+            if denied:
+                absent.add(label)
+                break
+    if _ABSENT_HORN_RE.search(masked):
+        absent.add("角")
+    return absent
+
+
 def _traits(masked: str) -> List[str]:
     found: List[str] = []
     for label, words in _TRAITS:
@@ -207,10 +246,48 @@ def _traits(masked: str) -> List[str]:
     return found
 
 
+#: 人类旁路要求结构词**与她本人绑定**：词前一小段里要有领属/身体语境。
+#: 只看身份区还不够——短人设整段都算身份区，「她喜欢蝴蝶翅膀的标本」也在里面。
+_POSSESS_CUES = (
+    "有", "长着", "长了", "带着", "生有", "背后", "身上", "头上", "额前",
+    "肩", "腰", "腿", "手臂", "手腕", "她的", "你的",
+)
+_BIND_WINDOW = 6
+
+
+def _bound(text: str, word: str) -> bool:
+    """这个词有没有一次出现在「她本人的身体/领属语境」里。"""
+    start = 0
+    while True:
+        idx = text.find(word, start)
+        if idx < 0:
+            return False
+        window = text[max(0, idx - _BIND_WINDOW):idx]
+        if any(cue in window for cue in _POSSESS_CUES):
+            return True
+        start = idx + len(word)
+
+
+def _human_terms(zone: str, absent: set) -> List[str]:
+    """人类旁路：只收身份区里、她本人身上的结构词（别人的尾巴/翅膀标本不算）。"""
+    found: List[str] = []
+    for label, words in _TRAITS:
+        if label in absent:
+            continue
+        for word in words:
+            if _hit(zone, word) and _bound(zone, word):
+                found.append(label)
+                break
+    if "角" not in found and "角" not in absent and _POSSESS_HORN_RE.search(zone):
+        found.append("角")
+    return found
+
+
 def _specific(masked: str, zone: str) -> Tuple[str, List[str]]:
     """明确物种：label + 附加结构。"""
     for word, label, extra in _SPECIFIC:
-        if word in zone:
+        # 与 _pony_conf 同一条判据：否定句里的词不是身份声明。
+        if _hit(zone, word):
             return label, list(extra)
     return "", []
 
@@ -241,7 +318,7 @@ def _pony_label(traits: List[str], masked: str = "") -> str:
         ("幻形灵", "幻形灵"), ("陆马", "陆马"), ("麒麟", "麒麟"),
         ("天马", "天马"), ("飞马", "天马"),
     ):
-        if word in masked:
+        if _hit(masked, word):
             return label
     if "角" in traits and "翅膀" in traits:
         return "天角兽"
@@ -254,7 +331,8 @@ def _pony_label(traits: List[str], masked: str = "") -> str:
 
 def _animal_label(zone: str) -> str:
     for animal in _ANIMALS:
-        if animal in zone:
+        # 否定感知：「她不是龙，是普通女孩」不能把标签写成「龙（兽形）」。
+        if _hit(zone, animal):
             return animal + "（兽形）"
     return "兽形"
 
@@ -276,6 +354,11 @@ def detect(persona: str, *, override: str = "") -> Dict[str, Any]:
     masked = _mask(body if source == "override" else body.lower())
     zone = _zone(masked)
     traits = _traits(masked)
+    # 人设里明确否认的结构（「没有兽耳」「无角」）不再从任何物种的隐含结构里补回来：
+    # 「她是精灵，没有兽耳」不能因为「精灵→兽耳」的隐含映射又被加回去。
+    absent = _absent_terms(masked)
+    if absent:
+        traits = [t for t in traits if t not in absent]
 
     pony_conf, pony_terms = _pony_conf(masked)
     if source == "override" and pony_conf > 0:
@@ -286,7 +369,7 @@ def detect(persona: str, *, override: str = "") -> Dict[str, Any]:
     # 明确物种（半人马/人鱼/魅魔/龙…）优先
     spec_label, spec_traits = _specific(masked, zone)
     for item in spec_traits:
-        if item not in traits:
+        if item not in traits and item not in absent:
             traits.append(item)
 
     if pony_conf >= 0.65:
@@ -309,7 +392,7 @@ def detect(persona: str, *, override: str = "") -> Dict[str, Any]:
         elif "麒麟" in masked:
             implied = ["角"]
         for key in ("角", "翅膀"):
-            if key in traits or key in implied:
+            if key in traits or (key in implied and key not in absent):
                 pony_traits.append(key)
         if any(_hit(masked, w) for w in ("四蹄", "蹄子", "马蹄")) or "四蹄" in implied:
             pony_traits.append("四蹄")
@@ -321,16 +404,15 @@ def detect(persona: str, *, override: str = "") -> Dict[str, Any]:
             if key in traits:
                 pony_traits.append(key)
         # 结构声明优先：「绝对无独角」不能被别处的「双龙角」盖过去。
+        # 否认的清理统一交给 _absent_terms（见 _traits 上方），这里只补「声明里有」的结构。
         seg = _structure_segment(masked)
         if seg:
-            if re.search(r"无独角|没有独角|无角", seg):
-                pony_traits = [t for t in pony_traits if t != "角"]
-            elif re.search(r"独角|龙角|犄角", seg) and "角" not in pony_traits:
+            if re.search(r"独角|龙角|犄角", seg) and "角" not in pony_traits and "角" not in absent:
                 pony_traits.append("角")
-            if re.search(r"无翅膀|没有翅膀|无翼", seg):
-                pony_traits = [t for t in pony_traits if t != "翅膀"]
-            elif re.search(r"翅膀|双翼|羽翼", seg) and "翅膀" not in pony_traits:
+            if re.search(r"翅膀|双翼|羽翼", seg) and "翅膀" not in pony_traits and "翅膀" not in absent:
                 pony_traits.append("翅膀")
+        if absent:
+            pony_traits = [t for t in pony_traits if t not in absent]
         traits = pony_traits[:4]
         label = _pony_label(traits, masked)
     elif spec_label:
@@ -340,28 +422,28 @@ def detect(persona: str, *, override: str = "") -> Dict[str, Any]:
         confidence = 0.85
         terms = [spec_label]
         label = spec_label
-    elif any(w in zone for w in _MACHINE_WORDS):
+    elif any(_hit(zone, w) for w in _MACHINE_WORDS):
         kind = KIND_MACHINE
         confidence = 0.75
         terms = ["machine"]
         label = "机械身体"
-    elif any(w in zone for w in _BEAST_EAR_WORDS):
+    elif any(_hit(zone, w) for w in _BEAST_EAR_WORDS):
         kind = KIND_BEAST_EAR
         confidence = 0.75
         terms = ["beast_ear"]
         label = "半兽人形"
-    elif outfit._IDENTITY_RE.search(masked) or any(w in zone for w in outfit._BEAST_STRONG):
+    elif outfit._IDENTITY_RE.search(zone) or any(_hit(zone, w) for w in outfit._BEAST_STRONG):
         kind = KIND_BEAST
         confidence = 0.75
         terms = ["beast"]
         label = _animal_label(zone)
     else:
         kind = KIND_HUMAN
-        confidence = 0.0
-        terms = []
-        if any(t in traits for t in ("触手", "多臂", "翅膀", "尾巴", "鳞片", "兽耳")):
-            confidence = 0.7
-            terms = traits[:]
+        # 只有身份区里、**她本人**的结构词才算：正文里「蝴蝶翅膀标本」「别人的尾巴」
+        # 不是她的身体。判不出来就是不知道（confidence 0），不注入。
+        traits = _human_terms(zone, absent)
+        confidence = 0.7 if traits else 0.0
+        terms = traits[:]
         label = "人类"
 
     if source == "override" and confidence > 0:

@@ -16,6 +16,7 @@ from astrbot.api import logger
 
 from ..config import HumanoidConfig
 from .. import ccb as _ccb
+from .. import clock as _clock
 from ..data.mood_map import generate_mood_tag, get_mood_label
 from ..jsonx import extract_json_object
 from ..llm import PURPOSE_MOOD, LLMGateway
@@ -390,6 +391,9 @@ _STALE_SHELL_FIELDS = (
     # 名单里，否则一个只剩称呼+基线的条目就再也进不了「90 天整条删除」，state.json
     # 又会随群规模一路涨——那是 v2.27.38 专门修过的问题。
     "base_affection_kept",
+    # v3.0.4：清理时搬出来的「处过多少轮」峰值（见 `prune_expired`）。它和基线一样
+    # 必须在这份名单里，否则一个只剩称呼+峰值的条目再也进不了「90 天整条删除」。
+    "turn_count_peak",
 )
 # 整条删除的静默期（天）的**兜底值**。真正的取值来自配置项
 # `stale_user_retention_days`（v2.27.38 起可配；之前这里是唯一来源、写死 90 天）。
@@ -792,6 +796,10 @@ class MoodService:
         kept = self._kept_base_of(user_state)
         if kept is not None and kept > affection:
             affection = kept
+        # 「处过多少轮」也要接回来（审核 #45）：关系阶段取
+        # max(turn_count, turn_count_peak)，峰值跟着档案一起被删掉的话，重建出来的
+        # 档案会从「刚认识」重新数起——聊了三个月的阶段清理一次就倒退。
+        turns_peak = max(0, int(_num_or(user_state.get("turn_count_peak"), 0.0)))
         record = {
             "affection": affection,
             "libido": float(cfg.mood_initial_libido),
@@ -805,7 +813,8 @@ class MoodService:
             "first_met": self._first_met_of(user_state),
             "last_interaction": self._time(),
             "last_decay": self._time(),
-            "turn_count": 0,
+            "turn_count": turns_peak,
+            "turn_count_peak": turns_peak,
             "messages_since_llm": 0,
             # 新建档案的 base 就是面板初始值，不用再等 _repair 重锚一次。
             "base_sync_v": BASE_SYNC_VERSION,
@@ -894,6 +903,15 @@ class MoodService:
             if field not in record:
                 record[field] = 0 if field == "turn_count" else self._time()
                 changed = True
+        # 峰值只升不降（审核 #45）：`state_snapshot.relation_of` 用
+        # max(turn_count, turn_count_peak) 判关系阶段，但此前**没有任何地方写 peak**，
+        # 于是「衰减/清理把 turn_count 归零」等于阶段当场倒退。老档没有 peak 时按
+        # 当前 turn_count 兜底（不能写 0——那会把已经处出来的阶段压回去）。
+        peak = max(int(_num_or(record.get("turn_count_peak"), 0.0)),
+                   int(_num_or(record.get("turn_count"), 0.0)))
+        if int(_num_or(record.get("turn_count_peak"), 0.0)) != peak:
+            record["turn_count_peak"] = peak
+            changed = True
         # 关系时长靠 first_met：老档案没有时用 last_interaction 补（不丢历史，只是少算一段）。
         if "first_met" not in record:
             record["first_met"] = record.get("last_interaction", self._time())
@@ -1371,11 +1389,29 @@ class MoodService:
             days = int(cfg.mood_data_retention_days)
         except (TypeError, ValueError):
             return 0
-        if days <= 0:
-            return 0
-
         now = self._time() if now is None else float(now)
-        cutoff = now - days * 86400.0
+        # 0 或负数 = **不清理情绪字段**（不是「整段什么都不做」）。以前这里直接
+        # `return 0`，于是纯空壳 `{}` 的清理（下面那段）也一起跳过了——而空壳正是
+        # 群聊里每个说过话的陌生人留下的那一行，state.json 会随群规模一直涨，
+        # 每次落盘还要全量重写。空壳不含任何用户数据，删它不违反「0=永不清理」。
+        do_field_cleanup = days > 0
+        cutoff = now - days * 86400.0 if do_field_cleanup else 0.0
+        if not do_field_cleanup:
+            # 两条清理链是串联的：字段级清理整段跳过，下面「整条删除」的静默期
+            # 就永远等不到时间戳变老，配置面板上设的 stale_user_retention_days
+            # 事实上完全失效。0 本身是合法值（永不清理），但这两项不该互相悄悄
+            # 抵消——只报一次，让人知道另一项现在没有意义。
+            try:
+                stale_cfg = int(getattr(cfg, "stale_user_retention_days", STALE_USER_RETENTION_DAYS))
+            except (TypeError, ValueError):
+                stale_cfg = STALE_USER_RETENTION_DAYS
+            if stale_cfg > 0:
+                self._warn_throttled(
+                    f"mood_data_retention_days={days}（永不清理）会让 "
+                    f"stale_user_retention_days={stale_cfg} 完全失效："
+                    "字段级清理不跑，静默期永远等不到老时间戳",
+                    "retention_cancel",
+                )
         # 整条删除的静默期可配（v2.27.38）：写死 90 天时，一个 bot 攒到 7000+ 用户、
         # state.json 2.5 MB 也清不下来。
         #
@@ -1423,6 +1459,9 @@ class MoodService:
                 self._scope.delete_user(uid)
                 pruned += 1
                 continue
+            if not do_field_cleanup:
+                # retention=0：情绪字段一律保留（只有空壳与静默期的整条删除还在跑）。
+                continue
             stamp = user_state.get("last_interaction")
             if stamp is None:
                 mood = user_state.get("mood")
@@ -1452,6 +1491,15 @@ class MoodService:
                 if _finite(kept_base) and kept_base > 0.0:
                     user_state["base_affection_kept"] = max(
                         AFFECTION_RANGE[0], min(AFFECTION_RANGE[1], kept_base)
+                    )
+                # 「处过多少轮」同样搬走（审核 #45）：关系阶段取
+                # max(turn_count, turn_count_peak)，峰值跟着档案一起删掉的话，
+                # 重建档案的人会从「刚认识」重新开始数。
+                peak = max(int(_num_or(mood.get("turn_count_peak"), 0.0)),
+                           int(_num_or(mood.get("turn_count"), 0.0)))
+                if peak > 0:
+                    user_state["turn_count_peak"] = max(
+                        int(_num_or(user_state.get("turn_count_peak"), 0.0)), peak
                     )
             # 把最后活动时间也留在 user 级：mood 被清掉之后，它就是下一次判定的依据
             # （顶部注释一直这么写，但代码从没写过这个字段，于是清过一次的条目再也
@@ -1985,32 +2033,48 @@ class MoodService:
         return Delta(affection, libido, aggression)
 
     def _day_key(self) -> str:
-        """当日额度的「日」键（正向 `warm_day` 与负向 `loss_day` 共用）。
+        """当日额度的「日」键——mood.py 里**所有**日闸共用这一把尺子。
 
-        用 `_time()`（**账本的时间基**）换算到角色所在时区，而不是直接取
-        `clock.today_str()`：账本时衰走 `_time()`，日闸必须跟同一台钟走——两台钟被
-        分别替换时（测试冻结时钟、角色换城市），按另一条时间线算出来的「今天」会让
-        日闸要么永远不重置、要么一天重置好几次。
+        四个键都由本方法产出：`warm_day`（正向日额度）、`loss_day`（负向日额度）、
+        `neg_day`（同一天同类递减）、`log_day`（事件日志按日累加）。以前 `neg_day`
+        自己读 `clock.today_str()`，其余走这里：跨午夜那一瞬、时钟被换掉、角色换城市
+        时两者给出**不同的日期字符串**——同类递减记在 A 日、每日亏损记在 B 日，各自按
+        自己的「今天」翻篇；`clock` 取不到时 `today_str()` 还是空串，而空串永远等于
+        空串，计数一辈子不翻篇（递减永久停在 ×0.2）。
 
-        原来只有负向走这里，正向直接读 `clock.today_str()`：时钟缺失时正向记下的
-        日期是空串，而空串永远等于空串，于是当日额度再也不会重置——「这辈子只能加
-        6.0」。现在两边同一把尺子；连时钟都没有时按账本时间兜底取日期，日额度照样会翻篇。
+        取日期按 R5 的时间口径（角色时区 + 账本时间基 `_time()`）：
+        1. `clock.day_key(ts)`——真 Clock 走这条；
+        2. 只有 `now()`/`today_str()` 的替身钟：用它的 `now().tzinfo` 走同一个模块级
+           换算（真 Clock 上两步等价）；
+        3. 连时钟都没有：按账本时间 + 宿主机时区兜底，日额度照样会翻篇。
         """
+        clock = self._clock
         try:
-            tz = self._clock.now().tzinfo
-            return datetime.fromtimestamp(float(self._time()), tz=tz).strftime("%Y-%m-%d")
-        except Exception:
-            pass
+            ts = float(self._time())
+        except (TypeError, ValueError):
+            ts = None
+        if clock is not None:
+            # 1) 真 Clock：`day_key(ts)` = 角色时区 + 账本时间基（R5 唯一口径）。
+            try:
+                key = str((clock.day_key() if ts is None else clock.day_key(ts)) or "")
+                if key:
+                    return key
+            except Exception:
+                pass
+            # 2) 老式/测试替身钟只有 now()/today_str()：用它的 tz 走同一个模块级换算。
+            #    在真 Clock 上这两步等价；替身钟的 now() 就是它自己的「今天」。
+            try:
+                moment = clock.now()
+                if ts is None:
+                    ts = float(moment.timestamp())
+                return str(_clock.day_key(ts, moment.tzinfo) or "")
+            except Exception:
+                pass
+        # 3) 连时钟都没有：按账本时间 + 宿主机时区兜底，日额度照样会翻篇。
+        if ts is None:
+            return ""
         try:
-            today = str(self._clock.today_str() or "") if self._clock else ""
-            if today:
-                return today
-        except Exception:
-            pass
-        # 最后一档兜底：没有时钟也要给得出一个「今天」，否则日额度会永远记在空日期上、
-        # 攒满一次就再也不重置（正向尤其致命：等于「这辈子只能加 6.0」）。
-        try:
-            return datetime.fromtimestamp(float(self._time())).strftime("%Y-%m-%d")
+            return str(_clock.day_key(ts, None) or "")
         except Exception:
             return ""
 
@@ -2069,25 +2133,27 @@ class MoodService:
         # 同类递减：同一天里同一个词第 2 次 ×0.6、第 3 次 ×0.35、之后 ×0.2。
         factor = 1.0
         if neg_key.startswith("neg:"):
-            today = ""
-            try:
-                today = str(self._clock.today_str() or "") if self._clock else ""
-            except Exception:
-                today = ""
-            day = record.get("neg_day")
-            if not isinstance(day, dict) or str(day.get("date") or "") != today:
-                day = {"date": today, "counts": {}}
-            counts = day.get("counts")
-            if not isinstance(counts, dict):
-                counts = {}
-            try:
-                count = int(counts.get(neg_key, 0) or 0)
-            except (TypeError, ValueError):
-                count = 0
-            factor = REPEAT_DECAY[min(count, len(REPEAT_DECAY) - 1)]
-            counts[neg_key] = count + 1
-            day["counts"] = counts
-            record["neg_day"] = day
+            # 日闸与 `loss_day`/`warm_day` 共用 `_day_key()`：以前这里读的是
+            # `clock.today_str()`，于是同一个「今天」有两把尺子——跨午夜、时钟被换、
+            # 角色换城市时，递减计数与每日亏损各自按自己的日期翻篇。
+            today = self._day_key()
+            # 判不出「今天」就不记：空串永远等于空串，写进去的计数一辈子不翻篇，
+            # 同类递减会永久停在 ×0.2（与 `_charge_negative_day` 判不出日期时不封顶同理）。
+            if today:
+                day = record.get("neg_day")
+                if not isinstance(day, dict) or str(day.get("date") or "") != today:
+                    day = {"date": today, "counts": {}}
+                counts = day.get("counts")
+                if not isinstance(counts, dict):
+                    counts = {}
+                try:
+                    count = int(counts.get(neg_key, 0) or 0)
+                except (TypeError, ValueError):
+                    count = 0
+                factor = REPEAT_DECAY[min(count, len(REPEAT_DECAY) - 1)]
+                counts[neg_key] = count + 1
+                day["counts"] = counts
+                record["neg_day"] = day
 
         # 单条封顶
         aff = max(aff, -NEGATIVE_MESSAGE_CAP)
@@ -2249,8 +2315,30 @@ class MoodService:
         record["cool_no_proactive_until"] = float(now) + days * 86400.0
         record["cool_reason"] = reason
 
+    def cooling_line(self, record: dict, inner: bool = False) -> str:
+        """冷静期那一句的**唯一模板**（D3）。两条通道都从这里出，不再各拼 f-string。
+
+        `inner=True` 给「她的内心」通道：只放感受，不放祈使句——「先别理他」是让模型
+        照做的指令，写进她的内心独白就成了命令；也不在 reason 后面补「的事」，
+        reason 本身已经是完整短语（「你刚才说的话」「你一直没好好理我」），
+        再套一层会拼出「还在为你刚才说的话的事烦着」（审核 F1）。
+
+        `inner=False` 给关系层：保留「想让他先别来吵」——那描述的是她的态度，
+        不是给模型的命令，关系层本来就该说这个。
+
+        reason 一律当**括号里的从句**用，所以任何历史写法都读得通，不需要迁移。
+        """
+        phrase = str(record.get("cool_reason") or "").strip()
+        if inner:
+            if phrase:
+                return f"还在气头上（{phrase}），这会儿不想好好说话，过一会儿再讲"
+            return "这会儿还在气头上，不想好好说话，过一会儿再讲"
+        if phrase:
+            return f"她此刻还在气头上，不想好好说话（因为{phrase}），想让他先别来吵，过几分钟再说"
+        return "她此刻还在气头上，不想好好说话，想让他先别来吵，过几分钟再说"
+
     def cooling_note(self, user_id: str) -> str:
-        """冷静期里给注入的一句「她正在气头上」（D3）。不在冷静期返回空串。"""
+        """关系层的入口（D3）：不在冷静期返回空串；句子由 `cooling_line` 渲染。"""
         try:
             # 只读注入路径（每轮都会调）：走 peek，别给陌生人建永久空壳。
             record = self._scope.peek_user(user_id, "mood")
@@ -2267,11 +2355,7 @@ class MoodService:
             return ""
         if until <= 0 or now >= until:
             return ""
-        reason = str(record.get("cool_reason") or "")
-        note = "她此刻还在气头上，不想好好说话"
-        if reason:
-            note += f"（因为{reason}）"
-        return note + "，想让他先别来吵，过几分钟再说"
+        return self.cooling_line(record)
 
     def current_tone(self, user_id: str) -> str:
         """给 system_prompt 的一句「她此刻对这个人的心境」（I1）。
@@ -2600,9 +2684,16 @@ class MoodService:
         )
         self._maybe_enter_cooling(user_id, record, now, delta)
         # E4：关系里程碑——阶段往上跨了一档就记一笔（情绪层给一句淡淡的，不报出来）。
+        # 阶段走 state_snapshot 的唯一一份（好感 + 相处）：只按好感算的话，
+        # 聊过几百轮的人在注入里「熟到可以直说」、里程碑却记在「还在熟悉」（审核 状态与人设 1）。
         try:
-            from ..relstage import stage_of as _stage_of
-            _new_stage = int(_stage_of(record["affection"])[0])
+            from ..state_snapshot import relation_of as _relation_of
+            # 天数按她的时区算日历天：宿主时区不同会让「认识 N 天」早/晚一天翻页。
+            try:
+                _tz = self._clock.tz if self._clock is not None else None
+            except Exception:
+                _tz = None
+            _new_stage = int(_relation_of(record, now, tz=_tz).stage_id)
             _old_stage = int(record.get("_last_stage", _new_stage) or _new_stage)
             if _new_stage > _old_stage:
                 record["stage_rose_at"] = float(now)
@@ -2624,6 +2715,9 @@ class MoodService:
         # 想让 base 跟着长期表现走，另说；现在先保证「每条消息只算一次」。
 
         record["turn_count"] = turn
+        # 峰值只升不降（审核 #45）：关系阶段取 max(turn_count, turn_count_peak)，
+        # 而 turn_count 会被清理/衰减归零——峰值必须在这里抬起来，否则阶段倒退。
+        record["turn_count_peak"] = max(int(_num_or(record.get("turn_count_peak"), 0.0)), turn)
         record["last_interaction"] = now
         user_state["mood"] = record
         self._scope.mark_dirty()
@@ -2642,11 +2736,9 @@ class MoodService:
         # 不传种子时 mood_map 用的是无种子 `random.choice`——同一状态相邻两次调用
         # 97.78% 不同，下面「变了才写盘」的守卫形同虚设（实测 200 次调用写盘 197 次），
         # 标签还会每次重启都换一遍。日期进种子是刻意的：第二天她换另一套说法。
-        today = ""
-        try:
-            today = str(self._clock.today_str() or "") if self._clock else ""
-        except Exception:
-            today = ""
+        # 日期跟日闸同一把尺子（`_day_key()`）：原来这里读 `today_str()`，时钟缺失时
+        # 拿到空串，种子恒定，于是「第二天换一套说法」变成「这辈子同一句」。
+        today = self._day_key()
         tag = generate_mood_tag(
             float(record["affection"]),
             float(record["libido"]),
@@ -2817,11 +2909,11 @@ class MoodService:
         cfg = self.config
         if not cfg.mood_log_enabled:
             return
-        today = ""
-        try:
-            today = str(self._clock.today_str() or "") if self._clock else ""
-        except Exception:
-            today = ""
+        # 按日累加的键也必须跟日闸同一把尺子：空串永远等于空串，写进去的日志
+        # 累加器就不再翻篇（今天、明天、后天的事件全被折进同一条「今日」里）。
+        today = self._day_key()
+        if not today:
+            return
         day = record.get("log_day")
         if not isinstance(day, dict) or str(day.get("date") or "") != today:
             day = {"date": today, "acc": {}}
@@ -2899,6 +2991,10 @@ class MoodService:
         # 下一条消息 _commit 又会用旧账本把好感顶回去——「重置」等于没重置。
         record.pop(LEDGER_KEY, None)
         record["turn_count"] = 0
+        # 管理员重置是「从头开始」：峰值也归零，否则 state_snapshot 取
+        # max(turn_count, peak) 仍按旧峰值判阶段——好感回到初始值，关系阶段却
+        # 还停在「处了一阵子」，两条事实互相打架。
+        record["turn_count_peak"] = 0
         record["last_interaction"] = self._time()
         record["last_decay"] = self._time()
         record["messages_since_llm"] = 0
@@ -2915,6 +3011,7 @@ class MoodService:
         # 清理留下的关系基线同样要清：重置就是「回到面板初始值」，留着它下次重建
         # 档案时会被接回来，用户看到的还是「重置没生效」。
         user_state.pop("base_affection_kept", None)
+        user_state.pop("turn_count_peak", None)
         self._scope.mark_dirty()
         return record
 
@@ -3105,6 +3202,12 @@ class MoodService:
             now = float(self._time())
         except Exception:
             return ""
+        # 亲密账按天滚，日键要按**她的**时区：宿主时区不同会让「今日 n/8」
+        # 在宿主午夜而不是她的午夜清零（审核 时钟 4 / 跨插件契约 3）。
+        try:
+            _tz = self._clock.tz if self._clock is not None else None
+        except Exception:
+            _tz = None
         snap = _ccb.scene_status(
             state,
             now,
@@ -3122,6 +3225,7 @@ class MoodService:
                                    _ccb.CCB_AFFECTION_RISE),
             affection_deep=_num_or(getattr(cfg, "ccb_affection_deep", _ccb.CCB_AFFECTION_DEEP),
                                    _ccb.CCB_AFFECTION_DEEP),
+            tz=_tz,
         )
 
         bits: List[str] = []

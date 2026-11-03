@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime
+from unittest import mock
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -18,7 +19,7 @@ from humanoid import clock as clock_module
 from humanoid.clock import Clock, now_in_city, resolve_zone, resolve_zone_name
 from humanoid.config import HumanoidConfig
 from humanoid.core_instance import HumanoidCoreInstance
-from humanoid.data.cities import DEFAULT_CITY_PLACEHOLDER, lookup_city_time
+from humanoid.data.cities import CITY_TO_TIMEZONE, DEFAULT_CITY_PLACEHOLDER, lookup_city_time
 from humanoid.data.cities import resolve_zone_name as table_zone
 from humanoid.link import build_contract
 from humanoid.prompt_builder import (
@@ -114,7 +115,7 @@ class InjectionFreedomTest(unittest.TestCase):
         text = core.build_injection("42", is_group=False)
         # 困意措辞按天抽签（很困/困得不行…），断言只能认「说的是困」而不是某一句原话。
         self.assertTrue("困" in text or "疲惫" in text, f"她此刻的困意得说得出：\n{text}")
-        self.assertIn("她对TA", text)
+        self.assertIn("我对TA", text)
         self.assertIn("私聊", text)
         # 但「这副身体这会儿只够说一两句，20字上下的量」那种形式限制不许回来：
         # 插件拦不住她说话，写出来只是让她猜规矩。
@@ -140,7 +141,7 @@ class InjectionFreedomTest(unittest.TestCase):
         for word in ("不要", "必须", "别", "控制在", "只说", "回一句"):
             self.assertNotIn(word, FRAMING_TEXT, f"框架句里出现了「{word}」")
         self.assertIn("身上的状态", FRAMING_TEXT)
-        self.assertIn("身体与生活", FRAMING_TEXT, "框架句要指得清它说的是哪几块")
+        self.assertIn("我现在的身体", FRAMING_TEXT, "框架句要指得清它说的是哪几块")
         self.assertIn("由你自己判断", FRAMING_TEXT, "参考边界要说清：插件不替她决定怎么开口")
         for digit in ("%", "UTC+"):
             self.assertNotIn(digit, FRAMING_TEXT)
@@ -174,12 +175,30 @@ class InjectionFreedomTest(unittest.TestCase):
         for line in mine + cold:
             self.assertNotIn("0.", line, f"三轴把数值端上来了：{line}")
 
+    def test_a_broken_mood_call_only_drops_that_one_sentence(self):
+        """P-11 / #44：last_emotional_event 抛出异常时，关系句照旧在场。
+
+        这一行以前是 _relation_lines 里唯一没有 try 的外部取值，而它在每轮最热的
+        路径上：mood 的坏值一抛，位置句与「认识多久」会跟着整段消失。
+        """
+        core = self.core()
+        builder = PromptBuilder(core)
+        with mock.patch.object(core.mood, "last_emotional_event",
+                               side_effect=RuntimeError("坏档案")):
+            lines = builder._relation_lines(
+                "42", False, interest={"care": 0.9, "focus": 0.9, "spare": 0.9}
+            )
+        self.assertTrue(lines, "单句取值失败把整段关系句吞掉了")
+        self.assertTrue(
+            any("她对TA" in line or "亲密" in line or "在意" in line for line in lines), lines
+        )
+
     def test_mood_label_comes_bare_without_tone_hints(self):
         """情绪只给标签本身（如「亲密」），不附「态度亲昵」这类语气括号。"""
         core = self.core()
         core.mood.profile("42").update({"affection": 90.0, "libido": 40.0, "aggression": 5.0})
         text = core.build_injection("42", is_group=False)
-        self.assertIn("她对TA", text)
+        self.assertIn("我对TA", text)
         for word in ("态度", "语气", "带有敌意", "保持警惕", "充满信任"):
             self.assertNotIn(word, text, f"语气提示又回来了：{word}\n{text}")
 
@@ -345,6 +364,9 @@ class DiagnosticsTimezoneTest(unittest.TestCase):
         self.assertIn("认不出城市", text)
         self.assertIn("没拿到可用时区", text)
         self.assertIn("按这台机器的时间排", text, "退化时不该再说「日程按她那个城市算」")
+        self.assertNotIn(
+            "机器本地时间与她的钟一致", text, "降级时不能既说「按机器时间过」又说「两者一致」"
+        )
 
     def test_report_gives_the_install_hint_when_tzdata_is_missing(self):
         real = clock_module.ZoneInfo
@@ -546,6 +568,53 @@ class NewConstraintTest(unittest.TestCase):
             tag = generate_mood_tag(80.0, 80.0, 5.0, 5.0)
             for banned in ("想贴贴", "气鼓鼓", "想找人说话"):
                 self.assertNotIn(banned, tag, f"心情标签又带上了台词：{tag}")
+
+
+class DisplayCityContractTest(unittest.TestCase):
+    """display_city 只能说出口的地名；说不出来时返回 None，调用方省略整句。"""
+
+    def clock(self, city: str) -> Clock:
+        conf = cfg(timezone_city=city)
+        return Clock(lambda: conf)
+
+    def test_placeholder_never_speaks_a_sentinel(self):
+        got = self.clock(DEFAULT_CITY_PLACEHOLDER).display_city
+        self.assertNotEqual(got, clock_module.SYSTEM_TIMEZONE_LABEL)
+        self.assertTrue(
+            got is None or got in CITY_TO_TIMEZONE,
+            f"占位符说出了一个不是地名的值：{got!r}",
+        )
+
+    def test_unknown_place_is_silent(self):
+        self.assertIsNone(self.clock("火星").display_city)
+
+    def test_table_city_is_spoken(self):
+        self.assertEqual(self.clock("北京").display_city, "北京")
+
+    def test_iana_timezone_label_is_not_a_city(self):
+        """「你在北京时间」是病句：时区标签与带注解的说明都不是地名，只能省略整句。"""
+        self.assertIsNone(self.clock("Asia/Shanghai").display_city)
+        self.assertIsNone(self.clock("Etc/GMT-8").display_city)
+        self.assertIsNone(self.clock("Asia/Urumqi").display_city)
+
+    def test_iana_zone_with_a_city_name_is_spoken(self):
+        self.assertEqual(self.clock("Europe/London").display_city, "伦敦")
+
+
+class SystemTimezoneCityTest(unittest.TestCase):
+    """宿主机时区只有唯一候选城市时才说得出城市，否则闭嘴。"""
+
+    def test_ambiguous_zone_says_nothing(self):
+        with mock.patch.object(clock_module, "_host_zone_name", return_value="Asia/Shanghai"):
+            self.assertEqual(clock_module.system_timezone_city(), "")
+
+    def test_unique_zone_gives_the_city(self):
+        with mock.patch.object(clock_module, "_host_zone_name", return_value="Europe/London"):
+            self.assertEqual(clock_module.system_timezone_city(), "伦敦")
+
+    def test_no_zone_says_nothing(self):
+        with mock.patch.object(clock_module, "_host_zone_name", return_value=""):
+            self.assertEqual(clock_module.system_timezone_city(), "")
 
 
 if __name__ == "__main__":

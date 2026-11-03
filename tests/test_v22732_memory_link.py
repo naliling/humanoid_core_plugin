@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from types import SimpleNamespace
 
@@ -132,6 +133,42 @@ class FindMemoryBridgeTest(unittest.TestCase):
         ctx = SimpleNamespace(get_all_stars=lambda: [self._meta(module, activated=False)])
         self.assertIsNone(memory_link.find_memory_bridge(ctx))
 
+    def test_a_module_path_is_not_an_identity(self):
+        """module_path 是文件系统路径，与三个短名的取值域不相交：拿它比对永远为假。"""
+        module = SimpleNamespace(get_memory_companion_bridge=lambda: object())
+        meta = self._meta(
+            module,
+            name="astrbot_plugin_别的",
+            module_path=memory_link.MEMORY_PLUGIN_ID,
+        )
+        ctx = SimpleNamespace(get_all_stars=lambda: [meta])
+        self.assertIsNone(memory_link.find_memory_bridge(ctx))
+
+    def test_a_plugin_that_is_not_activated_yet_is_not_reported_as_missing(self):
+        """装好了但没激活完是启动时序，不是「没装」——否则用户会去翻安装步骤。"""
+        module = SimpleNamespace(get_memory_companion_bridge=lambda: None)
+        ctx = SimpleNamespace(get_all_stars=lambda: [self._meta(module, activated=False)])
+        self.assertIsNone(memory_link.find_memory_bridge(ctx))
+        self.assertTrue(
+            memory_link.last_error().startswith(memory_link.FAIL_NOT_READY),
+            memory_link.last_error(),
+        )
+
+    def test_a_disabled_bridge_is_still_reported_as_disabled(self):
+        """对面开了、只是把桥接开关关了：这条必须仍然报 disabled（配置问题）。"""
+        module = SimpleNamespace(get_memory_companion_bridge=lambda: None)
+        ctx = SimpleNamespace(get_all_stars=lambda: [self._meta(module)])
+        self.assertIsNone(memory_link.find_memory_bridge(ctx))
+        self.assertTrue(
+            memory_link.last_error().startswith(memory_link.FAIL_DISABLED),
+            memory_link.last_error(),
+        )
+
+    def test_bridge_from_tells_not_ready_apart_from_disabled(self):
+        module = SimpleNamespace(get_memory_companion_bridge=lambda: None)
+        self.assertIsNone(memory_link._bridge_from(self._meta(module, activated=False)))
+        self.assertIn(memory_link.FAIL_NOT_READY, memory_link.last_error())
+
     def test_a_registry_that_raises_is_survivable(self):
         def boom():
             raise RuntimeError("注册表坏了")
@@ -189,6 +226,58 @@ class FetchMemoryTextTest(unittest.IsolatedAsyncioTestCase):
         await memory_link.fetch_memory_text(bridge, "umo", "u1")
         await memory_link.fetch_memory_text(bridge, "umo", "u1")
         self.assertEqual(len(calls), 1, "同一个会话连着两条消息不该查两次记忆库")
+
+    async def test_three_consecutive_timeouts_trip_the_breaker(self):
+        """连续 3 次超时后熔断一分钟：第 4 次连 await 都不进，不再白等满超时。"""
+
+        class _Slow:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def compose_context(self, **_kw):
+                self.calls += 1
+                await asyncio.sleep(1.0)
+                return "迟到的记忆"
+
+        bridge = _Slow()
+        for _ in range(memory_link.TIMEOUT_STREAK_LIMIT):
+            self.assertEqual(
+                await memory_link.fetch_memory_text(
+                    bridge, "umo", "u1", query="猫", timeout=0.02
+                ),
+                "",
+            )
+        self.assertEqual(bridge.calls, memory_link.TIMEOUT_STREAK_LIMIT)
+        self.assertEqual(
+            await memory_link.fetch_memory_text(bridge, "umo", "u1", query="猫", timeout=0.02),
+            "",
+        )
+        self.assertEqual(bridge.calls, memory_link.TIMEOUT_STREAK_LIMIT, "熔断期内不该再进 await")
+        self.assertGreater(memory_link._SKIP_UNTIL, 0.0)
+        self.assertIn("timeout", memory_link.last_error())
+
+    async def test_a_success_clears_the_timeout_streak(self):
+        """偶发一次超时不该把下一轮也熔断：成功一次就清零。"""
+
+        class _Flaky:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def compose_context(self, **_kw):
+                self.calls += 1
+                if self.calls == 1:
+                    await asyncio.sleep(1.0)
+                return "团子"
+
+        bridge = _Flaky()
+        self.assertEqual(
+            await memory_link.fetch_memory_text(bridge, "umo", "u1", query="a", timeout=0.02), ""
+        )
+        self.assertEqual(
+            await memory_link.fetch_memory_text(bridge, "umo", "u1", query="b", timeout=0.5),
+            "团子",
+        )
+        self.assertEqual(memory_link._TIMEOUT_STREAK, 0)
 
     async def test_no_user_means_no_lookup(self):
         class _Bridge:
@@ -312,6 +401,9 @@ class FinishedProcessWriteTest(unittest.IsolatedAsyncioTestCase):
         obj._memory_bridge_resolved = True
         obj._last_written_process = {}
         obj._life_write_stamps = {}
+        obj._life_write_failed_at = {}
+        # 契约 14：这一次「过程结束」被看见的时刻进幂等键（真实实例在 __init__ 里建）。
+        obj._life_event_seen_at = {}
         return obj
 
     async def test_the_first_sighting_only_records(self):
@@ -338,6 +430,46 @@ class FinishedProcessWriteTest(unittest.IsolatedAsyncioTestCase):
         for i in range(6):
             await obj._write_finished_process(self._Core(f"第{i}件"), "umo", "u1")
         self.assertEqual(len(rec.calls), obj.LIFE_WRITE_PER_DAY)
+
+    async def test_a_capped_day_does_not_swallow_the_event(self):
+        """额度用完只是「今天不写」，不该把这条名字标记成已写过。"""
+        rec = self._Recorder()
+        obj = self._plugin(rec)
+        await obj._write_finished_process(self._Core("第零件"), "umo", "u1")  # 只记账
+        for i in range(obj.LIFE_WRITE_PER_DAY + 1):
+            await obj._write_finished_process(self._Core(f"第{i}件"), "umo", "u1")
+        self.assertEqual(len(rec.calls), obj.LIFE_WRITE_PER_DAY)
+        # 额度重置（窗口滑出）后，被挡回的那条还应该能补上。
+        obj._life_write_stamps["bot1"] = []
+        await obj._write_finished_process(self._Core(f"第{obj.LIFE_WRITE_PER_DAY}件"), "umo", "u1")
+        self.assertEqual(
+            len(rec.calls), obj.LIFE_WRITE_PER_DAY + 1, "被额度挡回的那条不该永久丢失"
+        )
+
+    async def test_a_failed_write_is_retried_later(self):
+        """写失败不能落「已写过」标记，否则这件事永远不会补上。"""
+
+        class _Flaky:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def record_external_memory(self, **kw):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("坏了")
+
+        flaky = _Flaky()
+        obj = self._plugin(flaky)
+        await obj._write_finished_process(self._Core("第零件"), "umo", "u1")  # 只记账
+        await obj._write_finished_process(self._Core("整理个案"), "umo", "u1")  # 第一次失败
+        self.assertEqual(flaky.calls, 1)
+        # 退避期内不重试（否则每条消息都撞一次坏接口）
+        await obj._write_finished_process(self._Core("整理个案"), "umo", "u1")
+        self.assertEqual(flaky.calls, 1, "退避期内不该重复调用")
+        # 退避过后补写：失败没有落标记，所以这条还能补上
+        obj._life_write_failed_at["bot1"] = 0.0
+        await obj._write_finished_process(self._Core("整理个案"), "umo", "u1")
+        self.assertEqual(flaky.calls, 2, "失败过的那条必须在退避期后补写")
 
     async def test_no_bridge_and_no_user_are_both_silent(self):
         obj = self._plugin(None)

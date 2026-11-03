@@ -136,7 +136,7 @@ class BehaviorService:
             if low < elapsed <= high or (elapsed == low and low == 300.0):
                 affection = 50.0
                 try:
-                    affection = float(self._core.mood.profile(user_id).get("affection", 50.0))
+                    affection = float(self._profile_readonly(user_id).get("affection", 50.0))
                 except Exception:
                     pass
 
@@ -351,6 +351,23 @@ class BehaviorService:
         digest = hashlib.blake2b(raw.encode("utf-8"), digest_size=4).digest()
         return (int.from_bytes(digest, "big") / 4294967295.0 - 0.5) * 2.0 * CARE_SEED_SPAN
 
+    def _profile_readonly(self, user_id: str) -> Dict[str, Any]:
+        """只读情绪快照：算行为不该顺手给别人建一份档案。
+
+        `mood.profile()` 是**写路径**（没有档案就现建一条并 mark_dirty）。行为层
+        每次注入都要问在意度/上心程度，用它就等于「每轮注入都在写 state.json」；
+        群聊里更糟——每个被看到的陌生人都会留下一条永久空壳（空壳不含可清理字段，
+        `prune_expired` 跳过它），state.json 随群规模一直涨。
+        `peek_profile` 有档案时返回修好坏的**浅拷贝**，口径与写路径一致。
+        """
+        try:
+            peek = getattr(self._core.mood, "peek_profile", None)
+            if callable(peek):
+                return peek(user_id) or {}
+        except Exception:
+            pass
+        return {}
+
     def _care_target(self, user_id: str, profile: Dict[str, Any]) -> float:
         """目标在意度：好感度为主，脾气与“她本来对这个人是什么缘分”为辅。"""
         try:
@@ -395,10 +412,7 @@ class BehaviorService:
         # 钉死的满分在意度（这一轴的半衰期是 72 小时，不会自己回来）。
         if not _is_finite(current) or not _is_finite(at):
             current, at = 0.0, 0.0
-        try:
-            profile = self._core.mood.profile(user_id)
-        except Exception:
-            profile = {}
+        profile = self._profile_readonly(user_id)
         target = self._care_target(user_id, profile)
         if current <= 0.0 or at <= 0.0:
             # 第一面直接落在目标上（含基线错位）：这一轴不该从 0 慢慢爬。
@@ -496,10 +510,7 @@ class BehaviorService:
                 return {}
         if not cfg.mood_enabled:
             return {"care": 0.5, "focus": self._focus(user_id, text, {}), "spare": self._spare(now)}
-        try:
-            profile = self._core.mood.profile(user_id)
-        except Exception:
-            profile = {}
+        profile = self._profile_readonly(user_id)
         try:
             care_value = self.care(user_id, now)
         except Exception:

@@ -1,4 +1,8 @@
-﻿__pycache__/
-/data/
+__pycache__/
 *.pyc
-tmp*/
+.pytest_cache/
+# 只忽略仓库根下的运行时数据目录（AstrBot 写的 cmd_config.json / temp / t2i_templates）。
+# 写成 `data/` 会连源码包 humanoid/data/（cities/holidays/mood_map）一起吞掉：
+# 那几个文件是被 clock.py、config.py、prompt_builder.py 直接 import 的，
+# 一旦用 `git archive` 出包，插件会因为少一个包直接 ImportError。
+/data/

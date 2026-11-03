@@ -69,7 +69,11 @@ class HumanoidEngine:
         result = lookup_city_time(city)
         if result is None:
             return None
-        text = f"📍 {result.display_city} 当前时间: {result.text}（星期{result.weekday}）"
+        # 地名可能拿不到（表外 IANA 名、空值等）：宁可不给名字，也别把 None 或英文
+        # 时区名递给她。城市名缺失时只给时间。
+        name = (result.display_city or "").strip()
+        stamp = f"当前时间: {result.text}（星期{result.weekday}）"
+        text = f"📍 {name} {stamp}" if name else f"📍 {stamp}"
         if result.note:
             text += f"\n⚠ {result.note}"
         return text
@@ -119,7 +123,21 @@ class HumanoidEngine:
             zone_status=self._zone_status(core),
             state_size_lines=state_size_lines(core),
             version=__version__,
+            role_id=str(getattr(core, "role_id", "") or ""),
+            # 后台循环启动失败的角色（role_manager 的退避重试记录）：失败实例仍能读状态，
+            # 但日程/情绪/天气/社交都不再自己跑——不写进面板，用户只能去翻日志。
+            failed_loops=self._failed_loops(),
         )
+
+    def _failed_loops(self) -> dict[str, float]:
+        getter = getattr(self.role_manager, "failed_roles", None)
+        if not callable(getter):
+            return {}
+        try:
+            out = getter()
+        except Exception:
+            return {}
+        return out if isinstance(out, dict) else {}
 
     @staticmethod
     def _zone_status(core) -> dict:
@@ -134,13 +152,18 @@ class HumanoidEngine:
 
     @staticmethod
     def _inject_estimate(core) -> dict:
-        """量一下当前角色实际会追加多大的上下文——拿真状态算，不拿常量猜。"""
+        """量一下当前角色实际会追加多大的上下文——拿真状态算，不拿常量猜。
+
+        返回结构化结果：成功 `{"tokens": N, "scene": "私聊探针"}`，失败
+        `{"error": "<原因>"}`。失败时以前返回空 dict，诊断页那一整节就静默消失了：
+        用户看到的是一节空白，而不是「测不出来，因为 X」。
+        """
         from .prompt_builder import estimate_tokens
 
         try:
             text = core.build_injection("status-probe", is_group=False)
-        except Exception:
-            return {}
+        except Exception as exc:  # noqa: BLE001 - 探针失败不能让整节诊断消失
+            return {"error": f"{type(exc).__name__}: {exc}"}
         finally:
             # 诊断必须无副作用：build_injection 会经 mood.profile() 给这个探针 uid
             # 建一份用户档案。用完就删，别在 state.json 里留一个假用户。
@@ -148,10 +171,10 @@ class HumanoidEngine:
                 core.scope.delete_user("status-probe")
             except Exception:
                 pass
-        return {
-            f"{core.config.inject_activity_context}（实测）": estimate_tokens(text),
-            "Token 预算": int(core.config.inject_token_budget),
-        }
+        if not text:
+            return {"error": "注入为空"}
+        # 这是**一次假用户私聊**的注入量，不是聊天时真实追加的上下文：群聊注入另计。
+        return {"tokens": estimate_tokens(text), "scene": "私聊探针"}
 
     def parse_affection_batch(self, raw: str) -> tuple[list[tuple[str, float]], int]:
         """解析批量导入：返回（可用的 QQ-数值对, 一眼就看错了多少条）。

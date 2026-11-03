@@ -38,11 +38,12 @@ class _StubCore:
             now=lambda: datetime(2026, 8, 22, 23, 0, tzinfo=TZ),
             today_str=lambda: "2026-08-22",
         )
-        # 「现在是不是她的夜里」现在按她**日程**推出来的夜判（soma.in_scheduled_night），
-        # 不再看配置里的固定窗口。测试用 night 直接驱动它。
+        # 「现在是不是她的夜里」现在只有一份推导：state_snapshot.night() 读
+        # soma.scheduled_night()（日程推出来的睡段）→ 配置窗口兜底，再看钟点。
+        # 钟是 23:00，所以「夜」= 23:00-06:00，「白天」= 05:00-11:00。
         self.soma = SimpleNamespace(
             snapshot=lambda: {"asleep": 1.0 if asleep else 0.0},
-            in_scheduled_night=lambda hour: night,
+            scheduled_night=lambda: (23.0, 6.0) if night else (5.0, 11.0),
         )
 
 

@@ -21,7 +21,7 @@ from humanoid.services.schedule import (
     day_phrases,
     segment_prompt,
 )
-from humanoid.slots import normalize_slots
+from .slot_fixtures import normalize_slots
 from humanoid.state import StateStore
 from humanoid.recall import note_said, recall_lines, snippet
 
@@ -146,6 +146,27 @@ class PersonaSourceTest(unittest.TestCase):
         self.run_it(src.persona("bot1"))
         self.assertEqual(ctx.persona_manager.calls, 2)
 
+    def test_an_equal_empty_persona_is_not_cached(self):
+        """判空按值而不是按身份：新建的等值空人设也不能被缓存六百秒。"""
+        from unittest import mock
+
+        from humanoid import persona as persona_module
+
+        calls: list[str] = []
+
+        async def fake_resolve(context, umo):
+            calls.append(umo)
+            return persona_module.Persona()  # 等值，但不是 EMPTY 单例
+
+        src = PersonaSource(FakeContext(), RecordingLogger())
+        with mock.patch.object(persona_module, "resolve_persona", fake_resolve):
+            first = self.run_it(src.persona("bot1"))
+            second = self.run_it(src.persona("bot1"))
+        self.assertEqual(first, Persona())
+        self.assertEqual(second, Persona())
+        self.assertEqual(len(calls), 2, "空人设说明解析失败，下一条消息要重新试")
+        self.assertIsNone(src.cached_persona("bot1"))
+
     def test_broken_persona_manager_does_not_break_generation(self):
         class Boom:
             async def resolve_selected_persona(self, **kwargs):
@@ -162,9 +183,11 @@ class PersonaSourceTest(unittest.TestCase):
     def test_truncate_cuts_on_line_boundary(self):
         text = "\n".join(f"第{i}行人设内容写得很清楚" for i in range(200))
         cut = truncate(text, 120)
-        self.assertLessEqual(len(cut), 160)
-        self.assertTrue(cut.endswith("（以上是完整人设的开头部分。）"))
-        self.assertFalse(cut.split("（")[0].endswith("写"), "不该切在一句话中间")
+        self.assertLessEqual(len(cut), 120)
+        # 只截正文：不追加「（以上是完整人设的开头部分。）」这类编辑说明
+        # （审核 注入取舍 #132——那句会跟着人设一起进日程注入）。
+        self.assertNotIn("以上是完整人设", cut)
+        self.assertFalse(cut.endswith("写"), "不该切在一句话中间")
 
 
 class SchedulePersonaTest(unittest.TestCase):
@@ -256,21 +279,21 @@ class SchedulePersonaTest(unittest.TestCase):
         # 「人设超长时被截断」这件事。直接量注入的人设正文，跟包装文字解耦。
         injected = truncate(huge.prompt, cfg().schedule_persona_max_chars)
         self.assertIn(injected[:80], prompt, "被截断后的人设正文应该原样出现在 prompt 里")
-        # truncate 会在末尾补一句「（以上是完整人设的开头部分。）」告诉模型被砍过，
-        # 那十几个字不算在人设正文里，但确实进了请求。
-        marker = len("（以上是完整人设的开头部分。）") + 8
+        # truncate 只返回正文、不追加元说明（审核 注入取舍 #132）：那句
+        # 「（以上是完整人设的开头部分。）」是写给读者看的编辑说明，拼在正文末尾
+        # 就变成「关于这段文本的指令」一起进了请求。
         self.assertLessEqual(
-            len(injected), cfg().schedule_persona_max_chars + marker,
+            len(injected), cfg().schedule_persona_max_chars,
             "注入的人设正文超过了配置的上限",
         )
-        self.assertIn("以上是完整人设的开头部分", prompt)
+        self.assertNotIn("以上是完整人设的开头部分", prompt)
         # 带换行的人设也要按行边界切，不能把一句话砍一半
         lines = Persona("小娜", "\n".join(["第%d行人设内容" % n for n in range(2000)]), "x")
         cut = segment_prompt(cfg(), now_text="15:20", weekday="六", persona=lines)
         cut_injected = truncate(lines.prompt, cfg().schedule_persona_max_chars)
         self.assertIn(cut_injected[:60], cut, "被截断的人设正文应该原样出现")
         self.assertLessEqual(
-            len(cut_injected), cfg().schedule_persona_max_chars + marker,
+            len(cut_injected), cfg().schedule_persona_max_chars,
             "按行边界切完仍然超过上限",
         )
         self.assertFalse(cut_injected.rstrip().endswith("内容写"), "不该切在一句话中间")
@@ -351,7 +374,8 @@ class DayNarrativeTest(unittest.TestCase):
         got = self.phrases_at(15, 20)
         self.assertEqual(got["doing"], "跟客户过方案")
         self.assertIn("中午在午餐与午休", got["done"])
-        self.assertTrue(got["next"], "15:20 离 17:30 不到三小时，该有「接下来」")
+        # #73：滚动分段不预排未来，next 恒为空（未来段压根不进 day_phrases）。
+        self.assertEqual(got["next"], [], "滚动分段不预排未来：未来段不会出现在 day_phrases 里")
 
     def test_sleep_block_is_not_reported_as_an_activity(self):
         got = self.phrases_at(8, 0)
@@ -444,6 +468,20 @@ class RecallTest(unittest.TestCase):
     def test_stale_memories_are_not_injected(self):
         got = note_said([], "我猫今天吐了，带去医院看了一下", 1000.0)
         self.assertEqual(recall_lines(got, 1000.0 + 90 * 3600.0), [])
+
+    def test_unknown_timestamp_is_kept_not_treated_as_expired(self):
+        """老数据没有 at（或 at=0）是「时间未知」，不该被当成十二小时前的旧事丢掉。"""
+        body = "我猫今天吐了，带去医院看了一下"
+        self.assertEqual(
+            recall_lines([{"said": body, "at": 0}], 1e9), [f"TA之前说过「{body}」"]
+        )
+        self.assertEqual(recall_lines([{"said": body}], 1e9), [f"TA之前说过「{body}」"])
+
+    def test_recording_does_not_drop_entries_without_timestamp(self):
+        existing = [{"said": "我下周要搬家了，东西还没收", "at": 0}]
+        got = note_said(existing, "面试要考两小时的专业课", 4000.0)
+        self.assertEqual(len(got), 2, "时间未知的旧事不该被一次记账顺手删掉")
+        self.assertEqual(got[1]["at"], 0)
 
     def test_on_message_records_and_injection_uses_it(self):
         import asyncio

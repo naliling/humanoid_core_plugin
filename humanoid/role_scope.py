@@ -101,7 +101,15 @@ class RoleScope:
         self.mark_dirty()
 
     def get_user(self, user_id: str, key: str, default=None):
-        return self.user_state(user_id).get(key, default)
+        """**只读**：读一个字段，不因为读而建出这个用户的条目。
+
+        原来走 `user_state()`（get-or-create）：`get_user` 的调用方全是纯读
+        （core_instance 的 last_interaction / last_message / her_said_at、mood 的 nickname），
+        每读一次就给这个人留一条永久空壳——空壳不含任何会被过期清理的字段，
+        `prune_expired` 直接跳过，于是 state.json 随群规模一直涨（审核 引擎与诊断 M7）。
+        写路径仍走 `user_state()` / `ensure_user()` 显式建档。
+        """
+        return self.peek_user(user_id, key, default)
 
     def peek_user(self, user_id: str, key: str, default=None):
         """**只读**，而且不因为读而建出这个用户的条目。

@@ -17,14 +17,24 @@
 
 from __future__ import annotations
 from . import ccb as _ccb
+from . import state_snapshot as _snap
+# 情绪记忆的有效期只有一份（审核 F10）：以前 7 天只写在 mood 的写入侧剪枝里，
+# 读取侧（_memory_note）不判时间，「7 天有效期」实际变成「下次再记一笔时才生效」。
+from .services.mood import EMOTION_MEMORY_DAYS
+# 时间换算只许有一处实现（R5）：这里原来自己 `datetime.fromtimestamp(ts, tz)`，
+# 与 clock.local 是同一件事的两份写法——换时区/换城市后各处各算一天。
+from .clock import local as _clock_local
 import hashlib
 import math
 
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-# 门槛：情绪要**高于初始值**才出现。初始值是 affection 46 / libido 34 / aggression 28，
-# 门槛压着初始值时，这些话就是常驻背景而不是异常信号。
+from astrbot.api import logger
+
+# 门槛：情绪要**高于初始值**才出现。初始值读配置（默认 affection 35 / libido 34 /
+# aggression 28），门槛压着初始值时，这些话就是常驻背景而不是异常信号。
+# 这里以前把 46 / 34 / 28 写死成「初始值」，而面板默认是 35 / 34 / 28——注释和代码
+# 说的不是同一个数（审核 注入生成 P-10）。默认值现在只有 state_snapshot 一份。
 SHIFT_HIGH = 9.0
 SHIFT_LOW = -7.0
 AGGRESSION_UP = 7.0
@@ -41,6 +51,44 @@ GRUDGE_SAME_DAY = 2
 # 而 ccb 是在**读路径**（build_injection）里推进的，不去重的话一条消息会被算成几次
 # （当日次数、一辈子的次数都重复计，ccb_satisfy 还会一步跨几格）。
 CCB_ADVANCE_DEDUP_SECONDS = 60.0
+
+# 注入里出现的「阶段」只给感受词，不给档位名（#62）。索引就是 `ccb.phase_of()` 的
+# 返回值：0=不在场景、1=起步、2=中间、3=接近顶点、4=顶点、5=余韵。边界由
+# `ccb.CCB_SATISFY_STEP` / `CCB_SATISFY_FULL` 决定，这里**只翻词、不写阈值**——
+# 所以 #12 改 `PHASE_NAMES` 的字面量（面板用的内部档位名）不会影响注入。
+# 长度必须与 `ccb.PHASE_NAMES` 对齐：`_scene_feeling` 用它做边界，
+# `tests/test_v304_b5_body.py` 里有守卫用例。
+_SCENE_FEELINGS: Tuple[str, ...] = (
+    # 每一条都**不能**包含 `PHASE_NAMES` 里的词（「动情/沉醉/临界/爆发/余韵」）：
+    # 守卫用例按子串查，写成「有点动情」会让「动情」照样漏进上下文。
+    "", "心跳有点快", "正舒服", "快忍不住了", "到了", "还没缓过来",
+)
+
+
+def _scene_feeling(phase: int) -> str:
+    """相位编号 → 她自己的感受。0 / 越界 / 非数 → 空串（宁可不说，也不说档位名）。"""
+    try:
+        idx = int(phase)
+    except (TypeError, ValueError):
+        return ""
+    if idx <= 0 or idx >= len(_ccb.PHASE_NAMES) or idx >= len(_SCENE_FEELINGS):
+        return ""
+    return _SCENE_FEELINGS[idx]
+
+
+# 注意：调用点一律写 `getattr(self, "_core", None)`，不要直接 `self._core`。
+# 这几个方法只依赖 `core.config`，而测试会用 `EmotionLayer.__new__` 直接构造对象来
+# 单独验纯函数（不跑 __init__，也就没有 _core）；直接取属性会 AttributeError。
+def _seed_affection(core: Any) -> float:
+    return _snap.affection_default(getattr(core, "config", None))
+
+
+def _seed_libido(core: Any) -> float:
+    return _snap.libido_default(getattr(core, "config", None))
+
+
+def _seed_aggression(core: Any) -> float:
+    return _snap.aggression_default(getattr(core, "config", None))
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -165,11 +213,11 @@ class EmotionLayer:
 
     def _now_mood(self, profile: Dict[str, Any], index: int) -> Tuple[float, str]:
         """此刻的心气。三轴相对基线动了多少。"""
-        aff = _num(profile.get("affection"), 46.0)
+        aff = _num(profile.get("affection"), _seed_affection(getattr(self, "_core", None)))
         base_aff = _num(profile.get("base_affection"), aff)
-        libido = _num(profile.get("libido"), 34.0)
+        libido = _num(profile.get("libido"), _seed_libido(getattr(self, "_core", None)))
         base_lib = _num(profile.get("base_libido"), libido)
-        aggr = _num(profile.get("aggression"), 28.0)
+        aggr = _num(profile.get("aggression"), _seed_aggression(getattr(self, "_core", None)))
         base_aggr = _num(profile.get("base_aggression"), aggr)
         eager = libido - base_lib >= LIBIDO_UP
 
@@ -191,9 +239,9 @@ class EmotionLayer:
     def _attitude(self, profile: Dict[str, Any], user_id: str, index: int) -> Tuple[float, str]:
         """对你的态度。含「记着上次那件事」这一类。"""
         ups, downs = self._today_events(user_id)
-        aff = _num(profile.get("affection"), 46.0)
+        aff = _num(profile.get("affection"), _seed_affection(getattr(self, "_core", None)))
         base_aff = _num(profile.get("base_affection"), aff)
-        aggr = _num(profile.get("aggression"), 28.0)
+        aggr = _num(profile.get("aggression"), _seed_aggression(getattr(self, "_core", None)))
         base_aggr = _num(profile.get("base_aggression"), aggr)
 
         if downs >= GRUDGE_SAME_DAY:
@@ -233,9 +281,9 @@ class EmotionLayer:
             care = float(interest.get("care"))
         except (TypeError, ValueError):
             return 0.0, ""
-        aff = _num(profile.get("affection"), 46.0)
+        aff = _num(profile.get("affection"), _seed_affection(getattr(self, "_core", None)))
         base_aff = _num(profile.get("base_affection"), aff)
-        aggr = _num(profile.get("aggression"), 28.0)
+        aggr = _num(profile.get("aggression"), _seed_aggression(getattr(self, "_core", None)))
         base_aggr = _num(profile.get("base_aggression"), aggr)
         upset = (aggr - base_aggr >= AGGRESSION_UP) or (aff - base_aff <= SHIFT_LOW)
 
@@ -275,11 +323,11 @@ class EmotionLayer:
         显著度刻意压在既有五维之下——它们是「没什么大事、但心里有点东西」的底色，
         不该盖过「被惹了」「很在意你」这些更重的信号。
         """
-        aff = _num(profile.get("affection"), 46.0)
+        aff = _num(profile.get("affection"), _seed_affection(getattr(self, "_core", None)))
         base_aff = _num(profile.get("base_affection"), aff)
-        libido = _num(profile.get("libido"), 34.0)
+        libido = _num(profile.get("libido"), _seed_libido(getattr(self, "_core", None)))
         base_lib = _num(profile.get("base_libido"), libido)
-        aggr = _num(profile.get("aggression"), 28.0)
+        aggr = _num(profile.get("aggression"), _seed_aggression(getattr(self, "_core", None)))
         base_aggr = _num(profile.get("base_aggression"), aggr)
         d_aff = aff - base_aff
         d_lib = libido - base_lib
@@ -348,8 +396,8 @@ class EmotionLayer:
         if first <= 0 or now_epoch <= first:
             return 0.0, ""
         try:
-            met = datetime.fromtimestamp(first, tz)
-            today = datetime.fromtimestamp(now_epoch, tz)
+            met = _clock_local(first, tz)
+            today = _clock_local(now_epoch, tz)
         except Exception:
             return 0.0, ""
         years = today.year - met.year
@@ -370,6 +418,18 @@ class EmotionLayer:
         if not isinstance(led, list) or not led:
             return 0.0, ""
         last = led[-1] if isinstance(led[-1], dict) else {}
+        # 读取侧也要判有效期（审核 F10）：写入侧 `mood._note_emotion_memory` 只在
+        # 「又记了一笔」时剪枝，而正常使用里 8–30 天没有一笔 ±1.5 的情绪事件很常见
+        # ——那段时间 led[-1] 一直是旧的那笔，注入句照旧说「前几天那件事我还记着」，
+        # 把一个月前的事说成前几天。TTL 只在一个方向生效，读到的就不是「还新鲜的」，
+        # 而是「最后写进去的」。
+        try:
+            stamp = float(last.get("t", 0.0) or 0.0)
+            now = float(self._core.now_epoch())
+        except (TypeError, ValueError):
+            return 0.0, ""
+        if not math.isfinite(now) or stamp <= 0 or now - stamp > EMOTION_MEMORY_DAYS * 86400.0:
+            return 0.0, ""
         kind = str(last.get("k") or "")
         level = str(last.get("lvl") or "light")
         # M3：分轻重——重的是「那件事还堵着」，轻的是「有点小别扭/记着你的好」。
@@ -383,8 +443,13 @@ class EmotionLayer:
             return 0.50, _pick(("记着你的好", "这点好我记着"), index)
         return 0.0, ""
 
-    def _cooling_line(self, user_id: str, index: int) -> Optional[Tuple[float, str]]:
-        """D 冷静期：她带着情绪冷着，直接返回、不参与竞争。"""
+    def _cooling_line(self, user_id: str) -> Optional[Tuple[float, str]]:
+        """D 冷静期：她带着情绪冷着，直接返回、不参与竞争。
+
+        句子一律由 `mood.cooling_line(record, inner=True)` 渲染（审核 F1/F2）：模板只有
+        一份，所以「还在为你刚才说的话的事」这种二次拼装不会再出现；inner 通道只给
+        感受、不给祈使句，所以「先别理他」不会混进她的内心独白。
+        """
         try:
             record = self._core.mood.profile(user_id) or {}
             # 非有限数当「没有冷静期」，不能当「还在冷静」：`now >= nan` 为假，
@@ -400,13 +465,13 @@ class EmotionLayer:
             return None
         if until <= 0 or now >= until:
             return None
-        reason = str(record.get("cool_reason") or "")
-        if reason:
-            return 0.95, _pick((
-                f"还在为{reason}的事烦着，这会儿不想好好说话，想让他先别来吵",
-                f"心里堵着{reason}那件事，先别理他，过几分钟再说",
-            ), index)
-        return 0.95, _pick(("现在很烦，想让他先别来吵", "这会儿不想说话，过几分钟再讲"), index)
+        try:
+            text = self._core.mood.cooling_line(record, inner=True)
+        except Exception:
+            return None
+        if not text:
+            return None
+        return 0.95, text
 
     # ------------------------------------------------------------------
 
@@ -434,13 +499,22 @@ class EmotionLayer:
         agency: Dict[str, Any],
         is_group: bool = False,
         persona_prompt: str = "",
+        asleep: bool = False,
     ) -> Tuple[float, str, str]:
-        """同 `candidate`，多返回一个来源标记：`"emotion"` / `"ccb"` / 空串。
+        """同 `candidate`，多返回一个来源标记：`"emotion"` / `"ccb"` / `"cooling"` / 空串。
 
         `prompt_builder._emotion_line` 要对「逐轮重复的同一句」去重（线上实测：
         同一句情绪话连续 8 轮被照抄成「心里窝火」模板）。但 ccb 那句不能去重——
         它本来就是场景里的实时状态（姿势/满足度还会拼在后面），隔一轮不给等于场景里
-        突然没声音了。来源标记就是给这一处判断用的。
+        突然没声音了。冷静期那句同理：`cool_until` 是一个会过期的状态，
+        被 10 分钟去重压掉就会出现「她还在生气，但注入里一句都不提」的空窗
+        （黄金快照实测：t0 有、t+2/t+9 没有、t+11 又有）。所以这两种来源都单独标记，
+        只有普通情绪句参与逐字去重。
+
+        `asleep=True` 时去掉「主动性」这一维：睡着的人不会「有点想说话」。
+        同一轮里睡眠状态句已经写着「正睡着」，再来一句「她内心：有点想说话」，
+        模型只能把两条互斥的事实二选一——实测它选了后者，照着「想说话」的口气回话。
+        心情（心气/态度/记忆）照样保留：半夜被吵醒时她仍然可能是窝火或心软的。
         """
         try:
             profile = self._core.mood.profile(user_id) or {}
@@ -477,8 +551,10 @@ class EmotionLayer:
             self._now_mood(profile, index),
             self._attitude(profile, user_id, index),
             self._intimacy(interest or {}, profile, index),
-            self._willingness(agency or {}, index),
         ]
+        # 主动性只在醒着时成立：睡着的人不「想开话头」（见 docstring 的 asleep 段）。
+        if not asleep:
+            pools.append(self._willingness(agency or {}, index))
         pools.extend(self._extra_moods(profile, index))
         note = self._memory_note(user_id, index)
         if note[1]:
@@ -491,12 +567,15 @@ class EmotionLayer:
             pools.append(after)
 
         # 冷静期优先于一切：她正在气头上，别的情绪都让位。
-        cool = self._cooling_line(user_id, index)
+        cool = self._cooling_line(user_id)
         if cool is not None:
-            return cool[0], cool[1], "emotion"
+            # 来源标 "cooling"：它会过期，不能被 _emotion_line 的逐字去重压掉。
+            return cool[0], cool[1], "cooling"
 
         # ccb：一个默认关的独立开关。条件全中时它**直接返回**，不参与竞争——
-        # 门槛已经很高（亲近欲 45/50 且是涨上来的），到了就是这一刻，
+        # 门槛已经很高（亲近欲 ≥ `ccb.CCB_LIBIDO_MIN`=38，且比基线涨了
+        # `ccb.CCB_LIBIDO_RISE`=4 以上，见 ccb.py:36-45；这里以前写死「45/50」，
+        # 是 #158 之前那套已作废的数字），到了就是这一刻，
         # 让它再和「有点想说话」比显著度就等于把它稀释掉了。
         got = self._ccb_line(
             user_id, profile, is_group=is_group, persona_prompt=persona_prompt, now=None
@@ -525,8 +604,11 @@ class EmotionLayer:
             cfg = getattr(self._core, "config", None)
             if not bool(getattr(cfg, "ccb", False)):
                 return 0.0, ""
-            if not bool(getattr(cfg, "ccb_scene_detail", True)):
-                return 0.0, ""
+            # #82：这里以前还有一道 `if not ccb_scene_detail: return`——余韵句是
+            # **独立的一条情绪候选**（在 pools 里按显著度竞争），不是「场景细节」，
+            # 关掉细节把它一起关掉，等于 `ccb_scene_detail` 的文档承诺（只影响
+            # 场景状态段）与实际行为不符：用户关掉细节后，连「她还没缓过来」也消失了。
+            # 细节开关只该管 `_scene_text` 那道闸（:861），不该管这一条。
         except Exception:
             return 0.0, ""
         until_raw = self._core._scope.peek_user(user_id, "ccb_aftercare_until", 0.0)
@@ -544,6 +626,11 @@ class EmotionLayer:
         ratio = _ccb.aftercare_ratio(aftercare_until=until, now=now, window=window)
         return 0.50 + 0.40 * ratio, text
 
+    def _tz(self):
+        """她的时区（ccb 的按天账按她的日历算，不按宿主）。取不到就 None=旧行为。"""
+        clock = getattr(self._core, "clock", None)
+        return getattr(clock, "tz", None)
+
     def _roll_ccb_day(self, user_state: Dict[str, Any], moment: float) -> bool:
         """按天滚动 ccb 的满足度与当日次数，返回**确实改了状态**没有。
 
@@ -559,7 +646,7 @@ class EmotionLayer:
         keys = ("ccb_day", "ccb_satisfy", "ccb_turns")
         try:
             before = tuple(user_state.get(key) for key in keys)
-            _ccb.decay_satisfy(user_state, float(moment))
+            _ccb.decay_satisfy(user_state, float(moment), tz=self._tz())
             return tuple(user_state.get(key) for key in keys) != before
         except Exception:
             # 修复项本身失败不该连累这一轮的内心话（这个函数外面没有 try）。
@@ -595,6 +682,9 @@ class EmotionLayer:
         # 还要推进状态、扣精力——被挡的人不该留下任何账。
         safety = _ccb.safety_block(persona_prompt)
         if safety:
+            # 命中原因写 debug：这是**静默关掉整条功能**的闸，不写日志时用户只看到
+            # 「没反应」，分不清是门槛没到还是人设被安全词表拦了（B6 #81）。
+            logger.debug("[humanoid] ccb 安全闸命中，整条功能不生效：%s", safety)
             return None
         # P0：进 evaluate 之前先把「按天回落 + 当日次数重算」做掉。
         # 不做的话第 8 次之后 `ccb_turns` 永久卡住、ccb 再也不触发（根因见
@@ -627,19 +717,21 @@ class EmotionLayer:
                 arousal = float(self._core.soma.snapshot().get("arousal", 50.0) or 50.0)
             except Exception:
                 arousal = 50.0
-        # 关系到哪一步：用现成的 relstage，不新造一套档位。
+        # 关系到哪一步：走 state_snapshot 的唯一一份（好感 + 相处时长）。
+        # 原来这里只传好感，于是聊过几百轮的人在注入里是「熟到可以直说」、
+        # 在这里还算成「还在熟悉」——同一轮两套阶段（审核 状态与人设 1）。
         rel_index = 0
         try:
-            from .relstage import stage_of
-
-            rel_index = int(stage_of(affection)[0])
+            rel_index = int(
+                _snap.relation_of(state, moment, tz=_snap.tz_of(self._core)).stage_id
+            )
         except Exception:
             rel_index = 0
         initiative_score = _ccb.initiative(
             libido=libido,
             base_libido=base_libido,
             arousal=arousal,
-            aggression=_num(state.get("aggression"), 25.0),
+            aggression=_num(state.get("aggression"), _seed_aggression(getattr(self, "_core", None))),
             relstage_index=rel_index,
             affection=affection,
             affection_min=affection_min,
@@ -649,7 +741,14 @@ class EmotionLayer:
         # ── 进门判断────────────────────────────────────
         # 模型分只在那次情绪批里更新（默认 10 条一次），所以必须判它新不新鲜：
         # 30 分钟前的结论不能拿来决定现在进不进。过期 → -1（不知道）→ 退回兜底。
-        in_scene = float(user_state.get("ccb_stage", 0.0) or 0.0) > 0
+        # F8：闲置超时（`CCB_SCENE_IDLE_SECONDS`，默认 6 小时）必须**真的结束这一场**。
+        # 原来只有只读面板（`scene_status`）判「已过期」，状态机照旧拿
+        # `ccb_stage > 0` 当「还在场景里」——于是隔夜再聊，她还在上一场的姿势、
+        # 满足度与「临界」里续着。判据走 `scene_active()`，与面板同源，不另算。
+        in_scene = _ccb.scene_active(user_state, moment)
+        if not in_scene and float(user_state.get("ccb_stage", 0.0) or 0.0) > 0:
+            _ccb.reset_scene(user_state)
+            self._core._scope.mark_dirty()
         raw_score = _num(user_state.get("ccb_scene_score"), -1.0)
         score_at = _num(user_state.get("ccb_scene_at"), 0.0)
         scene_score = raw_score if _ccb.scene_score_fresh(score_at, moment) else -1.0
@@ -667,7 +766,7 @@ class EmotionLayer:
         lead_mode = str(getattr(_cfg, "ccb_lead", "auto") or "auto")
         dominance_score = _ccb.dominance(
             persona_prompt=persona_prompt,
-            aggression=_num(state.get("aggression"), 25.0),
+            aggression=_num(state.get("aggression"), _seed_aggression(getattr(self, "_core", None))),
             relstage_index=rel_index,
             affection=affection,
             her_acts=_num(user_state.get("ccb_her_acts"), 0.0),
@@ -751,25 +850,27 @@ class EmotionLayer:
         if not was_in_scene:
             _ccb.log_clear(user_state)
             user_state["ccb_peak_depth"] = 0.0
-        user_state["ccb_stage"] = float(stage)
-        # P0-4 的收口：**同一个事件只记一次**。原来这里无条件 +1，而
-        # `note_occurrence`（用户/她的话命中词表）也 +1 —— 一次事情被记两遍。
-        # 现在两边共用 `ccb_event_dedup_at`：60 秒内谁先记谁算，后一个不重复。
-        try:
-            last_event = float(user_state.get("ccb_event_dedup_at", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            last_event = 0.0
-        if float(moment) - last_event >= 60.0:
-            user_state["ccb_event_dedup_at"] = float(moment)
+            # F5：当日次数 = 今天开了几场（进场时 +1），不是「推进了几格」。
+            # 原来每推进一格 +1，而一场要 4 格——面板上的「今天 3 次」其实是
+            # 「推进了 3 格」，也就是同一次事情还没做完就已经记了 3 次。
             user_state["ccb_turns"] = float(user_state.get("ccb_turns", 0.0) or 0.0) + 1.0
-            # 一辈子的次数：社交层靠它判断「有没有和对方色色过」
-            user_state["ccb_done_count"] = (
-                float(user_state.get("ccb_done_count", 0.0) or 0.0) + 1.0
-            )
-        user_state["ccb_last_at"] = float(moment)
+        user_state["ccb_stage"] = float(stage)
+        # F5 / F6 / F7：这里只推进场景，**不记账**。
+        # * `ccb_turns`（今天几场）在进场时 +1，见上面 `if not was_in_scene`。
+        # * `ccb_done_count`（一辈子的次数）只有一个入口：`note_occurrence()`。
+        #   这里再 +1 会让一次事情被记两遍（另一遍来自正文命中「已经发生」）。
+        # * `ccb_last_at` 的语义是「上一次真的发生」，推进不是发生——它记在
+        #   `ccb_activity_at`（只给闲置超时用），免得「上次发生」被推进刷成现在。
+        user_state["ccb_activity_at"] = float(moment)
         # 推进场景。跨天的回落和次数重算都发生在这一步里，所以只在真进场景时
         # 才付这个代价——没进场景的日子不该把状态改掉。
-        if _ccb.advance_satisfy(user_state, float(moment)):
+        # F3：进场那一轮**不推进**。`advance_satisfy` 每次 +40，进场时 satisfy=0 →
+        # 首轮立刻 40 → `phase_of()` 直接是 2「沉醉」，phase 1「动情」在注入路径上
+        # 一次都到不了。改成从第二场内轮开始累积：0(动情) → 40(沉醉) → 80(临界)
+        # → 100(到顶)；一场完整的场景因此是 4 轮，不是 3 轮。
+        if was_in_scene and _ccb.advance_satisfy(
+            user_state, float(moment), tz=self._tz()
+        ):
             # 刚到顶：这一次是收场，扣一次体力。
             self._core._scope.set_self(
                 "energy", max(0.0, float(self._core.energy.energy) - _ccb.CCB_ENERGY_COST)
@@ -795,7 +896,7 @@ class EmotionLayer:
         self._core._scope.mark_dirty()
         # 状态段放在**推进之后**算：原来放在 `evaluate` 之后、写 stage 之前，
         # 于是进场那一轮读到的还是 stage=0（整段不出），之后每轮读到的是**上一轮**
-        # 的满足度（注入说"平台"、状态里已经是"临界"）。实测对不上，S3。
+        # 的满足度（注入说"沉醉"、状态里已经是"临界"）。实测对不上，S3。
         return score, self._scene_text(text, user_state, moment, user_id, _cfg)
 
     def _scene_text(self, text: str, user_state: Dict[str, Any], moment: float,
@@ -848,13 +949,24 @@ class EmotionLayer:
         depth = _ccb.depth_estimate(_num(partner.get("length_cm"), 0.0), phase)
         # 单调化：这一场只升不降。
         depth = _ccb.note_peak_depth(user_state, depth)
-        note = _ccb.scene_note(
+        # cm 数字与"过深/未过深"的判定都留在 ccb 内部，注入只拿三态感受：
+        # True=撑满、False=没撑满、None=这一场还没深度数据（不知道就不说）。
+        cap = _num(body.get("depth_cap_cm"), 14.0)
+        over = _ccb.is_over_depth(depth, cap) if depth > 0 else None
+        # 姿势/位置是场景里的事实，照原样给；**阶段名不给**——「动情/沉醉/临界/爆发」
+        # 是状态机的档位名（面板给运营看的内部刻度），递进上下文就会被当成事实复述
+        # （「现在是临界」）。同一份 phase 走 `_scene_feeling` 翻成她自己的感受（#62）。
+        scene = _ccb.scene_note(
             pose=int(_num(user_state.get("ccb_pose"), _ccb.POSE_UNKNOWN)),
             site=int(_num(user_state.get("ccb_site"), _ccb.POSE_UNKNOWN)),
-            phase=phase,
-            depth_cm=depth,
-            cap_cm=_num(body.get("depth_cap_cm"), 14.0),
+            phase=0,
+            over=over,
         )
+        feeling = _scene_feeling(phase)
+        # P4 验收：不用「·」拼，读感像读数，用「，」更自然
+        # ccb.scene_note 内部还是用「·」拼的，我们把它替换掉
+        scene = scene.replace("·", "，")
+        note = "，".join(part for part in (scene, feeling) if part)
         return f"{text}（{note}）" if note else text
 
 

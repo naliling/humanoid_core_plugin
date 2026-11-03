@@ -19,7 +19,8 @@ from humanoid.services.schedule import (
     segment_prompt,
 )
 from humanoid.services.soma import SomaService
-from humanoid.slots import find_slot, is_sleep_event, normalize_slots
+from humanoid.slots import find_slot, is_sleep_event
+from .slot_fixtures import normalize_slots
 
 from .fakes import FrozenClock, ScopeStore
 
@@ -80,10 +81,25 @@ SLEEP_UNTIL_0400 = [
 
 class NightWindowGeometryTest(unittest.TestCase):
     def test_cross_midnight_midpoint_is_the_real_one(self):
-        """23→5 的中点是凌晨 2 点，不是算术平均出来的下午 2 点。"""
-        self.assertAlmostEqual(cfg().night_mid_hour, 2.0)
-        self.assertAlmostEqual(cfg(night_start_hour=23, night_end_hour=6).night_mid_hour, 2.5)
-        self.assertAlmostEqual(cfg(night_start_hour=1, night_end_hour=9).night_mid_hour, 5.0)
+        """23→5 的中点是凌晨 2 点，不是算术平均出来的下午 2 点。
+
+        中点只有一个真实来源：soma 按**生物钟夜**算的那份（config 里那份已删——
+        它零引用，且 start==end 时与 night_span_hours 给出互相矛盾的答案）。
+        """
+        moment = datetime(2026, 8, 22, 8, 0, tzinfo=TZ)
+        self.assertAlmostEqual(BodyFixture(moment, cfg()).soma._night_mid_hour(), 2.0)
+        self.assertAlmostEqual(
+            BodyFixture(moment, cfg(night_start_hour=23, night_end_hour=6)).soma._night_mid_hour(),
+            2.5,
+        )
+        self.assertAlmostEqual(
+            BodyFixture(moment, cfg(night_start_hour=1, night_end_hour=9)).soma._night_mid_hour(),
+            5.0,
+        )
+
+    def test_no_second_midpoint_algorithm_on_config(self):
+        """config 上不该再有第二个「夜的中点」：零引用属性只会带来第二套结论。"""
+        self.assertFalse(hasattr(cfg(), "night_mid_hour"))
 
     def test_dip_lands_in_the_night_not_the_afternoon(self):
         soma = BodyFixture(datetime(2026, 8, 22, 8, 0, tzinfo=TZ), cfg()).soma
@@ -189,6 +205,57 @@ class SleepKeywordTest(unittest.TestCase):
             ],
         )
         self.assertTrue(fixture.soma.is_sleep_time(datetime(2026, 8, 22, 13, 0, tzinfo=TZ)))
+
+
+class SleepStateUnknownTest(unittest.TestCase):
+    """日程空窗时的睡眠态是 unknown，不能冒充「她醒着」（v3.0.4 审核 F3）。
+
+    docstring 一直写着「空窗就按不知道处理：两边都不假定」，但旧实现 return False，
+    空窗被当成醒着：夜里每空一分钟就白攒睡眠压力、白记睡眠债。
+    """
+
+    def test_no_schedule_at_all_is_unknown(self):
+        moment = datetime(2026, 8, 22, 3, 0, tzinfo=TZ)
+        fixture = BodyFixture(moment, cfg(), [])
+        self.assertEqual(fixture.soma.sleep_state(moment), "unknown")
+        # 薄封装保持旧行为：unknown 不算睡
+        self.assertFalse(fixture.soma.is_sleep_time(moment))
+
+    def test_gap_between_slots_is_unknown_not_awake(self):
+        """跨零点、新段还没排出来：那一刻既不是睡着，也不是醒着。"""
+        fixture = BodyFixture(
+            datetime(2026, 8, 22, 23, 0, tzinfo=TZ),
+            cfg(),
+            [{"start": "09:00", "end": "22:00", "event": "活动", "energy_rate": 0.0}],
+        )
+        self.assertEqual(
+            fixture.soma.sleep_state(datetime(2026, 8, 22, 23, 30, tzinfo=TZ)),
+            "unknown",
+        )
+        self.assertFalse(fixture.soma.is_sleep_time(datetime(2026, 8, 22, 23, 30, tzinfo=TZ)))
+
+    def test_unknown_does_not_raise_pressure_or_owe_debt(self):
+        start = datetime(2026, 8, 22, 23, 0, tzinfo=TZ)
+        fixture = BodyFixture(start, cfg(), [])
+        fixture.soma._set("sleep_pressure", 20.0)
+        fixture.soma.data["sleep_debt"] = 3.0
+        fixture.soma.data["asleep_since"] = start.timestamp()
+        fixture.to(start + timedelta(hours=1, minutes=30))
+        self.assertAlmostEqual(fixture.soma.data["sleep_pressure"], 20.0, places=6)
+        self.assertAlmostEqual(fixture.soma.data["sleep_debt"], 3.0, places=6)
+        # 空窗不是「醒来」：不该把被打断的一觉结算成 last_sleep_hours
+        self.assertIsNotNone(fixture.soma.data["asleep_since"])
+        self.assertNotIn("last_sleep_hours", fixture.soma.data)
+
+    def test_awake_at_night_still_owes(self):
+        """对照组：日程写着醒着时，夜里照样涨压力、记债（别把 awake 也弄成 unknown）。"""
+        start = datetime(2026, 8, 22, 23, 0, tzinfo=TZ)
+        fixture = BodyFixture(start, cfg(), AWAKE_ALL_DAY)
+        fixture.soma._set("sleep_pressure", 20.0)
+        fixture.soma.data["sleep_debt"] = 3.0
+        fixture.to(start + timedelta(hours=1, minutes=30))
+        self.assertGreater(fixture.soma.data["sleep_pressure"], 20.0)
+        self.assertGreater(fixture.soma.data["sleep_debt"], 3.0)
 
 
 class RoutinePromptTest(unittest.TestCase):

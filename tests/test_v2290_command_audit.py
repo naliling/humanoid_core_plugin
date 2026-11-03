@@ -113,6 +113,20 @@ class CommandRegistrationTest(unittest.TestCase):
                     f"main.py 里没有可调用的 {fn}",
                 )
 
+    def test_admin_commands_are_not_gated_by_the_framework_decorator(self):
+        """权限只该有一层：函数体里的 `_is_admin`（含 `admin_qq`）。
+
+        `@filter.permission_type(ADMIN)` 在派发阶段就拦人，与函数体里的 `_is_admin`
+        是 AND 关系——两处都要求「AstrBot 全局管理员」，插件自己的名单因此永远
+        不生效，NO_PERMISSION 这句提示也永远发不出去。行为测试只能发现「名单里的人
+        被拒」，发现不了「框架层又加了一道闸」，所以在这里钉住源码。
+        """
+        src = (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "filter.PermissionType.ADMIN", src,
+            "又有指令挂了框架层 ADMIN 装饰器：admin_qq 名单里的人会被挡在函数体外",
+        )
+
 
 class CommandExecutionTest(unittest.IsolatedAsyncioTestCase):
     """22 条指令真的能跑完：有回复、不抛异常。"""
@@ -167,6 +181,28 @@ class CommandExecutionTest(unittest.IsolatedAsyncioTestCase):
         """`admin_qq` 没写的人，靠 AstrBot 全局管理员身份也该能用管理指令。"""
         out = await collect(self.star.cmd_diagnose(FakeEvent("拟人 诊断", sender="888", admin=True)))
         self.assertNotIn("权限不足", out[0])
+
+    async def test_admin_qq_member_passes_without_global_admin(self):
+        """`admin_qq` 名单里的人靠插件自己的判据就能用，不需要 AstrBot 全局管理员身份。
+
+        v3.0.2 里这 13 条指令头上都挂着 `@filter.permission_type(ADMIN)`：框架在派发
+        阶段先拦一遍，名单里的普通用户根本进不到函数体里的 `_is_admin`，于是
+        「能发管理指令的 QQ 名单」这句 hint 对 11 条指令是假的（`/拟人 参照名称` 与
+        `/拟人 重载` 没挂装饰器，只有它们一直有效）。权限只该有一层。
+        """
+        for fn, text in ADMIN_GROUP:
+            with self.subTest(command=text):
+                out = await collect(getattr(self.star, fn)(FakeEvent(text, sender="10001")))
+                self.assertTrue(out, f"{text} 一条回复都没有")
+                self.assertNotIn(
+                    "权限不足", out[0],
+                    f"{text} 把 admin_qq 名单里的人挡在外面：{out[0][:60]}",
+                )
+
+    async def test_stranger_gets_the_no_permission_constant(self):
+        """非名单用户拿到的是 main.py 的 NO_PERMISSION 原文，而不是被框架静默丢弃。"""
+        out = await collect(self.star.cmd_diagnose(FakeEvent("拟人 诊断", sender="777")))
+        self.assertEqual(out[0], main_module.NO_PERMISSION)
 
     async def test_disabled_features_exit_early_instead_of_crashing(self):
         self.star._config_box.reload({**self.raw, "mood_enabled": False, "mood_log_enabled": False,

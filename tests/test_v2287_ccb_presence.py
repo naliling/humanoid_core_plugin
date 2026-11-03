@@ -107,20 +107,22 @@ def _in_scene(core: HumanoidCoreInstance, stage: float = 2.0, satisfy: float = 4
 class DesireOutsideTheScene(unittest.TestCase):
     """不在场景时的常驻那句：数字 + 相对基线的方向，让模型判断"到没到"。"""
 
-    def test_the_prompt_carries_number_and_direction(self):
+    def test_the_prompt_carries_direction_without_a_number(self):
         core = _core()
         _mood(core)
         text = core.build_injection("u1")
-        self.assertIn("亲近欲 41/50", text)
-        self.assertIn("比平常高 7", text)
+        # R2：体检单读数不进上下文，但「往哪个方向偏」必须留着。
+        self.assertIn("我此刻的欲望", text)
+        self.assertIn("比平常想要", text)
+        self.assertNotRegex(text, r"\d+/\d+")
 
     def test_when_shell_not_have_the_mood_it_says_so(self):
         core = _core()
         _mood(core, libido=22.0)
         text = core.build_injection("u1")
         self.assertIn("没有那个心思", text)
-        self.assertIn("亲近欲 22/50", text)
-        self.assertIn("比平常低 12", text)
+        self.assertIn("比平常还淡", text)
+        self.assertNotRegex(text, r"\d+/\d+")
 
     def test_it_appears_even_though_ccb_did_not_fire(self):
         """用户的核心诉求：场景没在进行，也要看得见欲望在哪。"""
@@ -129,20 +131,21 @@ class DesireOutsideTheScene(unittest.TestCase):
         text = core.build_injection("u1")
         state = _state(core)
         self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 0.0, "这个用例里不该进场景")
-        self.assertIn("她此刻的欲望", text)
+        self.assertIn("我此刻的欲望", text)
 
-    def test_near_the_threshold_it_says_how_far(self):
+    def test_near_the_threshold_it_still_says_not_yet(self):
         core = _core()
         _mood(core, libido=36.0)
         text = core.build_injection("u1")
-        self.assertIn("亲近欲 36/50", text)
-        self.assertIn("还差 2 才到忍不住", text)
+        self.assertIn("我此刻的欲望", text)
+        self.assertIn("还没到忍不住的那条线", text)
+        self.assertNotRegex(text, r"\d+/\d+")
 
     def test_mood_only_mode_also_carries_it(self):
         """最轻的一档也要看得见——那是最常被用到的模式。"""
         core = _core(inject_activity_context="mood_only")
         _mood(core)
-        self.assertIn("她此刻的欲望", core.build_injection("u1"))
+        self.assertIn("我此刻的欲望", core.build_injection("u1"))
 
 
 class InsideTheScene(unittest.TestCase):
@@ -151,40 +154,51 @@ class InsideTheScene(unittest.TestCase):
     def test_the_prompt_says_shell_in_a_scene(self):
         core = _core()
         _mood(core)
-        _in_scene(core)
+        state = _in_scene(core)
+        # 已经在场景里 = 今天已经开过 1 场（F5：当日次数按场计，进场时 +1）。
+        state["ccb_turns"] = 1.0
         text = core.build_injection("u1")
         self.assertIn("正在亲密里", text)
         self.assertIn("满足", text)
-        self.assertRegex(text, r"满足 \d+/100")
-        # 阶段名由 `_with_scene_note` 写在同一块事实里（45 + 40 = 85 → 临界）
-        self.assertIn("临界", text)
+        self.assertNotRegex(text, r"\d+/\d+")
+        # #62：场景块里给的是感受词（45 + 40 = 85 → 相位 3「快忍不住了」），
+        # 档位名（临界）是面板用的内部刻度，不进上下文。
+        self.assertIn("快忍不住了", text)
+        self.assertNotIn("临界", text)
         self.assertIn("后入", text)
-        self.assertIn("今日第 1 次", text)
+        # v13：次数是系统账本（今日第几次），模型读到只会切回「我在读系统」的元视角。
+        self.assertNotIn("今日第 1 次", text)
 
     def test_presence_line_does_not_repeat_the_phase_when_detail_is_on(self):
         """场景 note 已经写了阶段，presence 行就不再写一遍（别两句同一状态）。"""
         core = _core()
         _mood(core)
-        _in_scene(core, satisfy=45.0)  # 45 → 平台
+        _in_scene(core, satisfy=45.0)  # 45 → 沉醉
         line = core.prompt_builder._ccb_presence_line("u1")
         self.assertIn("正在亲密里", line)
-        self.assertIn("满足 45/100", line)
-        self.assertNotIn("平台", line, f"与场景 note 重复了阶段：{line!r}")
+        self.assertIn("她还不太满足", line)  # 45 < 2×40：没到「挺满足」那档
+        self.assertNotIn("沉醉", line, f"与场景 note 重复了阶段：{line!r}")
 
-    def test_phase_name_fills_in_when_scene_detail_is_off(self):
-        """场景 note 关掉时阶段只能由 presence 行给，否则模型彻底看不到阶段。"""
+    def test_scene_detail_off_does_not_smuggle_the_phase_back(self):
+        """#82：关掉场景细节就只留满足度那句，不再补阶段名。
+
+        以前 presence 行有一条补偿分支——细节关掉时把阶段名补回来，于是这个开关
+        只关掉了余韵句，阶段名照样每轮进注入，schema 承诺的「退回纯单行」不成立。
+        """
         core = _core(ccb_scene_detail=False)
         _mood(core)
         _in_scene(core, satisfy=45.0)
         line = core.prompt_builder._ccb_presence_line("u1")
-        self.assertIn("平台", line)
+        self.assertIn("她还不太满足", line)
+        self.assertNotIn("沉醉", line, f"关掉细节后阶段名不该再进注入：{line!r}")
 
-    def test_a_recent_pose_change_is_reported(self):
+    def test_a_recent_pose_change_is_not_a_ledger_line(self):
+        """v13：姿势是系统账本，不再进注入（模型读「刚换过姿势」只会出戏）。"""
         core = _core()
         _mood(core)
         state = _in_scene(core)
         state["ccb_log"] = [{"kind": "pose", "value": 0, "at": core.now_epoch() - 60.0}]
-        self.assertIn("刚换过姿势", core.prompt_builder._ccb_presence_line("u1"))
+        self.assertNotIn("刚换过姿势", core.prompt_builder._ccb_presence_line("u1"))
 
     def test_an_old_pose_change_is_not_called_recent(self):
         core = _core()
@@ -195,15 +209,26 @@ class InsideTheScene(unittest.TestCase):
 
 
 class AftercarePresence(unittest.TestCase):
-    def test_the_window_reports_how_long_is_left(self):
+    def test_the_window_says_a_feeling_not_a_countdown(self):
+        """v13/P1：余韵窗按还剩多久给三档身体感受，不再报「还剩 N 分钟」（那是账本）。
+
+        三档的分界在 body_sense：>1h 最热、>15min 缓过来一些、否则差不多缓过来。
+        这里三个时间点都走一遍——只测一档的话，档位边界写反了也照样绿。
+        """
         core = _core()
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 0.0
-        state["ccb_aftercare_until"] = core.now_epoch() + 3600.0
-        line = core.prompt_builder._ccb_presence_line("u1")
-        self.assertIn("余韵里", line)
-        self.assertIn("还剩 60 分钟", line)
+        for left, expected in (
+            (7000.0, "身上还热着"),
+            (2000.0, "缓过来一些"),
+            (300.0, "差不多缓过来"),
+        ):
+            state["ccb_aftercare_until"] = core.now_epoch() + left
+            line = core.prompt_builder._ccb_presence_line("u1")
+            self.assertIn(expected, line, f"还剩 {left:.0f} 秒时应给「{expected}」")
+            self.assertNotIn("还剩", line)
+            self.assertNotIn("分钟", line)
 
     def test_after_the_window_it_falls_back_to_desire(self):
         core = _core()
@@ -221,7 +246,7 @@ class HardGates(unittest.TestCase):
     def _assert_absent(self, text: str) -> None:
         # 只查这句常驻事实自己的措辞，不查「欲望」两个字：身体/状态那句本来就会写
         # 「社交的欲望也在抬头」，那不是 ccb，命中它等于这条硬闸永远是红的。
-        for word in ("她此刻的欲望", "她此刻没有那个心思", "她正在亲密里", "她还在余韵里"):
+        for word in ("我此刻的欲望", "我此刻没有那个心思", "我正在亲密里", "身上还热着"):
             self.assertNotIn(word, text, f"不该出现却出现了「{word}」：{text}")
 
     def test_ccb_off(self):
@@ -268,7 +293,7 @@ class Significance(unittest.TestCase):
     """显著度必须够高：token 预算裁剪时它是先被保住的那一批。"""
 
     def _presence_salience(self, sents) -> float:
-        for text, salience in sents:
+        for text, salience, *_ in sents:
             # 认这句常驻事实自己的开头，不认「欲望」二字：full 模式里身体/状态那句
             # 会先写「社交的欲望也在抬头」，按两个字找会量到它的 4.0 而不是这句的 9.5。
             if text and (
@@ -312,7 +337,8 @@ class BadData(unittest.TestCase):
         }
         line = core.prompt_builder._ccb_presence_line("u1")
         self.assertNotIn("nan", line.lower())
-        self.assertIn("亲近欲 34/50", line)
+        self.assertIn("她此刻的欲望", line)
+        self.assertNotRegex(line, r"\d+/\d+")
 
     def test_no_profile_means_nothing_to_say(self):
         core = _core()

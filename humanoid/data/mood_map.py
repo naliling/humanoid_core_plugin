@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..state_snapshot import energy_word
 from ..wording import pick
 
 _LIBIDO_AGGRESSION_BUCKETS = (0.0, 12.5, 25.0, 37.5, 50.0)
@@ -100,15 +101,13 @@ def generate_mood_tag(affection: float, libido: float, aggression: float, energy
     base = () if seed is None else (seed if isinstance(seed, (tuple, list)) else (seed,))
     parts: list[str] = []
 
-    if energy >= 70:
-        parts.append(pick("mood_tag_energy_high", base,
-                          ("精力充沛", "精神饱满", "状态在线", "劲头很足")))
-    elif energy >= 40:
-        parts.append(pick("mood_tag_energy_mid", base,
-                          ("状态平稳", "还算有精神", "不咸不淡", "情绪平稳")))
-    else:
-        parts.append(pick("mood_tag_energy_low", base,
-                          ("有点疲惫", "犯困", "电量不足", "身上发沉")))
+    # 精力档位只有一份（审核 F13）：这里原来按 70/40 两刀切「精力充沛/状态平稳/
+    # 有点疲惫」，注入里的体感句却走 services/energy.py 的五档梯子（90/70/40/20/0），
+    # 同一个 75 在面板是「精力充沛」、在注入里是「状态挺好」——同一个人同一天两副面孔。
+    # 现在两边都读 state_snapshot.energy_word（转调 describe_energy），措辞与门槛同源。
+    word = energy_word(energy, list(base) or None)
+    if word:
+        parts.append(word)
 
     if affection >= 70:
         parts.append(pick("mood_tag_affection_high", base,
@@ -123,7 +122,7 @@ def generate_mood_tag(affection: float, libido: float, aggression: float, energy
     # 门槛与情绪层（`emotion.AGGRESSION_UP` / `LIBIDO_UP`）同量级：拿初始值（28/34）
     # 当门槛时，「矛盾」几乎每条消息都在，那不是矛盾，那是常态。
     if aggression >= 40 and libido >= 42:
-        parts.append(pick("mood_tag_conflict", base, ("矛盾", "拧巴", "两个念头抣着")))
+        parts.append(pick("mood_tag_conflict", base, ("矛盾", "拧巴", "两个念头拧着")))
     elif aggression >= 40:
         # 「气鼓鼓」是角色会说的话，不是第三人称叙述；换成一组的客观状态词
         parts.append(pick("mood_tag_aggression", base,
