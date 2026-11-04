@@ -14,6 +14,15 @@
       "use_llm_schedule": true
     }
   },
+  "schedule_quality_gate": {
+    "description": "生成后质量闸",
+    "hint": "开：每段日程装进来之前判一次——今天已经排过的事不再排、人设里没有的身份/家人/宠物/约定不许凭空出现；判中了先重写一次，仍不合格就换成中性处境词。关：模型给什么就用什么",
+    "type": "bool",
+    "default": true,
+    "condition": {
+      "use_llm_schedule": true
+    }
+  },
   "use_llm_schedule": {
     "description": "大模型排日程",
     "hint": "要不要让模型现排下一段日程",

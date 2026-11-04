@@ -286,6 +286,11 @@ class HumanoidConfig:
     # 日程直接按 AstrBot 当前生效的人格设定生成（v2.15 起）。关掉后 prompt 里不带入设，
     # 回到中性身份；schedule_prompt_extra 两种情况下都照带。
     schedule_use_persona: bool = True
+    # 生成后的质量闸（v3.0.6）：这一段排进来之前，独立判一次「今天是不是已经排过
+    # 同一件事」和「事件里的身份/家人/宠物/约定，人设里有没有依据」。判中了先带着
+    # 提示重写一次，仍然编造就降级成中性处境词。默认开——prompt 里的规则是请求，
+    # 不是保证，这是唯一不依赖模型自觉的那道。
+    schedule_quality_gate: bool = True
 
     admin_qq: tuple[str, ...] = ()
 
@@ -621,6 +626,7 @@ class HumanoidConfig:
             ),
             schedule_time_granularity=c("schedule_time_granularity", tuple(GRANULARITY_MINUTES)),
             schedule_use_persona=b("schedule_use_persona"),
+            schedule_quality_gate=b("schedule_quality_gate"),
             admin_qq=_as_str_tuple(pick("admin_qq")),
             weather_enabled=b("weather_enabled"),
             weather_api_key=s_opt("weather_api_key"),

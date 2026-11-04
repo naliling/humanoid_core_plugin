@@ -43,8 +43,15 @@ MIN_RETRY_BACKOFF_SECONDS = 60.0
 
 SLEEP_EVENT = "睡眠"
 
-# 一段的时长边界：最短一刻钟；清醒的事最长 3 小时；一觉最长 12 小时（跨午夜）。
-SEGMENT_MIN_MINUTES = 15
+# 一段的时长边界：最短 3 分钟；清醒的事最长 3 小时；一觉最长 12 小时（跨午夜）。
+#
+# 下限原来是 15 分钟，是「微动作被写成半小时」那条链的第一环，三处叠在一起：
+#   ① prompt 写着「最短 15 分钟」，模型不敢写更短；
+#   ② `_segment_minutes` 把模型写的 5 分钟抬到 15（写了也没用）；
+#   ③ 起点按 15 分钟刻度向下对齐，几分钟的事也要占掉一个刻度。
+# 于是「在沙发上喝东西」必然是 30 分钟一段。下限改 3：洗把脸、倒杯水、回条消息
+# 本来就是几分钟的事；短段不再对齐刻度（见 `_step_for`）。
+SEGMENT_MIN_MINUTES = 3
 SEGMENT_MAX_MINUTES = 180
 SEGMENT_SLEEP_MAX_MINUTES = 720
 SEGMENT_DEFAULT_MINUTES = 60
@@ -611,12 +618,21 @@ def body_reference_block(body: dict[str, Any] | None, now_text: str) -> str:
 # 现在按「这件事本身占多久」分档，每档抽一条，所以任何一天递出去的范例都同时有短、
 # 有长、有歇着的；事件本身写成中性、能落到任何角色身上的样子——
 # 她具体做什么，从人设和她当下的处境里长出来，不从范例里抄。
+#
+# v3.0.6 扩到 30 条，按「这件事属于哪一类」标注，责任（工作/照护/宠物）与社交两类
+# 只在人设里确实提到时才发（见 examples_for）：范例是最容易被照着抄的东西，一条
+# 「给猫添粮」的范例递给没有猫的角色，就是在替她编一只猫。
 EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
     # 短：十几二十分钟就完事，做完自然换下一件
     (
         {"event": "洗了把脸，把厨房台面擦了一遍", "location": "厨房", "emotion": "清爽了点", "energy_rate": -0.02, "minutes": 20},
         {"event": "把攒着的几条消息回完", "location": "客厅", "emotion": "清掉一件事", "energy_rate": -0.02, "minutes": 25},
         {"event": "下楼走了一圈，顺手把垃圾扔了", "location": "楼下", "emotion": "透了口气", "energy_rate": 0.02, "minutes": 25},
+        {"event": "烧了壶水，站在窗边慢慢喝完", "location": "厨房", "emotion": "缓了缓", "energy_rate": 0.01, "minutes": 10},
+        {"event": "把桌上的东西归了归位", "location": "书桌前", "emotion": "眼前清爽", "energy_rate": -0.01, "minutes": 15},
+        {"event": "给猫添了粮，把水碗洗了", "location": "厨房", "emotion": "顺手的事", "energy_rate": -0.01, "minutes": 10, "needs": ("pet",)},
+        {"event": "回了几条工作上的消息，把明天要用的东西理出来", "location": "书桌前", "emotion": "先清掉一件", "energy_rate": -0.03, "minutes": 25, "needs": ("job",)},
+        {"event": "把家里要添的东西列了张单子", "location": "客厅", "emotion": "心里有数", "energy_rate": -0.01, "minutes": 15, "needs": ("care",)},
     ),
     # 中：要坐下来做、要动手的一件完整的事
     (
@@ -624,18 +640,30 @@ EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
         {"event": "把手头的事往下推了一段，中间歇了一次", "location": "书桌前", "emotion": "有点进展", "energy_rate": -0.05, "minutes": 75},
         {"event": "洗了个澡，把头发吹干，换了身衣服", "location": "浴室", "emotion": "松下来", "energy_rate": 0.05, "minutes": 45},
         {"event": "去楼下超市把缺的东西补上", "location": "超市", "emotion": "例行公事", "energy_rate": -0.06, "minutes": 50},
+        {"event": "把攒下的衣服洗了晾好，顺手把地也扫了", "location": "家里", "emotion": "屋里清爽了", "energy_rate": -0.05, "minutes": 60},
+        {"event": "把手上的活儿收了个尾，顺手记下明天要接的地方", "location": "书桌前", "emotion": "告一段落", "energy_rate": -0.06, "minutes": 80, "needs": ("job",)},
+        {"event": "带狗下楼转了一圈，回来给它擦了脚", "location": "楼下", "emotion": "被拽着走", "energy_rate": -0.04, "minutes": 40, "needs": ("pet",)},
+        {"event": "收拾了一遍屋子，把该洗的泡上了", "location": "家里", "emotion": "屋里清爽了", "energy_rate": -0.05, "minutes": 60, "needs": ("care",)},
+        {"event": "跟人聊了一阵，把要说的事说完了", "location": "客厅", "emotion": "说开了", "energy_rate": -0.03, "minutes": 45, "needs": ("social",)},
     ),
     # 长：要出门、要等人、要占掉整块时间
     (
         {"event": "出门跑了一趟，来回都在路上，事情办完才回来", "location": "外面", "emotion": "总算办完", "energy_rate": -0.09, "minutes": 130},
         {"event": "把一件要花整块时间的事认真做了一轮", "location": "书桌前", "emotion": "顾不上别的", "energy_rate": -0.07, "minutes": 110},
         {"event": "去了一趟不算近的地方，办完事在外面吃了饭才回", "location": "外面", "emotion": "有点累", "energy_rate": -0.08, "minutes": 150},
+        {"event": "把家里从上到下收拾了一遍，中途没停", "location": "家里", "emotion": "累但痛快", "energy_rate": -0.08, "minutes": 120},
+        {"event": "一头扎进手头那件事，做完才抬头看时间", "location": "书桌前", "emotion": "耗掉了半天", "energy_rate": -0.09, "minutes": 140, "needs": ("job",)},
+        {"event": "出去跟人见了一面，回来的路上顺道买了东西", "location": "外面", "emotion": "见完有点空", "energy_rate": -0.07, "minutes": 150, "needs": ("social",)},
     ),
     # 歇着：什么都不干也是一种状态，但它是「歇着」，不是一个动作
     (
         {"event": "靠在椅背上放空，什么也没干", "location": "客厅", "emotion": "什么都没想", "energy_rate": 0.03, "minutes": 30, "wants": True},
         {"event": "戴上耳机听歌，躺着没动", "location": "卧室", "emotion": "缓过来一点", "energy_rate": 0.04, "minutes": 40, "wants": True},
         {"event": "坐在窗边看外面，发了一会儿呆", "location": "窗边", "emotion": "空落落的", "energy_rate": 0.02, "minutes": 30, "wants": True},
+        {"event": "躺着刷手机，什么正事也没做", "location": "卧室", "emotion": "有点空", "energy_rate": 0.02, "minutes": 50, "wants": True},
+        {"event": "泡了杯东西，慢慢喝完", "location": "客厅", "emotion": "缓下来了", "energy_rate": 0.02, "minutes": 20, "wants": True},
+        {"event": "把要做的事往后推了推，先缓了一会儿", "location": "客厅", "emotion": "不想动", "energy_rate": 0.03, "minutes": 40, "needs": ("job",), "wants": True},
+        {"event": "猫凑过来，就顺手摸了半天", "location": "客厅", "emotion": "被哄好了", "energy_rate": 0.03, "minutes": 30, "needs": ("pet",), "wants": True},
     ),
 )
 
@@ -644,14 +672,81 @@ EXAMPLE_POOL: tuple[dict[str, Any], ...] = tuple(item for band in EXAMPLE_BANDS 
 EXAMPLE_COUNT = len(EXAMPLE_BANDS)
 
 
-def examples_for(seed: list[Any] | None, count: int = EXAMPLE_COUNT) -> list[dict[str, Any]]:
+# 递进 prompt 的范例只带输出契约里的字段：`needs` 是代码侧的适用条件，
+# 递过去等于告诉模型「你可以有宠物」。
+_EXAMPLE_FIELDS = ("event", "location", "emotion", "energy_rate", "minutes", "wants")
+
+# 生活条件词表：人设正文里出现这些词，才认为她确实有工作/宠物/要照护的人/社交。
+# 只用来**过滤范例**，不参与事实判定（那是 invented_facts 的事）。
+_EXAMPLE_NEEDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "job",
+        (
+            "工作", "上班", "公司", "职业", "同事", "老板", "领导", "客户", "开会",
+            "项目", "店里", "开店", "老师", "医生", "护士", "程序", "工程师", "学生",
+            "上学", "学校", "学业", "自由职业", "画师", "写手", "店员", "服务", "创业",
+            "兼职", "实习", "打工",
+        ),
+    ),
+    ("pet", ("猫", "狗", "宠物", "仓鼠", "鹦鹉", "兔子", "养了", "养着")),
+    (
+        "care",
+        (
+            "孩子", "女儿", "儿子", "家人", "妈妈", "爸爸", "爸妈", "老公", "老婆",
+            "丈夫", "妻子", "老人", "妹妹", "弟弟", "姐姐", "哥哥", "家庭", "照护",
+        ),
+    ),
+    ("social", ("朋友", "同学", "闺蜜", "室友", "邻居", "同事", "社交", "认识的人")),
+)
+
+
+def example_capabilities(text: str) -> set[str]:
+    """从「她是谁」的原文里认出她确实有的生活条件（工作/宠物/照护/社交）。"""
+    body = str(text or "")
+    return {name for name, words in _EXAMPLE_NEEDS if any(word in body for word in words)}
+
+
+def _example_allowed(item: Mapping[str, Any], caps: set[str]) -> bool:
+    needs = item.get("needs") or ()
+    if isinstance(needs, str):
+        needs = (needs,)
+    return all(need in caps for need in needs)
+
+
+def _example_evidence(persona: Persona | None, cfg: HumanoidConfig | None = None) -> str:
+    """抽范例时可用的「她是谁」原文：人设正文 + 用户补充偏好（都没有就是空串）。"""
+    parts = []
+    if persona is not None:
+        parts.append(str(getattr(persona, "prompt", "") or ""))
+    if cfg is not None:
+        parts.append(str(getattr(cfg, "schedule_prompt_extra", "") or ""))
+    return "\n".join(part for part in parts if str(part).strip())
+
+
+def examples_for(
+    seed: list[Any] | None,
+    persona_text: str = "",
+    count: int = EXAMPLE_COUNT,
+) -> list[dict[str, Any]]:
     """按（角色+日期）抽一批范例：每档一条，同一天稳定、不同天不同。
 
     每档抽一条而不是整池洗牌，是为了让模型每次看到的范例都同时有短的、有长的——
     只看得到一档，它会把当天所有事都往那个时长上凑。
+
+    `persona_text` 是「她是谁」的原文：池子里责任（上班/照护/宠物）与社交两类范例
+    只在她的人设里确实提到这些时才发——范例是最容易被照着抄的东西，一条「给猫添粮」
+    递给没有猫的角色，就是在替她编一只猫。没有依据时退回不依赖身份条件的通用条。
     """
+    caps = example_capabilities(persona_text)
     rnd = random.Random("|".join(str(x) for x in (seed or [])) or "default")
-    picked = [rnd.choice(band) for band in EXAMPLE_BANDS]
+    picked: list[dict[str, Any]] = []
+    for band in EXAMPLE_BANDS:
+        pool = [item for item in band if _example_allowed(item, caps)]
+        if len(pool) < 2:
+            # 这一档有依据的太少：补上通用条，别让某一档从今天的范例里消失
+            # （少了哪一档，模型对那一档时长的判断就跟着塌掉）。
+            pool = [item for item in band if not item.get("needs")] or list(band)
+        picked.append(rnd.choice(pool))
     rnd.shuffle(picked)
     return picked[: max(1, int(count))]
 
@@ -659,7 +754,8 @@ def examples_for(seed: list[Any] | None, count: int = EXAMPLE_COUNT) -> list[dic
 def _render_examples(items: list[dict[str, Any]]) -> str:
     rows = []
     for item in items:
-        rows.append("   · " + json_dumps_example(item))
+        clean = {key: item[key] for key in _EXAMPLE_FIELDS if key in item}
+        rows.append("   · " + json_dumps_example(clean))
     # continue 是格式的一部分，不是活动范例——每次都给。
     rows.append('   · {"continue": true}')
     return "\n".join(rows)
@@ -856,6 +952,14 @@ def segment_prompt(
     # 勤快不是默认值）；后面两条只在对应处境下出现，编号顺延，免得平时白占 prompt。
     rule_no = 9
     extra_rules = (
+        # 当天去重（v3.0.6）：history_block 早就把今天过完的时段列出来了，但从没说过
+        # 「别再排一遍」。于是「上午在厨房弄吃的」到下午能再出现一次——看起来不是
+        # 她过日子，是模型在填表。
+        f"{rule_no}. 上面【今天到这会她已经过完的时段】里出现过的事，别原样再排一遍；"
+        "同一类事一天最多两段（是同一件事接着做就 continue，不算新的一段）。\n"
+    )
+    rule_no += 1
+    extra_rules += (
         f"{rule_no}. 00:00-06:00 也是完整的一天，不是天然的睡觉时段：\n"
         "   人设是夜猫子/夜班/白天补觉的，凌晨可以排夜里的活动"
         "（出门、值班、打游戏、写东西、散步、吃夜宵）；\n"
@@ -952,7 +1056,7 @@ def segment_prompt(
         # 所以给回几个**有画面、长度和内容都不一样**的范例，并明说这是举例不是填空。
         # 长度不一这件事本身就是示范：它告诉模型 22 分钟和 2 小时都是对的。
         "2. 下面是几个**举例**，看格式和详略，不是让你照抄，也不是填空题：\n"
-        + _render_examples(examples_for(seed))
+        + _render_examples(examples_for(seed, _example_evidence(persona, cfg)))
         + "\n"
         # 范例只示范「一段话该长成什么样」。范例里的事跟她是谁无关——原来那批范例
         # 是带身份的（书店、个案笔记、朋友电话），模型照着抄，所有角色就都长成同一个人。
@@ -968,10 +1072,12 @@ def segment_prompt(
             "   如果上面给了【被打断之前】那一段，想回去接着做时输出 {\"resume\": true}。\n"
             if _susp_event else ""
         )
-        + f"4. minutes：这一段做多久。最短 {SEGMENT_MIN_MINUTES} 分钟，一般的事最长 "
-        f"{SEGMENT_MAX_MINUTES} 分钟；睡觉可以睡一整夜（最长 {SEGMENT_SLEEP_MAX_MINUTES // 60} 小时，"
-        "跨过半夜也没关系）。这个是**上下限，不是目标值**——"
-        "多数日常小事落在 20~60 分钟，真正要花时间的事才写长。\n"
+        + f"4. minutes：这一段做多久。**{SEGMENT_MIN_MINUTES} 分钟也是一段**——洗把脸、"
+        "倒杯水、回条消息本来就是几分钟的事，写几分钟就行，别为了填满时间把它抬长；"
+        "要坐下来做、要出门、要等人的事才写到 1~3 小时；"
+        f"一般的事最长 {SEGMENT_MAX_MINUTES} 分钟；睡觉可以睡一整夜（最长 "
+        f"{SEGMENT_SLEEP_MAX_MINUTES // 60} 小时，跨过半夜也没关系）。"
+        "这个是**上下限，不是目标值**。\n"
         "5. energy_rate 是这一段对精力的作用：睡眠/休息为正（0.05~0.2），"
         "工作/外出/社交为负（-0.05~-0.15）。\n"
         # 梦：夜里 2 条、白天睡的那一觉 3 条。不是睡眠就不写这个字段——写空数组
@@ -1094,6 +1200,82 @@ def _ongoing_stem(text: str) -> str:
     return stripped.strip()[:12]
 
 
+# 事实来源闸（v3.0.6）：事件里一旦出现下面这些词，就说明她在做一件「需要人设里
+# 确实有」的事。每一条 = (触发词, 依据词)：触发词进了 event、依据词却不在人设与补充
+# 偏好里，这一句就是凭空给她加了一个身份/家人/宠物/约定。
+#
+# 为什么不靠 prompt 保证：prompt 里早就写着「从人设里长出来」，但那是**请求**。
+# 模型对着「今天大概是这样的」和一整段人设，照样能写出「下午去接孩子放学」——
+# 合法 JSON 只说明格式对。这里只判能客观判定的东西，不判「自不自然」。
+_FACT_CHECKS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        ("猫", "狗", "宠物", "猫粮", "狗粮", "铲屎", "遛狗"),
+        ("猫", "狗", "宠物", "仓鼠", "鹦鹉", "兔子", "养了", "养着"),
+    ),
+    (
+        # 「公司」不算触发词：去一趟公司楼下不等于在那儿上班（取快递、办事都会经过）。
+        ("同事", "老板", "领导", "客户", "开会", "会议", "工位",
+         "上班", "下班", "加班", "汇报", "述职", "项目"),
+        ("工作", "上班", "公司", "职业", "同事", "老板", "领导", "客户", "开会",
+         "店里", "开店", "老师", "医生", "护士", "程序", "工程师", "学生", "上学",
+         "学校", "学业", "自由职业", "画师", "写手", "店员", "服务", "创业", "兼职",
+         "实习", "打工", "项目"),
+    ),
+    (
+        ("孩子", "女儿", "儿子", "家人", "妈妈", "爸爸", "爸妈", "老公", "老婆",
+         "丈夫", "妻子", "老人", "妹妹", "弟弟", "姐姐", "哥哥"),
+        ("孩子", "女儿", "儿子", "家人", "妈妈", "爸爸", "爸妈", "老公", "老婆",
+         "丈夫", "妻子", "老人", "妹妹", "弟弟", "姐姐", "哥哥", "家庭", "照护"),
+    ),
+    (
+        ("预约", "约好", "挂号", "复诊", "家长会", "面试", "体检"),
+        ("预约", "约好", "挂号", "复诊", "家长会", "面试", "体检", "医院", "看病"),
+    ),
+)
+
+
+def invented_facts(event: str, evidence: str) -> list[str]:
+    """事件里出现的、依据里找不到出处的身份/关系/约定词（没有就返回空列表）。
+
+    `evidence` 为空时一律返回空：**「人设没读到」不等于「人设里没有这只猫」**，
+    没有依据文本就没有判定基准，这时候不判比误判好。
+    """
+    text = str(event or "")
+    basis = str(evidence or "")
+    if not text or not basis:
+        return []
+    hits: list[str] = []
+    for triggers, proofs in _FACT_CHECKS:
+        if not any(trigger in text for trigger in triggers):
+            continue
+        if any(proof in basis for proof in proofs):
+            continue
+        hits.append(next(trigger for trigger in triggers if trigger in text))
+    return hits
+
+
+def _event_key(text: str) -> str:
+    """同一件事的比对键：去掉标点与进度数字后取前 12 字（与 `_ongoing_stem` 同口径）。"""
+    cleaned = re.sub(r"[，。、；：！？…·\-—~～\s（）()「」“”\"'’]+", "", str(text or ""))
+    return _ongoing_stem(cleaned)
+
+
+def _quality_fix_block(issues: list[str], invented: list[str]) -> str:
+    """重写时追加的那一段：只说哪里不对，不重写整份规则（规则已经在上面的 prompt 里）。"""
+    lines = ["", "【上一版没通过】"]
+    if "repeat" in issues:
+        lines.append("- 上面【今天到这会她已经过完的时段】里已经有这件事了，换一件别的。")
+    if invented:
+        lines.append(
+            "- 这件事里的"
+            + "、".join(invented)
+            + "在她的人设里找不到依据。不要凭空给她加身份、家人、宠物或约定，"
+            "换成不需要这些东西也能做的事。"
+        )
+    lines.append("只输出一个 JSON 对象，不要解释。")
+    return "\n".join(lines) + "\n"
+
+
 def parse_segment(
     raw: Any,
     *,
@@ -1109,7 +1291,7 @@ def parse_segment(
     剩下的写进 `carry_end`，由 `_append_segment` 结转到明天。
 
     `resume=true`（优先级高于 continue）时用 `suspended` 里那件被打断的事重建
-    这一段的开头：start = 现在，minutes = 剩余分钟数（下限 15），地点/心情/进度
+    这一段的开头：start = 现在，minutes = 剩余分钟数（下限 SEGMENT_MIN_MINUTES），地点/心情/进度
     沿用。没有 `suspended` 时 resume 不生效，按普通回复解析。
     """
     if isinstance(raw, list):
@@ -1130,7 +1312,7 @@ def parse_segment(
             remaining = SEGMENT_DEFAULT_MINUTES
         cap = SEGMENT_SLEEP_MAX_MINUTES if sleeping else SEGMENT_MAX_MINUTES
         minutes = max(SEGMENT_MIN_MINUTES, min(cap, remaining))
-        start = _start_after(prev, now_minute, step)
+        start = _start_after(prev, now_minute, _step_for(minutes, step))
         end = start + minutes
         slot: Slot = {
             "start": format_time(start),
@@ -1190,7 +1372,7 @@ def parse_segment(
 
     sleeping = is_sleep_event(raw_event)
     minutes = _segment_minutes(raw, now_minute, sleeping)
-    start = _start_after(prev, now_minute, step)
+    start = _start_after(prev, now_minute, _step_for(minutes, step))
     end = start + minutes
     rate_raw = raw.get("energy_rate", prev.get("energy_rate", 0.0) if want_continue else 0.0)
 
@@ -1251,6 +1433,24 @@ def _start_after(prev: Slot | None, now_minute: int, step: int) -> int:
     if prev_end is not None and prev_end <= now_minute:
         start = max(start, prev_end)
     return start
+
+
+def _step_for(minutes: int, step: int) -> int:
+    """起点对齐用的刻度：比这一段本身还粗的刻度不用。
+
+    15 分钟粒度下，一段 5 分钟的事若也向下对齐到 15 分钟刻度，起点会退回到上一段里
+    （或让这一段罩不住此刻），`_append_segment` 只好把上一段的 end 收回来——于是
+    「几分钟的事」又被拉成十几分钟。短段直接用现在这一刻当起点。
+    """
+    try:
+        step = max(1, int(step))
+    except (TypeError, ValueError):
+        step = 1
+    try:
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        return step
+    return step if minutes >= step else 1
 
 
 def _in_window(minutes: int, start: int, end: int) -> bool:
@@ -1475,6 +1675,14 @@ class ScheduleService:
         # 装上，是因为被节流挡回（事件/来访已在里面原样还回），还是生成真的失败了
         # （取走的事件/来访必须还回去）」。空串 = 还没生成过。
         self._last_outcome: str = ""
+        # 质量闸计数（v3.0.6）：repeat=今天重复放行、invented=编造、rewrite=触发重写、
+        # fallback=降级成中性段。会话内累计，只报计数不报分数（没有标注就没有分母）。
+        self._quality: dict[str, int] = {
+            "repeat": 0,
+            "invented": 0,
+            "rewrite": 0,
+            "fallback": 0,
+        }
         # 失败退避的计时源：必须可注入，否则测试无法验证「退避窗口内不再投递」。
         self._monotonic = monotonic or time.monotonic
         # 日程得按她是谁来排：递一个 async () -> Persona 进来，不递就不读人设。
@@ -2884,6 +3092,51 @@ class ScheduleService:
             if self._log and cfg.debug_mode:
                 self._log.debug(f"[humanoid_core] 日程打断失败: {self.last_error}")
             return None
+        # ---- 质量闸（v3.0.6）：装进日程之前独立判一遍 ----
+        # prompt 里的规则是「请求」，不是「保证」。这里只判两件能客观判定的事：
+        #   ① 今天是不是已经排过同一件事（重复）；
+        #   ② 事件里的身份/关系/约定，人设里有没有依据（编造）。
+        # 判中了先带提示重写一次；仍然编造就降级成中性段——宁可只给处境词，
+        # 也不让「下午去接孩子放学」这种凭空事实进她的日程。
+        degraded = False
+        if getattr(cfg, "schedule_quality_gate", False):
+            evidence = self._fact_evidence(persona, cfg)
+            issues, invented = self._quality_issues(slot, evidence, prev)
+            if issues:
+                self._bump_quality("rewrite")
+                retried = await self._rewrite_once(
+                    cfg,
+                    prompt,
+                    issues,
+                    invented,
+                    ignore_cooldown,
+                    now_minute=minutes,
+                    prev=prev,
+                    suspended=suspended or None,
+                )
+                if retried is not None:
+                    raw, slot = retried
+                    issues, invented = self._quality_issues(slot, evidence, prev)
+                if "invented" in issues:
+                    slot = self._degrade_to_neutral(cfg, minutes, prev)
+                    raw = {}
+                    degraded = True
+                    self._bump_quality("invented")
+                    self._bump_quality("fallback")
+                    if self._log:
+                        self._log.info(
+                            "[humanoid_core] 日程质量闸：人设里找不到依据的"
+                            f"「{'/'.join(invented)}」，已降级为中性段"
+                            f"（{self._scope.role_id}）"
+                        )
+                elif "repeat" in issues:
+                    self._bump_quality("repeat")
+                    if self._log and cfg.debug_mode:
+                        self._log.debug(
+                            "[humanoid_core] 日程质量闸：今天已经排过"
+                            f"「{slot.get('event')}」，重写后仍重复，放行"
+                        )
+
         if suspended and str(slot.get("event") or "") == str(suspended.get("event") or ""):
             # resume 成功（或模型自己又排了同一件事）：挂起结束。
             self._clear_suspended()
@@ -2892,7 +3145,8 @@ class ScheduleService:
         self.last_error = ""
         self._retry_after = 0.0
         self._last_outcome = OUTCOME_OK
-        self._set_source(SOURCE_LLM)
+        if not degraded:
+            self._set_source(SOURCE_LLM)
         if self._log:
             # 带上是哪个 bot：多开时日志里分不清谁生成了谁没生成。
             self._log.info(
@@ -2904,6 +3158,137 @@ class ScheduleService:
             self._store_day_frame(
                 str(raw.get("today") or "") if isinstance(raw, dict) else ""
             )
+        return slot
+
+    # ------------------------------------------------------------------
+    # 质量闸（v3.0.6）：生成之后、装进日程之前的独立判定
+    # ------------------------------------------------------------------
+
+    def _bump_quality(self, name: str) -> None:
+        """记一次质量闸命中。只计数，不打分——没有标注就没有分母。"""
+        self._quality[name] = int(self._quality.get(name, 0)) + 1
+
+    def _fact_evidence(self, persona: Persona | None, cfg: HumanoidConfig) -> str:
+        """判「有没有依据」的原文：人设正文 + 用户补充偏好。"""
+        parts = [
+            str(getattr(persona, "prompt", "") or ""),
+            str(getattr(cfg, "schedule_prompt_extra", "") or ""),
+        ]
+        return "\n".join(part for part in parts if part.strip())
+
+    def _quality_issues(
+        self,
+        slot: Slot,
+        evidence: str,
+        prev: Mapping[str, Any] | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """这一段客观上的两个问题：今天重复 / 事实没有依据。"""
+        if slot.get("status") or slot.get("sleep"):
+            # 兜底的处境词不是「一件事」；睡段不涉及身份。
+            return [], []
+        issues: list[str] = []
+        event = str(slot.get("event") or "")
+        if self._is_repeat_today(event, prev):
+            issues.append("repeat")
+        invented = invented_facts(event, evidence)
+        if invented:
+            issues.append("invented")
+        return issues, invented
+
+    def _is_repeat_today(self, event: str, prev: Mapping[str, Any] | None = None) -> bool:
+        """今天是不是已经把这件事排过了？（按 `_event_key` 归一化后比，不看标点）
+
+        两种**不算**重复的情形，否则闸门会把正常的日子判成重复：
+        * 紧接上一段接着做同一件事（continue/resume）——prompt 里明写着这不算新的一段；
+        * 同一类事今天才第二次出现——规则给的上限是「一天最多两段」。
+        第三次起才算重复。
+        """
+        key = _event_key(event)
+        if not key:
+            return False
+        prev_key = _event_key(str((prev or {}).get("event") or ""))
+        matched: list[Mapping[str, Any]] = []
+        for seg in self.segments():
+            if not isinstance(seg, Mapping):
+                continue
+            if seg.get("sleep") or seg.get("status"):
+                continue
+            if _event_key(str(seg.get("event") or "")) == key:
+                matched.append(seg)
+        if not matched:
+            return False
+        if len(matched) >= 2:
+            return True
+        only = matched[0]
+        if prev_key == key and str(only.get("start") or "") == str((prev or {}).get("start") or ""):
+            return False  # 就是紧接着的那一段，属于接着做
+        return True
+
+    async def _rewrite_once(
+        self,
+        cfg: HumanoidConfig,
+        prompt: str,
+        issues: list[str],
+        invented: list[str],
+        ignore_cooldown: bool,
+        *,
+        now_minute: int,
+        prev: Mapping[str, Any] | None,
+        suspended: Mapping[str, Any] | None,
+    ) -> tuple[Any, Slot] | None:
+        """带着「哪里不对」再问一次模型；失败返回 None（由调用方决定放行还是降级）。"""
+        if self.gateway is None:
+            return None
+        try:
+            result = await self.gateway.generate(
+                prompt=prompt + _quality_fix_block(issues, invented),
+                chain=cfg.schedule_provider_ids,
+                allow_global=cfg.schedule_allow_global_fallback,
+                timeout=float(cfg.schedule_llm_timeout_seconds),
+                # 重写只问一次：这条路每段都可能走到，放大 attempts 等于放大额度消耗。
+                attempts_per_provider=1,
+                retry_interval=float(cfg.schedule_retry_interval_seconds),
+                purpose=PURPOSE,
+                ignore_cooldown=ignore_cooldown,
+                role_label=str(self._scope.role_id or ""),
+            )
+        except Exception:
+            return None
+        if not result.ok:
+            return None
+        raw = extract_json_object(result.text)
+        if raw is None:
+            raw = extract_json_array(result.text)
+        if raw is None:
+            return None
+        slot = parse_segment(
+            raw,
+            now_minute=now_minute,
+            step=cfg.granularity_minutes,
+            prev=prev,
+            suspended=suspended,
+        )
+        if slot is None:
+            return None
+        return raw, slot
+
+    def _degrade_to_neutral(
+        self,
+        cfg: HumanoidConfig,
+        now_minute: int,
+        prev: Mapping[str, Any] | None,
+    ) -> Slot:
+        """降级：给中性处境词（与模型不可用时同一条兜底路径）。"""
+        slot = dynamic_segment(
+            cfg,
+            self._body_snapshot(),
+            now_minute=now_minute,
+            step=cfg.granularity_minutes,
+            prev=prev,
+            seed=self._seed(),
+            asleep_minutes=self.sleeping_minutes(now_minute),
+        )
+        self._set_source(SOURCE_TEMPLATE)
         return slot
 
     def _set_source(self, source: str) -> None:
@@ -3164,6 +3549,8 @@ class ScheduleService:
             "suspended": suspended,
             # 打断闸门：pending/ttl_left/cooldown_left/quiet_left 等只读字段。
             "interrupt": self._interrupt_status(),
+            # 质量闸计数（v3.0.6）：repeat/invented/rewrite/fallback。
+            "quality": dict(self._quality),
         }
 
     async def aclose(self):
