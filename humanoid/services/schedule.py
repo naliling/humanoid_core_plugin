@@ -602,39 +602,58 @@ def body_reference_block(body: dict[str, Any] | None, now_text: str) -> str:
 
 # 举例池：每次给模型看的范例从这里按天抽。
 #
-# 原来那 5 条是写死在代码里的，每次调用都一模一样。模型对 few-shot 的模仿远强于
-# 对抽象规则的服从，于是她的一天反复长成那几件事（「翻翻最近想去的那几家店」）。
-# 改成按（角色+日期）抽一批，每天看到的范例不同；顺带把「翻个身」这类没有信息量
-# 的微动作从示范里去掉。
-EXAMPLE_POOL: tuple[dict[str, Any], ...] = (
-    {"event": "啃两口昨天剩的面包", "location": "厨房", "emotion": "有点没睡醒", "energy_rate": 0.02, "minutes": 22},
-    {"event": "翻翻最近想去的那几家店，顺路买双袜子", "location": "商场", "emotion": "有点期待", "energy_rate": -0.08, "minutes": 145},
-    {"event": "拐去那家一直想去的书店", "location": "街角书店", "emotion": "有点期待", "energy_rate": -0.05, "minutes": 60, "wants": True},
-    {"event": "把阳台那几盆花浇一遍、修掉黄叶", "location": "阳台", "emotion": "踏实", "energy_rate": -0.03, "minutes": 35},
-    {"event": "回一封拖了两天的邮件", "location": "书桌前", "emotion": "终于动手了", "energy_rate": -0.04, "minutes": 40},
-    {"event": "煮一锅面，就着剩菜吃完", "location": "厨房", "emotion": "饿坏了", "energy_rate": 0.05, "minutes": 30},
-    {"event": "出门取个快递，顺便绕小区走两圈", "location": "楼下", "emotion": "透透气", "energy_rate": 0.02, "minutes": 45},
-    {"event": "窝在沙发上把攒的两集看完", "location": "客厅", "emotion": "放松下来", "energy_rate": 0.03, "minutes": 95},
-    {"event": "跟朋友打一通电话，聊了聊近况", "location": "卧室", "emotion": "有点高兴", "energy_rate": -0.04, "minutes": 55},
-    {"event": "把桌上的东西归拢、擦一遍", "location": "书桌前", "emotion": "看着清爽些了", "energy_rate": -0.05, "minutes": 40},
-    {"event": "认真做一顿饭，切切炒炒", "location": "厨房", "emotion": "挺享受", "energy_rate": -0.06, "minutes": 80},
-    {"event": "去楼下超市补点菜和日用品", "location": "超市", "emotion": "例行公事", "energy_rate": -0.07, "minutes": 50},
-    {"event": "坐在窗边发会儿呆，什么也没干", "location": "窗边", "emotion": "空落落的", "energy_rate": 0.04, "minutes": 30, "wants": True},
-    {"event": "把攒下的照片挑一挑、删掉重复的", "location": "床上", "emotion": "有点走神", "energy_rate": 0.01, "minutes": 65},
-    {"event": "写点东西，开了个头又删了", "location": "书桌前", "emotion": "有点卡", "energy_rate": -0.05, "minutes": 70},
-    {"event": "出门办那件拖了一阵的事", "location": "外面", "emotion": "得办完", "energy_rate": -0.09, "minutes": 130},
-    {"event": "洗个热水澡，把今天收拾掉", "location": "浴室", "emotion": "慢慢松下来", "energy_rate": 0.06, "minutes": 35},
-    {"event": "接着整理那份个案笔记", "location": "书桌前", "emotion": "还差几份", "energy_rate": -0.05, "minutes": 110, "ongoing": "整理那份个案笔记（还差 4 份）"},
+# 这块踩过两个坑，都记在这里：
+#   一是范例写得越具体，模型抄得越像。原来那批写的是「拐去那家一直想去的书店」
+#     「接着整理那份个案笔记」「跟朋友打一通电话」——那不是范例，是给她安了一个身份，
+#     于是不管人设写的是谁，所有角色都长成同一个孤独文人。
+#   二是整池洗牌抽四条，抽到什么全看当天运气：一天可能全是二十分钟的小事，
+#     也可能全是两小时的大件，模型对时长的判断跟着当天的范例漂。
+# 现在按「这件事本身占多久」分档，每档抽一条，所以任何一天递出去的范例都同时有短、
+# 有长、有歇着的；事件本身写成中性、能落到任何角色身上的样子——
+# 她具体做什么，从人设和她当下的处境里长出来，不从范例里抄。
+EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
+    # 短：十几二十分钟就完事，做完自然换下一件
+    (
+        {"event": "洗了把脸，把厨房台面擦了一遍", "location": "厨房", "emotion": "清爽了点", "energy_rate": -0.02, "minutes": 20},
+        {"event": "把攒着的几条消息回完", "location": "客厅", "emotion": "清掉一件事", "energy_rate": -0.02, "minutes": 25},
+        {"event": "下楼走了一圈，顺手把垃圾扔了", "location": "楼下", "emotion": "透了口气", "energy_rate": 0.02, "minutes": 25},
+    ),
+    # 中：要坐下来做、要动手的一件完整的事
+    (
+        {"event": "做了点吃的，吃完把锅洗了", "location": "厨房", "emotion": "踏实", "energy_rate": 0.04, "minutes": 55},
+        {"event": "把手头的事往下推了一段，中间歇了一次", "location": "书桌前", "emotion": "有点进展", "energy_rate": -0.05, "minutes": 75},
+        {"event": "洗了个澡，把头发吹干，换了身衣服", "location": "浴室", "emotion": "松下来", "energy_rate": 0.05, "minutes": 45},
+        {"event": "去楼下超市把缺的东西补上", "location": "超市", "emotion": "例行公事", "energy_rate": -0.06, "minutes": 50},
+    ),
+    # 长：要出门、要等人、要占掉整块时间
+    (
+        {"event": "出门跑了一趟，来回都在路上，事情办完才回来", "location": "外面", "emotion": "总算办完", "energy_rate": -0.09, "minutes": 130},
+        {"event": "把一件要花整块时间的事认真做了一轮", "location": "书桌前", "emotion": "顾不上别的", "energy_rate": -0.07, "minutes": 110},
+        {"event": "去了一趟不算近的地方，办完事在外面吃了饭才回", "location": "外面", "emotion": "有点累", "energy_rate": -0.08, "minutes": 150},
+    ),
+    # 歇着：什么都不干也是一种状态，但它是「歇着」，不是一个动作
+    (
+        {"event": "靠在椅背上放空，什么也没干", "location": "客厅", "emotion": "什么都没想", "energy_rate": 0.03, "minutes": 30, "wants": True},
+        {"event": "戴上耳机听歌，躺着没动", "location": "卧室", "emotion": "缓过来一点", "energy_rate": 0.04, "minutes": 40, "wants": True},
+        {"event": "坐在窗边看外面，发了一会儿呆", "location": "窗边", "emotion": "空落落的", "energy_rate": 0.02, "minutes": 30, "wants": True},
+    ),
 )
-EXAMPLE_COUNT = 4
+
+# 扁平的池子：测试和别处要「所有范例」，不关心分档。
+EXAMPLE_POOL: tuple[dict[str, Any], ...] = tuple(item for band in EXAMPLE_BANDS for item in band)
+EXAMPLE_COUNT = len(EXAMPLE_BANDS)
 
 
 def examples_for(seed: list[Any] | None, count: int = EXAMPLE_COUNT) -> list[dict[str, Any]]:
-    """按（角色+日期）抽一批范例：同一天稳定，不同天不同。"""
-    pool = list(EXAMPLE_POOL)
+    """按（角色+日期）抽一批范例：每档一条，同一天稳定、不同天不同。
+
+    每档抽一条而不是整池洗牌，是为了让模型每次看到的范例都同时有短的、有长的——
+    只看得到一档，它会把当天所有事都往那个时长上凑。
+    """
     rnd = random.Random("|".join(str(x) for x in (seed or [])) or "default")
-    rnd.shuffle(pool)
-    return pool[: max(1, int(count))]
+    picked = [rnd.choice(band) for band in EXAMPLE_BANDS]
+    rnd.shuffle(picked)
+    return picked[: max(1, int(count))]
 
 
 def _render_examples(items: list[dict[str, Any]]) -> str:
@@ -887,9 +906,14 @@ def segment_prompt(
         "2. 一件事做到一半接着做很正常（continue=true）；做很久了、或身体不允许时就换。\n"
         # 「怎么决定」原来只有上面两条，全是「什么时候该换」。这等于只教了它何时停下，
         # 没教它一段能有多短——于是模型把每段都当成一件大事，minutes 天然偏长。
-        "3. minutes 要真的反映这件事要多久：\n"
-        "   喝口水、吃两口、回个消息就是 15~30 分钟，不用非撑满；\n"
-        "   出门办事、见人、认真做一件事可以 1~3 小时；\n"
+        # 改的时候又踩了第二个坑：为了教「短」，把「喝口水、吃两口」写成了 15~30 分钟的段，
+        # 等于告诉它一个动作也能占半小时；而 _segment_minutes 那边又有 15 分钟硬下限，
+        # 两处一叠，「在沙发上喝东西」就必然被写成 30 分钟的一段。
+        "3. minutes 要真的反映这件事要多久——是这件事本身占多久，不是把这一段时间填满：\n"
+        "   一件事十几二十分钟就做完，就写十几二十分钟，做完自然换下一件；\n"
+        "   要坐下来做、要出门、要等人的事才写到 1~3 小时；\n"
+        "   一个动作不算一件事：喝一口水、看一眼手机、回一句话撑不起一段，别单独成段——\n"
+        "   要么接着上一段（continue），要么写成真的在做的样子（在厨房弄点吃的，而不是「喝东西」）；\n"
         "   一次出门可以是一整段（路上→店里→回来），也可以中途换成另一件事。\n"
         "   **别因为「反正要填一段时间」就往长的填。**\n"
         # 粒度变细之后，段与段之间「接不接得上」就比时长更要紧了：20 分钟一段，
@@ -930,6 +954,10 @@ def segment_prompt(
         "2. 下面是几个**举例**，看格式和详略，不是让你照抄，也不是填空题：\n"
         + _render_examples(examples_for(seed))
         + "\n"
+        # 范例只示范「一段话该长成什么样」。范例里的事跟她是谁无关——原来那批范例
+        # 是带身份的（书店、个案笔记、朋友电话），模型照着抄，所有角色就都长成同一个人。
+        "   这几条只示范形状和粒度：一条要具体到这个程度、长短要差这么多；\n"
+        "   里面的事跟她是谁无关，别照着抄——她做什么要从人设和她今天的处境里长出来。\n"
         "   event 写具体在做什么、location 写她在哪，两者都要具体到能说出口的程度；\n"
         "   不要写「翻个身」「换个姿势」这种没有信息量的微动作——睡眠就直接写「睡眠」，\n"
         "   其它事要是一件说得出口的事（做了什么、去了哪），不是姿势或状态。\n"

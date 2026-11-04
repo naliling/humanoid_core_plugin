@@ -93,8 +93,17 @@ class ScheduleDurationGuidance(unittest.TestCase):
     def test_says_bounds_are_not_a_target(self):
         self.assertIn("上下限，不是目标值", build())
 
-    def test_gives_short_segments_permission(self):
-        self.assertIn("15~30 分钟", build())
+    def test_micro_actions_are_not_segments(self):
+        """一个动作撑不起一段。
+
+        这里原来是断言「15~30 分钟」在场——那句是在教「短也可以」，但把一个动作
+        （喝口水、吃两口）定义成 15~30 分钟的一段，加上代码里 15 分钟的硬下限，
+        「在沙发上喝东西 30 分钟」就成了必然。改成反过来钉：微动作不许成段。
+        """
+        p = build()
+        self.assertIn("一个动作不算一件事", p)
+        self.assertIn("撑不起一段", p)
+        self.assertNotIn("喝口水、吃两口、回个消息就是 15~30 分钟", p)
 
 
 class ScheduleTransitionContinuity(unittest.TestCase):
@@ -210,6 +219,28 @@ class ScheduleExamplesRotateDaily(unittest.TestCase):
 
         for item in EXAMPLE_POOL:
             self.assertNotIn("翻个身", item["event"])
+
+    def test_every_day_sees_short_and_long(self):
+        """每档抽一条：模型每次看到的范例都得同时有短的、有长的。
+
+        整池洗牌的时候，一天可能全是二十分钟的小事、另一天全是两小时的大件，
+        模型对时长的判断跟着当天抽到的那批范例漂。
+        """
+        from humanoid.services.schedule import examples_for
+
+        for seed in (["bot1", "2026-10-06"], ["bot2", "2026-11-04"], ["bot3", "2026-01-31"]):
+            mins = [int(x["minutes"]) for x in examples_for(seed)]
+            self.assertLessEqual(min(mins), 30, seed)
+            self.assertGreaterEqual(max(mins), 110, seed)
+
+    def test_pool_carries_no_identity(self):
+        """范例不许暗示她是谁：带身份的具体事件会让所有角色长成同一个人。"""
+        from humanoid.services.schedule import EXAMPLE_POOL
+
+        banned = ("书店", "个案", "朋友", "邮件", "照片", "阳台")
+        for item in EXAMPLE_POOL:
+            for word in banned:
+                self.assertNotIn(word, item["event"], item["event"])
 
 
 class ScheduleDayFrame(unittest.TestCase):

@@ -1,11 +1,14 @@
-"""【此刻的她】里「她这会儿在过什么」的可见性，不再由关键词表决定。
+"""【此刻的她】里「她这会儿在过什么」的可见性：只在她被问起时给。
 
-历史两版：
-* v2.29.0 之前每轮都写，日程事件一挂几个小时，每条回复都带「我在忙」；
+历史三版，都记在这里：
+* v2.29.0 之前每轮都写：日程事件一挂几个小时，每条回复都带「我在忙」；
 * v2.29.0 改成「用户这句话命中 _ASK_ACTIVITY 才写」——换个说法就问不出来，
-  不问又完全不提（审核 注入生成 P-06 / #39）。
-现在：日程槽位非空就进事实，说不说由 injection.select 的预算决定；这一段也有了
-字数红线（mood_only 档），不再比事实块还长（P-05 / #38）。
+  不问又完全不提（审核 注入生成 P-06 / #39）；
+* v3.0.x 把门拆掉，回到「日程槽位非空就进事实」：第一个毛病原样回来，而且更明显——
+  递过去的是一句已经成句的第一人称事实（「我这会儿窝在沙发上把攒的两集看完。」），
+  模型最省力的做法就是把它说出来，于是不问也报备。
+现在：门装回来（main._asks_about_now），但只挡这一句；关系/心境/待办/穿搭/外界照旧
+每轮都给，这一段也仍有字数红线（mood_only 档，P-05 / #38）。
 """
 from __future__ import annotations
 
@@ -69,15 +72,22 @@ def _core():
 
 
 class StateNoteActivityLineTest(unittest.TestCase):
-    def test_activity_is_present_even_when_the_user_never_asks(self) -> None:
-        """旧契约是「问了才提」，新契约是「日程非空就进事实，由预算决定去留」。"""
-        for said in ("在吗", "早安", "今天好累", "", "你在干嘛"):
+    def test_activity_is_absent_when_the_user_does_not_ask(self) -> None:
+        """对方没问就不给：递过去一句成句的第一人称事实，模型就会把它说出来。"""
+        for said in ("在吗", "早安", "今天好累", "", "晚安"):
+            note = main_module._state_note(_core(), "u1", said=said)
+            self.assertNotIn("忙手里的活", note, said)
+
+    def test_activity_is_present_when_the_user_asks(self) -> None:
+        """问起时才给，而且换个问法也要命中——这是 v2.29.0 那张表被拆掉的原因。"""
+        for said in ("你在干嘛", "在忙什么", "这会儿在做什么呀", "最近忙不忙"):
             note = main_module._state_note(_core(), "u1", said=said)
             self.assertIn("忙手里的活", note, said)
 
-    def test_the_keyword_table_is_gone(self) -> None:
+    def test_the_gate_is_a_named_helper_not_an_old_table(self) -> None:
         self.assertFalse(hasattr(main_module, "_asked_about_activity"))
         self.assertNotIn("_ASK_ACTIVITY", inspect.getsource(main_module))
+        self.assertTrue(callable(getattr(main_module, "_asks_about_now", None)))
 
     def test_verb_phrase_event_is_not_given_a_second_zai(self) -> None:
         """日程事件本身是动词短语时，不能再加「在」——旧模板拼出「正在坐在窗边」。"""
@@ -93,7 +103,7 @@ class StateNoteActivityLineTest(unittest.TestCase):
 
         core = _core()
         core.schedule = _VerbSchedule()
-        note = main_module._state_note(core, "u1", said="在吗")
+        note = main_module._state_note(core, "u1", said="你在干嘛")
         self.assertIn("我这会儿窝在沙发上把攒的两集看完", note)
         self.assertNotIn("正在窝在", note)
         self.assertNotIn("在在", note)
@@ -111,7 +121,7 @@ class StateNoteActivityLineTest(unittest.TestCase):
 
         core = _core()
         core.schedule = _SleepSchedule()
-        note = main_module._state_note(core, "u1", said="在吗")
+        note = main_module._state_note(core, "u1", said="你在干嘛")
         self.assertIn("我这会儿睡着了", note)
         self.assertNotIn("在睡眠", note)
 

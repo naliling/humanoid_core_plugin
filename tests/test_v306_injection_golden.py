@@ -88,8 +88,16 @@ GOLDEN = {
         "〔我现在的身体 v13〕\n"
         "私聊，只有我和TA。我这几天人挺有精神，皮肤也顺眼。我对TA还不算熟，你们刚认识不久。我内心：有点想说话。前面聊的还能接上，我这会儿还挺专注，我现在很闲。"
     ),
-    # 日程事件在身：事实块 + 【我现在的情况】合起来，事件短语只出现一次。
+    # 日程事件在身、但对方没问：事实块与【我现在的情况】里都不该有事件原文。
     "s6_schedule": (
+        "〔我现在的身体 v13〕\n"
+        "私聊，只有我和TA。我这几天人挺有精神，皮肤也顺眼。我对TA还不算熟，你们刚认识不久。我内心：有点想说话。前面聊的还能接上，我这会儿还挺专注，我现在很闲。\n"
+        "\n"
+        "【我现在的情况】\n"
+        "我和TA还在互相认识，没到能说私事的地步。今天是2026-09-26，现在是13:03:00；今天周六；入秋了；你在北京。"
+    ),
+    # 对方问起她这会儿在做什么：这时才给，而且只在【我现在的情况】里出现一次。
+    "s6_schedule_asked": (
         "〔我现在的身体 v13〕\n"
         "私聊，只有我和TA。我这几天人挺有精神，皮肤也顺眼。我对TA还不算熟，你们刚认识不久。我内心：有点想说话。前面聊的还能接上，我这会儿还挺专注，我现在很闲。\n"
         "\n"
@@ -172,7 +180,7 @@ def _cooling_body() -> str:
     return core.build_injection(UID, text=SAID)
 
 
-def _schedule_bodies() -> tuple:
+def _schedule_bodies(said: str = SAID) -> tuple:
     core = _core()
     core._scope.update_self(
         today_date="2026-09-26",
@@ -183,7 +191,7 @@ def _schedule_bodies() -> tuple:
         ],
     )
     injection_body = core.build_injection(UID, text=SAID)
-    note = main_module._state_note(core, UID, said=SAID)
+    note = main_module._state_note(core, UID, said=said)
     return injection_body, note
 
 
@@ -258,9 +266,15 @@ class GoldenSnapshotTest(unittest.TestCase):
         self.assertEqual(body.count("气头上"), 1, "冷静期从两条通道各说了一遍")
         self.assertNotIn("说的话的事", body, "reason 被二次拼装成「…的事」")
 
-    def test_6_schedule_event_is_said_once(self):
+    def test_6_schedule_event_stays_out_until_she_is_asked(self):
         injection_body, note = _schedule_bodies()
         self.assertEqual(injection_body + note, GOLDEN["s6_schedule"])
+        self.assertNotIn("整理个案笔记", injection_body + note,
+                         "对方没问她这会儿在做什么，日程事件不该出现在任何一块里")
+
+    def test_6b_schedule_event_is_said_once_when_asked(self):
+        injection_body, note = _schedule_bodies("你在干嘛")
+        self.assertEqual(injection_body + note, GOLDEN["s6_schedule_asked"])
         self.assertEqual((injection_body + note).count("整理个案笔记"), 1)
         self.assertNotIn("整理个案笔记", injection_body,
                          "日程是背景，走【此刻的她】；混进事实块会被当成要回应的内容")

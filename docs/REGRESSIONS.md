@@ -77,6 +77,16 @@
 | 白名单外的人仍能在 `/你的状态` 看到裸的「亲近欲 41/50」 | 状态页在「亲密」段为空时会退回显示裸数字（`if not intimate: out.append(row("亲近欲" ...))`） | `test_v302_ccb_whitelist.py::PanelHidden` | `ccb.allowed_for()` 读不到配置一律放行（挡错 = 功能整条消失）；名单外既不能出「亲密」段，也不能退回裸数值——那正是这份名单要挡的东西。 |
 | 关掉 `ccb`/`mood_enabled` 之后，下面那几十项照样铺满面板 | `_conf_schema.json` 没有任何 `condition`，面板只认「有没有这一项」 | `test_v302_schema_conditions.py` | `condition` 的值类型必须与主开关默认值一致（前端是严格 `!==`，写成 `"true"` 等于永久隐藏）；主开关自己绝不能加 `condition`；新增从属项时一并加上，否则面板又会长回去。 |
 
+## v3.0.5 之后新增的守则
+
+这些是 v3.0.5 修掉的、删掉一行就会回来的毛病。动日程生成或「此刻的她」那一段前先看用例：
+
+| 症状 | 根因 | 守门测试 | 以后改这里要注意什么 |
+|---|---|---|---|
+| 她每条回复都在报备「我这会儿在整理个案笔记」，或者照着当前日程安排接下来的动作 | 日程事件原文每轮以第一人称、【我现在的情况】标题段落塞进请求末尾；一句已经成句的台词摆在那里，模型就会念出来，而 system_prompt 里那句「背景不是内容」离得太远、又没有门控 | `test_v306_injection_golden.py::test_6_schedule_event_stays_out_until_she_is_asked`、`test_6b_schedule_event_is_said_once_when_asked`；`test_v22741_activity_note.py::test_activity_is_absent_when_the_user_does_not_ask` | 这条修过两次又复发：v2.27.1 的结论是「日程不进对话」，v2.29.0 用关键词门，v3.0.x 又回到每轮都给。门在 `main._asks_about_now()`，宁宽不宁严——漏判她会自己编一句，误判只是多一句报备。断言必须打在**请求层**（两块临时块都不含事件原文）：只断言 `build_injection()` 挡不住 `_state_note`，当年就是这么漏的。待办（跨天、不带「正在」）不跟这道门一起关。 |
+| 她在沙发上喝东西喝了 30 分钟；一件小事被撑成一小时的段 | prompt 的时长示范把「喝口水、吃两口、回个消息」定义成 15~30 分钟的段，而 `_segment_minutes()` 有 15 分钟硬下限——两处叠加，微动作必然成段 | `test_v2236_schedule_prompt.py::ScheduleDurationGuidance::test_micro_actions_are_not_segments` | `SEGMENT_MIN_MINUTES=15` 是滚动决策窗的下限，不是「一件小事至少占 15 分钟」的许可。写时长规则时只问「这件事本身占多久」，别写「这类事写多少分钟」——后者会被读成「这类事就该占这么久」。 |
+| 所有角色过成同一个人（书店、个案笔记、朋友电话）；范例的长短天天跳 | few-shot 范例是 18 条写死的、带强烈单一性格的具体事件，按日期整池洗牌抽 4 条 | `test_v2236_schedule_prompt.py::ScheduleExamplesRotateDaily::test_every_day_sees_short_and_long`、`test_pool_carries_no_identity` | 范例只示范**形状和粒度**（一条具体到什么程度、长短差多少），不许带身份线索；按档抽（短/中/长/歇着各一条），别改回整池洗牌——那样每天看到的长度分布都不一样。她做什么要从人设和当天处境里长出来。 |
+
 ## 「现实→网友」/「变成手机发消息」是什么（v1.28.1 / v2.28.1 调查结论）
 
 **不是插件的问题，也无需修。** 已按一位用户的反馈逐条核对过日志（其 QQ 号与昵称已隐去）。

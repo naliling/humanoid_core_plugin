@@ -8,7 +8,7 @@
 > 不是一句人设，是一整天的生活。
 > 插件负责她的身体、日程、情绪和关系背景；怎么说话，仍然由大模型按人设自己决定。
 
-![version](https://img.shields.io/badge/version-v3.0.4-2563eb?style=flat-square)
+![version](https://img.shields.io/badge/version-v3.0.5-2563eb?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -233,7 +233,7 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 
 ## 深入一点：她的一天是怎么跑起来的
 
-- **状态与背景都走临时内容块**：每轮在变的东西（她对 TA、心情、身体感觉、几点、天气、季节、她今天在做什么）作为临时内容块追加，只发给模型、不落会话历史；system_prompt 里只放一句「这些是背景、不是要念出来的内容」的框架句——写进 system_prompt 会让前缀缓存逐轮失效。
+- **状态与背景都走临时内容块**：每轮在变的东西（她对 TA、心情、身体感觉、几点、天气、季节、她手上还没做完的事）作为临时内容块追加，只发给模型、不落会话历史；system_prompt 里只放一句「这些是背景、不是要念出来的内容」的框架句——写进 system_prompt 会让前缀缓存逐轮失效。她这会儿正在做什么不常驻，只在对方问起时给一句：常驻就会变成每条回复都在报备。
 - **给体感，不给数值**：「有点困」是递给她的；「好感 46/100」这种体检单留在 `/你的状态` 里给你看。
 - **同一件事只说一遍**：关系位置、心气、精力、想不想说话，各自有且只有一个来源。
 - **日程按 15 分钟一个决策窗**：到点或掷中「改主意概率」才排下一段，不预排未来；关掉模型就用按日期轮换的本地模板，任何时刻都有段可做。

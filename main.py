@@ -432,14 +432,40 @@ def _resolve_data_root(context: Any = None) -> Path:
             logger.debug(f"{LOG_PREFIX} context.get_plugin_data_dir() 失败: {exc}")
     return Path("data").resolve()
 
-# 「她这会儿在过什么」不再由用户这句话里有没有某个词决定（审核 注入生成 P-06 / #39）。
+# 「她这会儿在过什么」这一句，要不要进这一轮的上下文，取决于**对方是不是在问她此刻的事**。
 #
-# 旧写法是一张「干嘛 / 干啥 / 在忙」的子串表：用户换个说法（「你这会儿忙不忙呀」
-# 里的「忙不忙」命中，「最近在忙什么项目」也命中，但「今天累不累」不命中）就答不出来，
-# 不问又完全不提——同一个事实的可见性由关键词表决定，而不是由它该不该出现决定。
-# v2.29.0 曾因为「她每条回复都说我在忙」把它改成「问了才说」，但病根是**日程事件一挂
-# 几个小时、每轮原样重发**，不是「说了」这件事本身；现在由 injection.select 的预算
-# 决定说不说（这一段是每轮重发的临时块，token 预算见 _state_note 尾部）。
+# 这一个句子上已经翻过三次车，都记在这里：
+#   · v2.29.0 之前每轮都写：日程事件一挂几个小时、每轮原样重发，于是她每条回复都带
+#     「我在忙」——用户看到的是每句话都在报备；
+#   · v2.29.0 改成一张「干嘛 / 干啥 / 在忙」的子串表 `_asked_about_activity`：换个说法
+#     （「最近在忙什么项目」命中，「今天累不累」不命中）就问不出来，于是 v3.0.x 又把门
+#     整个拆了，回到「日程槽位非空就进事实，说不说交给预算」（审核 注入生成 P-06 / #39）；
+#   · 拆门之后第一个毛病原样回来了，而且更明显：模型拿到的是一句**已经成句的第一人称
+#     事实**（「我这会儿窝在沙发上把攒的两集看完。」），最省力的做法就是把它说出来——
+#     不问也说，句句都是日程。v2.27.1 的结论本来是「日程不进对话」（CHANGELOG「她是背景，
+#     不是台词」），v3.0.x 又把它放了回去，同一个病第四次出现。
+#
+# 所以这里把门装回来，但只装在这一句上：关系阶段、心境、穿搭、外界照旧每轮都给，
+# 只有「她此刻在做什么」要等对方问起。两边的代价都算过——漏判（该给没给）的后果是
+# 她没拿到这件事、照人设自己说话，看不见，也正是 README 承诺的「插件不替她写台词」；
+# 误判（不该给给了）的后果是这一轮可能多一句报备。宁可她不知道。
+_ASKS_ABOUT_NOW = (
+    "干嘛", "干啥", "干什么", "做什么", "做什么呢", "在做什么", "在干什么",
+    "忙什么", "忙啥", "忙不忙", "在忙", "忙吗", "忙不忙呀", "有没有在忙",
+    "这会儿在", "现在在", "今天在", "最近在", "在不在忙",
+)
+
+
+def _asks_about_now(said: str) -> bool:
+    """对方这句话是不是在问她此刻在做什么。
+
+    只决定「要不要把当前这一段日程递给她」，不决定别的。表宁宽不宁严：漏判的后果是
+    她自己编一句，误判的后果是多一句报备，两个都比「每轮都在报备」轻。
+    """
+    text = (said or "").strip()
+    if not text:
+        return False
+    return any(word in text for word in _ASKS_ABOUT_NOW)
 
 
 # 「她这会儿正在X」里的 X 是**日程事件原文**，不是名词短语：日程兜底模板从 B1 起就
@@ -459,11 +485,14 @@ _NOUN_EVENTS = {"睡眠": "睡着了"}
 
 def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "",
                 is_group: bool = False, said: str = "") -> str:
-    """I1/I2：算「此刻的她」那一段（关系阶段 + 心境 + 她这会儿在过什么）。
+    """I1/I2：算「此刻的她」那一段（关系阶段 + 心境 + 手头未完的事 + 外界 + 穿搭）。
 
     它每轮都在变，调用方把它当临时内容块发出去（不落会话历史），不写进 system_prompt——
     否则整段提示词的前缀缓存会逐轮失效。日程与外界走这里、不进事实块（I2）：
     单独成段只当她「知道」，要不要提由她自己定。
+
+    其中「她此刻在做什么」这一句还要再过一道门（`_asks_about_now`）：对方没问就不给，
+    见 _ASKS_ABOUT_NOW 上面那段。其余几项（关系、心境、待办、穿搭、外界）每轮都给。
     """
     try:
         from .humanoid import injection as _injection
@@ -496,31 +525,40 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
                 stage = ""
             tone = core.mood.current_tone(user_id)
             style = core.mood.style_tendency(user_id)
+        # 「她此刻在做什么」只在对方问起时才给（理由见 _ASKS_ABOUT_NOW 上面那段）。
+        # 门开的时候也不改事件原文，只补一个前缀——事件本身是动词短语，再加「在」
+        # 会拼出「她这会儿正在坐在窗边」。
         day = ""
-        try:
-            slot = core.schedule.current_slot() or {}
-            event = str(slot.get("event", "") or "").strip()
-            loc = str(slot.get("location", "") or "").strip()
-            if event:
-                head = _NOUN_EVENTS.get(event) or (
-                    event if event.startswith(_ACT_HEADS) else "在" + event
-                )
-                day = f"她这会儿{head}" + (f"（{loc}）" if loc else "")
-        except Exception:
-            day = ""
+        if _asks_about_now(said):
+            try:
+                slot = core.schedule.current_slot() or {}
+                event = str(slot.get("event", "") or "").strip()
+                loc = str(slot.get("location", "") or "").strip()
+                if event:
+                    head = _NOUN_EVENTS.get(event) or (
+                        event if event.startswith(_ACT_HEADS) else "在" + event
+                    )
+                    day = f"她这会儿{head}" + (f"（{loc}）" if loc else "")
+            except Exception:
+                day = ""
         # 她手上还没做完的那几件事（`ongoing_tasks`，跨天跟着她）也进这一段。
         # 它本来就只被送去社交侧，从没进过普通对话的注入——于是她「手头正压着件事」
         # 这件事，在跟人聊天时根本不在场。放这里是**免费的**：这一段本来就是每轮重发的
         # 临时块，多几行不增加任何前缀缓存代价（真正要省的是 system_prompt）。
         # 它属于 I2「日程与外界」：单独成段只当她「知道」，要不要提由她自己定；
         # 不进事实块，免得被当成一条要回应的内容。
+        #
+        # 它跟「她此刻在做什么」不是一回事，所以不跟着上面那道门一起关：日程是这一小时
+        # 在做什么（说出口就成报备），这个跨天跟着她、也不带「正在」，是她的待办，
+        # 对方不问也可以知道。
         try:
             ongoing = [str(t).strip() for t in (core.schedule.ongoing_tasks() or []) if str(t).strip()]
         except Exception:
             ongoing = []
+        ongoing_line = ""
         if ongoing:
             # 一件也说「还没做完的事」，不说「几件」——件数在 1~3 之间，写死量词会数错。
-            day = "；".join(p for p in (day, "她手上还没做完的事：" + "、".join(ongoing)) if p)
+            ongoing_line = "她手上还没做完的事：" + "、".join(ongoing)
         # 身体事实**不在这里**：每轮 `core.build_injection()` 返回的「〔她的身体与生活〕」
         # 事实块已经带着 `soma.feelings()` 的档位词（medium 档 2 条、full 档 5 条，
         # 同一套阈值）。v2.28.1 曾在这里再拼一遍，结果是同一句话在一轮请求里出现两次
@@ -553,6 +591,7 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
                 ("state_stage", stage, 9.0),
                 ("state_tone", tone, 8.0),
                 ("state_day", day, 7.0),
+                ("state_ongoing", ongoing_line, 6.5),
                 ("state_style", style, 6.0),
                 ("state_world", world, 3.0),
             )
