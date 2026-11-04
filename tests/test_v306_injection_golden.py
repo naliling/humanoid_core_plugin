@@ -99,6 +99,22 @@ GOLDEN = {
 }
 
 
+def _pin_cycle(core: HumanoidCoreInstance, moment: datetime = DAY) -> None:
+    """把生理周期日钉在快照录制时那一天。
+
+    core 在构造时已经用**真实 Clock** 的今天播种了 current_cycle_day
+    （core_instance.py:225-230 → state.seed_cycle_day），而这个测试只在构造之后才把
+    时钟换成 FrozenClock，于是快照会随「跑测试那天」漂：2026-11-04 播到第 21 天
+    （phase 6，注入里是「人有点沉，总想吃东西」），而快照录的是 phase 2（周期第
+    9-11 天，「人挺有精神，皮肤也顺眼」）。固定成第 10 天，并把 last_cycle_update
+    对齐到快照那天，让 energy.advance_cycle 不再推进。
+    """
+    core._scope.update_self(
+        current_cycle_day=10,
+        last_cycle_update=moment.strftime("%Y-%m-%d"),
+    )
+
+
 def _core(moment: datetime = DAY, **conf) -> HumanoidCoreInstance:
     """一个固定时钟、固定配置、空档案的 core（照 tests/test_v304_b4_prompt_time.py）。"""
     store = StateStore(Path(tempfile.mkdtemp()) / "state.json", lambda: 0.01)
@@ -120,6 +136,7 @@ def _core(moment: datetime = DAY, **conf) -> HumanoidCoreInstance:
         svc = getattr(core, name, None)
         if svc is not None and hasattr(svc, "_clock"):
             svc._clock = clock
+    _pin_cycle(core, moment)
     return core
 
 
@@ -330,6 +347,7 @@ class GoldenIsStableTest(unittest.TestCase):
             svc = getattr(core, name, None)
             if svc is not None and hasattr(svc, "_clock"):
                 svc._clock = clock
+        _pin_cycle(core, DAY)
         medium_first = core.build_injection(UID, text=SAID)
         holder["cfg"] = HumanoidConfig.from_raw(
             {"timezone_city": "北京", "inject_activity_context": "full"}

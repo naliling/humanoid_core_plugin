@@ -294,6 +294,52 @@ def sleep_window_minutes(slots: Iterable[Slot]) -> tuple[int, int] | None:
     return best[0] % DAY_MINUTES, best[1] % DAY_MINUTES
 
 
+# 生物钟夜的合理跨度（小时）。`sleep_window_minutes` 只保证「挑得对」（夜觉优先、
+# 其次最长），不保证「挑出来的是一夜」：当天日程里唯一一段睡眠是 11:15-12:45 的
+# 小睡时，它照样返回 11.25→12.75。谁拿这个窗口当生物钟夜，谁就会把上午十一点
+# 判成深夜——一天剩下 22.5 小时全算「夜里醒着」，困意与睡眠债只增不减。
+# 所以这里给出「一段觉算不算一夜」的跨度区间，两个边界都从「她一晚需要睡多久」推，
+# 不写死：短睡型（need=4）与长睡型（need=10）不该用同一个下限。
+NIGHT_SPAN_LOW_RATIO = 0.6   # 下限 = sleep_need_hours 的 60%
+NIGHT_SPAN_LOW_FLOOR = 2.0   # 但不少于 2 小时（sleep_need_hours 配得很小时）
+NIGHT_SPAN_LOW_CEIL = 6.0    # 也不多于 6 小时（否则 14 小时型会把正常的一夜判掉）
+NIGHT_SPAN_HIGH_PAD = 6.0    # 上限 = sleep_need_hours + 6 小时
+NIGHT_SPAN_HIGH_CEIL = 16.0
+
+
+def night_span_bounds(sleep_need_hours: float) -> tuple[float, float]:
+    """一段觉算「一夜」的跨度区间（小时）：(下限, 上限)。"""
+    try:
+        need = float(sleep_need_hours)
+    except (TypeError, ValueError):
+        need = 8.0
+    if need != need or need <= 0.0:  # NaN / 非正数：按默认 8 小时
+        need = 8.0
+    low = min(NIGHT_SPAN_LOW_CEIL, max(NIGHT_SPAN_LOW_FLOOR, need * NIGHT_SPAN_LOW_RATIO))
+    high = min(NIGHT_SPAN_HIGH_CEIL, max(low, need + NIGHT_SPAN_HIGH_PAD))
+    return low, high
+
+
+def night_span_hours(window: tuple[float, float] | None) -> float:
+    """(起始小时, 结束小时) 的跨度；跨午夜用 `(end - start) % 24`，起点等于终点是 0。"""
+    if window is None:
+        return 0.0
+    try:
+        start, end = float(window[0]), float(window[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return 0.0
+    return (end - start) % 24.0
+
+
+def plausible_night(window: tuple[float, float] | None, sleep_need_hours: float) -> bool:
+    """这一段觉像不像「她的一夜」：太短（白天小睡）或太长（大半天都在睡）都不算。"""
+    span = night_span_hours(window)
+    if span <= 0.0:
+        return False
+    low, high = night_span_bounds(sleep_need_hours)
+    return low <= span <= high
+
+
 def find_slot(slots: Iterable[Slot], minutes: int) -> Slot:
     minutes = max(0, min(DAY_MINUTES - 1, int(minutes)))
     fallback: Slot = {

@@ -22,10 +22,20 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
+from astrbot.api import logger
+
 from ..clock import local as _clock_local
 from ..config import HumanoidConfig
 from ..role_scope import RoleScope
-from ..slots import is_meal_event, iter_segments, slot_sleeps, sleep_window_minutes
+from ..slots import (
+    is_meal_event,
+    iter_segments,
+    night_span_bounds,
+    night_span_hours,
+    plausible_night,
+    slot_sleeps,
+    sleep_window_minutes,
+)
 from ..wording import FEELING_WORDS, band_index, pick, scale_word
 
 # 一次补算最多推进多久。插件停机一周后重启，不该攒出「睡眠压力 5000」。
@@ -140,6 +150,8 @@ class SomaService:
         # 状态文件写成常驻磁盘写入。
         self._persisted: dict[str, Any] | None = None
         self._last_persist = 0.0
+        # 「日程里那段觉不像一夜」只提示一次：这是每 60 秒 tick 都会走到的路径。
+        self._night_warned = False
         # 新角色当场定下计时基准。不能等第一次 advance 才写：那时「现在」已经往前走了，
         # 启动后第一次补算会被当成零时长，把开机期间真正该补的那段体感全弄丢。
         self._ensure_data()
@@ -572,13 +584,55 @@ class SomaService:
             "last_sleep_hours": _rounded(self._get("last_sleep_hours", 0.0)),
         }
 
+    def _scheduled_sleep_window(self) -> tuple[float, float] | None:
+        """日程里推出来的那一段觉；**不像一夜**时返回 None，并提示一次。
+
+        为什么不直接信 `slots.sleep_window_minutes`：它只保证「挑得对」（夜觉优先、其次
+        最长），不保证「挑出来的是一夜」。当天日程里唯一一段睡眠是 11:15–12:45 的小睡时，
+        它照样返回 11.25→12.75：于是上午十一点 `in_scheduled_deep_sleep` 为真（注入里说
+        她在深睡），`_night_mid_hour()` 被摆到中午 12:00——低谷锚点跟着挪到下午三点、
+        凌晨三点反倒最清醒。反过来，某天唯一那段觉是 00:00–18:00 时窗口长 18 小时，
+        `_in_biological_night` 对其中 18 小时都为真：白天醒着也按「夜里醒着」每小时
+        +7.5 困意、按小时记睡眠债（现场另一个角色的窗口就是 0→18）。
+
+        跨度区间由 `slots.night_span_bounds` 从 `sleep_need_hours` 推出，不写死：值夜班
+        白天补 7 小时的人照样算一夜，1.5 小时的午睡不算。
+        """
+        window = _sleep_window(self._slots())
+        if window is None:
+            return None
+        if plausible_night(window, getattr(self.config, "sleep_need_hours", 8.0)):
+            return window
+        self._warn_implausible_night(window)
+        return None
+
+    def _warn_implausible_night(self, window: tuple[float, float]) -> None:
+        """日程里那段觉不像一夜时提示一次（每 60 秒 tick 都会走到这条路径，不能刷屏）。"""
+        if self._night_warned:
+            return
+        self._night_warned = True
+        cfg = self.config
+        low, high = night_span_bounds(getattr(cfg, "sleep_need_hours", 8.0))
+        logger.warning(
+            "[humanoid_core] 日程里最长的一段睡眠只有 %.1f 小时（按 %.1f 小时的睡眠需要，"
+            "合理跨度是 %.1f~%.1f 小时），不把它当生物钟夜：否则白天小睡会把夜窗压成很短的一段，"
+            "一天剩下的大部分时间都被算成「夜里醒着」，困意和睡眠债只增不减。"
+            "改用配置里的夜间窗口 %02d:00-%02d:00。",
+            night_span_hours(window),
+            float(getattr(cfg, "sleep_need_hours", 8.0) or 8.0),
+            low,
+            high,
+            int(getattr(cfg, "night_start_hour", 23)),
+            int(getattr(cfg, "night_end_hour", 6)),
+        )
+
     def biological_night(self) -> tuple[float, float] | None:
         """她的生物钟夜里是哪一段：**(起始小时, 结束小时)**，跨午夜用 start > end 表示。
 
-        优先按她自己今天那份日程里最长的连续睡眠段推，日程没排睡眠（或还没生成）才退回
-        配置里的夜间窗口。以前是反过来的：日程被 `align_sleep_to_night` 切到 23:00→06:00
-        上去，夜猫子人格凌晨四点睡、十一点起，身体却按早上六点算“该醒了”，低谷也摆在
-        下午——那等于一个固定窗口替所有人决定几点睡。
+        优先按她自己今天那份日程里那段觉推，日程没排睡眠（或还没生成、或那段觉不像一夜）
+        才退回配置里的夜间窗口。以前是反过来的：日程被 `align_sleep_to_night` 切到
+        23:00→06:00 上去，夜猫子人格凌晨四点睡、十一点起，身体却按早上六点算「该醒了」，
+        低谷也摆在下午——那等于一个固定窗口替所有人决定几点睡。
 
         `night_mode_enabled=False` 时**整个返回 None**：关掉夜间模式就是「不再有生物钟夜
         这一层」。旧写法只在**日程没排睡眠**时才看这个开关，于是日程里只要有一段觉，
@@ -587,21 +641,24 @@ class SomaService:
         cfg = self.config
         if not cfg.night_mode_enabled:
             return None
-        window = _sleep_window(self._slots())
-        if window is None:
-            if cfg.night_start_hour == cfg.night_end_hour:
-                return None
-            return float(cfg.night_start_hour), float(cfg.night_end_hour)
-        return window
+        window = self._scheduled_sleep_window()
+        if window is not None:
+            return window
+        if cfg.night_start_hour == cfg.night_end_hour:
+            return None
+        return float(cfg.night_start_hour), float(cfg.night_end_hour)
 
     def scheduled_night(self) -> tuple[float, float] | None:
-        """她**日程里**推出来的夜；日程没排睡眠（或还没生成）时返回 None。
+        """她**日程里**推出来的夜；日程没排睡眠（或还没生成、或那段觉不像一夜）时返回 None。
 
         与 `biological_night()` 的区别：这个**不退回配置窗口**。判断「现在是不是她
         自己的夜里」必须用这个——配置窗口只是没日程时的兑底，拿它硬套会让夜猫子在
         23:00-06:00 被当成「她的生物钟夜」（生成日程时去排睡眠、注入时说睡眠时段）。
+
+        「不像一夜」也返回 None（判据见 `_scheduled_sleep_window`）：只有一段午睡的一天，
+        不能因为日程里「有睡」就宣称自己排出了一夜。
         """
-        return _sleep_window(self._slots())
+        return self._scheduled_sleep_window()
 
     def in_scheduled_night(self, hour_of_day: float) -> bool:
         """给定钟点是不是在她日程推出来的夜里。没有日程 → False。"""
