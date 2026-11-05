@@ -811,7 +811,8 @@ class PromptBuilderGuardsTest(unittest.TestCase):
             SimpleNamespace(
                 energy=SimpleNamespace(energy=50.0),
                 soma=SimpleNamespace(
-                    feelings=lambda energy: [(80.0, "很困"), None, ("bad", "x")]
+                    # 体感接口多了 include_discomfort 关键字（m08275 限流），替身要跟着走。
+                    feelings=lambda energy, **kw: [(80.0, "很困"), None, ("bad", "x")]
                 ),
             ),
             SimpleNamespace(soma_enabled=True, show_sleep_window=True),
@@ -825,7 +826,7 @@ class PromptBuilderGuardsTest(unittest.TestCase):
                 energy=SimpleNamespace(energy=50.0),
                 soma=SimpleNamespace(
                     snapshot=lambda: {"asleep": 1.0},
-                    feelings=lambda energy: [(0.9, "这会儿在睡"), (0.5, "有点饿")],
+                    feelings=lambda energy, **kw: [(0.9, "这会儿在睡"), (0.5, "有点饿")],
                 ),
             ),
             SimpleNamespace(soma_enabled=True, show_sleep_window=True),
@@ -844,7 +845,7 @@ class PromptBuilderGuardsTest(unittest.TestCase):
                 energy=SimpleNamespace(energy=50.0),
                 soma=SimpleNamespace(
                     snapshot=lambda: {"asleep": 0.0},
-                    feelings=lambda energy: [(0.9, "这会儿在睡"), (0.5, "有点饿")],
+                    feelings=lambda energy, **kw: [(0.9, "这会儿在睡"), (0.5, "有点饿")],
                 ),
             ),
             SimpleNamespace(soma_enabled=True, show_sleep_window=False),

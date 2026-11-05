@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from .state import seed_cycle_day
 from . import __version__
+from . import body_voice as _body_voice
 from . import life_log
 from . import ccb as _ccb
 from . import outfit
@@ -1539,6 +1540,15 @@ class HumanoidCoreInstance:
             current = float(self._scope.peek_user(user_id, "her_said_at", 0.0) or 0.0)
             if moment > current:
                 self._scope.set_user(user_id, "her_said_at", moment)
+        except Exception:
+            pass
+        # 她**自己**刚说过身体上的事，就在这段时间内不再递身体事实（m08275 现场：
+        # 她的每一句回复都在说小腹）。注入递一句「小腹坠着」→ 她说一遍 → 下一轮
+        # 注入又递 → 她再说一遍，这是自我强化的循环；闸门在
+        # prompt_builder._body_echo_quiet。这里只记「她说了」，不判断该不该说。
+        try:
+            if _body_voice.mentions_body(body):
+                self._scope.set_self("body_echo_at", moment)
         except Exception:
             pass
         if not bool(getattr(cfg, "ccb", False)) or is_group:

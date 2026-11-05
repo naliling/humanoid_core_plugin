@@ -114,7 +114,7 @@
 | 换完人设素材还是旧的，要等半小时 | `needs_build` 只按「上次尝试时间」退避，不看那次尝试是冲着哪版人设去的：换人设时被上一个人设的尝试记录挡住 | `test_v3010_role_materials.py::NeedsBuildTest` | 退避要按指纹记账（`ROLE_MATERIALS_TRY_FP_KEY`）：同一版人设失败过才等，人设变了立刻重建。 |
 | 每换一段就多问一次模型 | 素材生成一度写进 `_generate_segment`，直接打破「换段只调一次模型」 | `test_schedule.py` 里 `provider.calls == 1` 那批用例 | 新的模型调用不许进换段路径：素材在后台 `ensure_role_materials()` 里生成落盘，生成侧只读缓存。 |
 | 测试里人设根本没进来，测的是降级路径 | 测试把 persona provider 写成同步函数，`_resolve_persona` 的 `await` 抛 `TypeError` 被它自己吞掉，变成「没人设」，用例照样绿 | — | 替身必须与真实接口同形（async）；降级路径要另有用例显式覆盖，不能靠同步替身撞出来。 |
-| 经期那句一天几十轮一字不变地进上下文，模型逐字复述 | `_CYCLE_FEELING_SETS` 每个阶段只有一句，月经期横跨 1-5 天就用同一句；三个调用点每轮无条件注入 | `test_v3010_cycle_quiet.py` | 身体描述按「第几天」轮换（同一天稳定、换天换句），并在同一天只说一次（`_cycle_worth_saying`，对方问起身体才恢复）。任何「每轮都进上下文」的描述，先算它一天会重复多少遍。 |
+| 经期那句一天几十轮一字不变地进上下文，模型逐字复述 | `_CYCLE_FEELING_SETS` 每个阶段只有一句，月经期横跨 1-5 天就用同一句；三个调用点每轮无条件注入 | `test_v3010_cycle_quiet.py` | 身体描述按「第几天」轮换（同一天稳定、换天换句），递送**三天一次**（`_cycle_worth_saying`，m08275 起从「一天一次」收紧，对方问起身体才恢复；她自己刚说过时连问起之外一律不给，见下方「硬规则」）。任何「每轮都进上下文」的描述，先算它一天会重复多少遍。 |
 | 她永远是同一个勤快模板人，看不出她自己的作息 | 生成侧只读 `daily_schedule`，跨天把昨天挪进 `prev_day_schedule`，第三天被覆盖——过去几周根本读不到 | `test_v3010_habits.py` | 归档（`habit.archive_day`）必须幂等、按天裁期（28 天）、坏 scope 静默放弃；习惯只在样本 ≥5 天且重复率 ≥0.4 时说，且明写「今天可以有例外」。 |
 | 质量闸判中了却什么都没发生：重复、睡够了还睡、白天一觉太长全部静默放行 | 生成那一次 `consume()` 已经把 `_last_call` 刷新、`_next_gap` 抽成 30~60 分钟，紧接着的重写请求走 `check()` 的间隔判定当场被拒 → `generate()` 返回 None → `_rewrite_once` 拿不到重写版 | `test_v3011_review.py::ReviewServiceTest::test_reason_verdict_sends_the_reason_into_the_rewrite` | 同一次决定里的后续调用（重写、审查）必须传 `ignore_interval=True`。测试替身不查闸门，`provider.calls` 全绿证明不了这条路通——凡「调不通就降级」的分支，都要有一条用例断言它真的调到了。 |
 | 她手上那一段过完之后，30~60 分钟里「她这会儿在做什么」没有任何一段罩着 | `ensure_fresh()` 只看节流间隔，不看「手上有没有段」；空档与「提前再问一次」走了同一条判定 | `test_v3011_review.py::GapContinuityTest::test_gap_is_filled_right_away_despite_the_interval` | 空档（`active is None`）要传 `ignore_interval`；空闲静默与每日额度不许跟着绕（`test_idle_silence_still_blocks_even_in_a_gap`、`test_ignore_interval_still_counts_budget`）。 |
@@ -168,6 +168,18 @@ QQ 的「手机/Pad/PC」由**当前在线会话**决定。NapCat 用平板协�
 
 无需改插件。要减少观感只能从 NapCat 侧降低掉线频率（网络稳定性/心跳/避免多端抢占）。
 
+
+## 硬规则（用户明确要求，跨版本适用）
+
+下面几条不是「某个版本修掉的 bug」，是用户反复强调、写进来就不许再犯的规矩。
+动注入正文、动措辞、动日程之前先读这一节；违反其中任何一条，前面所有版本记录都白修。
+
+| 规则 | 具体要求 | 为什么（用户原话 / 现场） | 守门测试 |
+|---|---|---|---|
+| **人称是「我」，不是「她」** | 注入正文与抬头一律第一人称：抬头「〔我现在的身体 v13〕」、小节「【我现在的情况】」，正文里不许用「她」指她自己（框架句里那句「她指你自己」是解释，不是正文）。 | 用户原话（m08244）：「我不是说了 人称换成"我"吗你这个记录问题的目录到底你有没有写！」——这条以前只写在 CHANGELOG v13 里，没写进守则，于是换个地方又回来了。 | `test_v306_injection_golden.py` 的快照整段比对（第一人称，逐字） |
+| **身体事实不逐轮播报** | 周期句**三天**一次（`body_voice.CYCLE_QUIET_SECONDS`）、「身体不适」**八小时**一次（`DISCOMFORT_QUIET_SECONDS`）、**她自己刚说过**身体上的事四小时内一律不递（`note_her_words` → `body_echo_at` → `_body_echo_quiet`，`ECHO_QUIET_SECONDS`）；对方问起（`body_voice.asked_about_body`）永远优先给。 | 用户原话（m08275）：「每一句都是这样！小腹小腹！有病啊！……他应该适当的说而不是句句都说！你能不能全部改完！严格一点！别省啊！」现场是两条回路互相加强：注入每轮递「小腹坠着」→ 她说一遍 → 下一轮注入又递。判据必须落在**结构化入参**上（`soma.feelings(..., include_discomfort=)`），不许在正文里做字面删除——「`if "在睡" not in text`」那种子串过滤是反面教材：同义说法换个词就漏。 | `test_v3011_body_quiet.py`（BodyWords / EchoQuiet / DiscomfortQuiet）、`test_v3010_cycle_quiet.py` |
+| **日程不是台词** | 日程事件原文只在「对方问起她在做什么」时进请求，其余轮次一个字都不给（`main._asks_about_now()`）。 | 见 v3.0.5 那节第一条（本文件 :86）。这条修过三次又复发，用户原话（m05601）：「模型甚至还是出现了严重照着日程生活的情况（以前就有 这次修改必须记录）」。 | `test_v306_injection_golden.py::test_6_schedule_event_stays_out_until_she_is_asked`、`test_v22741_activity_note.py` |
+| **同一件事一轮里只说一遍** | 一个事实只留一个来源：睡眠状态句在时，体感里的「这会儿在睡」按结构化 `asleep` 排除；日程在 `_state_note` 里时，`build_injection` 不再重复。 | 历史回归：「她在睡」+「正睡着」同一轮出现两次（本文件 v3.0.4 那节）。两块临时块（state_note / injection）分头拼装，最容易在这里重复。 | `test_v3011_body_quiet.py`、`test_v306_injection_golden.py` |
 
 ## 改完自检
 

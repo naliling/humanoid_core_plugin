@@ -6,10 +6,16 @@
 「我这两天小腹坠着，腰也酸」一天几十轮、连着五天逐字进上下文。模型读到的
 是「她一直在说这件事」，于是每轮都把它当台词复述一遍。
 
-修法两条，这里各守一条：
+修法三条，这里各守一条：
 
 1. 措辞按天轮换（body_sense._CYCLE_FEELING_SETS，8 阶段 × 3 句）；
-2. 递送一天一次，除非对方问到了身体（prompt_builder._cycle_worth_saying）。
+2. 递送**三天一次**，除非对方问到了身体（prompt_builder._cycle_worth_saying）；
+3. 她自己刚说过身体上的事，四小时内一律不递（humanoid/body_voice.py）。
+
+为什么从「一天一次」收紧到「三天一次」（m08275 现场）：月经期横跨五天，
+一天一次就是连着五天、每天第一轮都在说同一件事；而模型看到注入里写着
+「小腹坠着」，就会在**每一句**回复里带一遍。闸门必须比「一天」更稀，
+才可能让她偶尔提一句，而不是把它当口癖。
 """
 
 from __future__ import annotations
@@ -31,8 +37,8 @@ def _cycle_lines_in(body: str) -> list:
     return [line for line in ALL_CYCLE_LINES if line in body]
 
 
-class SameDayOnceTest(unittest.TestCase):
-    """同一天：第一轮说，后面不再说。"""
+class CooldownTest(unittest.TestCase):
+    """第一轮说，之后三天内不再说。"""
 
     def test_the_first_build_carries_it(self):
         body = _core().build_injection(UID, text="在吗")
@@ -47,12 +53,22 @@ class SameDayOnceTest(unittest.TestCase):
             "同一天第二次还在说：模型会把它当台词逐字复述",
         )
 
-    def test_it_comes_back_the_next_day(self):
+    def test_the_next_day_it_stays_quiet(self):
         core = _core()
         core.build_injection(UID, text="在吗")
-        core.scope.update_self(cycle_said_date="2026-09-25")
+        core.scope.update_self(cycle_said_at=core.now_epoch() - 86400.0)
         body = core.build_injection(UID, text="在吗")
-        self.assertTrue(_cycle_lines_in(body), "换了一天就该重新说一次")
+        self.assertEqual(
+            _cycle_lines_in(body), [],
+            "隔天就再说一遍，五天经期就是五遍同一件事",
+        )
+
+    def test_it_comes_back_after_three_days(self):
+        core = _core()
+        core.build_injection(UID, text="在吗")
+        core.scope.update_self(cycle_said_at=core.now_epoch() - 3 * 86400.0 - 60.0)
+        body = core.build_injection(UID, text="在吗")
+        self.assertTrue(_cycle_lines_in(body), "过了三天就该重新说一次")
 
 
 class AskedAboutBodyTest(unittest.TestCase):

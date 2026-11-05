@@ -26,6 +26,7 @@ from __future__ import annotations
 from . import ccb as _ccb
 from . import clock as _clock
 from . import body_sense as _body_sense
+from . import body_voice as _body_voice
 from . import injection as _injection
 from . import species as _species
 from . import life_log
@@ -413,13 +414,10 @@ _LINE_BREAK = re.compile(r"[\r\n\u2028\u2029]+")
 _SENTENCE_TAIL = ("。", "！", "？", "…", "」", "』", "”")
 
 
-#: 对方的话里出现这些词，才把「经期感觉」递给她（见 `PromptBuilder._cycle_worth_saying`）。
-#: 只收身体与经期本身：把「累/心情/脾气」也收进来，等于每两句家常就触发一次，
-#: 又会回到「每轮都在说小腹坠」。
-_CYCLE_TOPICS = (
-    "姨妈", "月经", "经期", "生理期", "例假", "小腹", "肚子", "腰", "疼", "痛",
-    "难受", "不舒服", "身体", "气色", "脸色", "怎么了", "还好吗", "没事吧",
-)
+#: 对方的话里出现什么，才算在问她的身体——词表搬到 `humanoid/body_voice.py`。
+#: 这里只留一个转发，免得两处词表各自演化（一处加了「腰」、另一处没加，就会
+#: 出现"问了却答不上"与"没问却硬说"两种毛病各一半）。
+_CYCLE_TOPICS = _body_voice.ASKED_TOPICS
 
 def _strip_heading_spans(text: str) -> str:
     """摘掉混进正文的【…】**整段**（含方括号里的字），并把换行压成空格。
@@ -502,7 +500,13 @@ class PromptBuilder:
                 (self._emotion_line(user_id, interest, agency, is_group), 8.5, _meta("emotion")),
                 # ccb 常驻状态：不参与上一行的"每轮一条"竞争，显著度单独给高。
                 (self._ccb_presence_line(user_id, is_group), 9.5, _meta("ccb_presence")),
-                (self._sentence(self._feelings_lines(max_items=1, threshold=0.7)), 7.0, _meta("feelings")),
+                (
+                    self._sentence(
+                        self._feelings_lines(max_items=1, threshold=0.7, text=text)
+                    ),
+                    7.0,
+                    _meta("feelings"),
+                ),
                 (self._sentence(self._memory_lines(user_id, detailed=False)), 6.0, _meta("memory")),
                 (self._sentence(self._open_lines(user_id, is_group)), 6.0, _meta("opens")),
                 (self._memory_link_line(memory_text), 6.0, _meta("memory_link")),
@@ -547,7 +551,8 @@ class PromptBuilder:
         return "，".join(lines)
 
     def _feelings_lines(
-        self, max_items: int, threshold: float, *, include_sleep: bool = True
+        self, max_items: int, threshold: float, *, include_sleep: bool = True,
+        text: str = "",
     ) -> List[str]:
         """按显著度挑体感。低于门槛的一律不注入。
 
@@ -559,7 +564,12 @@ class PromptBuilder:
         if not self.config.soma_enabled:
             return []
         try:
-            feelings = core.soma.feelings(float(core.energy.energy))
+            # 「身体不适」这一条走限流（对方问起 / 八小时一次 / 她刚说过就不给）：
+            # 它在 discomfort≥62 时每轮都会命中，而落到她嘴里就是「肚子难受」。
+            feelings = core.soma.feelings(
+                float(core.energy.energy),
+                include_discomfort=self._discomfort_worth_saying(text),
+            )
         except Exception:
             return []
         try:
@@ -1718,6 +1728,24 @@ class PromptBuilder:
         # 与新的感觉句同时出现就是同一件事两个说法。面板与跨插件契约仍读那个字段。
         return lines
 
+    def _body_echo_quiet(self, now: float) -> bool:
+        """她**自己**刚说过身体上的事吗（说过就先别递身体事实）。
+
+        现场（m08275）：她的回复每一句都在说小腹。注入只是一半原因——另一半是自我
+        强化：她上一轮说完「肚子难受」，这一轮注入又递一句「小腹坠着」，模型于是把
+        这件事当成正在进行的对话主题接着往下说，越说越像在播报病情。
+
+        她刚说过 = 这件事已经在对话里了，不需要再提醒她一遍。
+        """
+        try:
+            last = float(self._core.scope.get_self("body_echo_at", 0.0) or 0.0)
+        except Exception:
+            return False
+        if last <= 0.0:
+            return False
+        elapsed = float(now) - last
+        return 0.0 <= elapsed < _body_voice.ECHO_QUIET_SECONDS
+
     def _cycle_worth_saying(self, text: str) -> bool:
         """这一轮要不要把「经期身上什么样」递过去。
 
@@ -1725,28 +1753,61 @@ class PromptBuilder:
         坠着，腰也酸」被逐字复述，一天几十次。身体事实不该每轮重复播报，真人也不会
         每隔一句就告诉对方自己肚子疼。
 
-        两个时机给：她这边换了一天（一天只说一次），或对方问到了身体/经期。
-        一天一次那次由 `cycle_said_date` 记着，写不进去就按「还没说过」处理——
-        宁可多说一次，也不要因为存不下而整月不吭声。
+        判据三条（都在 `humanoid/body_voice.py`，这里只做取数与记账）：
+
+        1. 对方问到了身体 → 给（问到了却不答，等于她没感觉）；
+        2. 她自己刚说过身体上的事 → 不给（已经在对话里，再递就是催她重复）；
+        3. 距上次递过去不足 `CYCLE_QUIET_SECONDS`（三天）→ 不给。
+
+        上一版是「一天一次」，仍然等于**每天开场必提**，五天经期提五次；用户的原话是
+        「他应该适当的说而不是句句都说」，所以间隔按天改成按三天，并且加了第 2 条。
         """
-        said = str(text or "")
-        if any(word in said for word in _CYCLE_TOPICS):
-            return True
-        try:
-            today = self._core.clock.today_str()
-        except Exception:
-            return True
         scope = getattr(self._core, "scope", None)
-        if scope is None:
-            return True
         try:
-            shown = str(scope.get_self("cycle_said_date", "") or "")
+            now = float(self._core.now_epoch())
         except Exception:
-            return True
-        if shown == today:
+            now = time.time()
+        asked = _body_voice.asked_about_body(text)
+        if not asked and self._body_echo_quiet(now):
             return False
         try:
-            scope.update_self(cycle_said_date=today)
+            last = float(scope.get_self("cycle_said_at", 0.0) or 0.0) if scope else 0.0
+        except Exception:
+            last = 0.0
+        if not _body_voice.cycle_due(now, last, asked=asked):
+            return False
+        try:
+            if scope is not None:
+                scope.update_self(cycle_said_at=now)
+        except Exception:
+            pass
+        return True
+
+    def _discomfort_worth_saying(self, text: str) -> bool:
+        """这一轮要不要说「身体不适」。
+
+        久坐、闷热、经期都会推高 discomfort，而它一旦过 62 就每轮都出一条「身体不适」
+        ——落到她嘴里就是「肚子难受」「身上不舒服」，和周期句叠在一起，等于每一句
+        都在讲身体。同样三条判据：对方问了给，她刚说过不给，八小时内说过不给。
+        """
+        scope = getattr(self._core, "scope", None)
+        try:
+            now = float(self._core.now_epoch())
+        except Exception:
+            now = time.time()
+        if _body_voice.asked_about_body(text):
+            return True
+        if self._body_echo_quiet(now):
+            return False
+        try:
+            last = float(scope.get_self("discomfort_said_at", 0.0) or 0.0) if scope else 0.0
+        except Exception:
+            last = 0.0
+        if not _body_voice.due(now, last, _body_voice.DISCOMFORT_QUIET_SECONDS):
+            return False
+        try:
+            if scope is not None:
+                scope.update_self(discomfort_said_at=now)
         except Exception:
             pass
         return True
@@ -1937,7 +1998,7 @@ class PromptBuilder:
             # 体感里那句「这会儿在睡」在取的时候就排除，不再事后按文案从正文里删。
             body = self._sentence(
                 self._feelings_lines(
-                    MAX_FEELINGS_LOW, 0.0, include_sleep=not sleep_state
+                    MAX_FEELINGS_LOW, 0.0, include_sleep=not sleep_state, text=text
                 )
             )
             if body:
@@ -1953,7 +2014,7 @@ class PromptBuilder:
         # 与原来 _sentence 拼出来的形状一致。睡眠相关两句带 when 标签，
         # 关掉睡眠时段开关时由 select 统一丢，不再各处写守卫（P-03）。
         feelings = self._sentence(
-            self._feelings_lines(MAX_FEELINGS_LOW, FEELING_THRESHOLD_LOW)
+            self._feelings_lines(MAX_FEELINGS_LOW, FEELING_THRESHOLD_LOW, text=text)
         )
         if feelings:
             sents.append((feelings, 8.0, _meta("feelings")))
@@ -2038,7 +2099,7 @@ class PromptBuilder:
             # 与 medium 档同一口径：睡眠状态句在时，体感里的睡眠条目不再重复。
             body = self._sentence(
                 self._feelings_lines(
-                    MAX_FEELINGS_FULL, 0.0, include_sleep=not sleep_state
+                    MAX_FEELINGS_FULL, 0.0, include_sleep=not sleep_state, text=text
                 )
             )
             if body:
@@ -2053,7 +2114,7 @@ class PromptBuilder:
         if state:
             sents.append((self._sentence(state), 4.0, _meta("state")))
         # 与 medium 档同一结构：身体一块同组、睡眠两句带 when 标签（P-03）。
-        feelings = self._sentence(self._feelings_lines(MAX_FEELINGS_FULL, 0.0))
+        feelings = self._sentence(self._feelings_lines(MAX_FEELINGS_FULL, 0.0, text=text))
         if feelings:
             sents.append((feelings, 8.0, _meta("feelings")))
         # 与 medium 档同一句（P2）：周期只给感觉，不改数值。

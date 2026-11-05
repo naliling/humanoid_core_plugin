@@ -880,7 +880,9 @@ class SomaService:
     # 体感与形式倾向
     # ------------------------------------------------------------------
 
-    def feelings(self, energy: float) -> list[tuple[float, str]]:
+    def feelings(
+        self, energy: float, *, include_discomfort: bool = True
+    ) -> list[tuple[float, str]]:
         """(显著度 0~1, 体感一句话)。只保留中性的身体事实，移除所有替AI说话或带情绪倾向的台词。
 
         身体轴里实际会用的是 sleepy / debt / hunger / discomfort / arousal。后两条的词表
@@ -965,8 +967,14 @@ class SomaService:
                         )
                     )
 
+        # 不适这一条由调用方决定说不说（include_discomfort）：它一旦过 62 就**每轮**
+        # 都会命中，而落到她嘴里是「肚子难受」「身上不舒服」。注入层按「对方问起 /
+        # 八小时一次 / 她刚说过就不给」限流（prompt_builder._discomfort_worth_saying），
+        # 这里只负责在拿到 False 时不产出——判据在结构化入参上，不靠事后从正文里删词。
         discomfort = snap["discomfort"]
-        if discomfort >= 62:
+        if not include_discomfort:
+            pass
+        elif discomfort >= 62:
             say("discomfort", discomfort, 60.0, 0.85)
         elif discomfort >= 38:
             out.append((0.5, "略有不适"))
