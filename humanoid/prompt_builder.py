@@ -413,6 +413,14 @@ _LINE_BREAK = re.compile(r"[\r\n\u2028\u2029]+")
 _SENTENCE_TAIL = ("。", "！", "？", "…", "」", "』", "”")
 
 
+#: 对方的话里出现这些词，才把「经期感觉」递给她（见 `PromptBuilder._cycle_worth_saying`）。
+#: 只收身体与经期本身：把「累/心情/脾气」也收进来，等于每两句家常就触发一次，
+#: 又会回到「每轮都在说小腹坠」。
+_CYCLE_TOPICS = (
+    "姨妈", "月经", "经期", "生理期", "例假", "小腹", "肚子", "腰", "疼", "痛",
+    "难受", "不舒服", "身体", "气色", "脸色", "怎么了", "还好吗", "没事吧",
+)
+
 def _strip_heading_spans(text: str) -> str:
     """摘掉混进正文的【…】**整段**（含方括号里的字），并把换行压成空格。
 
@@ -1710,7 +1718,40 @@ class PromptBuilder:
         # 与新的感觉句同时出现就是同一件事两个说法。面板与跨插件契约仍读那个字段。
         return lines
 
-    def _cycle_line(self) -> str:
+    def _cycle_worth_saying(self, text: str) -> bool:
+        """这一轮要不要把「经期身上什么样」递过去。
+
+        现场：那句话一天之内一字不变、每轮都递，模型就把它当台词念——「我这两天小腹
+        坠着，腰也酸」被逐字复述，一天几十次。身体事实不该每轮重复播报，真人也不会
+        每隔一句就告诉对方自己肚子疼。
+
+        两个时机给：她这边换了一天（一天只说一次），或对方问到了身体/经期。
+        一天一次那次由 `cycle_said_date` 记着，写不进去就按「还没说过」处理——
+        宁可多说一次，也不要因为存不下而整月不吭声。
+        """
+        said = str(text or "")
+        if any(word in said for word in _CYCLE_TOPICS):
+            return True
+        try:
+            today = self._core.clock.today_str()
+        except Exception:
+            return True
+        scope = getattr(self._core, "scope", None)
+        if scope is None:
+            return True
+        try:
+            shown = str(scope.get_self("cycle_said_date", "") or "")
+        except Exception:
+            return True
+        if shown == today:
+            return False
+        try:
+            scope.update_self(cycle_said_date=today)
+        except Exception:
+            pass
+        return True
+
+    def _cycle_line(self, text: str = "") -> str:
         """生理周期当前阶段的一句感觉（P2）。
 
         周期数据早就算好了（`config.cycle_phase_index` 八阶段），但一直只被
@@ -1719,6 +1760,8 @@ class PromptBuilder:
         **不改任何数值**（用户拍板）：energy / libido 的调制仍在各自原来的地方算。
         """
         try:
+            if not self._cycle_worth_saying(text):
+                return ""
             return _body_sense.cycle_line(self._core)
         except Exception:
             return ""
@@ -1813,6 +1856,7 @@ class PromptBuilder:
         detailed: bool,
         memory_text: str = "",
         sleep_state: Optional[List[str]] = None,
+        text: str = "",
     ) -> None:
         """睡着时也不能丢的必需品：她对TA、称呼、间隔、TA说过的话。
 
@@ -1858,9 +1902,9 @@ class PromptBuilder:
         # 取舍层按 key/group 也看不出语义冲突（黄金快照 D2）。
         # 周期也照给（P2）：睡着的人照样会痛经、会被胀醒。它不是「互动前置」，
         # 不该跟倾向一起被省掉；优先级压到 7.0，预算紧时先丢它。
-        cycle = self._cycle_line()
+        cycle = self._cycle_line(text)
         if cycle:
-            sents.append((cycle, 7.0, _meta("cycle", "cycle")))
+            sents.append((cycle, 7.5, _meta("cycle", "cycle")))
         memory = self._sentence(self._memory_lines(user_id, detailed=detailed))
         if memory:
             sents.append((memory, 6.0, _meta("memory")))
@@ -1901,6 +1945,7 @@ class PromptBuilder:
             self._append_sleep_essentials(
                 sents, user_id, is_group, events, agency, interest,
                 detailed=False, memory_text=memory_text, sleep_state=sleep_state,
+                text=text,
             )
             return sents
 
@@ -1914,7 +1959,7 @@ class PromptBuilder:
             sents.append((feelings, 8.0, _meta("feelings")))
         # P2：生理周期的感觉。与体感分开成组：它一天之内不变，不该和「这一轮
         # 身上什么样」挤进同一组去互斥（同组只会留一条）。
-        cycle = self._cycle_line()
+        cycle = self._cycle_line(text)
         if cycle:
             sents.append((cycle, 7.5, _meta("cycle", "cycle")))
         night = self._sentence(self._night_lines())
@@ -2001,6 +2046,7 @@ class PromptBuilder:
             self._append_sleep_essentials(
                 sents, user_id, is_group, events, agency, interest,
                 detailed=True, memory_text=memory_text, sleep_state=sleep_state,
+                text=text,
             )
             return sents
         state = self._state_lines(snap, detailed=True)
@@ -2011,7 +2057,7 @@ class PromptBuilder:
         if feelings:
             sents.append((feelings, 8.0, _meta("feelings")))
         # 与 medium 档同一句（P2）：周期只给感觉，不改数值。
-        cycle = self._cycle_line()
+        cycle = self._cycle_line(text)
         if cycle:
             sents.append((cycle, 7.5, _meta("cycle", "cycle")))
         night = self._sentence(self._night_lines())

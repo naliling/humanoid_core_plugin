@@ -1915,6 +1915,16 @@ class HumanoidCore(Star):
                 logger.debug(f"{LOG_PREFIX} 同一请求重放且注入还在，跳过重复注入")
                 return
             said = text
+            # 她今天要办的事（v3.0.10）：只从这句话里抽「带明确日期、主语是她」的原话
+            # 片段存下来，日程生成时再递进去。抽不出来是常态（大部分人聊天不提日期），
+            # 所以这里不报错、不写日志，失败也只是今天没有这一层素材。
+            try:
+                core.schedule.note_today_plans(said)
+            except Exception as exc:
+                self._warn_once(
+                    "note_today_plans",
+                    f"对话里的「今天要办的事」抽取失败，这一段日程不会有这条素材: {exc}",
+                )
             # 对话对方的名字：开关开着才用真名（默认关=写「TA」）。取的是**这条消息的
             # 发送者名**——群聊是群名片、私聊是 QQ 昵称，不依赖 AstrBot 的任何配置开关。
             user_name = ""

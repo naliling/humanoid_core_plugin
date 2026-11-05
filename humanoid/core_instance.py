@@ -2844,6 +2844,14 @@ class HumanoidCoreInstance:
             except Exception as exc:
                 self._log.warning(f"{LOG_PREFIX} 日程后台检查失败: {exc}")
 
+            # 她自己的素材（v3.0.10）：人设第一次出现（或改了）时在后台按她生成一批，
+            # 和日程生成分开跑——换段那次调用仍然只问一次模型。指纹没变时这里只读一次
+            # 盘，什么都不做；失败也只是继续用原来的池子。
+            try:
+                self.schedule.ensure_role_materials()
+            except Exception as exc:
+                self._log.warning(f"{LOG_PREFIX} 角色专属素材检查失败: {exc}")
+
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=30)
             except asyncio.TimeoutError:

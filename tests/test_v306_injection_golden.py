@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from humanoid import ccb, injection
+from humanoid import body_sense, ccb, injection
 from humanoid.config import HumanoidConfig
 from humanoid.core_instance import HumanoidCoreInstance
 from humanoid.state import StateStore
@@ -224,6 +224,22 @@ def _without_emotion(body: str) -> str:
     return _EMOTION_SENTENCE.sub("", body)
 
 
+#: 周期句的全部候选措辞（8 个阶段 × 每阶段 3 句）。同一实例连渲染两次时，
+#: 第二次按「今天已经说过」不再出现（prompt_builder._cycle_worth_saying），
+#: 所以「两次只差情绪句」的比较必须先把它们摘掉，否则测的是门控不是漂移。
+_CYCLE_SENTENCES = tuple(
+    line for choices in body_sense._CYCLE_FEELING_SETS for line in choices
+)
+
+
+def _without_repeats(body: str) -> str:
+    """去掉会被「同一句只说一次」挡掉的句子：情绪句与周期句。"""
+    text = _without_emotion(body)
+    for line in _CYCLE_SENTENCES:
+        text = text.replace(line + "。", "").replace(line, "")
+    return text
+
+
 def _injection_bodies() -> dict:
     """所有注入正文（不含【此刻的她】那段）。结构不变量逐条扫这一份。"""
     return {
@@ -333,13 +349,15 @@ class GoldenIsStableTest(unittest.TestCase):
         self.assertEqual(_body(), _body(), "同样的固定状态，两次渲染出了不同正文")
 
     def test_same_instance_second_build_differs_only_by_the_emotion_sentence(self):
-        """第二次只少「她内心」那句，别的逐字相同（去重是有意的，漂移不是）。"""
+        """第二次只少「她内心」与周期句，别的逐字相同（去重是有意的，漂移不是）。"""
         core = _core()
         first = core.build_injection(UID, text=SAID)
         second = core.build_injection(UID, text=SAID)
         self.assertIn("我内心：", first, "第一次该带一句内心话")
         self.assertNotIn("我内心：", second, "同一句 10 分钟内不该再说一遍")
-        self.assertEqual(_without_emotion(second), _without_emotion(first))
+        # 周期句第二次也不再出现：_cycle_worth_saying 记了「今天说过」，
+        # 否则同一句「小腹坠着」会连着五天、每天几十轮逐字进上下文。
+        self.assertEqual(_without_repeats(second), _without_repeats(first))
 
     def test_tier_switch_does_not_leak_tier_content(self):
         holder = {}
@@ -373,15 +391,16 @@ class GoldenIsStableTest(unittest.TestCase):
         # 情绪句按「同一句 + 10 分钟」逐字去重（EMOTION_REPEAT_SECONDS）：紧接着
         # 渲染第二次时它本来就会少这一句，所以比的是「除情绪句外」。
         self.assertEqual(
-            _without_emotion(full), _without_emotion(GOLDEN["s8_full"]), "full 档正文变了"
+            _without_repeats(full), _without_repeats(GOLDEN["s8_full"]), "full 档正文变了"
         )
         # P2：周期句改由 body_sense 统一翻成感觉，full 档不再单出运营口径那句
         # （「激素在往上爬」「内膜最厚」）。这份夹具没有情绪档案，所以 full 与
         # medium 只差在「档位能多装」，正文相同——这不是漏档，是没东西可多。
         self.assertNotIn("激素", full, "运营口径的周期描述不该再进注入")
         self.assertNotIn("激素", medium_again, "full 档的内容漏进了 medium")
-        # 第二次 medium 唯一少掉的是「她内心」那句（_emotion_repeated 的设计）。
-        self.assertEqual(_without_emotion(medium_again), _without_emotion(medium_first))
+        # 第二次 medium 少掉的是「她内心」那句（_emotion_repeated 的设计）与周期句
+        # （_cycle_worth_saying 的当天去重）。
+        self.assertEqual(_without_repeats(medium_again), _without_repeats(medium_first))
 
     def test_tier_switch_medium_full_medium_leaves_no_residue(self):
         """换档不留下残留：回到 medium 时，除情绪句去重外与第一次逐字相同。"""
@@ -393,7 +412,7 @@ class GoldenIsStableTest(unittest.TestCase):
         core.build_injection(UID, text=SAID)
         core.config_provider = lambda: HumanoidConfig.from_raw({"timezone_city": "北京"})
         again = core.build_injection(UID, text=SAID)
-        self.assertEqual(_without_emotion(again), _without_emotion(first))
+        self.assertEqual(_without_repeats(again), _without_repeats(first))
         self.assertNotIn("激素", again, "full 档的内容漏回了 medium")
 
 

@@ -35,10 +35,25 @@ from ..slots import (
 )
 from ..traits import detect as detect_traits, trait_hints
 from ..wording import pick
+from .habit import archive_day, habit_lines, history_of, render_habits
 from .life_material import (
     CAPABILITY_WORDS as _EXAMPLE_NEEDS,
     materials_for,
     render_materials,
+)
+from .plans import load_plans, note_plans, render_plans
+from .role_materials import (
+    ROLE_MATERIALS_COUNT,
+    ROLE_MATERIALS_MIN,
+    ROLE_MATERIALS_RETRY_SECONDS,
+    accepted as _role_accepted,
+    build_prompt as _role_build_prompt,
+    load as _role_load,
+    mark_try as _role_mark_try,
+    needs_build as _role_needs_build,
+    parse_materials as _role_parse_materials,
+    persona_fingerprint as _role_fingerprint,
+    store as _role_store,
 )
 
 PURPOSE = "日程生成"
@@ -797,6 +812,11 @@ def segment_prompt(
     materials: str = "",
     # 今天已经睡了多少（分钟）：判断这一段要不要睡时的客观输入。0 表示不给这一段。
     day_sleep_minutes: int = 0,
+    # 过去几周她自己长出来的习惯（v3.0.10）：只在她真的重复过时才给，空串表示没有。
+    habits: str = "",
+    # 她自己在对话里说过的「今天要办的事」（v3.0.10）：只认带明确日期/时间的计划，
+    # 已经从原话里抽好、按天存过。空表表示没有——那就只当普通的一天。
+    plans: list[str] | None = None,
 ) -> str:
     """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
 
@@ -946,6 +966,26 @@ def segment_prompt(
         "不用逐条回应。\n\n"
         if materials else ""
     )
+    # 她自己的习惯（v3.0.10）：过去几周她这个钟点常做什么、一般几点起睡。
+    # 用户原话：「没有从她过去几周日程长出来的习惯」——生成侧以前只看得到今天和
+    # 昨天，每天从零挑事，于是天天那几件。习惯只说明她偏向怎么过，不替她决定今天。
+    habits_block = (
+        "【她这段时间的习惯】（过去几周她自己的日程里反复出现的样子，不是今天必须照做）\n"
+        + habits + "\n"
+        "  习惯说明她平时偏向怎么过，今天可以有例外；也别为了贴合习惯把今天排成昨天的复制。\n\n"
+        if habits else ""
+    )
+    # 她今天确实要办的事（v3.0.10）：只来自对话里带明确日期的原话片段。
+    # 这一段补的是「今天跟她有关」这一层——没有它，模型只能让她一个人在屋里绕圈。
+    # 明写「不必全做、也别当清单」：事实是约束，不是任务书。
+    _plans = [str(x).strip() for x in (plans or []) if str(x or "").strip()][:3]
+    plans_block = (
+        "【她自己说过今天要办的事】（她或对方在对话里提到、带明确日期的原话片段）\n"
+        + render_plans(_plans) + "\n"
+        "  这些是她今天确实要面对的，安排这一段时按时间顺序带上；"
+        "没到点就先做别的，别把一整天都围着它们排。\n\n"
+        if _plans else ""
+    )
     # 今天睡了多久：中午睡不睡、下午还困不困，得先知道她已经睡过多少。
     sleep_block = (
         "【今天睡了多少】\n"
@@ -1020,6 +1060,8 @@ def segment_prompt(
         + frame_block
         + sleep_block
         + materials_block
+        + habits_block
+        + plans_block
         + world_block
         + history_block
         + extra_block
@@ -1703,6 +1745,12 @@ class ScheduleService:
         self._generating = False
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
+        # 角色专属素材的生成任务（v3.0.10）：和日程生成分开跑，单飞，不占生成闸。
+        self._role_task: asyncio.Task | None = None
+        # 上一次「检查她的人设有没有变」的时刻（monotonic）。None = 还没查过。
+        # 每次检查都要读一次人设，所以按退避期节流：后台每 30 秒问一次，不节流的话
+        # 就是每 30 秒读一次人格库。
+        self._role_checked_at: float | None = None
         self.last_error = ""
         self._retry_after = 0.0
         # 上一次 `_generate_segment` 的结局（#75）。`ensure_fresh` 据此判断「这一段没
@@ -2201,6 +2249,24 @@ class ScheduleService:
     # 跨天与结转
     # ------------------------------------------------------------------
 
+    def _archive_previous_day(self, today: str) -> None:
+        """跨天前把昨天那份日程压进归档——习惯层唯一的数据来源（v3.0.10）。
+
+        以前跨天只把昨天挪进 `prev_day_schedule`，再往后一天就被覆盖了：生成侧
+        永远只看得到「今天 + 昨天」，没有「她平时这个钟点在哪、做什么」。于是每天
+        从零挑事，模型只能挑最通用的几件。
+
+        幂等：同一天重复调用只是把同一条记录再写一遍。写不进去就算了，习惯是
+        锦上添花，不能让它把跨天本身弄失败。
+        """
+        try:
+            stored_date = str(self._scope.get_self("today_date", "") or "")
+        except Exception:
+            return
+        if not stored_date or stored_date == str(today or ""):
+            return
+        archive_day(self._scope, stored_date, self._stored_slots())
+
     def _migrate_new_day(self, today: str) -> None:
         """跨天：把结转到今天的那截觉接成今天的第一段。
 
@@ -2213,6 +2279,7 @@ class ScheduleService:
         """
         if str(self._scope.get_self("today_date", "") or "") == today:
             return
+        self._archive_previous_day(today)
         previous = self._stored_slots()
         carry = self._scope.get_self(CARRY_KEY)
         if not isinstance(carry, dict) or not carry:
@@ -2985,6 +3052,124 @@ class ScheduleService:
         backoff = max(MIN_RETRY_BACKOFF_SECONDS, float(cfg.schedule_provider_cooldown_minutes) * 60)
         self._retry_after = self._monotonic() + backoff
 
+    def _today_plans(self) -> list[str]:
+        """她今天确实要办的事（v3.0.10）：读盘上抽好的原话片段，读不到就是空表。"""
+        try:
+            today = self._clock.now().date()
+        except Exception:
+            return []
+        return load_plans(self._scope, today)
+
+    def note_today_plans(self, text: str) -> list[str]:
+        """从一句对话里抽「她今天要办的事」（v3.0.10）。
+
+        抽取规则全在 humanoid/services/plans.py：带明确日期、主语是她、不是疑问或
+        否定、只留原话片段。宁可漏抽也不能把对方的安排记成她的——漏抽只是少一条素材，
+        记错就是日程在编造。这里不抛异常：抽计划失败不该影响这一轮回复。
+        """
+        said = str(text or "").strip()
+        if not said:
+            return []
+        try:
+            today = self._clock.now().date()
+        except Exception:
+            return []
+        try:
+            return note_plans(self._scope, said, today)
+        except Exception:
+            return []
+
+    def ensure_role_materials(self) -> bool:
+        """排一次「按人设生成专属素材」（v3.0.10）。
+
+        和日程生成分开跑：它要单独一次模型调用，塞进 _generate_segment 会让每次换段
+        都可能多等一次往返，也会把「换段只调一次模型」这条不变量弄坏（测试、节流预算
+        都靠它）。所以由后台循环来问，单飞；生成好了下一次换段自然用上，生成失败就
+        继续用原来的池子。返回是否真的排了任务。
+        """
+        cfg = self._config()
+        if self.gateway is None or not cfg.use_llm_schedule:
+            return False
+        if self._role_task is not None and not self._role_task.done():
+            return False
+        now = float(self._monotonic())
+        if (
+            self._role_checked_at is not None
+            and now - self._role_checked_at < ROLE_MATERIALS_RETRY_SECONDS
+        ):
+            return False
+        self._role_checked_at = now
+        coro = self._build_role_materials(cfg)
+        name = f"humanoid-role-materials-{self._scope.role_id}"
+        try:
+            task = self._spawn(coro, name) if self._spawn else asyncio.create_task(coro, name=name)
+        except Exception as exc:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            if self._log:
+                self._log.warning(f"[humanoid_core] 角色专属素材投递失败: {exc}")
+            return False
+        if task is None:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return False
+        self._role_task = task
+        return True
+
+    async def _build_role_materials(self, cfg: HumanoidConfig) -> list[dict[str, Any]]:
+        """她自己的素材（v3.0.10）：按人设一次性生成、按人设指纹缓存。
+
+        内置的 49 条是「人可能做的事」，不是「她会做的事」——人设是兽医的人，池子里
+        也不会出现给猫量体温。所以人设第一次出现（或人设改了）时让模型按她写一批，
+        存进 scope；指纹没变就一直用缓存，一次都不再调模型。
+        失败、被节流、生成得太少都退回缓存（缓存为空时退回内置池）：素材是锦上添花，
+        不值得让日程生成跟着失败。
+        """
+        cached = _role_load(self._scope)
+        if self.gateway is None or not cfg.use_llm_schedule:
+            return cached
+        persona = await self._resolve_persona()
+        persona_text = _example_evidence(persona, cfg)
+        if not persona_text.strip():
+            return cached
+        fingerprint = _role_fingerprint(persona_text)
+        now_ts = time.time()
+        if not _role_needs_build(self._scope, fingerprint, now_ts, ROLE_MATERIALS_RETRY_SECONDS):
+            return cached
+        # 先记账再调用：调用失败（网络、被节流）也要等退避时间到了才重试，
+        # 否则每次换段都白问一次模型。
+        _role_mark_try(self._scope, now_ts, fingerprint)
+        try:
+            result = await self.gateway.generate(
+                prompt=_role_build_prompt(persona_text, ROLE_MATERIALS_COUNT),
+                chain=cfg.schedule_provider_ids,
+                allow_global=cfg.schedule_allow_global_fallback,
+                timeout=float(cfg.schedule_llm_timeout_seconds),
+                attempts_per_provider=1,
+                retry_interval=float(cfg.schedule_retry_interval_seconds),
+                purpose=PURPOSE,
+                ignore_cooldown=True,
+                role_label=str(self._scope.role_id or ""),
+            )
+        except Exception:
+            return cached
+        if str(getattr(result, "outcome", "") or "") != OUTCOME_OK:
+            return cached
+        items = _role_parse_materials(str(getattr(result, "text", "") or ""), ROLE_MATERIALS_COUNT)
+        # 人设里没有的能力/兴趣一律丢掉：模型很容易给她加一只猫、一份工作。
+        items = _role_accepted(items, persona_text)
+        if len(items) < ROLE_MATERIALS_MIN:
+            if self._log:
+                self._log.info(
+                    f"[humanoid_core] 角色专属素材只生成出 {len(items)} 条"
+                    f"（少于 {ROLE_MATERIALS_MIN} 条），这次仍用原来的素材"
+                )
+            return cached
+        _role_store(self._scope, fingerprint, items)
+        if self._log:
+            self._log.info(f"[humanoid_core] 角色专属素材已生成 {len(items)} 条")
+        return items
+
     async def _generate_segment(
         self,
         cfg: HumanoidConfig,
@@ -3027,16 +3212,23 @@ class ScheduleService:
             str(slot.get("event") or "")
             for slot in list(history) + list(self._prev_day_slots())
         ]
+        # 她自己的素材（v3.0.10）：按人设生成过一批就用那批，没有就只剩内置池。
+        # 生成在后台（ensure_role_materials），这里只读缓存——换段仍然只调一次模型。
+        role_items = _role_load(self._scope)
         materials = render_materials(
             materials_for(
                 self._seed(),
                 _example_evidence(persona, cfg),
                 minutes,
                 recent_events,
+                extra=role_items,
             ),
             self._seed(),
         )
         day_sleep = self._sleep_today(minutes)
+        # 她自己长出来的习惯：过去几周这个钟点常做的事 + 作息。样本不够时是空串，
+        # prompt 里连标题都不会出现。
+        habits = render_habits(habit_lines(history_of(self._scope), minutes))
         prompt = segment_prompt(
             cfg,
             now_text=now.strftime("%H:%M"),
@@ -3064,6 +3256,8 @@ class ScheduleService:
             heard_asleep=self.heard_while_asleep(),
             materials=materials,
             day_sleep_minutes=day_sleep,
+            habits=habits,
+            plans=self._today_plans(),
         )
         if self._log and cfg.debug_mode:
             self._log.info(
@@ -3458,6 +3652,9 @@ class ScheduleService:
         """
         now = self._clock.now()
         minutes = now.hour * 60 + now.minute
+        # 跨天第一段会走这里（没有结转时 `_migrate_new_day` 提前返回）：先把昨天归档，
+        # 再覆盖 `daily_schedule`，否则昨天那份在这里被就地丢掉。
+        self._archive_previous_day(today)
         # 排序与「覆盖现在的那一段」都走 `_ordered_segments` / `_active_and_prev`：
         # 与读路径同一份口径（盲取 `segs[-1]` 会截错段、留下重叠，
         # `active_segment`/`day_phrases` 于是看错她在做什么）。

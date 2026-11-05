@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 import random
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 # ----------------------------------------------------------------------
 # 生活条件：人设正文里出现这些词，才认为她确实有工作/宠物/要照护的人/社交
@@ -232,11 +232,16 @@ def materials_for(
     now_minute: int = 720,
     recent_events: Iterable[str] = (),
     count: int = DEFAULT_COUNT,
+    extra: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     """抽一批「这个时候她可能做的事」：同一天稳定，不同天不同。
 
     recent_events 是今天已经过完的段 + 昨天的收尾：题眼出现过的事不再发——否则
     模型每天看到的都是同一批素材，「她的一天高度雷同」这条老毛病就换了个来源。
+
+    extra 是这个角色专属的素材（role_materials 按人设生成的）：它们已经按人设筛过
+    身份条件，进池后优先于内置条目——不然「她是谁」写进去的那些具体的事永远排在
+    通用条目后面，等于没加。
     """
     caps = capabilities(persona_text)
     interests = interests_in(persona_text)
@@ -244,17 +249,23 @@ def materials_for(
     recent = [str(text or "") for text in recent_events or () if str(text or "").strip()]
     rnd = random.Random("|".join(str(x) for x in (seed or [])) + "|materials")
 
-    pool = [
+    def usable(item: Mapping[str, Any]) -> bool:
+        return (
+            slot in tuple(item.get("slots") or ())
+            and not _topic_used(str(item.get("topic") or ""), recent)
+        )
+
+    role_pool = [dict(item) for item in extra if isinstance(item, Mapping) and usable(item)]
+    builtin_pool = [
         item for item in MATERIALS
-        if slot in item["slots"]
-        and _allowed(item, caps, interests)
-        and not _topic_used(str(item.get("topic") or ""), recent)
+        if usable(item) and _allowed(item, caps, interests)
     ]
+    rnd.shuffle(role_pool)
+    rnd.shuffle(builtin_pool)
+    pool = role_pool + builtin_pool
     by_band: dict[str, list[dict[str, Any]]] = {}
     for item in pool:
         by_band.setdefault(str(item["band"]), []).append(item)
-    for items in by_band.values():
-        rnd.shuffle(items)
 
     picked: list[dict[str, Any]] = []
     seen: set[int] = set()

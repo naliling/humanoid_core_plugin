@@ -110,6 +110,12 @@
 | 夜里那一觉被当成「白天睡太久」重写，睡着的段被重掷 | `_overlong_nap` 只看时长（>240 分钟），白天补觉与夜觉不分 | `test_schedule.py::ScheduleServiceTest::test_sleep_segment_is_never_rerolled` | 两条不变量压过美观判据：①今天头一觉不判（`_sleep_today(...) <= 0` → False），夜猫子/周末补觉的长觉合法；②睡段不许因闸门被重掷。加新判据时先跑这条用例。 |
 | 质量闸新加的判据在重写之后失效 | `_rewrite_once` 之后只重算 `_quality_issues`，`needless_sleep` / `overlong_nap` 是另外追加的，重写后没人再算 | `test_v3010_materials.py::NeedLessSleepGateTest` | 判据分两处产生，就必须在两处都重算：新增任何追加式判据，`if retried is not None` 分支里同步加一行。 |
 | 她在沙发上喝东西喝了 30 分钟 | `_append_segment` 把上一段的 `end` 顺延到下一段的 `start`（间隔 ≤ `SEGMENT_GAP_MERGE_MINUTES`=30），于是 5 分钟的事被显示成 30 分钟；空档的来源是节流间隔 30~60 分钟远大于段长 | `test_schedule.py::test_short_gap_is_not_backfilled` | 空档就空着，不许拿旧事件去填。`current_activity()` 用 `elapsed` 报「已做多久」，补过的 `end` 会让任何时刻都像在做同一件事。 |
+| 「你今天要去医院？」被记成她今天要办的事 | 分句用 `re.split(r"[。！？…]")` 把问号当分隔符一起吃掉，分句里再没有问号，`_is_plan` 里「有问号就是疑问」的判断永远不成立 | `test_v3010_plans.py::ExtractTest` | 要按标点判断语气，切分就必须保留标点：`_CLAUSE_SPLIT` 用捕获组，`_clauses()` 成对返回「分句 + 结束它的标点」，疑问句按标点整句跳过。 |
+| 换完人设素材还是旧的，要等半小时 | `needs_build` 只按「上次尝试时间」退避，不看那次尝试是冲着哪版人设去的：换人设时被上一个人设的尝试记录挡住 | `test_v3010_role_materials.py::NeedsBuildTest` | 退避要按指纹记账（`ROLE_MATERIALS_TRY_FP_KEY`）：同一版人设失败过才等，人设变了立刻重建。 |
+| 每换一段就多问一次模型 | 素材生成一度写进 `_generate_segment`，直接打破「换段只调一次模型」 | `test_schedule.py` 里 `provider.calls == 1` 那批用例 | 新的模型调用不许进换段路径：素材在后台 `ensure_role_materials()` 里生成落盘，生成侧只读缓存。 |
+| 测试里人设根本没进来，测的是降级路径 | 测试把 persona provider 写成同步函数，`_resolve_persona` 的 `await` 抛 `TypeError` 被它自己吞掉，变成「没人设」，用例照样绿 | — | 替身必须与真实接口同形（async）；降级路径要另有用例显式覆盖，不能靠同步替身撞出来。 |
+| 经期那句一天几十轮一字不变地进上下文，模型逐字复述 | `_CYCLE_FEELING_SETS` 每个阶段只有一句，月经期横跨 1-5 天就用同一句；三个调用点每轮无条件注入 | `test_v3010_cycle_quiet.py` | 身体描述按「第几天」轮换（同一天稳定、换天换句），并在同一天只说一次（`_cycle_worth_saying`，对方问起身体才恢复）。任何「每轮都进上下文」的描述，先算它一天会重复多少遍。 |
+| 她永远是同一个勤快模板人，看不出她自己的作息 | 生成侧只读 `daily_schedule`，跨天把昨天挪进 `prev_day_schedule`，第三天被覆盖——过去几周根本读不到 | `test_v3010_habits.py` | 归档（`habit.archive_day`）必须幂等、按天裁期（28 天）、坏 scope 静默放弃；习惯只在样本 ≥5 天且重复率 ≥0.4 时说，且明写「今天可以有例外」。 |
 ## 「现实→网友」/「变成手机发消息」是什么（v1.28.1 / v2.28.1 调查结论）
 
 **不是插件的问题，也无需修。** 已按一位用户的反馈逐条核对过日志（其 QQ 号与昵称已隐去）。

@@ -17,6 +17,7 @@ import re
 import unittest
 
 from humanoid import body_sense, ccb
+from humanoid.config import HumanoidConfig
 
 from .test_v2287_ccb_presence import _core, _in_scene, _mood, _state
 
@@ -206,6 +207,8 @@ class AftercareTest(unittest.TestCase):
 class CycleLineTest(unittest.TestCase):
     def test_every_phase_is_reachable(self):
         core = _core()
+        cfg = HumanoidConfig.from_raw({})
+        by_phase = {}
         seen = {}
         for day in range(1, 29):
             core._scope.update_self(current_cycle_day=day)
@@ -213,7 +216,20 @@ class CycleLineTest(unittest.TestCase):
             self.assertTrue(line, f"第 {day} 天没有周期感觉")
             self.assertTrue(line.startswith("我"), "周期句必须自带主语「我」")
             seen.setdefault(line, []).append(day)
-        self.assertEqual(len(seen), 8, f"8 个阶段应各有一句，实得 {sorted(seen)}")
+            by_phase.setdefault(cfg.cycle_phase_index(day), set()).add(line)
+        # 8 个阶段各至少一句；跨多天的阶段按天轮换，所以候选句总数可以多于 8。
+        self.assertEqual(len(by_phase), 8, f"8 个阶段应各有一句，实得 {sorted(by_phase)}")
+        self.assertGreaterEqual(len(seen), 8)
+        rotated = [p for p, lines in by_phase.items() if len(lines) > 1]
+        self.assertTrue(rotated, "没有任何一个阶段按天换措辞：月经期会五天一字不变")
+
+    def test_the_same_day_keeps_one_wording(self):
+        """同一天里所有请求必须拿到同一句：一轮一个说法比重复更糟。"""
+        core = _core()
+        core._scope.update_self(current_cycle_day=10)
+        self.assertEqual(
+            body_sense.cycle_line(core), body_sense.cycle_line(core)
+        )
 
     def test_disabled_cycle_says_nothing(self):
         core = _core(enable_cycle=False)
