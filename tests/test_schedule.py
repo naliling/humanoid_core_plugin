@@ -564,15 +564,22 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(segs[0]["end"], "10:00", "旧段保持原样，不被拉长到 15:00")
         self.assertEqual(segs[1]["start"], "15:00")
 
-    async def test_short_gap_is_merged(self):
-        provider = FakeProvider("p", reply=seg_reply(minutes=30))
+    async def test_short_gap_is_not_backfilled(self):
+        """短空档也不许拿旧事件去填：填了就是编造时长（5 分钟的倒杯水变成半小时）。
+
+        这是「她在沙发上喝东西喝了 30 分钟」的根因：决策被节流间隔卡住，5 分钟的段
+        结束后 25 分钟没人接手，旧实现把上一段的 end 顺延到新段起点。
+        """
+        provider = FakeProvider("p", reply=seg_reply(event="倒杯水", minutes=5))
         service, _, _ = self.build(cfg(schedule_provider_name="p"), [provider])
-        await service.ensure_fresh()  # 09:00-09:30
-        service._clock.advance(minutes=40)  # 09:40，隔了 10 分钟
+        await service.ensure_fresh()  # 09:00-09:05
+        service._clock.advance(minutes=30)  # 09:30，隔了 25 分钟
         provider.reply = seg_reply(event="回消息", minutes=30)
         self.assertTrue(await service.ensure_fresh())
         segs = service.segments()
-        self.assertEqual(segs[0]["end"], "09:30", "短空档由旧段顺延补上，不留窟窿")
+        self.assertEqual(segs[0]["end"], "09:05", "倒杯水就是 5 分钟，不许被拉长")
+        self.assertEqual(segs[1]["start"], "09:30")
+        self.assertEqual(len(segs), 2, "空档不补段，也不改旧段")
 
     async def test_sleep_segment_is_never_rerolled(self):
         provider = FakeProvider("p", reply=seg_reply(event="睡觉", minutes=480))

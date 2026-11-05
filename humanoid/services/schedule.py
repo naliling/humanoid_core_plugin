@@ -35,6 +35,11 @@ from ..slots import (
 )
 from ..traits import detect as detect_traits, trait_hints
 from ..wording import pick
+from .life_material import (
+    CAPABILITY_WORDS as _EXAMPLE_NEEDS,
+    materials_for,
+    render_materials,
+)
 
 PURPOSE = "日程生成"
 SOURCE_TEMPLATE = "template"
@@ -57,15 +62,19 @@ SEGMENT_SLEEP_MAX_MINUTES = 720
 SEGMENT_DEFAULT_MINUTES = 60
 # 睡段的 end 写在过去、又不像「明天那个点」时，按一小觉接上（见 _segment_minutes）。
 SEGMENT_SLEEP_FALLBACK_MINUTES = 90
+# 今天累计睡到这个数就算睡够了：再排睡就不是缺觉，是没别的事可做。
+# 90 分钟取的是「一整段午觉」的量——真困到需要补觉的人会同时越过敏意线
+# （CHANGE_TRIGGER_SLEEP_PRESSURE），那条规则仍然放行，这里只拦「睡够了还睡」。
+NAP_REDUNDANT_MINUTES = 90
+# 白天一觉最长到这儿：白天睡四小时以上不是「补觉」，是这一天没了。
+# 夜里那一觉不受这条约束（睡多久由夜里那段决定），困意越线时也不拦。
+DAY_SLEEP_MAX_MINUTES = 240
 # 一天最多留这么多段（超出丢最早的：三十段之前的事她自己也记不清）。
 # 这只是**硬天花板**：真正生效的是配置项 `schedule_max_slots`（面板上限就是 96）。
 # 以前这里写死 48，把用户填 96 砍成 48——面板上写着却不起作用的数比没有更糟。
 SEGMENTS_DAY_CAP = 96
 # prompt 里带多少段「已经过完的时段」。
 SEGMENTS_PROMPT_HISTORY = 8
-# 上一段结束到新一段之间隔了这么久以内，才把它顺延补上；隔得更久说明插件停机了，
-# 那段时间她做了什么没人知道，不能拿旧事件把窟窿填上。
-SEGMENT_GAP_MERGE_MINUTES = 30
 
 # 身体越线：不等这一段结束，当场重新决定（饿到发慌还在做事、困到不行还醒着）。
 CHANGE_TRIGGER_HUNGER = 78.0
@@ -676,28 +685,9 @@ EXAMPLE_COUNT = len(EXAMPLE_BANDS)
 # 递过去等于告诉模型「你可以有宠物」。
 _EXAMPLE_FIELDS = ("event", "location", "emotion", "energy_rate", "minutes", "wants")
 
-# 生活条件词表：人设正文里出现这些词，才认为她确实有工作/宠物/要照护的人/社交。
-# 只用来**过滤范例**，不参与事实判定（那是 invented_facts 的事）。
-_EXAMPLE_NEEDS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (
-        "job",
-        (
-            "工作", "上班", "公司", "职业", "同事", "老板", "领导", "客户", "开会",
-            "项目", "店里", "开店", "老师", "医生", "护士", "程序", "工程师", "学生",
-            "上学", "学校", "学业", "自由职业", "画师", "写手", "店员", "服务", "创业",
-            "兼职", "实习", "打工",
-        ),
-    ),
-    ("pet", ("猫", "狗", "宠物", "仓鼠", "鹦鹉", "兔子", "养了", "养着")),
-    (
-        "care",
-        (
-            "孩子", "女儿", "儿子", "家人", "妈妈", "爸爸", "爸妈", "老公", "老婆",
-            "丈夫", "妻子", "老人", "妹妹", "弟弟", "姐姐", "哥哥", "家庭", "照护",
-        ),
-    ),
-    ("social", ("朋友", "同学", "闺蜜", "室友", "邻居", "同事", "社交", "认识的人")),
-)
+# 生活条件词表搬到了 life_material（日程素材要用同一套判据）：两处各写一份，迟早
+# 有一处走偏。这里只保留这个名字——范例过滤与素材筛选认的是同一张表。
+# 它只用来**过滤**，不参与事实判定（那是 invented_facts 的事）。
 
 
 def example_capabilities(text: str) -> set[str]:
@@ -802,6 +792,11 @@ def segment_prompt(
     # 她睡着期间发生过什么（#66）：睡着那一段不重掷，事件与来访以前就在保鲜期里
     # 过期了。醒来这一段把那些短句递进去，听没听见由她判断。默认 None：旧调用不变。
     heard_asleep: list[str] | None = None,
+    # 今天的素材（v3.0.10）：这个钟点她可能做的事，已按人设与近期去重筛过。
+    # 只给可能性，不给「所以该做什么」——挑哪件、做多久还是她的事。
+    materials: str = "",
+    # 今天已经睡了多少（分钟）：判断这一段要不要睡时的客观输入。0 表示不给这一段。
+    day_sleep_minutes: int = 0,
 ) -> str:
     """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
 
@@ -941,6 +936,22 @@ def segment_prompt(
         f"{day_frame}\n\n"
         if day_frame else ""
     )
+    # 今天的素材：把「这个钟点她可能做的事」摆出来。没有这一段时模型手里只有人设 +
+    # 四条范例，能挑的事太少，于是天天那几件（睡、吃、收拾、看手机）——这不是模型
+    # 笨，是素材不够。明写「不是清单」：素材只扩大可能性，不替她决定。
+    materials_block = (
+        "【今天她可能做的事】（这个钟点她这样的人可能会做的事，不是清单）\n"
+        + materials + "\n"
+        "  可以挑一件、可以改成更贴她的、也可以一件都不做；做多久按这件事本身算，"
+        "不用逐条回应。\n\n"
+        if materials else ""
+    )
+    # 今天睡了多久：中午睡不睡、下午还困不困，得先知道她已经睡过多少。
+    sleep_block = (
+        "【今天睡了多少】\n"
+        f"- 今天到现在她已经睡了 {int(day_sleep_minutes)} 分钟。\n\n"
+        if int(day_sleep_minutes) > 0 else ""
+    )
     # 困意越线：调用方传的 flag 优先；没传时这里自己从 body 读一次（C1 要求
     # 「body_pressure 或困意 >=80」都算），两条线必须和 `CHANGE_TRIGGER_SLEEP_PRESSURE` 同值。
     try:
@@ -984,6 +995,17 @@ def segment_prompt(
             "   除非人设里有非做不可的理由（值班、赶工），"
             "否则别排做饭、工作、出门、社交这类要精神的事。\n"
         )
+    # 睡够了还睡：原来「中午」在模型眼里是默认的睡觉点，一天能睡出两三段。真正
+    # 缺觉时上面那条（困意越线）已经说了；这里管的是另一头——今天已经睡够了、
+    # 困意也没越线，就别再排睡，把这一段给她别的日子。
+    if int(day_sleep_minutes) >= NAP_REDUNDANT_MINUTES and not pressure_crossed:
+        rule_no += 1
+        extra_rules += (
+            f"{rule_no}. 今天她已经睡过 {int(day_sleep_minutes)} 分钟，困意也没越线："
+            "这一段别再排睡。\n"
+            "   睡觉是「实在没别的事可做」时的默认值，不是中午的固定一站——"
+            "不困就做点别的（上面那些素材里挑一件，或者她自己想做的事）。\n"
+        )
 
     return (
         persona_block(persona, cfg.schedule_persona_max_chars)
@@ -996,6 +1018,8 @@ def segment_prompt(
         + "\n"
         + body_reference_block(body, now_text)
         + frame_block
+        + sleep_block
+        + materials_block
         + world_block
         + history_block
         + extra_block
@@ -1271,6 +1295,16 @@ def _quality_fix_block(issues: list[str], invented: list[str]) -> str:
             + "、".join(invented)
             + "在她的人设里找不到依据。不要凭空给她加身份、家人、宠物或约定，"
             "换成不需要这些东西也能做的事。"
+        )
+    if "needless_sleep" in issues:
+        lines.append(
+            "- 今天她已经睡够了，困意也没越线，这一段别再排睡。"
+            "睡觉不是中午的固定一站，换成一件醒着做的事。"
+        )
+    if "overlong_nap" in issues:
+        lines.append(
+            "- 白天这一觉太长了。她并不困的时候，小睡最多一两个小时；"
+            "醒着做点什么，真的累了再歇。"
         )
     lines.append("只输出一个 JSON 对象，不要解释。")
     return "\n".join(lines) + "\n"
@@ -2214,6 +2248,23 @@ class ScheduleService:
             return []
         return [slot for slot in stored if isinstance(slot, dict)]
 
+    def _sleep_today(self, minutes: int) -> int:
+        """今天到现在她一共睡了多久（分钟）。
+
+        只看日程里已经发生的部分：睡段的起点必须已经过去。用来回答「这一段要不要
+        睡」——中午之所以老在睡，一半原因是生成时没人知道她已经睡过多少。
+        """
+        total = 0
+        for slot in self.segments():
+            if not slot_sleeps(slot):
+                continue
+            lo = parse_time(slot.get("start"))
+            hi = parse_time(slot.get("end"))
+            if lo is None or hi is None or hi <= lo:
+                continue
+            total += max(0, min(hi, minutes) - lo)
+        return total
+
     def _history_for_prompt(self) -> tuple[list[Slot], str]:
         """生成 prompt 用的「最近过完的段」：今天的不够看就接昨天的收尾。"""
         now = self._clock.now()
@@ -2969,6 +3020,23 @@ class ScheduleService:
         except (TypeError, ValueError):
             sleep_pressure = 0.0
         prev_sleep = bool(prev) and slot_sleeps(prev)
+        # 今天的素材：模型手里原来只有人设正文 + 四条范例，能挑的事太少，于是
+        # 天天那几件。素材按「这个钟点 + 她这样的人 + 最近做过什么」筛过，
+        # 去重用的是今天已过完的段与昨天的收尾。
+        recent_events = [
+            str(slot.get("event") or "")
+            for slot in list(history) + list(self._prev_day_slots())
+        ]
+        materials = render_materials(
+            materials_for(
+                self._seed(),
+                _example_evidence(persona, cfg),
+                minutes,
+                recent_events,
+            ),
+            self._seed(),
+        )
+        day_sleep = self._sleep_today(minutes)
         prompt = segment_prompt(
             cfg,
             now_text=now.strftime("%H:%M"),
@@ -2994,6 +3062,8 @@ class ScheduleService:
             force_switch=force_switch,
             # 睡着期间听到的话（#66）：醒来这一段递给她，装上新段后清空。
             heard_asleep=self.heard_while_asleep(),
+            materials=materials,
+            day_sleep_minutes=day_sleep,
         )
         if self._log and cfg.debug_mode:
             self._log.info(
@@ -3102,6 +3172,12 @@ class ScheduleService:
         if getattr(cfg, "schedule_quality_gate", False):
             evidence = self._fact_evidence(persona, cfg)
             issues, invented = self._quality_issues(slot, evidence, prev)
+            # 「睡够了还睡」也算一条：它不是重复、也不是编造，但同样是「这一段
+            # 本不该这样」。三条一起进重写，重写不动时只有编造会降级。
+            if self._needless_sleep(slot, minutes):
+                issues = list(issues) + ["needless_sleep"]
+            if self._overlong_nap(slot):
+                issues = list(issues) + ["overlong_nap"]
             if issues:
                 self._bump_quality("rewrite")
                 retried = await self._rewrite_once(
@@ -3117,6 +3193,12 @@ class ScheduleService:
                 if retried is not None:
                     raw, slot = retried
                     issues, invented = self._quality_issues(slot, evidence, prev)
+                    # 重写之后要重新判一遍「睡够了还睡」：只重算 repeat/invented
+                    # 的话，重写版照样排睡会被静默放行（闸门等于没装）。
+                    if self._needless_sleep(slot, minutes):
+                        issues = list(issues) + ["needless_sleep"]
+                    if self._overlong_nap(slot):
+                        issues = list(issues) + ["overlong_nap"]
                 if "invented" in issues:
                     slot = self._degrade_to_neutral(cfg, minutes, prev)
                     raw = {}
@@ -3127,6 +3209,22 @@ class ScheduleService:
                         self._log.info(
                             "[humanoid_core] 日程质量闸：人设里找不到依据的"
                             f"「{'/'.join(invented)}」，已降级为中性段"
+                            f"（{self._scope.role_id}）"
+                        )
+                elif "overlong_nap" in issues:
+                    self._bump_quality("overlong_nap")
+                    if self._log:
+                        self._log.info(
+                            "[humanoid_core] 日程质量闸：白天这一觉太长，"
+                            f"重写后仍是「{slot.get('event')}」，放行"
+                            f"（{self._scope.role_id}）"
+                        )
+                elif "needless_sleep" in issues:
+                    self._bump_quality("needless_sleep")
+                    if self._log:
+                        self._log.info(
+                            "[humanoid_core] 日程质量闸：今天已经睡够，"
+                            f"重写后仍在排睡「{slot.get('event')}」，放行"
                             f"（{self._scope.role_id}）"
                         )
                 elif "repeat" in issues:
@@ -3175,6 +3273,56 @@ class ScheduleService:
             str(getattr(cfg, "schedule_prompt_extra", "") or ""),
         ]
         return "\n".join(part for part in parts if part.strip())
+
+    def _overlong_nap(self, slot: Slot) -> bool:
+        """白天这一觉长得不像话（超过 DAY_SLEEP_MAX_MINUTES），且她并不困。
+
+        「能一直睡」的另一半原因在这里：时长只有 12 小时的天花板，中午写一段
+        四五个小时的觉也不算违规，于是模型一困就把下午整段划给睡觉。
+        """
+        if not slot_sleeps(slot):
+            return False
+        if in_scheduled_night(self.current_slots(), self._clock.now()):
+            return False
+        lo = parse_time(slot.get("start"))
+        hi = parse_time(slot.get("end"))
+        if lo is None or hi is None or hi <= lo:
+            return False
+        if hi - lo <= DAY_SLEEP_MAX_MINUTES:
+            return False
+        # 今天还没睡过：这一觉就是她今天的头一觉，很可能就是夜里那觉拖到现在
+        # （夜猫子、周末补觉）。判它「太长」会把她正常的作息当成违规——这正是
+        # REGRESSIONS 里「睡眠窗口不能按配置硬套」那条的老毛病。
+        if self._sleep_today(self._clock.now().hour * 60 + self._clock.now().minute) <= 0:
+            return False
+        try:
+            pressure = float(self._body_snapshot().get("sleep_pressure", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pressure = 0.0
+        return pressure < CHANGE_TRIGGER_SLEEP_PRESSURE
+
+    def _needless_sleep(self, slot: Slot, minutes: int) -> bool:
+        """这一段排睡，但她根本不缺觉。
+
+        三条同时成立才算：白天（不在日程里的夜里）、今天已经睡够了
+        （NAP_REDUNDANT_MINUTES）、困意没越线。真困的时候困意会越线，prompt 里
+        那条规则仍然放行——这里只拦「没事就睡」，不拦补觉。
+
+        这条判据存在的原因：prompt 里从 v3.0.5 起就写着「午睡不是每天必须有的
+        一站」，可中午还是照睡。规则是请求，不是保证；能不能不睡，得先让生成时
+        知道她已经睡过多少（sleep_block），生成后再独立判一遍。
+        """
+        if not slot_sleeps(slot):
+            return False
+        if in_scheduled_night(self.current_slots(), self._clock.now()):
+            return False
+        if self._sleep_today(minutes) < NAP_REDUNDANT_MINUTES:
+            return False
+        try:
+            pressure = float(self._body_snapshot().get("sleep_pressure", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            pressure = 0.0
+        return pressure < CHANGE_TRIGGER_SLEEP_PRESSURE
 
     def _quality_issues(
         self,
@@ -3299,9 +3447,13 @@ class ScheduleService:
         """把这一段接在今天后面，并处理与上一段的衔接。
 
         - 上一段还没到点就被换掉（她提前结束去做别的）：end 收到新段起点，不留重叠；
-        - 上一段过完了、隔得不久：顺延到新段起点，不留窟窿（窟窿里 soma 读不到
-          「她在吃饭」，刚归零的饥饿会立刻又涨一格）；
-        - 隔得太久（插件停机）：不补，那段时间她做了什么没人知道。
+        - 上一段过完了、到新段开始之间有空档：**空档就空着，不拿旧事件去填**。以前这里
+          会把上一段的 end 顺延到新段起点（间隔 ≤30 分钟时），理由是「窟窿里 soma 读不到
+          「她在吃饭」」。代价是编造时长：模型写 5 分钟的「倒杯水」，而下一次决策要等节流
+          间隔（schedule_min_interval_minutes，默认 30 分钟），5 分钟后没人接手，空档被顺延
+          进去，于是她「喝了 30 分钟」。而 soma 的饥饿只在**用餐段**里归零
+          （is_eating_time → is_meal_event），顺延一件非用餐的事对饥饿毫无作用。
+          空档期 current_slot() 本来就给中性「自由活动」，不需要谁去补。
         - 睡觉跨午夜：今天截到 24:00，剩下的结转到明天（`segment_carry`）。
         """
         now = self._clock.now()
@@ -3344,9 +3496,7 @@ class ScheduleService:
                     else:
                         # 上一段刚开始就被换掉：它没有存在过，丢掉比留一条零长度记录干净。
                         segs.pop(target)
-                elif hi < new_start and new_start - hi <= SEGMENT_GAP_MERGE_MINUTES:
-                    last["end"] = format_time(new_start)
-                    segs[target] = last
+
 
         # 接着做同一件事：并回上一段，不拆成两条「上午在改海报」
         installed = slot

@@ -97,6 +97,19 @@
 | 没有猫的角色日程里在给猫添粮；凭空出现女儿、客户、预约 | 范例带生活条件却无条件发放；事件里的身份从来没人校验（提示词只是请求，不是保证） | `ExamplePoolTest`、`FactSourceTest`、`QualityGateTest` | 适用条件只留在代码侧（`needs`），`_render_examples` 必须剥掉，递过去等于告诉她「你可以有宠物」。事实闸的触发词要窄（「公司」不算上班：去公司楼下取快递也会经过）、依据词要宽；`invented_facts` 在 evidence 为空时**必须**返回空——读不到人设不等于人设里没有这只猫。 |
 | 上午做过的事下午又排一遍，一天像在填表 | `history_block` 早就把今天过完的时段列出来了，但提示词从没说过「别再排一遍」 | `QualityGateTest::test_today_already_had_it_twice` | 重复判定必须放过两类正常情形：紧接着上一段接着做（continue/resume）、同类事当天第二次（规则给的上限是两段）；第三次起才算重复，否则闸门会把正常的日子判成重复。 |
 
+## v3.0.10 之后新增的守则
+
+这些是 v3.0.10 修掉的、删掉一行就会回来的毛病。动日程生成、素材池或质量闸前先看用例：
+
+| 症状 | 根因 | 守门测试 | 以后改这里要注意什么 |
+|---|---|---|---|
+| 白天小睡被当成生物钟夜：上午十一点注入里说她在深睡，低谷锚点被挪到下午三点 | `biological_night()` 直接拿日程里唯一那段睡当夜窗，不看跨度像不像一夜（11:15-12:45 只有 1.5 小时） | `test_v3010_night_window.py::NapOnlyDayTest`、`RealNightTest` | 夜窗必须过 `plausible_night()`：跨度区间由 `sleep_need_hours` 推出（`night_span_bounds`，低 0.6 倍、高 +6 小时，夹在 2~16 小时）。值夜班白天补 7 小时算一夜，1.5 小时午睡不算；不像一夜时 `biological_night()` 退回配置窗口并只提示一次日志，`scheduled_night()` 返回 None。 |
+| 中午一到就在睡，睡了九十来分钟下午还能再睡一觉；一天里翻来覆去只有睡觉和发呆 | 生成侧只有人设一句、今天已过完的段、上一段、身体读数、天气节日和 4 条范例，没有「这个钟点她这样的人会做什么」的素材；提示词里写「午睡不是每天必须有的一站」是请求不是保证，模型手上没别的可写时就退回睡觉 | `test_v3010_materials.py::MaterialsPoolTest`、`NeedlessSleepTest`、`NeedLessSleepGateTest` | 生成质量差先查**输入**，别只往 prompt 里加规则：素材池（`life_material.MATERIALS`）与「今天已睡多少」（`_sleep_today`）是两条独立输入。素材池里不许出现「睡」——放一条睡，模型就会照着睡。 |
+| 凌晨那一段永远排不出别的事 | 素材池 49 条里没有一条的 `slots` 含「凌晨」，`materials_for` 在 02:00 返回空表，模型只剩「接着睡」 | `test_v3010_materials.py::MaterialsPoolTest::test_every_slot_has_materials` | 素材池的时段覆盖要有用例守着；新增时段词（`SLOT_NAMES`）时同时补该时段的素材，否则那个钟点等于没素材。 |
+| 白天睡够了还是排睡段，提示词那条「别再排睡」根本没生效 | 规则只在 `segment_prompt` 里说一遍，模型照样输出睡段；质量闸当时只判 `repeat` 和 `invented`，睡段直接 `return [], []` 放行 | `test_v3010_materials.py::NeedlessSleepTest`、`NeedLessSleepGateTest` | 睡段也要过闸：`_needless_sleep` 的四个条件缺一不可——是睡段、不在作息夜里、今天已睡够 `NAP_REDUNDANT_MINUTES`=90、困意没到 `CHANGE_TRIGGER_SLEEP_PRESSURE`。困意真越线时必须放行，不然会拦掉真的需要睡的那一觉。 |
+| 夜里那一觉被当成「白天睡太久」重写，睡着的段被重掷 | `_overlong_nap` 只看时长（>240 分钟），白天补觉与夜觉不分 | `test_schedule.py::ScheduleServiceTest::test_sleep_segment_is_never_rerolled` | 两条不变量压过美观判据：①今天头一觉不判（`_sleep_today(...) <= 0` → False），夜猫子/周末补觉的长觉合法；②睡段不许因闸门被重掷。加新判据时先跑这条用例。 |
+| 质量闸新加的判据在重写之后失效 | `_rewrite_once` 之后只重算 `_quality_issues`，`needless_sleep` / `overlong_nap` 是另外追加的，重写后没人再算 | `test_v3010_materials.py::NeedLessSleepGateTest` | 判据分两处产生，就必须在两处都重算：新增任何追加式判据，`if retried is not None` 分支里同步加一行。 |
+| 她在沙发上喝东西喝了 30 分钟 | `_append_segment` 把上一段的 `end` 顺延到下一段的 `start`（间隔 ≤ `SEGMENT_GAP_MERGE_MINUTES`=30），于是 5 分钟的事被显示成 30 分钟；空档的来源是节流间隔 30~60 分钟远大于段长 | `test_schedule.py::test_short_gap_is_not_backfilled` | 空档就空着，不许拿旧事件去填。`current_activity()` 用 `elapsed` 报「已做多久」，补过的 `end` 会让任何时刻都像在做同一件事。 |
 ## 「现实→网友」/「变成手机发消息」是什么（v1.28.1 / v2.28.1 调查结论）
 
 **不是插件的问题，也无需修。** 已按一位用户的反馈逐条核对过日志（其 QQ 号与昵称已隐去）。

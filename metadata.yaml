@@ -19,7 +19,7 @@ desc: |
   配置不复杂，真正要改的就那几项，额外的都标着【进阶】。
 
   关于更新与反馈：如果你喜欢这个插件，欢迎提出更新需求、帮它继续更新——常规更新只递增补丁版本（0.0.1 级别，例如 3.0.0 -> 3.0.1 -> 3.0.2），不会随意跳大版本；作者希望能无偿帮到更多人。
-version: 3.0.7
+version: 3.0.10
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.24.0"
