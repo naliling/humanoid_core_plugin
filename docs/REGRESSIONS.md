@@ -116,6 +116,11 @@
 | 测试里人设根本没进来，测的是降级路径 | 测试把 persona provider 写成同步函数，`_resolve_persona` 的 `await` 抛 `TypeError` 被它自己吞掉，变成「没人设」，用例照样绿 | — | 替身必须与真实接口同形（async）；降级路径要另有用例显式覆盖，不能靠同步替身撞出来。 |
 | 经期那句一天几十轮一字不变地进上下文，模型逐字复述 | `_CYCLE_FEELING_SETS` 每个阶段只有一句，月经期横跨 1-5 天就用同一句；三个调用点每轮无条件注入 | `test_v3010_cycle_quiet.py` | 身体描述按「第几天」轮换（同一天稳定、换天换句），并在同一天只说一次（`_cycle_worth_saying`，对方问起身体才恢复）。任何「每轮都进上下文」的描述，先算它一天会重复多少遍。 |
 | 她永远是同一个勤快模板人，看不出她自己的作息 | 生成侧只读 `daily_schedule`，跨天把昨天挪进 `prev_day_schedule`，第三天被覆盖——过去几周根本读不到 | `test_v3010_habits.py` | 归档（`habit.archive_day`）必须幂等、按天裁期（28 天）、坏 scope 静默放弃；习惯只在样本 ≥5 天且重复率 ≥0.4 时说，且明写「今天可以有例外」。 |
+| 质量闸判中了却什么都没发生：重复、睡够了还睡、白天一觉太长全部静默放行 | 生成那一次 `consume()` 已经把 `_last_call` 刷新、`_next_gap` 抽成 30~60 分钟，紧接着的重写请求走 `check()` 的间隔判定当场被拒 → `generate()` 返回 None → `_rewrite_once` 拿不到重写版 | `test_v3011_review.py::ReviewServiceTest::test_reason_verdict_sends_the_reason_into_the_rewrite` | 同一次决定里的后续调用（重写、审查）必须传 `ignore_interval=True`。测试替身不查闸门，`provider.calls` 全绿证明不了这条路通——凡「调不通就降级」的分支，都要有一条用例断言它真的调到了。 |
+| 她手上那一段过完之后，30~60 分钟里「她这会儿在做什么」没有任何一段罩着 | `ensure_fresh()` 只看节流间隔，不看「手上有没有段」；空档与「提前再问一次」走了同一条判定 | `test_v3011_review.py::GapContinuityTest::test_gap_is_filled_right_away_despite_the_interval` | 空档（`active is None`）要传 `ignore_interval`；空闲静默与每日额度不许跟着绕（`test_idle_silence_still_blocks_even_in_a_gap`、`test_ignore_interval_still_counts_budget`）。 |
+| 审查把「模型没回答」当成「不合格」，每段都多一次重写 | 只判 `ok` 真假，缺 `ok` 键时 `bool(None)` 是 False | `test_v3011_review.py::ReviewServiceTest::test_review_answer_without_ok_is_ignored` | 审查的四种返回必须显式分开：`ok` / `fixed` / `reason` / `skip`。没给结论、超时、返回不是 JSON 都是 `skip`（保持原样），不是失败。 |
+| 接着做同一件事的段也被审一遍，白花一次调用 | 判「是不是同一件事」只看事件名，`continue` 没参与；`raw` 还可能是 list | `test_v3011_review.py::ReviewServiceTest::test_review_is_skipped_when_she_keeps_doing_the_same_thing` | `continue`/`resume` 与同名事件都要跳过审查；取 `continue` 前先 `isinstance(raw, Mapping)`，模型直接回数组时 `raw.get` 会抛。 |
+| 每段日程从一次模型调用变成两次，200 次额度实际只够 100 段 | 审查是真实调用，`consume()` 各记一次 | `test_schedule.py::ThrottleTest::test_many_bots_share_one_budget` | 预算管的是真实调用次数，新增调用就同步改预算类用例；不许把审查做成「不计数」的免费调用，那等于开了个不限量的口子。 |
 ## 「现实→网友」/「变成手机发消息」是什么（v1.28.1 / v2.28.1 调查结论）
 
 **不是插件的问题，也无需修。** 已按一位用户的反馈逐条核对过日志（其 QQ 号与昵称已隐去）。

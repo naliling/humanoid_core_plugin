@@ -731,6 +731,7 @@ class CallGate:
         now: float | None = None,
         budget_only: bool = False,
         role_id: str = "",
+        ignore_interval: bool = False,
     ) -> GateVerdict:
         """该不该放行这一次。纯查询，不计数——调用方要的是「能不能调」。
 
@@ -777,7 +778,12 @@ class CallGate:
                 )
                 return GateVerdict(False, _GATE_IDLE, detail)
 
-        interval = self._gap_seconds()
+        # ignore_interval：只越过「距上次调用还没到间隔」这一条，空闲静默与每日预算
+        # 照旧生效。给的是「日程空档」——她手上那一段已经过完、现在没有任何一段罩着
+        # 此刻，这时候的生成不是「提前再问一次」，而是「接上断掉的地方」，不该被
+        # 上一段生成留下的间隔挡住。也用于一次决策里的后续调用（质量重写、审查），
+        # 它们属于同一次决定，不该各自再等一个间隔。
+        interval = 0.0 if ignore_interval else self._gap_seconds()
         if interval > 0 and self._last_call is not None:
             elapsed = self._mono() - self._last_call
             remaining = interval - elapsed
@@ -971,6 +977,7 @@ class LLMGateway:
         umo: str | None = None,
         purpose: str = PURPOSE_SCHEDULE,
         ignore_cooldown: bool = False,
+        ignore_interval: bool = False,
         role_label: str = "",
         **call_kwargs: Any,
     ) -> LLMResult:
@@ -1034,7 +1041,10 @@ class LLMGateway:
                 # role_label 就是发起这次调用的角色 id（日程侧传 self._scope.role_id）：
                 # 空闲静默必须按它判，否则多角色时闸门对不上人。
                 verdict = self._gate.check(
-                    purpose, budget_only=ignore_cooldown, role_id=role_label
+                    purpose,
+                    budget_only=ignore_cooldown,
+                    role_id=role_label,
+                    ignore_interval=ignore_interval,
                 )
                 if not verdict.allowed:
                     self._gate.log_block(purpose, verdict, role_label)

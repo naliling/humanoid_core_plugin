@@ -1326,8 +1326,12 @@ def _event_key(text: str) -> str:
     return _ongoing_stem(cleaned)
 
 
-def _quality_fix_block(issues: list[str], invented: list[str]) -> str:
-    """重写时追加的那一段：只说哪里不对，不重写整份规则（规则已经在上面的 prompt 里）。"""
+def _quality_fix_block(issues: list[str], invented: list[str], reason: str = "") -> str:
+    """重写时追加的那一段：只说哪里不对，不重写整份规则（规则已经在上面的 prompt 里）。
+
+    `reason` 是模型自己审查时说出的原因（v3.0.11）：它比任何固定条目都具体，
+    原样递回去比让模型猜「到底哪里不对」有效得多。
+    """
     lines = ["", "【上一版没通过】"]
     if "repeat" in issues:
         lines.append("- 上面【今天到这会她已经过完的时段】里已经有这件事了，换一件别的。")
@@ -1348,8 +1352,73 @@ def _quality_fix_block(issues: list[str], invented: list[str]) -> str:
             "- 白天这一觉太长了。她并不困的时候，小睡最多一两个小时；"
             "醒着做点什么，真的累了再歇。"
         )
+    if reason:
+        lines.append(f"- {reason}")
     lines.append("只输出一个 JSON 对象，不要解释。")
     return "\n".join(lines) + "\n"
+
+
+def _slot_minutes(slot: Mapping[str, Any]) -> int:
+    """这一段有多长（分钟）。时间读不出来时给 0，调用方按「没写」处理。"""
+    lo = parse_time(slot.get("start"))
+    hi = parse_time(slot.get("end"))
+    if lo is None or hi is None or hi <= lo:
+        return 0
+    return hi - lo
+
+
+def _review_prompt(
+    *,
+    now_text: str,
+    prev: Mapping[str, Any] | None,
+    slot: Mapping[str, Any],
+    persona_text: str,
+) -> str:
+    """审查这一段的提示词（v3.0.11）：只判「接不接得上」，不合格就顺手改好。
+
+    为什么要有这一步：规则写在生成 prompt 里是「请求」，模型写完不会回头检查。
+    而「上一段 09:05 在卧室结束，这一段 09:06 在超市」「倒杯水占了半小时」这种
+    错，只有把两段摆在一起才看得见。判不通过时不降级成中性段，而是让它按自己
+    说出的原因改一版——判定与修改由同一个模型完成，改完直接用。
+    """
+    lines = ["【审查这一段】"]
+    lines.append(f"现在 {now_text}。")
+    if prev:
+        lines.append(
+            "她刚过完的上一段："
+            f"{str(prev.get('event') or '').strip()}"
+            f"（{str(prev.get('location') or '家中').strip()}，"
+            f"{str(prev.get('start') or '')}–{str(prev.get('end') or '')}）"
+        )
+    else:
+        lines.append("今天还没有上一段。")
+    lines.append(
+        "这一版生成的下一段："
+        f"{str(slot.get('event') or '').strip()}"
+        f"（{str(slot.get('location') or '家中').strip()}，"
+        f"{str(slot.get('start') or '')}–{str(slot.get('end') or '')}，"
+        f"约 {_slot_minutes(slot)} 分钟）"
+    )
+    lines.append("")
+    lines.append("只判一件事：这一段接上去说不说得通。看五点：")
+    lines.append("- 时间：上一段结束到这一段开始，够不够她收拾、走路、准备？（她不会瞬移）")
+    lines.append("- 地点：从上一段的地点到这里，是不是可能？（在家要去外面得出门，外面回来要进门）")
+    lines.append("- 时长：这个动作值不值得这么久？（倒杯水、回一条消息不该占半小时；通勤、做饭、开会才可能长）")
+    lines.append("- 事实：有没有凭空多出来的家人、宠物、同事、预约、约定？")
+    lines.append("- 重复：是不是把上一段同一件事换个说法又排了一遍？")
+    if persona_text.strip():
+        lines.append("")
+        lines.append("她是谁（判断依据，不要照抄）：")
+        lines.append(persona_text.strip()[:600])
+    lines.append("")
+    lines.append('合格就只回 {"ok": true}。')
+    lines.append(
+        '不合格就回 {"ok": false, "reason": "一句话说清哪里不对", '
+        '"fixed": {"event": "改好的事", "location": "地点", "minutes": 20}}——'
+        "能留的都留着，只改不对的地方，时长按这件事本身算。"
+    )
+    lines.append("只输出一个 JSON 对象，不要解释。")
+    return "\n".join(lines)
 
 
 def parse_segment(
@@ -2360,11 +2429,14 @@ class ScheduleService:
     # 何时该重新决定
     # ------------------------------------------------------------------
 
-    def _gate_allows(self) -> bool:
+    def _gate_allows(self, *, ignore_interval: bool = False) -> bool:
         """节流闸门：没人看着 / 间隔没到 / 今日预算用完时，都算「不需要决定」。
 
         问在「本来该生成」之后而不是之前：正常无事可做的那几百个 tick 不该去
         反复查闸门，更不该把 _roll_change 的骰子白白掷掉。
+
+        `ignore_interval=True` 只越过「距上次调用还没到间隔」这一条（空闲静默与
+        每日预算照旧）——空档接续是同一条时间线上的补位，不是提前再问一次。
         """
         gate = getattr(self.gateway, "gate", None) if self.gateway is not None else None
         if gate is None:
@@ -2372,7 +2444,9 @@ class ScheduleService:
         # 按角色问「有没有人在看着她」：闸门全局一份，不传角色就会让别的 bot 的
         # 对话松开这个角色的空闲静默（审核 main.py 6）。
         role_id = str(getattr(self._scope, "role_id", "") or "")
-        return gate.check(PURPOSE, role_id=role_id).allowed
+        return gate.check(
+            PURPOSE, role_id=role_id, ignore_interval=ignore_interval
+        ).allowed
 
     def note_interruption(
         self,
@@ -2991,6 +3065,9 @@ class ScheduleService:
             # `segs[-1]` 会把更早的一段当成她正在做的事递给 prompt（时间跨度、
             # 「上一段是不是睡眠」、continue 判定全跟着错）。
             active, prev = self._active_and_prev(minutes)
+            # 空档：现在没有任何一段罩着此刻。这种时候的生成是「接上断掉的地方」，
+            # 不是「提前再问一次」，所以允许越过最小间隔（空闲静默与每日预算照旧）。
+            gap = active is None
             elapsed = 0
             if prev is not None:
                 lo = parse_time(prev.get("start"))
@@ -3021,6 +3098,7 @@ class ScheduleService:
                     cfg, now, minutes, prev, elapsed, ignore_cooldown,
                     interrupted_ts=interrupted_ts, event_phrase=event_phrase,
                     event_ts=event_ts, force_switch=force_switch,
+                    ignore_interval=gap,
                 )
                 # 生成真的失败了（超时/异常/解析失败/换事失败），把刚取走的事件与
                 # 「来访」**原样还回去**（#75）：它们一次提示词都没进过，就这么丢掉
@@ -3182,6 +3260,7 @@ class ScheduleService:
         event_phrase: str = "",
         event_ts: float = 0.0,
         force_switch: bool = False,
+        ignore_interval: bool = False,
     ) -> Slot | None:
         interrupted = interrupted_ts > 0.0
         self._resumed_event = ""
@@ -3276,6 +3355,7 @@ class ScheduleService:
                 retry_interval=float(cfg.schedule_retry_interval_seconds),
                 purpose=PURPOSE,
                 ignore_cooldown=ignore_cooldown,
+                ignore_interval=ignore_interval,
                 role_label=str(self._scope.role_id or ""),
             )
         except Exception as exc:
@@ -3429,6 +3509,55 @@ class ScheduleService:
                             f"「{slot.get('event')}」，重写后仍重复，放行"
                         )
 
+        # ---- 模型审查（v3.0.11）：写完之后回头看一眼「接不接得上」 ----
+        # 上面那道闸只判得了能客观计数的事（今天重复、人设里没有依据）。而
+        # 「上一段 09:05 在卧室结束，这一段 09:06 在超市」「倒杯水占了半小时」
+        # 这类问题要两段摆在一起才看得见，只有模型判得了。判不通过不降级成
+        # 中性段（那会把一天磨平成处境词），而是把原因交给它自己改一版再用。
+        # 只审「换了一件事」的段：continue/resume 是接着做同一件事，没有转场可审。
+        if getattr(cfg, "schedule_quality_gate", False) and not degraded:
+            # 「接着做同一件事」有两种写法：模型自己说 continue/resume，或者它给的
+            # 事件名与上一段一样（`_append_segment` 会把同名段并进上一段，不构成新
+            # 段，也就没有转场可审）。两种都跳过审查；真换了一件事才审。
+            raw_map = raw if isinstance(raw, Mapping) else {}
+            continuing = (
+                _truthy_flag(raw_map.get("continue"))
+                or _truthy_flag(raw_map.get("resume"))
+                or (
+                    bool(prev)
+                    and str(slot.get("event") or "") == str(prev.get("event") or "")
+                )
+            )
+            if not continuing:
+                verdict, payload = await self._review_segment(
+                    cfg, slot, prev, self._fact_evidence(persona, cfg), minutes
+                )
+                if verdict == "fixed":
+                    slot = payload
+                    raw = {}
+                    self._bump_quality("review_fixed")
+                    if self._log:
+                        self._log.info(
+                            "[humanoid_core] 日程审查：这一段接不上，已按模型自己"
+                            f"给的理由改成「{slot.get('event')}」"
+                            f"（{self._scope.role_id}）"
+                        )
+                elif verdict == "reason":
+                    retried = await self._rewrite_once(
+                        cfg, prompt, ["review"], [], ignore_cooldown,
+                        now_minute=minutes, prev=prev,
+                        suspended=suspended or None, reason=payload,
+                    )
+                    if retried is not None:
+                        raw, slot = retried
+                        self._bump_quality("review_rewritten")
+                        if self._log:
+                            self._log.info(
+                                "[humanoid_core] 日程审查：接不上（"
+                                f"{payload or '模型未说明'}），已按原因重写"
+                                f"（{self._scope.role_id}）"
+                            )
+
         if suspended and str(slot.get("event") or "") == str(suspended.get("event") or ""):
             # resume 成功（或模型自己又排了同一件事）：挂起结束。
             self._clear_suspended()
@@ -3577,13 +3706,17 @@ class ScheduleService:
         now_minute: int,
         prev: Mapping[str, Any] | None,
         suspended: Mapping[str, Any] | None,
+        reason: str = "",
     ) -> tuple[Any, Slot] | None:
-        """带着「哪里不对」再问一次模型；失败返回 None（由调用方决定放行还是降级）。"""
+        """带着「哪里不对」再问一次模型；失败返回 None（由调用方决定放行还是降级）。
+
+        `reason` 是模型审查时说出的原话（v3.0.11），原样递回去。
+        """
         if self.gateway is None:
             return None
         try:
             result = await self.gateway.generate(
-                prompt=prompt + _quality_fix_block(issues, invented),
+                prompt=prompt + _quality_fix_block(issues, invented, reason),
                 chain=cfg.schedule_provider_ids,
                 allow_global=cfg.schedule_allow_global_fallback,
                 timeout=float(cfg.schedule_llm_timeout_seconds),
@@ -3592,6 +3725,10 @@ class ScheduleService:
                 retry_interval=float(cfg.schedule_retry_interval_seconds),
                 purpose=PURPOSE,
                 ignore_cooldown=ignore_cooldown,
+                # 重写属于同一次决定：生成那一下已经刷新了闸门间隔，这里再
+                # 按间隔判会当场 GATED——真实环境里这条重写路径从来没跑到过
+                # （测试替身不查闸门，所以一直是绿的）。
+                ignore_interval=True,
                 role_label=str(self._scope.role_id or ""),
             )
         except Exception:
@@ -3613,6 +3750,75 @@ class ScheduleService:
         if slot is None:
             return None
         return raw, slot
+
+    async def _review_segment(
+        self,
+        cfg: HumanoidConfig,
+        slot: Slot,
+        prev: Mapping[str, Any] | None,
+        persona_text: str,
+        now_minute: int,
+    ) -> tuple[str, Any]:
+        """让模型审一遍这一段（v3.0.11）：返回 (结果, 载荷)。
+
+        结果四种：
+        * "ok"     —— 判它接得上，原样用；
+        * "fixed"  —— 判它接不上，模型在同一份回答里给了改好的版本，载荷是新 slot；
+        * "reason" —— 判它接不上，但没给改好的版本，载荷是原因原话（交给 _rewrite_once）；
+        * "skip"   —— 调不通、超时、返回不是 JSON：保持原样，不让审查本身拖垮日程。
+
+        审查调用同样绕开最小间隔：它属于同一次决定，生成那一下已经把闸门间隔
+        刷新成 30~60 分钟，按间隔判会当场 GATED——这条路径就永远跑不到。
+        """
+        if self.gateway is None:
+            return "skip", None
+        prompt = _review_prompt(
+            now_text=format_time(now_minute),
+            prev=prev,
+            slot=slot,
+            persona_text=persona_text,
+        )
+        try:
+            result: LLMResult = await self.gateway.generate(
+                prompt=prompt,
+                chain=cfg.schedule_provider_ids,
+                allow_global=cfg.schedule_allow_global_fallback,
+                timeout=float(cfg.schedule_llm_timeout_seconds),
+                # 审查只问一次：它每段都跑，放大尝试次数等于放大额度消耗。
+                attempts_per_provider=1,
+                retry_interval=float(cfg.schedule_retry_interval_seconds),
+                purpose=PURPOSE,
+                ignore_interval=True,
+                role_label=str(self._scope.role_id or ""),
+            )
+        except Exception:
+            return "skip", None
+        if not result.ok:
+            return "skip", None
+        raw = extract_json_object(result.text)
+        if not isinstance(raw, Mapping):
+            return "skip", None
+        if "ok" not in raw:
+            # 没给结论（模型答了别的东西、或旧版本提示词）——当成没审，不改原样。
+            # 不能把「没回答」判成「不合格」：那会让每次生成都多一次重写。
+            return "skip", None
+        ok = raw.get("ok")
+        if isinstance(ok, str):
+            ok = ok.strip().lower() in ("true", "1", "yes", "是")
+        if bool(ok):
+            return "ok", None
+        reason = str(raw.get("reason") or "").strip()
+        fixed = raw.get("fixed")
+        if isinstance(fixed, Mapping):
+            new_slot = parse_segment(
+                dict(fixed),
+                now_minute=now_minute,
+                step=cfg.granularity_minutes,
+                prev=prev,
+            )
+            if new_slot is not None:
+                return "fixed", new_slot
+        return "reason", reason
 
     def _degrade_to_neutral(
         self,

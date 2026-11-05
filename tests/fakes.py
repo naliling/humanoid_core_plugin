@@ -53,25 +53,39 @@ class FakeProvider:
         delay: float = 0.0,
         error: BaseException | None = None,
         response_factory: Any = None,
+        review_reply: str = '{"ok": true}',
     ) -> None:
         self._id = provider_id
         self.reply = reply
         self.delay = delay
         self.error = error
         self.response_factory = response_factory
+        self.review_reply = review_reply
         self.calls = 0
+        self.review_calls = 0
         self.last_kwargs: dict[str, Any] = {}
 
     def meta(self) -> FakeMeta:
         return FakeMeta(self._id)
 
     async def text_chat(self, prompt: str | None = None, **kwargs: Any) -> Any:
-        self.calls += 1
-        self.last_kwargs = {"prompt": prompt, **kwargs}
+        # 日程审查（v3.0.11）是在同一份 provider 上的第二次调用，提示词以
+        # 「【审查这一段】」开头。calls / last_kwargs 只记「生成那一次」，
+        # 这样所有既有断言（provider.calls == 1）仍然是「问了几次新日程」。
+        review = bool(prompt) and "【审查这一段】" in prompt
+        if review:
+            self.review_calls += 1
+        else:
+            self.calls += 1
+            self.last_kwargs = {"prompt": prompt, **kwargs}
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.error is not None:
             raise self.error
+        if review:
+            if self.response_factory is not None:
+                return self.response_factory(self.review_reply)
+            return FakeResponse(self.review_reply)
         if self.response_factory is not None:
             return self.response_factory(self.reply)
         return FakeResponse(self.reply)
