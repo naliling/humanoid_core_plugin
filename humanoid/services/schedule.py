@@ -2775,7 +2775,7 @@ class ScheduleService:
             # 本窗的骰子不该因为这次延长立刻把刚延长的段又截掉。
             self._roll_hit = False
             if self._log and cfg.debug_mode:
-                self._log.debug(
+                self._log.info(
                     f"[humanoid_core] 日程继续：{active.get('event')} "
                     f"{format_time(hi)} → {format_time(desired)}"
                 )
@@ -2996,7 +2996,7 @@ class ScheduleService:
             heard_asleep=self.heard_while_asleep(),
         )
         if self._log and cfg.debug_mode:
-            self._log.debug(
+            self._log.info(
                 f"[humanoid_core] 下一段提示词（人设："
                 f"{persona.label if persona else '未读'}）:\n{prompt}"
             )
@@ -3041,7 +3041,7 @@ class ScheduleService:
                     self._event_phrase = event_phrase
                     self._event_at = event_ts
                 if self._log and cfg.debug_mode:
-                    self._log.debug(f"[humanoid_core] 日程被节流跳过: {result.detail}")
+                    self._log.info(f"[humanoid_core] 日程被节流跳过: {result.detail}")
                 return None
             self.last_error = result.summary()
             self._fail_backoff(cfg)
@@ -3063,7 +3063,7 @@ class ScheduleService:
                 self._last_outcome = "force_switch_failed"
                 self._fail_backoff(cfg)
                 if self._log and cfg.debug_mode:
-                    self._log.debug(f"[humanoid_core] 日程打断失败: {self.last_error}")
+                    self._log.info(f"[humanoid_core] 日程打断失败: {self.last_error}")
                 return None
         slot = parse_segment(
             raw,
@@ -3078,7 +3078,7 @@ class ScheduleService:
             self.last_error = f"无法解析这一段：{result.text[:160]}"
             self._fail_backoff(cfg)
             if self._log and cfg.debug_mode:
-                self._log.debug(f"[humanoid_core] 下一段解析失败: {self.last_error}")
+                self._log.info(f"[humanoid_core] 下一段解析失败: {self.last_error}")
             return None
         if (
             force_switch
@@ -3090,7 +3090,7 @@ class ScheduleService:
             self._last_outcome = "force_switch_failed"
             self._fail_backoff(cfg)
             if self._log and cfg.debug_mode:
-                self._log.debug(f"[humanoid_core] 日程打断失败: {self.last_error}")
+                self._log.info(f"[humanoid_core] 日程打断失败: {self.last_error}")
             return None
         # ---- 质量闸（v3.0.6）：装进日程之前独立判一遍 ----
         # prompt 里的规则是「请求」，不是「保证」。这里只判两件能客观判定的事：
@@ -3132,7 +3132,7 @@ class ScheduleService:
                 elif "repeat" in issues:
                     self._bump_quality("repeat")
                     if self._log and cfg.debug_mode:
-                        self._log.debug(
+                        self._log.info(
                             "[humanoid_core] 日程质量闸：今天已经排过"
                             f"「{slot.get('event')}」，重写后仍重复，放行"
                         )
@@ -3477,7 +3477,7 @@ class ScheduleService:
             except Exception:
                 pass
         if self._log and self.config.debug_mode:
-            self._log.debug(
+            self._log.info(
                 f"[humanoid_core] 新的一段: {installed.get('start')}→{installed.get('end')} "
                 f"{installed.get('event')}"
                 + (f"（结转到明天 {carry_end}）" if carry_end else "")

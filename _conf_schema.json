@@ -66,6 +66,9 @@
       "min": 10,
       "max": 720,
       "step": 10
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "schedule_event_ttl_minutes": {
@@ -118,6 +121,9 @@
       "min": 0,
       "max": 720,
       "step": 15
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "schedule_interrupt_cooldown_minutes": {
@@ -131,13 +137,19 @@
       "min": 0,
       "max": 720,
       "step": 15
+    },
+    "condition": {
+      "use_llm_schedule": true
     }
   },
   "schedule_interrupt_on_call": {
     "description": "【进阶】叫住她就打断",
     "hint": "私聊里出现「在吗/你在干嘛/干嘛呢/过来/陪我/别弄了/停一下/理我/别写了/别忙了」这类明确叫住她的话时，即使没熬过安静间隔也算一次来访；仍受冷却，群聊永远不算",
     "type": "bool",
-    "default": true
+    "default": true,
+    "condition": {
+      "use_llm_schedule": true
+    }
   },
   "schedule_prompt_extra": {
     "description": "日程补充偏好",
@@ -220,7 +232,7 @@
   },
   "inject_activity_context": {
     "description": "上下文给多少事实",
-    "hint": "注入多少生活细节",
+    "hint": "注入多少生活细节；mood_only 只减事实块，「此刻的她」那段不受影响",
     "type": "string",
     "default": "medium",
     "options": [
@@ -347,7 +359,7 @@
     }
   },
   "schedule_allow_global_fallback": {
-    "description": "【进阶】允许回退全局模型",
+    "description": "【进阶】允许回退全局模型（日程与情绪分析共用）",
     "hint": "首选和备用都失败时，要不要再试 AstrBot 全局默认模型",
     "type": "bool",
     "default": true,
@@ -574,7 +586,7 @@
   },
   "outfit_scene_variation": {
     "description": "【进阶】穿搭随场景变",
-    "hint": "开：睡觉换睡衣、洗澡不穿、出门天冷加外套、生理期/不适换宽松；关：一直是那一件",
+    "hint": "开：睡觉换睡衣、洗澡不穿、出门天冷加外套、生理期/不适换宽松；关：一直是那一件。兽形角色不适用（始终是那一件）",
     "type": "bool",
     "default": true,
     "condition": {
@@ -728,7 +740,7 @@
   },
   "cooling_enabled": {
     "description": "冷静期",
-    "hint": "开：好感跌破门槛后她会冷着一段时间（带情绪、想让他先别来吵），且这段时间不主动找他；关：无冷静期。",
+    "hint": "开：好感跌破门槛后她会冷着一段时间（带情绪、想让他先别来吵），且这段时间不主动找他；关：无冷静期。「不主动找他」要装了「自主拟人社交」插件才生效。",
     "type": "bool",
     "default": true,
     "condition": {
@@ -788,7 +800,7 @@
   },
   "mood_log_enabled": {
     "description": "【进阶】情绪日志",
-    "hint": "记下明显的情绪波动事件，/情绪日志 可查，给「今天被TA气到了」这类延续感供料",
+    "hint": "记下明显的情绪波动事件，/情绪日志 可查，给「今天被TA气到了」这类延续感供料；关掉后注入里的「今日心境」也会一起消失",
     "type": "bool",
     "default": true,
     "condition": {
@@ -943,18 +955,9 @@
       "mood_use_llm_for_delta": true
     }
   },
-  "mood_verbose_log": {
-    "description": "【进阶】情绪计数日志",
-    "hint": "打印每人攒了几条待分析，排查用；平时关着避免刷屏。",
-    "type": "bool",
-    "default": false,
-    "condition": {
-      "mood_enabled": true
-    }
-  },
   "mood_enabled_in_group": {
     "description": "【进阶】群聊也算情绪",
-    "hint": "关：群消息不做情绪分析（私聊始终生效）；开：群里每人各自积累好感",
+    "hint": "关：群消息不做情绪分析（私聊始终生效）；开：群里每人各自积累好感。这里只挡群里的新分析，私聊过的人在群里仍读得到她的情绪",
     "type": "bool",
     "default": false,
     "condition": {
@@ -1350,7 +1353,7 @@
   },
   "schedule_follow_night_window": {
     "description": "【进阶】作息贴夜间窗口",
-    "hint": "硬覆盖：把她的睡眠强制切到你设的夜间窗口",
+    "hint": "开：排日程时把夜间窗口当硬约束告诉她；关：几点睡由人设决定",
     "type": "bool",
     "default": false,
     "condition": {
@@ -1416,7 +1419,7 @@
     }
   },
   "contract_enabled": {
-    "description": "【进阶】导出契约给社交层（与身体层无关，关掉身体层不影响它）",
+    "description": "【进阶】导出跨插件契约（总开关）",
     "hint": "把身体状态写成带版本号的契约快照，供「自主拟人社交」插件读取她想说话的程度。总开关：false 时整份跨插件契约（含 identity/日程/天气/节日等非身体块）都不导出，自主拟人社交会退回旧字段；只关身体请用 soma_enabled",
     "type": "bool",
     "default": true

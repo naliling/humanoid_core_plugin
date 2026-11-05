@@ -436,7 +436,7 @@ class WeatherService:
         try:
             url = build_url(location, cfg.weather_api_key)
             if cfg.debug_mode and self._log:
-                self._log.debug(f"[humanoid_core] 天气请求: {_redacted(url)}")
+                self._log.info(f"[humanoid_core] 天气请求: {_redacted(url)}")
             payload = await self._fetch(url, REQUEST_TIMEOUT)
             parsed = parse_payload(payload)
             if parsed is None:
@@ -452,7 +452,7 @@ class WeatherService:
             self._fail_streak = 0
             self._next_attempt_at = None
             if cfg.debug_mode and self._log:
-                self._log.debug(f"[humanoid_core] 天气刷新成功: {parsed}")
+                self._log.info(f"[humanoid_core] 天气刷新成功: {parsed}")
             return True
         except Exception as e:
             self._note_failure()

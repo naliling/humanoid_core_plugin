@@ -425,7 +425,6 @@ class HumanoidConfig:
     mood_llm_batch_max: int = 10
     # 每条截多少字进分析（10 条加起来仍可控）
     mood_llm_message_chars: int = 300
-    mood_verbose_log: bool = False
     mood_enabled_in_group: bool = False
     mood_data_retention_days: int = 7
     # 整条用户记录的静默期（天）：只剩称呼/初遇时间这种「没有可清理内容」的条目，
@@ -704,7 +703,6 @@ class HumanoidConfig:
             mood_llm_interval_messages=i("mood_llm_interval_messages", 1, 100),
             mood_llm_batch_max=i("mood_llm_batch_max", 1, 30),
             mood_llm_message_chars=i("mood_llm_message_chars", 50, 2000),
-            mood_verbose_log=b("mood_verbose_log"),
             mood_enabled_in_group=b("mood_enabled_in_group"),
             mood_data_retention_days=i("mood_data_retention_days", 0, 365),
             stale_user_retention_days=i("stale_user_retention_days", 0, 365),

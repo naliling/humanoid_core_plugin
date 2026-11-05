@@ -1004,7 +1004,7 @@ class LLMGateway:
             total_cap = 150.0
         deadline = self._monotonic() + total_cap
         if self._log and cfg.debug_mode:
-            self._log.debug(f"[humanoid_core] LLM 请求 (purpose={purpose}) 提示词前200字: {prompt[:200]}...")
+            self._log.info(f"[humanoid_core] LLM 请求 (purpose={purpose}) 提示词前200字: {prompt[:200]}...")
 
         counted = False
         for label, configured_id in candidates:
@@ -1051,7 +1051,7 @@ class LLMGateway:
 
             actual_id = self._resolver.id_of(provider) or configured_id
             if self._log and cfg.debug_mode:
-                self._log.debug(f"[humanoid_core] 调用 {label}({actual_id})")
+                self._log.info(f"[humanoid_core] 调用 {label}({actual_id})")
             outcome, detail, elapsed, text, permanent = await self._call_with_retries(
                 provider=provider,
                 prompt=prompt,
@@ -1079,7 +1079,7 @@ class LLMGateway:
                 self._last_results[purpose] = result
                 self._info(f"{purpose} 使用 {label}({actual_id}) 成功，用时 {elapsed:.1f}s")
                 if self._log and cfg.debug_mode:
-                    self._log.debug(f"[humanoid_core] {purpose} 响应内容前200字: {text[:200]}...")
+                    self._log.info(f"[humanoid_core] {purpose} 响应内容前200字: {text[:200]}...")
                 return result
 
             if not is_global:

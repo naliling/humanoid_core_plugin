@@ -1662,8 +1662,8 @@ class MoodService:
                 # 本地已经判死了（骂人/重话），模型的结果到了也会被 `_resolve_delta`
                 # 整段丢掉——这次调用纯白花。省掉它：结果一个数都不差，还快一拍。
                 should_call_llm = False
-                if cfg.mood_verbose_log and self._log is not None:
-                    self._log.debug(
+                if cfg.debug_mode and self._log is not None:
+                    self._log.info(
                         f"[humanoid_core] {user_id}: 本地已判负（{base_delta.affection:+.2f}），"
                         "跳过本轮模型情绪分析"
                     )
@@ -1686,8 +1686,8 @@ class MoodService:
             # 她那句话会永远挂着「对方还没回应」。
             self.close_last_spoke(user_id)
             self._scope.mark_dirty()
-            if cfg.mood_verbose_log and self._log is not None:
-                self._log.debug(
+            if cfg.debug_mode and self._log is not None:
+                self._log.info(
                     f"[humanoid_core] 情绪计数 {user_id}: {messages_since}/{interval}"
                     f"{'，本轮调用模型' if should_call_llm else ''}"
                 )
@@ -1716,8 +1716,8 @@ class MoodService:
                     # append 进来的要留着。**不能**走 ok=False：那条路会把整批
                     # 放回缓冲，重置前攒的消息下一轮又会被送去分析。
                     self._settle_llm_batch(user_id, True, batch)
-                    if cfg.mood_verbose_log and self._log is not None:
-                        self._log.debug(
+                    if cfg.debug_mode and self._log is not None:
+                        self._log.info(
                             f"[humanoid_core] {user_id}: 判定世代已变，"
                             "丢弃在飞的情绪分析结果"
                         )
@@ -2818,7 +2818,7 @@ class MoodService:
             parts.append("（只当背景。对方没接住的那几行，是这件事里最该被计入的部分。）")
         prompt = "\n".join(parts)
         if cfg.debug_mode and self._log:
-            self._log.debug(f"[humanoid_core] 情绪分析请求: {prompt}")
+            self._log.info(f"[humanoid_core] 情绪分析请求: {prompt}")
 
         result = await self._gateway.generate(
             prompt=prompt,
@@ -2865,7 +2865,7 @@ class MoodService:
         # 塞进去会让所有构造 Delta 的地方都要多传一个参数。
         self._note_scene_score(user_id, data.get("scene"))
         if cfg.debug_mode and self._log:
-            self._log.debug(f"[humanoid_core] 情绪分析结果: {delta}")
+            self._log.info(f"[humanoid_core] 情绪分析结果: {delta}")
         return delta
 
     def _note_scene_score(self, user_id: str, raw: Any) -> None:

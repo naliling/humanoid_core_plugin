@@ -1955,7 +1955,7 @@ class HumanoidCore(Star):
             if self._config.debug_mode:
                 from .humanoid.prompt_builder import estimate_tokens
 
-                logger.debug(
+                logger.info(
                     f"[humanoid_core] 注入上下文 {len(injection)} 字符"
                     f" ≈{estimate_tokens(injection)} token（{self._config.inject_activity_context} 档）:\n{injection}"
                 )
