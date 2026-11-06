@@ -288,9 +288,13 @@ class HumanoidConfig:
     schedule_use_persona: bool = True
     # 生成后的质量闸（v3.0.6）：这一段排进来之前，独立判一次「今天是不是已经排过
     # 同一件事」和「事件里的身份/家人/宠物/约定，人设里有没有依据」。判中了先带着
-    # 提示重写一次，仍然编造就降级成中性处境词。默认开——prompt 里的规则是请求，
-    # 不是保证，这是唯一不依赖模型自觉的那道。
-    schedule_quality_gate: bool = True
+    # 提示重写一次，仍然编造就降级成中性处境词。
+    #
+    # 为什么改默认（3.1.0）：实测报告 P0-4 里，这道闸把**正常日程**判成「编造」
+    # 降级成中性模板的情况比拦下的真编造还多，用户看到的是一整天只有「睡一觉」。
+    # 判据来自模型自己的二次审查，误判成本是整天的日程，比放过一段轻微编造更贵，
+    # 所以默认关；想要严格口径的部署自己开。
+    schedule_quality_gate: bool = False
 
     admin_qq: tuple[str, ...] = ()
 
@@ -336,7 +340,10 @@ class HumanoidConfig:
     mood_provider_name: str = ""
     mood_sensitivity: int = 60
     mood_decay_hours: float = 6.0
-    mood_initial_affection: int = 35
+    # 为什么改默认（3.1.0）：35 落在 ccb_affection_min（50）之下 15 分，新用户
+    # 起步就够不到「想更进一步」的门槛，报告 P1-5 说的「默认值互相矛盾」就是这一处。
+    # 55 比 50 高 5 分，delta_cap=2 时三条消息就能越过门槛，既够得到又不会一上来就满。
+    mood_initial_affection: int = 55
     # ccb 的四个门槛，与 ccb.py 里的同名常量保持一致（schema 有测试钉住）。
     # 面板上不解释它们是什么：那是用户自己去试的事，写清楚反而是替他们做判断。
     ccb_libido_min: float = 38.0
@@ -420,7 +427,9 @@ class HumanoidConfig:
     mood_tag_enabled: bool = True
     mood_use_llm_for_delta: bool = True
     mood_provider_cooldown_minutes: int = 5
-    mood_llm_interval_messages: int = 10
+    # 为什么改默认（3.1.0）：10 条才送一次分析，配合 delta_cap=2 时，一段十几条的
+    # 对话里情绪只更新一两次，用户感觉「她根本没反应」。4 条一次，单轮成本可控。
+    mood_llm_interval_messages: int = 4
     # 攒到间隔就触发时，一次最多把这么多条合起来分析（旧的在前）
     mood_llm_batch_max: int = 10
     # 每条截多少字进分析（10 条加起来仍可控）
@@ -491,6 +500,12 @@ class HumanoidConfig:
     soma_enabled: bool = True
     body_tick_seconds: int = 60
     sleep_need_hours: float = 8.0
+    # v3.1.0：睡眠自锁的硬上限（小时），0 = 自动取 max(10, sleep_need_hours + 3)。
+    # 日程一旦回落成「只有一段睡」的模板，`asleep_since` 就再没人清：出了那段就是
+    # 日程空窗（unknown），`_integrate` 的 unknown 分支既不记睡也不记醒，于是她
+    # 永久「在睡」——注入里说她睡着、social 闸门每轮都把她挡掉。这个上限是最后
+    # 一道保险：睡过它一律结算成醒，不再等日程。
+    max_sleep_hours: float = 0.0
     meal_interval_hours: float = 4.5
     sitting_discomfort_minutes: int = 90
     desire_refill_hours: float = 12.0
@@ -731,6 +746,7 @@ class HumanoidConfig:
             soma_enabled=b("soma_enabled"),
             body_tick_seconds=i("body_tick_seconds", 15, 600),
             sleep_need_hours=f("sleep_need_hours", 3.0, 14.0),
+            max_sleep_hours=f("max_sleep_hours", 0.0, 24.0),
             meal_interval_hours=f("meal_interval_hours", 1.5, 12.0),
             sitting_discomfort_minutes=i("sitting_discomfort_minutes", 15, 600),
             desire_refill_hours=f("desire_refill_hours", 0.5, 72.0),

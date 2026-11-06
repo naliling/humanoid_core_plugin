@@ -27,6 +27,7 @@ from humanoid.persona import Persona
 from humanoid.services.schedule import (
     EXAMPLE_BANDS,
     EXAMPLE_POOL,
+    SEGMENT_AWAKE_MIN_MINUTES,
     SEGMENT_MIN_MINUTES,
     ScheduleService,
     example_capabilities,
@@ -76,23 +77,35 @@ class ScriptedGateway:
         return LLMResult(ok=True, text=text, outcome=OUTCOME_OK, label="fake", provider_id="p1")
 
 
-class ShortSegmentTest(unittest.TestCase):
-    """P0：分钟级的动作就是几分钟，而且不许被推到刻度上。"""
+class AwakeSegmentFloorTest(unittest.TestCase):
+    """P0（#311 起）：清醒段下限 30 分钟，睡段仍是 3 分钟。
 
-    def test_floor_is_three_minutes(self):
-        self.assertEqual(SEGMENT_MIN_MINUTES, 3)
+    v3.0.6 把下限压到 3 分钟，是因为当时 prompt 把微动作写成 15~30 分钟的段，两处
+    叠加把「倒杯水」撑成半小时。代价是线上日程碎成 17~18 分钟一段的过渡小动作
+    （实测 22 段/中位 17 分钟），day.done 交出去的素材全是「把碗推到水池泡着」。
+    现在反过来收：prompt 要求一段是「一件有头有尾、说得出口的事」，下限也抬到 30；
+    睡段保持 3 分钟（一小觉合法，且睡段由 end 时刻算，不该被抬）。
+    """
 
-    def test_five_minutes_stays_five(self):
+    def test_awake_floor_is_thirty_minutes(self):
+        self.assertEqual(SEGMENT_AWAKE_MIN_MINUTES, 30)
+        self.assertGreater(SEGMENT_AWAKE_MIN_MINUTES, SEGMENT_MIN_MINUTES)
+
+    def test_five_minutes_climbs_to_the_awake_floor(self):
         slot = parse_segment({"event": "倒杯水", "minutes": 5}, now_minute=9 * 60, step=15)
-        self.assertEqual((slot["start"], slot["end"]), ("09:00", "09:05"), "5 分钟的事被抬成了别的时长")
+        self.assertEqual((slot["start"], slot["end"]), ("09:00", "09:30"), "5 分钟的动作被抬到 30")
 
     def test_below_the_floor_climbs_to_the_floor(self):
         slot = parse_segment({"event": "洗把脸", "minutes": 1}, now_minute=9 * 60, step=15)
-        self.assertEqual(slot["end"], "09:03", f"下限应是 {SEGMENT_MIN_MINUTES} 分钟")
+        self.assertEqual(slot["end"], "09:30", f"下限应是 {SEGMENT_AWAKE_MIN_MINUTES} 分钟")
 
-    def test_a_short_segment_starts_now_not_on_the_grid(self):
-        """10:07 做的 5 分钟事，起点该是 10:07；对齐到 10:00 等于把已经过完的时间又排一遍。"""
-        slot = parse_segment({"event": "回条消息", "minutes": 5}, now_minute=10 * 60 + 7, step=15)
+    def test_sleep_segment_keeps_the_three_minute_floor(self):
+        slot = parse_segment({"event": "睡觉", "minutes": 1}, now_minute=9 * 60, step=15)
+        self.assertEqual(slot["end"], "09:03", f"睡段下限仍是 {SEGMENT_MIN_MINUTES} 分钟")
+
+    def test_a_segment_shorter_than_the_step_starts_now(self):
+        """比刻度还短的段（睡段）起点用此刻：对齐到 10:00 等于把已经过完的时间又排一遍。"""
+        slot = parse_segment({"event": "睡觉", "minutes": 5}, now_minute=10 * 60 + 7, step=15)
         self.assertEqual(slot["start"], "10:07")
 
     def test_a_long_segment_still_snaps_to_the_grid(self):
@@ -175,10 +188,12 @@ class PromptRulesTest(unittest.TestCase):
             is_night=False,
         )
 
-    def test_minutes_rule_says_three_minutes_is_a_segment(self):
+    def test_minutes_rule_says_awake_segments_start_at_thirty_minutes(self):
         text = self._prompt()
-        self.assertIn(f"{SEGMENT_MIN_MINUTES} 分钟也是一段", text)
+        self.assertIn(f"清醒时最短 {SEGMENT_AWAKE_MIN_MINUTES} 分钟", text)
         self.assertIn("上下限，不是目标值", text)
+        self.assertIn("说得出口的事", text, "要写「一段是一件事」，不是「把 X 放到 Y」")
+        self.assertIn("过渡动作", text)
 
     def test_dedupe_rule_is_in_the_prompt(self):
         text = self._prompt()

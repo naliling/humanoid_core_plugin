@@ -33,6 +33,9 @@ def _last_prompt(provider) -> str:
 
 
 def cfg(**kw) -> HumanoidConfig:
+    # 3.1.0 起默认间隔从 10 改成 4。本文件的用例测的是「攒够 10 条合起来看」这条批量
+    # 语义，所以统一把间隔钉回 10；默认值本身由 test_default_interval_is_four 单独盯。
+    kw.setdefault("mood_llm_interval_messages", 10)
     return HumanoidConfig.from_raw(kw)
 
 
@@ -55,9 +58,11 @@ class MoodBatchTest(unittest.IsolatedAsyncioTestCase):
         for i in range(n):
             await service.update_from_message("u1", f"{prefix}{i}", 80.0, 10)
 
-    async def test_default_interval_is_ten(self):
-        self.assertEqual(cfg().mood_llm_interval_messages, 10,
-                         "默认应该是 10 条触发一次")
+    async def test_default_interval_is_four(self):
+        # 3.1.0 起默认 4 条分析一次：10 条才送一次模型，配合 delta_cap=2 情绪一整天
+        # 只动一两次，等于没在跟着聊。这里读裸默认值，绕开上面 cfg() 的钉死。
+        self.assertEqual(HumanoidConfig.from_raw({}).mood_llm_interval_messages, 4,
+                         "默认应该是 4 条触发一次")
 
     async def test_fires_only_on_the_tenth_message(self):
         provider = FakeProvider("p", reply=DELTA)

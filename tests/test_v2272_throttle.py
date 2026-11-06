@@ -126,7 +126,8 @@ class ThrottleAndCap(unittest.TestCase):
             asyncio.run(svc.update_from_message_async("u1", pool[i % len(pool)]))
             clock.advance(3)
         aff = svc.profile("u1")["affection"]
-        self.assertLessEqual(aff, 35.0 + DAILY_NET_GAIN_CAP + 0.01,
+        # 封顶是「初始值 + 当日净增额度」；初始值 3.1.0 起从 35 抬到 55，别写死。
+        self.assertLessEqual(aff, float(HumanoidConfig().mood_initial_affection) + DAILY_NET_GAIN_CAP + 0.01,
                              f"刷屏 300 条超出日封顶：{aff}")
 
     def test_normal_chat_grows(self):
@@ -151,8 +152,9 @@ class ThrottleAndCap(unittest.TestCase):
 
 
 class InitialValueAndMigration(unittest.TestCase):
-    def test_default_is_35(self):
-        self.assertEqual(HumanoidConfig().mood_initial_affection, 35)
+    def test_default_is_55(self):
+        # 3.1.0 起 35 → 55：35 落在 ccb 门槛（50）之下，新用户几天都够不着。
+        self.assertEqual(HumanoidConfig().mood_initial_affection, 55)
 
     def test_old_default_migrates(self):
         # P2-10（v3.0.0 语义修正）：46 本身就是**合法的手动选择**，而 AstrBot 在插件

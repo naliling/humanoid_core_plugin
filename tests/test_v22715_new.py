@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from humanoid.emotion import EmotionLayer
 
@@ -71,24 +72,27 @@ class AnniversaryTest(unittest.TestCase):
 class ContractHoliday(unittest.TestCase):
     """契约要导出「今天是节日」：社交层靠它派节日由头/破冰素材。"""
 
-    def _contract(self, **conf):
+    # 冻结在 2026-06-10 12:00（Asia/Shanghai）：非公历节日、非农历节日、非节气。
+    # 旧写法用真实时钟，于是每年 24 个节气日与每个节日当天都会红——2026-11-07 立冬
+    # 当天就是这样红的（审核：测试用真实时钟 = 日历炸弹）。
+    FROZEN = datetime(2026, 6, 10, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    def _contract(self, holidays=None):
         import asyncio
 
         from humanoid.link import build_contract
-        from .test_link import Harness
+        from .test_link import Harness, freeze
 
-        harness = Harness({"timezone_city": "北京", **conf})
+        harness = Harness({"timezone_city": "北京"})
         core = harness.roles.get_or_create("bot1")
+        freeze(core, self.FROZEN)
+        core.clock.holidays = list(holidays or [])
         contract = build_contract(core)
         asyncio.run(harness.roles.stop())
         return contract
 
     def test_holiday_is_exported(self):
-        from zoneinfo import ZoneInfo
-
-        # 不能用 FrozenClock：它的 holiday() 恒为空。改用真实的钟 + 把节日设在「今天」。
-        today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%m-%d")
-        contract = self._contract(holidays=[{"date": today, "name": "测试节"}])
+        contract = self._contract(holidays=[{"date": "06-10", "name": "测试节"}])
         self.assertEqual(contract.get("holiday"), "测试节")
 
     def test_no_holiday_is_empty(self):

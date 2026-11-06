@@ -295,8 +295,16 @@ class FrozenClock:
     def weekday(self) -> str:
         return "一二三四五六日"[self.moment.weekday()]
 
-    def holiday(self) -> str:
-        return ""
+    def holiday(self, moment: datetime | None = None) -> str:
+        """与真实 Clock 对齐：替身钟也要认节日/节气。
+
+        旧写法恒返回空串，于是「今天没有节日」这类用例只能挂真实时钟——而真实时钟
+        在节气/节日当天（2026-11-07 立冬）必然判出节日，测试当天必红。替身钟没有
+        配置对象，节日表由用例自己塞 `clock.holidays`，没塞就是没有节日。
+        """
+        from humanoid.data.holidays import resolve_holiday
+
+        return str(resolve_holiday(moment or self.moment, getattr(self, "holidays", None) or None) or "")
 
     @property
     def display_city(self) -> str:

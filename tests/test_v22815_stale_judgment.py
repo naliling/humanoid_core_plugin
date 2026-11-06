@@ -84,10 +84,12 @@ class StaleJudgmentTest(unittest.IsolatedAsyncioTestCase):
         return service, store, holder, log
 
     def conf(self, **kw):
-        # 每 10 条消息触发一次模型（默认），sensitivity=100 让 delta 原样落地。
+        # 每 10 条消息触发一次模型（3.1.0 起默认是 4，这里显式钉回 10：本文件靠
+        # 「第 10 条才进模型」这个窗口做在飞状态，间隔一变窗口就没了），
+        # sensitivity=100 让 delta 原样落地。
         return cfg(
             mood_use_llm_for_delta=True, mood_provider_name="p",
-            mood_sensitivity=100, **kw,
+            mood_sensitivity=100, mood_llm_interval_messages=10, **kw,
         )
 
     async def _feed(self, service, n, prefix="消息"):

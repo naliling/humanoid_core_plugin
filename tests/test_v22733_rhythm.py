@@ -476,7 +476,10 @@ class SegmentParsingTest(unittest.TestCase):
             },
             now_minute=600,
         )
-        self.assertLessEqual(len(slot["event"]), 24)
+        # 存盘只做粗上限（60）：24 字是**渲染时**才削的。存的时候就削到 24，
+        # 后半句永久丢失，渲染侧再想按标点收尾也补不回来（线上真句：
+        # 「…蹄子夹着手机慢悠悠回了两」）。
+        self.assertLessEqual(len(slot["event"]), 60)
         self.assertLessEqual(len(slot["location"]), 16)
         self.assertLessEqual(len(slot["emotion"]), 12)
 

@@ -207,7 +207,9 @@ class Cooling(unittest.TestCase):
     """D：好感跌破门槛后，她带情绪冷着，并在一段时间里不主动找 TA。"""
 
     def test_enters_and_expires(self):
-        svc, clock = _svc(cooling_affection=50)  # 基线 35 < 50 → 一开口就进
+        # 3.1.0 起默认初始好感是 55，会把 50 这条线盖过去；这里显式把基线压回 35，
+        # 测的仍是「基线低于门槛 → 一开口就进冷静期」。
+        svc, clock = _svc(mood_initial_affection=35, cooling_affection=50)
         svc.profile("1")
         asyncio.run(svc.update_from_message_async("1", "在吗"))
         rec = svc.profile("1")

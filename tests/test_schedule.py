@@ -20,6 +20,7 @@ from humanoid.llm import LLMResult, OUTCOME_GATED
 from humanoid.services.schedule import (
     SOURCE_LLM,
     SOURCE_TEMPLATE,
+    SEGMENT_AWAKE_MIN_MINUTES,
     SEGMENT_MIN_MINUTES,
     ScheduleService,
     _segment_minutes,
@@ -47,7 +48,11 @@ FIXED_MOMENT = datetime(2026, 8, 22, 9, 0, tzinfo=TZ)
 
 def cfg(**overrides) -> HumanoidConfig:
     # chance 默认压到 0：概率重估单独测，不让它污染「不该生成」的断言
-    return HumanoidConfig.from_raw({"timezone_city": "北京", "schedule_change_chance": 0, **overrides})
+    # 质量闸在 3.1.0 起默认关（实测误判多于拦下的真编造）；本文件的用例大多是在测
+    # 「生成 + 审查」这条链路本身，所以显式打开，别让默认值变化把被测对象改掉。
+    return HumanoidConfig.from_raw(
+        {"timezone_city": "北京", "schedule_change_chance": 0,
+         "schedule_quality_gate": True, **overrides})
 
 
 def today() -> str:
@@ -281,7 +286,15 @@ class SegmentParseTest(unittest.TestCase):
         self.assertEqual(parse_time(slot["end"]), 12 * 60 + 720)
 
     def test_min_duration_floor(self):
+        """清醒段的下限是 30 分钟（#311）：3 分钟的「倒杯水」不再单独成一段。"""
         slot = parse_segment({"event": "倒杯水", "minutes": 3}, now_minute=600, step=15)
+        self.assertEqual(
+            parse_time(slot["end"]) - parse_time(slot["start"]), SEGMENT_AWAKE_MIN_MINUTES
+        )
+
+    def test_sleep_keeps_the_three_minute_floor(self):
+        """睡段不受清醒下限影响：一小觉仍然可以是 3 分钟。"""
+        slot = parse_segment({"event": "睡觉", "minutes": 1}, now_minute=600, step=15)
         self.assertEqual(
             parse_time(slot["end"]) - parse_time(slot["start"]), SEGMENT_MIN_MINUTES
         )
@@ -544,9 +557,9 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
     async def test_expired_segment_regenerates(self):
         provider = FakeProvider("p", reply=seg_reply(minutes=25))
         service, _, _ = self.build(cfg(schedule_provider_name="p"), [provider])
-        await service.ensure_fresh()  # 09:00-09:25
+        await service.ensure_fresh()  # 09:00-09:30（25 分钟被抬到清醒下限 30）
         self.assertFalse(service.refresh_due())
-        service._clock.advance(minutes=26)  # 09:26 已过完
+        service._clock.advance(minutes=31)  # 09:31 已过完
         self.assertTrue(service.refresh_due())
         provider.reply = seg_reply(event="回消息", minutes=40)
         self.assertTrue(await service.ensure_fresh())
@@ -565,20 +578,20 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(segs[1]["start"], "15:00")
 
     async def test_short_gap_is_not_backfilled(self):
-        """短空档也不许拿旧事件去填：填了就是编造时长（5 分钟的倒杯水变成半小时）。
+        """短空档也不许拿旧事件去填：填了就是编造时长。
 
-        这是「她在沙发上喝东西喝了 30 分钟」的根因：决策被节流间隔卡住，5 分钟的段
-        结束后 25 分钟没人接手，旧实现把上一段的 end 顺延到新段起点。
+        这是「她在沙发上喝东西喝了 30 分钟」的根因：决策被节流间隔卡住，一段做完
+        之后 30 分钟没人接手，旧实现把上一段的 end 顺延到新段起点。
         """
         provider = FakeProvider("p", reply=seg_reply(event="倒杯水", minutes=5))
         service, _, _ = self.build(cfg(schedule_provider_name="p"), [provider])
-        await service.ensure_fresh()  # 09:00-09:05
-        service._clock.advance(minutes=30)  # 09:30，隔了 25 分钟
+        await service.ensure_fresh()  # 09:00-09:30（清醒下限 30）
+        service._clock.advance(minutes=60)  # 10:00，隔了 30 分钟
         provider.reply = seg_reply(event="回消息", minutes=30)
         self.assertTrue(await service.ensure_fresh())
         segs = service.segments()
-        self.assertEqual(segs[0]["end"], "09:05", "倒杯水就是 5 分钟，不许被拉长")
-        self.assertEqual(segs[1]["start"], "09:30")
+        self.assertEqual(segs[0]["end"], "09:30", "旧段就是 30 分钟，不许被顺延拉长")
+        self.assertEqual(segs[1]["start"], "10:00")
         self.assertEqual(len(segs), 2, "空档不补段，也不改旧段")
 
     async def test_sleep_segment_is_never_rerolled(self):

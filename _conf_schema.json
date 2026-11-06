@@ -16,9 +16,9 @@
   },
   "schedule_quality_gate": {
     "description": "生成后质量闸",
-    "hint": "开：每段日程装进来之前判一次——今天已经排过的事不再排、人设里没有的身份/家人/宠物/约定不许凭空出现；判中了先重写一次，仍不合格就换成中性处境词。关：模型给什么就用什么",
+    "hint": "开：每段日程装进来之前判一次——今天已经排过的事不再排、人设里没有的身份/家人/宠物/约定不许凭空出现；判中了先重写一次，仍不合格就换成中性处境词。关：模型给什么就用什么。默认关：这道闸是模型二次自审，实测误判成「编造」而把整天日程降级成模板的情况比拦下的真编造多",
     "type": "bool",
-    "default": true,
+    "default": false,
     "condition": {
       "use_llm_schedule": true
     }
@@ -633,9 +633,9 @@
   },
   "mood_initial_affection": {
     "description": "【进阶】初始好感",
-    "hint": "新用户的好感初始值（35 是中性起点，关系靠相处慢慢长）",
+    "hint": "新用户的好感初始值（55 是中性起点：比 ccb 门槛 50 高 5 分，处几天就能够到，又不会一上来就满；关系仍靠相处慢慢长）",
     "type": "int",
-    "default": 35,
+    "default": 55,
     "minimum": 0,
     "maximum": 100,
     "slider": {
@@ -940,9 +940,9 @@
   },
   "mood_llm_interval_messages": {
     "description": "【进阶】多少条消息触发一次模型情绪分析",
-    "hint": "攒够几条消息触发一次情绪分析",
+    "hint": "攒够几条消息触发一次情绪分析（4 条一次，一段对话里她的情绪才跟得上；调大更省 token，但会觉得她没反应）",
     "type": "int",
-    "default": 10,
+    "default": 4,
     "minimum": 1,
     "maximum": 100,
     "slider": {
@@ -1346,6 +1346,22 @@
       "min": 3,
       "max": 14,
       "step": 0.1
+    },
+    "condition": {
+      "soma_enabled": true
+    }
+  },
+  "max_sleep_hours": {
+    "description": "【进阶】一觉最长睡多久",
+    "hint": "小时，0 = 自动（睡眠需求 + 3 小时，至少 10）。睡过这个数强制结算成醒着，防止日程断档后她一直「在睡」。小于 4 按 4 小时算：太短等于每隔一会儿就把她叫醒。",
+    "type": "float",
+    "default": 0,
+    "minimum": 0,
+    "maximum": 24,
+    "slider": {
+      "min": 0,
+      "max": 24,
+      "step": 1
     },
     "condition": {
       "soma_enabled": true

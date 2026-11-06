@@ -719,7 +719,8 @@ class MoodPeekProfileTest(unittest.TestCase):
         store.scope.set_mark_dirty(lambda: calls.append(1))
         snapshot = service.peek_profile("u1")
         self.assertIsInstance(snapshot, dict)
-        self.assertEqual(snapshot["affection"], 35.0, "快照应带上修复后的数值")
+        # 坏值修复回落到默认初始好感；3.1.0 起这个默认值从 35 抬到 55。
+        self.assertEqual(snapshot["affection"], 55.0, "快照应带上修复后的数值")
         self.assertEqual(store.user("u1")["mood"]["affection"], "坏值", "只读快照改了真实档案")
         self.assertEqual(calls, [], "只读快照 mark_dirty 了")
         # 对照：写路径 profile() 才会回写 + mark_dirty

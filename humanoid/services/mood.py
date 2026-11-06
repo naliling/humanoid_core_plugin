@@ -152,6 +152,14 @@ AGGRESSION_RANGE = (0.0, 50.0)
 # 账本在 mood record 里的键。存的是「发生过的事」，不是累加结果。
 LEDGER_KEY = "ledger"
 
+# 面板里钉死的好感（mood_affection_override）在档案里的落点。
+#
+# 为什么要有这个键（3.1.0）：override 原来只在「新建档案」时读一次，老用户永远
+# 读不到；而好感有三条按「base_affection + 账本净值」重算的路径（_commit /
+# note_ignored_by_peer / _decay_record），光改入口的话下一句话就顶回去了。
+# 钉死值必须跟着档案走，每条重算路径后面都能读到它（见 _pin_affection）。
+PIN_KEY = "affection_pin"
+
 # ── 异步情绪判定的世代号（v2.28.15）──
 #
 # `update_from_message_async` 里「取批 → 锁外等模型 → 结算」中间要等一次网络调用
@@ -780,7 +788,12 @@ class MoodService:
         user_state = self._scope.user_state(user_id)
         record = user_state.get("mood")
         if isinstance(record, dict):
-            return self._repair(record, user_state)
+            # 为什么改（3.1.0）：原来这里直接返回，而 override 只在下面「新建档案」
+            # 那段读——面板里钉死的好感对**已经有档案的老用户**永远不生效（实测报告
+            # P0-3：钉死 100 的人聊两句就掉到 42）。先修档案，再把钉子压回去。
+            record = self._repair(record, user_state)
+            self._pin_affection(user_id, record, user_state)
+            return record
 
         cfg = self.config
         affection = float(cfg.mood_initial_affection)
@@ -793,8 +806,10 @@ class MoodService:
         # 就变回面板初始值——用户看到的是「好感度永远不会涨」。清理的初衷是别让
         # state.json 攒着一堆陈年对话细节，不是把关系一起清零：这里只接回那一个数字
         # （长期下限），账本、记忆、标签照旧全部丢掉。
+        # 钉死优先于「清理时接回来的基线」：配置说了算，不能因为以前聊得高就顶回一个
+        # 更大的数（钉死是钉死，不是下限）。
         kept = self._kept_base_of(user_state)
-        if kept is not None and kept > affection:
+        if kept is not None and kept > affection and override is None:
             affection = kept
         # 「处过多少轮」也要接回来（审核 #45）：关系阶段取
         # max(turn_count, turn_count_peak)，峰值跟着档案一起被删掉的话，重建出来的
@@ -819,9 +834,51 @@ class MoodService:
             # 新建档案的 base 就是面板初始值，不用再等 _repair 重锚一次。
             "base_sync_v": BASE_SYNC_VERSION,
         }
+        if override is not None:
+            # 新建档案也要带钉子，否则第一次聊天就被 _commit 按「基线 + 账本」重算掉。
+            record[PIN_KEY] = override
         user_state["mood"] = record
         self._scope.mark_dirty()
         return record
+
+    def _pin_affection(
+        self, user_id: str, record: dict, user_state: dict, *, persist: bool = True
+    ) -> bool:
+        """把面板里钉死的好感压回档案，返回是否改动。
+
+        为什么改（3.1.0）：mood_affection_override 的 hint 承诺「钉死后不随聊天
+        变化」，可它原来只在 profile() 的新建档案分支读一次，而好感有三条重算路径
+        （_commit、note_ignored_by_peer、_decay_record 都按「base_affection + 账本
+        净值」重算）——只改入口的话，下一句话就把钉死值顶回去（实测报告 P0-3）。
+
+        base_affection 一起钉：它是那三条重算的起点，不钉的话每句话都从旧基线出发，
+        钉子只压得住显示值、压不住下一次。账本**不清**：记忆、冷静期、「最近发生过
+        什么」都还在读它；好感既然按钉子取值，账本净值就不再参与这个用户的显示值。
+
+        persist=False 给「调用方随后自己会写盘」的路径（_commit 末尾就写）。
+        """
+        override = self.config.affection_override_for(user_id)
+        if override is None:
+            if PIN_KEY in record:
+                # 面板里撤掉了这条：把钉子摘掉，好感从此回到「基线 + 账本」。
+                record.pop(PIN_KEY, None)
+                if persist:
+                    user_state["mood"] = record
+                    self._scope.mark_dirty()
+                return True
+            return False
+        changed = False
+        if record.get(PIN_KEY) != override:
+            record[PIN_KEY] = override
+            changed = True
+        for key in ("affection", "base_affection"):
+            if abs(_num_or(record.get(key), AFFECTION_RANGE[0]) - override) > 1e-4:
+                record[key] = override
+                changed = True
+        if changed and persist:
+            user_state["mood"] = record
+            self._scope.mark_dirty()
+        return changed
 
     @staticmethod
     def _kept_base_of(user_state: dict) -> Optional[float]:
@@ -955,7 +1012,13 @@ class MoodService:
         # 只读：没档案就用配置里的初始值算，不因为查一个标签就建条目。
         record = self._scope.peek_user(user_id, "mood")
         if isinstance(record, dict):
-            return get_mood_label(*self._axes(record))
+            affection, libido, aggression = self._axes(record)
+            # 为什么改（3.1.0）：钉死的用户标签要按钉死值算——档案里可能还是上一条
+            # 消息的旧值（面板刚改过、还没聊过天），读一眼就自相矛盾。
+            override = self.config.affection_override_for(user_id)
+            if override is not None:
+                affection = override
+            return get_mood_label(affection, libido, aggression)
         cfg = self.config
         affection = float(cfg.mood_initial_affection)
         override = cfg.affection_override_for(user_id)
@@ -990,6 +1053,10 @@ class MoodService:
         record = self._scope.peek_user(user_id, "mood")
         if not isinstance(record, dict):
             # 没档案 → 用初始值那一档，别为了读一个标签建条目（滞回锚点也不写）。
+            return self.label(user_id)
+        # 为什么改（3.1.0）：钉死的好感不会漂，滞回在这里只会拿旧锚点顶住新配置
+        # （面板把 100 改成 60，标签还停在「信赖」），所以钉死的用户直接按钉子算。
+        if self.config.affection_override_for(user_id) is not None:
             return self.label(user_id)
         affection, libido, aggression = self._axes(record)
         anchor = record.get("label_anchor")
@@ -1348,6 +1415,9 @@ class MoodService:
         record = self._decayable(user_state)
         if record is None:
             return False
+        # 为什么改（3.1.0）：面板里刚加/刚撤的钉子要在衰减之前生效——decay_user 是
+        # on_message 里最早碰 mood 的一步，晚于它 profile() 才跑。
+        self._pin_affection(user_id, record, user_state)
         return self._decay_record(record, user_state, cfg, self._time())
 
     def decay_all(self) -> int:
@@ -1359,6 +1429,9 @@ class MoodService:
         for uid in self._scope.all_user_ids():
             user_state = self._scope.user_state(uid)
             record = self._decayable(user_state)
+            if record is not None:
+                # 同上：批量衰减也要先让面板里的钉子生效。
+                self._pin_affection(uid, record, user_state)
             if record is not None and self._decay_record(record, user_state, cfg, now):
                 changed += 1
         return changed
@@ -1581,6 +1654,18 @@ class MoodService:
         base_aff = float(record.get("base_affection", aff_bounds[0]))
         net = self._ledger_total(record, now)
         target = max(aff_bounds[0], min(aff_bounds[1], base_aff + net))
+        # 为什么改（3.1.0）：钉死的好感不参与衰减重算。这里拿不到 user_id（签名被
+        # tests/test_v2236_mood_batch.py 用 4 个位置参钉死），所以读档案里落好的钉子；
+        # 基线也一起压平，否则 _ratchet_base 会拿「base 低于钉子」当成关系还有空间，
+        # 一天两次慢慢把下限抬上去，撤掉钉子后好感再也降不下来。
+        pin = record.get(PIN_KEY)
+        pinned = _finite(pin)
+        if pinned:
+            target = max(aff_bounds[0], min(aff_bounds[1], float(pin)))
+            base_aff = target
+            if abs(_num_or(record.get("base_affection"), target) - target) > 1e-4:
+                record["base_affection"] = target
+                changed = True
         current_aff = float(record.get("affection", aff_bounds[0]))
         if abs(target - current_aff) > 1e-4:
             record["affection"] = target
@@ -2648,6 +2733,8 @@ class MoodService:
         _k, _bk, bounds = DIMENSIONS[0]
         base = float(record.get("base_affection", 50.0))
         record["affection"] = max(bounds[0], min(bounds[1], base + net))
+        # 为什么改（3.1.0）：被冷落也要走账本重算，钉死的好感同样不能被它推动。
+        self._pin_affection(user_id, record, user_state, persist=False)
         self._maybe_enter_cooling(user_id, record, self._time(), Delta(weight, 0.0, 0.0))
         user_state["mood"] = record
         self._scope.mark_dirty()
@@ -2682,6 +2769,10 @@ class MoodService:
         record["affection"] = max(
             aff_bounds[0], min(aff_bounds[1], float(record["base_affection"]) + net)
         )
+        # 为什么改（3.1.0）：钉死的用户在上面被重算了一次，这里必须压回钉子——
+        # 否则一句「谢谢」就把面板里写死的好感改了（实测报告 P0-3）。落盘交给下面的
+        # user_state 写入，所以 persist=False。
+        self._pin_affection(user_id, record, user_state, persist=False)
         self._maybe_enter_cooling(user_id, record, now, delta)
         # E4：关系里程碑——阶段往上跨了一档就记一笔（情绪层给一句淡淡的，不报出来）。
         # 阶段走 state_snapshot 的唯一一份（好感 + 相处）：只按好感算的话，
@@ -3122,6 +3213,13 @@ class MoodService:
                 "base_aggression": float(cfg.mood_initial_aggression),
                 "turn_count": 0,
             }
+        else:
+            # 为什么改（3.1.0）：钉死的用户，/好感度 显示的必须是钉死值——档案里
+            # 那个数字要等下一次聊天才会被 _pin_affection 压回来，中间这段时间
+            # 面板写 100、这里显示 42，用户只会以为钉死没生效。
+            override = self.config.affection_override_for(user_id)
+            if override is not None:
+                data = {**data, "affection": override, "base_affection": override}
         title = "〖情绪详细档案〗" if detailed else "〖情绪档案〗"
         lines = [title]
         if detailed:

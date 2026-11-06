@@ -75,6 +75,19 @@ MIN_PERSIST_INTERVAL_SECONDS = 300.0
 # 写成最后那一小段（实测 0.17 小时），prompt 里于是出现「昨晚睡了 0.17 小时」。
 # 阈值取 0.5 与 `prompt_builder` 的「睡了 >= 0.5 小时才算睡了一觉」同一口径。
 SLEEP_FRAGMENT_MIN_HOURS = 0.5
+# 一觉硬上限的下限（小时）：短于 4 小时的「一觉」不是一觉。配置项允许填 0（=自动），
+# 也允许填小数，但 0.5 这种值只会让她每 30 分钟被强制唤醒一次（审核 A-5）。
+MIN_SLEEP_CAP_HOURS = 4.0
+# 强制唤醒之后至少维持多久的「醒着」（分钟）。v3.1.0 的修复只顶一个 10 分钟积分步：
+# _record_wake 清掉 asleep_since 后，同一轮或下一步日程又判睡，立刻被置回去，
+# 对外仍然「在睡」（审核 A-2）。这里给一段豁免，日程再怎么说睡也不认。
+FORCED_WAKE_HOLD_MINUTES = 90.0
+# 豁免最长撑到多久（分钟）。当前这一段日程本来就写着睡时，豁免撑到这一段结束，
+# 免得 24 小时睡眠模板在 90 分钟后又把她判回去；但坏日程不能把「醒着」也锁死。
+FORCED_WAKE_HOLD_MAX_MINUTES = 720.0
+# 日程断档（unknown）里最多再认多久的「睡着」（分钟）。断档没有证据说她还在睡，
+# 超过这个时长就按醒着报——否则空窗能一路假睡到硬上限，傍晚到午夜 social 闸门全挡。
+UNKNOWN_SLEEP_GRACE_MINUTES = 30.0
 
 # 睡眠惯性：醒来之后「人还没缓过来」的那一小段时间。
 # 自然醒 10 分钟；睡不够（不足需要时长的 85%）25 分钟；被消息吵醒 +15 分钟；
@@ -359,6 +372,26 @@ class SomaService:
         cfg = self.config
         hours = minutes / 60.0
         state = self.sleep_state(moment)
+        # ── 睡眠自锁保险（v3.1.0）──────────────────────────────────
+        # 日程空窗走 unknown 分支，而 unknown 既不记睡也不记醒，`asleep_since`
+        # 就没人清：模板只剩一段睡时，出了那段她永远「在睡」。睡过硬上限
+        # （默认 max(10, 需求+3) 小时）强制结算成醒着，并按醒着积分这一段。
+        forced = False
+        if state != "awake" and self._sleep_overstay(moment):
+            self._force_wake(moment, state)
+            state = "awake"
+            forced = True
+        elif state == "asleep" and self._forced_awake_hold(moment):
+            # 刚被强制唤醒过：这一段日程还写着睡也不认。否则下一个 10 分钟积分步就把
+            # asleep_since 又置回去，强制唤醒等于只顶了一步（审核 A-2）。
+            state = "awake"
+            forced = True
+        if state == "awake" and not forced:
+            # 日程明确说她醒着：强制唤醒的豁免到此结束，不能让它盖住下一觉。
+            self.data["forced_awake_until"] = None
+        # 缓存这一刻的日程态：snapshot() 不能回调日程 provider（会递归），
+        # 对外报睡眠态时用它 + asleep_since 的年龄，和 _integrate 的判断保持一个口径。
+        self.data["sleep_state"] = state
         asleep = state == "asleep"
         hour_of_day = moment.hour + moment.minute / 60.0
 
@@ -551,6 +584,153 @@ class SomaService:
         self._scope.mark_dirty()
         return True
 
+    def _max_sleep_hours(self) -> float:
+        """一觉的硬上限（小时）。配置 0 / 坏值 → max(10, sleep_need_hours + 3)。"""
+        cfg = self.config
+        try:
+            raw = float(getattr(cfg, "max_sleep_hours", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            raw = 0.0
+        if not math.isfinite(raw) or raw <= 0:
+            try:
+                need = float(getattr(cfg, "sleep_need_hours", 8.0) or 8.0)
+            except (TypeError, ValueError):
+                need = 8.0
+            if not math.isfinite(need):
+                need = 8.0
+            raw = max(10.0, need + 3.0)
+        return max(MIN_SLEEP_CAP_HOURS, raw)
+
+    def _asleep_since_ts(self) -> float | None:
+        """`asleep_since` 的秒级时间戳；没睡或坏值都返回 None。
+
+        调用方要区分这两种情况：`data.get("asleep_since") is not None` 才是「有记录」。
+        坏值（用户手改过 state.json、旧版本写进字符串）**不能**当成「没睡」——那会让
+        硬上限永久失效，asleep_since 卡着不清（审核 A-3）。
+        """
+        raw = self.data.get("asleep_since")
+        if raw is None:
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value <= 0:
+            return None
+        return value
+
+    def _sleep_overstay(self, moment: datetime) -> bool:
+        """这一觉是不是睡过了硬上限——即 `asleep_since` 卡住没人清。
+
+        自锁的成因：`asleep_since` 只在日程判为「醒着」时由 `_record_wake` 清掉，
+        而日程断档（空窗）走的是 `unknown` 分支——不记睡也不记醒。模板一旦只剩
+        一段睡眠，出了这段就永远 unknown，`asleep_since` 于是一动不动。
+        """
+        if self.data.get("asleep_since") is None:
+            return False
+        since = self._asleep_since_ts()
+        if since is None:
+            # 坏值按「已经超时」处理：宁可多醒一次，也不能让上限永久失效。
+            return True
+        return (moment.timestamp() - since) / 3600.0 > self._max_sleep_hours()
+
+    def _forced_awake_hold(self, moment: datetime) -> bool:
+        """强制唤醒的豁免期还没过。
+
+        纯时间比较：`snapshot()` 里也会调它，而日程 provider 可能反过来读 snapshot，
+        所以这里绝对不能回调 `sleep_state()` / `slot_at()`（递归）。
+        """
+        try:
+            until = float(self.data.get("forced_awake_until") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(until) or until <= 0:
+            return False
+        return moment.timestamp() < until
+
+    def _current_slot_remaining_minutes(self, moment: datetime) -> float | None:
+        """当前日程段还剩多少分钟；空窗（没有段）返回 None。"""
+        current = self.slot_at(moment)
+        if not current:
+            return None
+        minutes = moment.hour * 60 + moment.minute
+        left: float | None = None
+        for lo, hi in iter_segments(current):
+            if lo <= minutes < hi:
+                remain = float(hi - minutes)
+                left = remain if left is None else min(left, remain)
+        return left
+
+    def _force_wake(self, moment: datetime, state: str = "") -> None:
+        """睡过硬上限：结算成醒着，并给一段不会再被日程立刻判睡的豁免。
+
+        与 `_record_wake` 的区别（审核 A-2）：这**不是**一觉睡完了。`last_sleep_hours`
+        和 `sleep_hours_today` 一个都不写——否则一次卡住的 18 小时会被记成「昨晚睡了
+        18.2 小时」，`sleep_hours_today` 还会被清零。
+        """
+        now_ts = moment.timestamp()
+        since = self._asleep_since_ts()
+        cap = self._max_sleep_hours()
+        overstayed = cap if since is None else (now_ts - since) / 3600.0
+        logger.warning(
+            "睡眠超时强制唤醒：asleep_since 已 %.1f 小时（上限 %.1f），日程态=%s",
+            overstayed,
+            cap,
+            state or "unknown",
+        )
+        self.data["asleep_since"] = None
+        self.data["last_wake_at"] = _rounded(now_ts)
+        self.data["wake_at"] = _rounded(now_ts)
+        self.data["sitting_since"] = _rounded(now_ts)
+        # 豁免时长：至少一个醒着的窗口；当前这一段日程本来就写着睡时，撑到这一段结束
+        # （上限 12 小时），否则 24 小时睡眠模板会在 90 分钟后再把她判回去。
+        hold = FORCED_WAKE_HOLD_MINUTES
+        remaining = self._current_slot_remaining_minutes(moment)
+        if remaining is not None:
+            hold = max(hold, min(float(remaining), FORCED_WAKE_HOLD_MAX_MINUTES))
+        self.data["forced_awake_until"] = _rounded(now_ts + hold * 60.0)
+        self._scope.mark_dirty()
+
+    def _asleep_public(self, moment: datetime) -> bool:
+        """对外报的睡眠态（只读、不回调日程 provider）。
+
+        只看：有没有 asleep_since、豁免期过没过、硬上限过没过，以及最近一次积分缓存
+        下来的日程态。日程明确写着醒着 → 不算睡；断档（unknown）里超过宽限期 →
+        不算睡（审核 A-4：断档最长假睡到硬上限，实测 06:00–13:30 睡段之后到次日
+        00:30 才解除，social 闸门整晚挡）。
+        """
+        if not self.data.get("asleep_since"):
+            return False
+        if self._forced_awake_hold(moment):
+            return False
+        if self._sleep_overstay(moment):
+            return False
+        state = str(self.data.get("sleep_state") or "")
+        if state == "awake":
+            return False
+        if state == "unknown":
+            # 只对「刚积分过、日程明确断档」的状态做宽限。没有缓存态（老状态文件、
+            # 测试直接塞 asleep_since）时不做判断，退回旧口径——快照不能被一次
+            # 没跑过的积分拖成「醒着」。
+            since = self._asleep_since_ts()
+            if since is None:
+                return False
+            return (moment.timestamp() - since) <= UNKNOWN_SLEEP_GRACE_MINUTES * 60.0
+        return True
+
+    def sleeping_now(self, moment: datetime | None = None) -> bool:
+        """此刻对外报的睡眠态：**日程与硬上限都认**才算睡着。
+
+        只读 `asleep_since` 会在日程断档后永久报「她在睡」：注入说她睡着、social
+        闸门每轮把她挡掉（实测线上连续 25 小时）。日程明确写着这一段醒着、已经
+        睡过硬上限、或刚被强制唤醒还在豁免期里，一律按醒着报。
+        """
+        if not self.data.get("asleep_since"):
+            return False
+        if moment is None:
+            moment = self._moment_at(self.now)
+        return self._asleep_public(moment)
+
     def wake_state(self) -> dict[str, Any]:
         """醒来状态（只读）：给注入与契约用，**不改 `snapshot()` 的结构**。
 
@@ -567,7 +747,9 @@ class SomaService:
                 return default
             return value if math.isfinite(value) else default
 
-        asleep = bool(data.get("asleep_since"))
+        # 不能只看 `asleep_since`：日程断档后它永远不清，报出来的就是「一直在睡」。
+        # 走 sleeping_now（日程 + 硬上限交叉校验）。
+        asleep = self.sleeping_now(self._moment_at(self.now))
         # 旧状态只有 last_wake_at；新状态两个都写，读哪个都对。
         wake_at = _num("wake_at") or _num("last_wake_at")
         inertia_until = _num("wake_inertia_until")
@@ -855,7 +1037,10 @@ class SomaService:
             "chill": _rounded(self._get("chill", 0.0)),
             "arousal": _rounded(self._get("arousal", 50.0)),
             "social_desire": _rounded(self._get("social_desire", 0.0)),
-            "asleep": 1.0 if data.get("asleep_since") else 0.0,
+            # 睡过硬上限就不算睡：日程断档时 asleep_since 没人清，快照会一直报 1.0。
+            # 这里走 _asleep_public（纯读缓存，不回调日程 provider——provider 可能反过来
+            # 读 snapshot，在快照里调 sleep_state 会递归）。
+            "asleep": 1.0 if self._asleep_public(self._moment_at(self.now)) else 0.0,
             "last_sleep_hours": _rounded(self._get("last_sleep_hours", 0.0)),
         }
 

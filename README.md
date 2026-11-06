@@ -8,7 +8,7 @@
 > 不是一句人设，是一整天的生活。
 > 插件负责她的身体、日程、情绪和关系背景；怎么说话，仍然由大模型按人设自己决定。
 
-![version](https://img.shields.io/badge/version-v3.0.11-2563eb?style=flat-square)
+![version](https://img.shields.io/badge/version-v3.1.3-2563eb?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -162,18 +162,18 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 
 ### 关键配置项
 
-面板上共 137 项（多数带【进阶】标记），这里列真正需要动的：
+面板上共 138 项（多数带【进阶】标记），这里列真正需要动的：
 
 | 项 | 默认 | 什么时候调 |
 | --- | --- | --- |
 | `timezone_city` | 河源（记得改~） | **必改**。决定她的钟点、作息、天气、季节 |
 | `她所在的角色人设` | AstrBot 那边设 | 日程按它排；写她的语气、身份、说话习惯 |
 | `use_llm_schedule` | 开 | 关掉则日程改用本地模板（更省额度，情节也更死板） |
-| `schedule_quality_gate` | 开 | 生成后质量闸：今天排过的别再排、人设里没有的身份/家人/宠物不许凭空出现；判中了先重写一次，仍不合格就换成中性处境词 |
+| `schedule_quality_gate` | 关 | 生成后质量闸：今天排过的别再排、人设里没有的身份/家人/宠物不许凭空出现；判中了先重写一次，仍不合格就换成中性处境词。默认关：它是模型二次自审，实测误判会把整天日程降级成模板 |
 | `llm_daily_call_budget` | 200 | 每日模型调用**次数**上限（不是 token），多 bot 共享一份 |
 | `llm_idle_silence_minutes` | 60 | 连续这么久没人说话就停掉后台调用，有人一说话立刻恢复 |
 | `mood_use_llm_for_delta` | 开 | 关掉则情绪**完全本地**判断，零额外调用 |
-| `mood_llm_interval_messages` | 10 | 每人每几条消息用模型分析一次情绪（**按人算**） |
+| `mood_llm_interval_messages` | 4 | 每人每几条消息用模型分析一次情绪（**按人算**） |
 | `mood_data_retention_days` | 7 | 超过这么多天没说话，情绪档案清回初始值（称呼保留） |
 | `mood_negative_streak_required` | 2 | 连着几句难听话才扣好感；1=每句都扣 |
 | `mood_negative_softening` | 开 | 底部减速 + 情绪韧性（好感越低扣得越少、关系越深越抗打击） |
@@ -190,6 +190,7 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 | `schedule_pause_ttl_minutes` | 180 | 被打断的事保留多久（期间她可以自己回去接着做） |
 | `weather_api_key` | 空 | OpenWeather 密钥（免费档就够） |
 | `soma_enabled` | 开 | 关掉则身体轴只保留精力一个数（不影响跨插件契约里的非身体内容） |
+| `max_sleep_hours` | 0 | 一觉的硬上限，睡过就强制结算成醒着。0 = 自动（睡眠需求 + 3 小时，至少 10）；小于 4 按 4 算。日程断档后她一直「在睡」时靠它兜底 |
 | `contract_enabled` | 开 | 跨插件契约总开关；关掉后不再向「自主拟人社交」导出她的状态 |
 | `input_state_enabled` | 开 | 私聊回复时显示「正在输入」（仅 NapCat） |
 

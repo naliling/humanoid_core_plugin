@@ -72,8 +72,20 @@ SLEEP_EVENT = "睡眠"
 # 于是「在沙发上喝东西」必然是 30 分钟一段。下限改 3：洗把脸、倒杯水、回条消息
 # 本来就是几分钟的事；短段不再对齐刻度（见 `_step_for`）。
 SEGMENT_MIN_MINUTES = 3
+# 清醒段的硬下限（#311）。3 分钟那个下限是给**睡段和兜底模板**的：睡一觉、
+# 一句「歇着」可以很短。但 LLM 排的清醒段下限压到 3 分钟以后，实测（3632823490
+# 22 段 / 中位 17 分钟、3951331639 25 段 / 18 分钟、3887128092 29 段 / 18 分钟）
+# 它就把一天切成几十个「把手机扣在沙发上，去厨房倒了小半杯草莓酒」这样的过渡动作——
+# 一段里没有一件说得出口的事，社交层拿去当由头只能压成 4~8 字碎片。
+# 清醒段抬到 30 分钟：一件事有头有尾至少得占这么久，零碎动作并进前后那件事里。
+SEGMENT_AWAKE_MIN_MINUTES = 30
 SEGMENT_MAX_MINUTES = 180
 SEGMENT_SLEEP_MAX_MINUTES = 720
+# 相邻两段睡之间允许的「缝隙」（分钟）：模型排的日程常有 1 分钟重叠或空档
+# （实测 00:00–05:46 接 05:45–18:00）。严格 `hi == cursor` 会让
+# `sleeping_minutes()` 在第一个接缝就 break，只数当前段 → 永远到不了「睡够了」
+# 的阈值 → 兜底模板一段接一段地排睡，她能睡一整天。
+SLEEP_CONTIGUITY_TOLERANCE_MINUTES = 3
 SEGMENT_DEFAULT_MINUTES = 60
 # 睡段的 end 写在过去、又不像「明天那个点」时，按一小觉接上（见 _segment_minutes）。
 SEGMENT_SLEEP_FALLBACK_MINUTES = 90
@@ -345,15 +357,36 @@ def period_of(minutes: int) -> str:
     return "白天"
 
 
+# 事件名开头可能自带时间词（「傍晚仰躺沙发…」），外面还会再套一个时段词，
+# 不剥掉就拼出「傍晚在傍晚仰躺沙发…」。清早/白天是模型常用、_PERIODS 里没有的。
+_PERIOD_WORDS: tuple[str, ...] = tuple(name for _, _, name in _PERIODS) + ("清早", "白天")
+# 事件名开头自带的时刻（「01:10–01:30 用蹄子端着热好的牛奶窝在…」），正文里不该出现。
+_TIME_RANGE_RE = re.compile(
+    r"^\s*\d{1,2}[:：]\d{2}\s*(?:[–—\-~～至到]\s*\d{1,2}[:：]\d{2})?\s*"
+)
+
+
 # 日程事件名是模型写的自由文本，有的自带动词与介词（"坐在客厅沙发上看书"）。外面再套
 # 一个「在」就成「现在在坐在客厅沙发上看书」——模型会照着这句病句往下说。
 # 拼接前先看一眼开头：动词/介词开头的直接接，其它才补「在」。
-_ACTION_HEADS = frozenset("在坐躺站靠趴蹲爬走跑跳吃喝做玩看读写听说聊打开学忙醒起洗梳穿等逛买煮烤拖练画唱骑划")
+_ACTION_HEADS = frozenset("在从坐躺站靠趴蹲爬走跑跳吃喝做玩看读写听说聊打开学忙醒起洗梳穿等逛买煮烤拖练画唱骑划")
 
 _EVENT_PHRASE_MAX = 24
 # 事件名一律削到 24 字（对外契约不变），但**怎么削**有讲究：原来解析时是 `raw_event[:24]`
 # 硬切，切在词中间（“在厨房做红烧肉和清炒时”），后面按标点收尾也补不回来——那个字已经
 # 不在数据里了。现在存和渲染都走 `_clip_event`：先按标点断句，整句没标点才硬截（#156）。
+#
+# 但存盘这一步不能削到 24：削了就永久丢了后半句，渲染时再想按标点收也补不回来。
+# 存盘只做个粗上限（防止模型一次写几百字），真正的 24 字在渲染时削。
+_EVENT_STORE_MAX = 60
+
+# 硬截之后容易挂在末尾的虚词，以及「窝在」「靠在」这类姿态动词。
+# 线上真句：「凌晨在用蹄子端着热好的牛奶窝在」——就是硬截留下的半句话。
+_DANGLING_TAILS = "在了着的把和跟往从对给就也还又而并一两"
+_POSTURE_TAILS = (
+    "窝", "躺", "靠", "坐", "站", "钻", "趴", "蹲", "挪", "挤", "躲",
+    "挂", "搭", "放", "端", "拿", "捧", "攥", "拎", "夹", "扛", "抱",
+)
 
 # 她睡着的时候听到的话，最多留几条：醒来那一段的 prompt 里逐条递进去。
 # 多留就成了任务清单（她得挨个回应），3 条已经够说明「那会儿有人来过」。
@@ -402,6 +435,18 @@ def _clean_dreams(raw: Any) -> list[str]:
     return out
 
 
+def _trim_dangling(text: str) -> str:
+    """剥掉硬截后挂在末尾的虚词（「窝在」「杯子洗了」的「了」）与姿态动词。"""
+    out = str(text or "")
+    while out and out[-1] in _DANGLING_TAILS:
+        out = out[:-1]
+    if out and out[-1] in _POSTURE_TAILS:
+        out = out[:-1]
+        while out and out[-1] in _DANGLING_TAILS:
+            out = out[:-1]
+    return out
+
+
 def _clip_event(text: str, limit: int = _EVENT_PHRASE_MAX) -> str:
     """把事件名削到 `limit` 字以内，且不留半个词、不悬空标点。
 
@@ -417,23 +462,36 @@ def _clip_event(text: str, limit: int = _EVENT_PHRASE_MAX) -> str:
         return text
     head = text[:limit]
     cut = max((head.rfind(ch) for ch in "，。；、,; "), default=-1)
-    if cut >= limit // 2:
+    # 早一点的标点也认（原来要求过 limit//2）：线上出现过「…蹄子夹着手机慢悠悠回了两」
+    # 这种从词中间切断的句子，宁可短一点，也不能留半句话。
+    if cut >= max(6, limit // 3):
         return head[:cut].strip(" -·、，。/~")
-    return head.rstrip(" -·、，。/~")
+    out = head.rstrip(" -·、，。/~")
+    # 硬截后把挂着的虚词/姿态动词剥掉：「…端着热好的牛奶窝在」→「…端着热好的牛奶」。
+    # 剥完太短就宁可留着（否则整句都没了），由调用方决定丢不丢。
+    trimmed = _trim_dangling(out)
+    return trimmed if len(trimmed) >= 6 else out
 
 
-def _event_phrase(event: str) -> str:
+def _event_phrase(event: str, limit: int = _EVENT_PHRASE_MAX) -> str:
     """把时段名削成能放进一句口语里的动作。
 
     原来直接按 16 字硬截，「坐在客厅沙发看书并吃点水果」会被砍成「坐在客厅沙发看书并吃点水」
     这种断句。改成先剥掉「安排/活动/时间」这类尾巴，再交给 `_clip_event` 按标点收尾。
     """
     text = str(event or "").strip()
+    # 模型偶尔把时刻写进事件名：「01:10–01:30 用蹄子端着热好的牛奶窝在…」。
+    # 这句话外面本来就会加「凌晨」，时刻再进正文就成了「凌晨在01:10–01:30 用蹄子…」。
+    text = _TIME_RANGE_RE.sub("", text)
+    for period in _PERIOD_WORDS:
+        if text.startswith(period):
+            text = text[len(period):].lstrip("在，, 　")
+            break
     for affix in ("安排", "活动", "时间", "（", "("):
         cut = text.find(affix)
         if cut > 1:
             text = text[:cut]
-    return _clip_event(text.strip(" -·、，。/~"))
+    return _clip_event(text.strip(" -·、，。/~"), limit=limit)
 
 
 def _with_at(lead: str, phrase: str) -> str:
@@ -460,12 +518,227 @@ def _at_phrase(lo: int, phrase: str, slot: Slot) -> str:
     return _with_at(period_of(lo), phrase)
 
 
+# —— 「今天做了什么」的素材质量（#311）———————————————————————————————
+#
+# 线上实测（3632823490 / 3951331639 / 3887128092 三份 state.json）：日程里大量段是
+# 「把手机扣在沙发上，去厨房倒了小半杯草莓酒」「把凉掉的牛奶端回厨房倒掉，顺手把
+# 杯子洗了」这种**过渡动作**——把东西挪个地方、把自己挪个地方，本身没有可说的内容。
+# 社交层只能把这种碎片压成「换了杯热的」这类 4~8 字空话，还跨用户重复。
+#
+# 判据刻意保守：**两条同时成立**才丢，宁可留一条平淡的，也不误杀真事。
+#   ① 整段没有任何内容词（`_CONTENT_MARKERS`）——吃喝、做饭、出门买东西、跟人说
+#      话、看/写/玩/学/工作、洗漱睡觉，这些才是「一件事」；
+#   ② 每一小句都是处置句/位移句/收拾句（`_TRANSITION_CLAUSE_RE`）。
+# 例：「低头把碗里的饺子慢慢吃完」以「把」开头（②成立），但带「吃」（①不成立）→ 留；
+# 「把碗推到水池边泡着，挪去客厅仰躺在沙发上」两条都成立 → 丢。
+_CONTENT_MARKERS: tuple[str, ...] = (
+    # 吃喝与做饭
+    "吃", "喝", "煮", "煎", "炒", "蒸", "烤", "做饭", "弄吃的", "尝", "抿", "烧了",
+    # 出门、买东西
+    "出门", "下楼", "逛", "买", "取快递", "拿快递", "散步",
+    # 跟人说话、消息
+    "聊", "说", "话", "见", "约", "陪", "送", "接人", "消息", "电话", "搭话",
+    # 看 / 写 / 玩 / 学 / 工作
+    "看书", "读书", "看电影", "看剧", "刷剧", "看视频", "听歌", "唱歌",
+    "刷手机", "看手机", "玩手机",
+    "写", "画", "练", "学", "复习", "工作", "上班", "开会", "加班", "整理",
+    "玩", "打游戏", "打球", "拆",
+    # 洗漱睡觉
+    "洗澡", "泡澡", "泡脚", "洗头", "洗漱", "睡", "梦",
+    # 歇着也要说得出口的那几种
+    "发呆", "发愣", "放空", "吹风", "晒太阳",
+)
+# 单字「喝」有假阳性：「端着没喝完的牛奶挪到客厅」里那是杯子里的状态，不是她做过的事。
+# 只排除否定式（没喝/不喝/未喝），「喝完」「喝了」照常算内容。
+_CONTENT_HE_RE = re.compile(r"(?<![没不未])喝")
+_CLAUSE_SPLIT_RE = re.compile(r"[，,。；;、！？!?]+")
+# 从句首认的处置/位移/收拾句。live 数据里的过渡段几乎全落在这个集合里；
+# 认不出来的一律当「有内容」留着（保守优先）。
+_TRANSITION_CLAUSE_RE = re.compile(
+    # 前缀先吃掉时段词（「傍晚仰躺沙发用蹄子夹手机」句首是时段词，不认出来就漏了）
+    # 和「顺手/然后/又/就」这类连接词。
+    r"^(?:(?:凌晨|清早|早上|上午|中午|下午|傍晚|晚上|夜里|深夜|白天)"
+    r"|顺手|随手|然后|接着|又|再|就|才|先|慢慢|终于|干脆|索性)*"
+    r"(?:把|将|从|在|去|往|到|用|端|拿|夹|叼|托|拎|抱|裹|披|套|穿|换|收|放|推|扣|"
+    r"搁|挪|走|回|进|退|钻|躺|坐|站|靠|窝|缩|趴|蹲|爬|晃|拐|落|转|翻|起|醒|擦|"
+    r"抹|洗|冲|关|拉|按|拨|拢|系|插|拔|挂|晾|抖|归|踢|踩|抬|伸|摸|掏|点开|划|锁|"
+    r"打开|盖上|合上|推开|拉严|拉上|关掉|关上|按灭|插上|拔掉|放下|搁下|起身|站起|"
+    r"站起来|撑起|爬起|坐起|躺下|仰躺|侧躺|窝进|窝回|缩进|收拢|收回|叼着|端着|"
+    r"拿着|夹着|托着|拎着|抱着|裹着|披上|套上|穿上)"
+)
+# 家务名词：句子里出现这些词、又没有任何内容词时，这句是在说「东西被怎么处置了」
+# （「杯子洗完没急着走」「靠着厨房台面摸出手机」），不是在说一件事。
+_CHORE_NOUNS: tuple[str, ...] = (
+    "杯子", "碗", "锅", "盘", "筷子", "勺子", "垃圾", "衣服", "被子", "枕头", "床单",
+    "毯子", "沙发", "台面", "桌面", "桌子", "椅子", "窗帘", "窗", "灯", "门", "冰箱",
+    "手机", "充电线", "包", "鞋", "外套", "毛巾", "晾衣架", "洗衣机", "拖鞋",
+    "遥控器", "水壶", "瓶子", "袋子", "水龙头", "水池",
+)
+# 「空杯子往茶几上一搁」这种主宾倒装的处置句句首认不出来，按句中认。
+_TRANSITION_ANYWHERE_RE = re.compile(
+    r"(?:往|朝)[^，,。；;、]{0,8}(?:一)?(?:搁|放|推|扣|扔|丢|挂|摆|塞|收|摞)"
+)
+# 合并后的句子放宽到 48 字：两条碎片并成一句本来就长一点，
+# 但也不能让一句占满整个 done（社交侧是按条数用的）。
+_MERGED_PHRASE_MAX = 48
+# 再长的事件不参与合并：那是一整件事，不是黏合剂。
+_MERGE_RAW_MAX = 48
+# 同一场景内允许合并的最大空档（分钟）。
+_MERGE_GAP_MINUTES = 20
+# 合并后最多几个小句：再多就是流水账（「…开始洗漱，洗漱收尾，擦干脸，关灯回卧室」）。
+_MERGE_MAX_CLAUSES = 3
+# 地点归一：「客厅→厨房」「厨房到客厅」「街角小馆子里（桌边）」算同一个场景。
+_SCENE_SPLIT_RE = re.compile(r"→|->|到|往|/|、")
+_SCENE_PAREN_RE = re.compile(r"[（(][^）)]*[）)]")
+# today_plans 兜底成 wants 时：一条最多 24 字，最多 3 条。
+_WANT_MAX_CHARS = 24
+_WANT_LEAD_WORDS = (
+    "今天", "今晚", "今早", "今日", "今儿",
+    "因为", "所以", "但是", "不过", "然后", "而且", "那",
+)
+# 计划里带这些词的，说的是已经发生/别人的事，不是「今天想做的事」。
+_WANT_PAST_MARKERS = ("已经", "过了", "上次", "昨天", "刚才", "之前", "那次")
+_WANT_TRIM_CHARS = " 　·-…，,。；;、：:！？!?"
+
+
+def _clauses(text: str) -> list[str]:
+    """按标点把事件名切成小句，去掉空串。"""
+    return [
+        clause.strip(" 　·-…")
+        for clause in _CLAUSE_SPLIT_RE.split(str(text or ""))
+        if clause.strip(" 　·-…")
+    ]
+
+
+# 「杯子洗完没急着走」：句首是家务物件、紧跟一个处置动作，通篇没有内容词。
+# 只认句首——「守着锅等饺子浮起来」句首是「守着」，那是真事，不能判过渡。
+_CHORE_CLAUSE_RE = re.compile(
+    r"^(?:" + "|".join(_CHORE_NOUNS) + r")"
+    r"(?:洗|擦|收|放|挪|晾|叠|扫|倒|扔|端|拿|刷|关|开|盖|冲|搁|挂|摆|塞|清|归|换)"
+)
+
+
+def _has_content(text: str) -> bool:
+    """这段里有没有「一件事」的内容词（吃喝、做饭、出门、说话、看/写/玩/工作、洗漱睡觉…）。"""
+    body = str(text or "")
+    for marker in _CONTENT_MARKERS:
+        if marker == "喝":
+            if _CONTENT_HE_RE.search(body):
+                return True
+            continue
+        if marker in body:
+            return True
+    return False
+
+
+def _is_transition_clause(clause: str) -> bool:
+    """这一小句是不是「过渡动作」：只挪东西/挪自己，没有可说的内容。"""
+    text = str(clause or "").strip(" 　·-…")
+    if not text:
+        return True
+    if _has_content(text):
+        return False
+    # 没有内容词、句首又是家务物件 + 处置动作：这是「杯子洗完没急着走」这一类，
+    # 说的是东西被怎么处置，不是她做了什么。看句首而不是「句子里出现物件」——
+    # 后者会把「守着锅等饺子浮起来」这种真事也判成过渡。
+    if _CHORE_CLAUSE_RE.match(text):
+        return True
+    return bool(_TRANSITION_CLAUSE_RE.match(text) or _TRANSITION_ANYWHERE_RE.search(text))
+
+
+def _is_transition_event(event: str) -> bool:
+    """整段都是过渡动作（每一小句都是），且通篇没有任何内容词。"""
+    text = str(event or "").strip()
+    if not text:
+        return True
+    if _has_content(text):
+        return False
+    clauses = _clauses(text)
+    return bool(clauses) and all(_is_transition_clause(clause) for clause in clauses)
+
+
+def _scene_of(slot: Mapping[str, Any]) -> str:
+    """段的地点的归一形式：只留最后一个地名，去掉括号里的细节。"""
+    loc = _SCENE_PAREN_RE.sub("", str(slot.get("location") or "")).strip()
+    if not loc:
+        return ""
+    parts = [part.strip() for part in _SCENE_SPLIT_RE.split(loc) if part.strip()]
+    return parts[-1] if parts else loc
+
+
+def _same_scene(left_slot: Mapping[str, Any], right_slot: Mapping[str, Any]) -> bool:
+    """两段是不是同一个场景（「卧室」与「卧室窗边」算同一个）。"""
+    left, right = _scene_of(left_slot), _scene_of(right_slot)
+    if not left or not right:
+        return False
+    return left == right or left.endswith(right) or right.endswith(left)
+
+
+def _dedupe_clauses(text: str) -> str:
+    """合并后去掉重复的小句：「开始洗漱，洗漱收尾」这种同义重复只留一条。"""
+    kept: list[str] = []
+    for clause in _clauses(text):
+        if not kept:
+            kept.append(clause)
+            continue
+        prev = kept[-1]
+        if clause == prev or clause in prev or prev in clause:
+            if len(clause) > len(prev):
+                kept[-1] = clause
+            continue
+        kept.append(clause)
+    return "，".join(kept)
+
+
+def _join_events(first: str, second: str) -> str:
+    """把相邻两段的事件名接成一句（中间补逗号，去掉重复的收尾标点与重复小句）。"""
+    left = str(first or "").strip().strip("，,。；;、 ")
+    right = str(second or "").strip()
+    if not left:
+        return right
+    if not right:
+        return left
+    return _dedupe_clauses(f"{left}，{right}")
+
+
+def _wants_from_plans(plans: list[str] | None) -> list[str]:
+    """today_plans 兜底成 wants：取她今天确实想做的事，最多 3 条。
+
+    线上 6 个角色的日程段 `wants_tagged` 全是 0——模型几乎不标 wants，于是
+    「她自己想做的」这一块永远是空的。today_plans 是她当天记下来的计划，拿它兜底
+    比空着有用；但计划里常混着「因为副人格带我去过了」这种抱怨式假阳性，带过去
+    时间词的整条跳过，也不硬凑——没有就是空列表。
+    """
+    out: list[str] = []
+    for plan in plans or []:
+        text = str(plan or "").strip()
+        if not text:
+            continue
+        clause = _CLAUSE_SPLIT_RE.split(text)[0].strip(_WANT_TRIM_CHARS)
+        if not clause or any(marker in clause for marker in _WANT_PAST_MARKERS):
+            continue
+        for lead in _WANT_LEAD_WORDS:
+            if clause.startswith(lead) and len(clause) > len(lead):
+                clause = clause[len(lead):].strip(_WANT_TRIM_CHARS)
+                break
+        clause = clause.strip(_WANT_TRIM_CHARS)
+        if not clause:
+            continue
+        clause = _clip_event(clause, limit=_WANT_MAX_CHARS)
+        if clause and clause not in out:
+            out.append(clause)
+        if len(out) >= 3:
+            break
+    return out
+
+
 def day_phrases(
     slots: list[Slot],
     now_minutes: int,
     *,
     past_limit: int = 2,
     future_limit: int = 1,  # 历史参数：滚动分段下「接下来」恒为空，恒被忽略（见下）
+    plans: list[str] | None = None,
 ) -> dict[str, Any]:
     """把日程拆成她能直接说出口的三段：刚做过什么 / 正在做什么 / 接下来做什么。
 
@@ -480,6 +753,14 @@ def day_phrases(
     `dreams` 是当天**最近一段睡眠**的梦：契约和社交层拿它说「她昨晚梦到什么」。
     旧日程没有这个字段，所有旧 slot 读出来都是空列表——调用方不需要区分
     「没有梦」和「旧版本没记」。
+
+    `done` 只收**说得出口的事**（#311）：过渡动作（把杯子放回厨房、挪去客厅仰躺）
+    先被相邻合并吸收，再按 `_is_transition_event` 丢掉；过滤后一条不剩时退回
+    「正在做的那件事」，宁可空着也不硬塞碎片。带 `status` 标记的处境段（“有点饿了”）
+    一律保留——那不是动作，是身体读数，社交侧正需要它。
+
+    `wants` 在日程段没标 wants 时用 `plans`（today_plans）兜底，最多 3 条；
+    两边都没有就是空列表，**键照留**。
     """
     doing = ""
     done: list[str] = []
@@ -493,24 +774,79 @@ def day_phrases(
             continue
         ordered.append((lo, hi, str(slot.get("event") or "").strip(), slot))
 
+    doing_slot: Slot | None = None
+    # 刚过去的清醒段（升序）。先攒着：要先把相邻同场景的并成一句，再决定丢哪条。
+    past: list[tuple[int, int, str, Slot]] = []
     for lo, hi, event, slot in ordered:
         if lo <= now_minutes < hi:
             phrase = _event_phrase(event)
             if phrase:
                 doing = "睡觉" if slot_sleeps(slot) else phrase
+                doing_slot = slot
             continue
         if hi <= now_minutes:
             if now_minutes - hi > DAY_RECENT_PAST_MINUTES:
                 continue
-            if slot_sleeps(slot):
-                # 睡眠不报成「刚在睡觉」：那是刚醒的人说的话，醒三小时就不算了。
-                if now_minutes - hi <= 90:
-                    done.insert(0, "才醒")
-                continue
-            phrase = _event_phrase(event)
-            if phrase:
-                done.insert(0, _at_phrase(lo, phrase, slot))
+            past.append((lo, hi, event, slot))
+
+    # 相邻同场景先合并：过渡动作常常是前后两件事之间的黏合剂，先并再筛，
+    # 才不会把「下饺子」「捞饺子」「吃饺子」拆成三条并列碎片。
+    # 一条最多并两段：再并下去就成一整段流水账，社交层拿去反而不好用。
+    merged: list[tuple[int, int, str, Slot, int]] = []
+    for lo, hi, event, slot in past:
+        if slot_sleeps(slot):
+            merged.append((lo, hi, event, slot, 0))
             continue
+        if merged:
+            prev_lo, prev_hi, prev_event, prev_slot, prev_joins = merged[-1]
+            if (
+                prev_joins < 1
+                and not prev_slot.get("status")
+                and not slot.get("status")
+                and not slot_sleeps(prev_slot)
+                and lo - prev_hi <= _MERGE_GAP_MINUTES
+                and len(prev_event) < _MERGE_RAW_MAX
+                and len(event) < _MERGE_RAW_MAX
+                and len(_join_events(prev_event, event)) <= _MERGE_RAW_MAX
+                # 两段加起来小句太多就别并：并出来是一整段流水账，不如各自单独判。
+                and len(_clauses(prev_event)) + len(_clauses(event)) <= _MERGE_MAX_CLAUSES
+                and _same_scene(prev_slot, slot)
+            ):
+                merged[-1] = (
+                    prev_lo,
+                    hi,
+                    _join_events(prev_event, event),
+                    prev_slot,
+                    prev_joins + 1,
+                )
+                continue
+        merged.append((lo, hi, event, slot, 0))
+
+    for lo, hi, event, slot, _joins in merged:
+        if slot_sleeps(slot):
+            # 睡眠不报成「刚在睡觉」：那是刚醒的人说的话，醒三小时就不算了。
+            if now_minutes - hi <= 90:
+                done.insert(0, "才醒")
+            continue
+        if slot.get("status"):
+            # 处境词（“有点饿了”）不是动作，永远留着——社交侧正需要它。
+            phrase = _event_phrase(event)
+        else:
+            if _is_transition_event(event):
+                continue
+            # 不削首尾小句：削掉「把冰箱里剩的半盒东西热了热」只剩「站在台边
+            # 一口口吃完」，吃什么没了；整句留着反而说得清。
+            phrase = _event_phrase(event, limit=_MERGED_PHRASE_MAX)
+        if phrase:
+            line = _at_phrase(lo, phrase, slot)
+            if line not in done:
+                done.insert(0, line)
+
+    done = done[: max(0, int(past_limit))]
+    if not done and doing and doing_slot is not None:
+        # 过滤后一条都不剩：宁可回退成「正在做的那件事」，也不硬塞过渡碎片。
+        if not slot_sleeps(doing_slot) and not _is_transition_event(doing):
+            done = [_at_phrase(now_minutes, doing, doing_slot)]
 
     # 梦：按开始时间排序后取**最后一段睡眠**（跨午夜结转的那一截也算）。
     # 不按 end 取：23:00→24:00 与 00:00→07:00 是同一觉拆成的两段，按 end 比
@@ -527,9 +863,13 @@ def day_phrases(
         event = str(slot.get("event", "") or "").strip()
         if event:
             wants.append(event)
+    if not wants:
+        # 日程段没标 wants（线上 6 个角色 wants_tagged 全是 0）时，用 today_plans
+        # 里她今天确实想做的事兜底；都没有就保持空列表。
+        wants = _wants_from_plans(plans)
     return {
         "doing": doing,
-        "done": done[:max(0, int(past_limit))],
+        "done": done,
         # 滚动分段没有预排的未来：恒为空列表。**键必须留着**——社交侧按
         # `day.get("next")` 取，缺键会被当成契约坏了（#73）。
         "next": [],
@@ -647,16 +987,16 @@ def body_reference_block(body: dict[str, Any] | None, now_text: str) -> str:
 # 只在人设里确实提到时才发（见 examples_for）：范例是最容易被照着抄的东西，一条
 # 「给猫添粮」的范例递给没有猫的角色，就是在替她编一只猫。
 EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
-    # 短：十几二十分钟就完事，做完自然换下一件
+    # 短：半小时上下就完事，做完自然换下一件
     (
-        {"event": "洗了把脸，把厨房台面擦了一遍", "location": "厨房", "emotion": "清爽了点", "energy_rate": -0.02, "minutes": 20},
-        {"event": "把攒着的几条消息回完", "location": "客厅", "emotion": "清掉一件事", "energy_rate": -0.02, "minutes": 25},
-        {"event": "下楼走了一圈，顺手把垃圾扔了", "location": "楼下", "emotion": "透了口气", "energy_rate": 0.02, "minutes": 25},
-        {"event": "烧了壶水，站在窗边慢慢喝完", "location": "厨房", "emotion": "缓了缓", "energy_rate": 0.01, "minutes": 10},
-        {"event": "把桌上的东西归了归位", "location": "书桌前", "emotion": "眼前清爽", "energy_rate": -0.01, "minutes": 15},
-        {"event": "给猫添了粮，把水碗洗了", "location": "厨房", "emotion": "顺手的事", "energy_rate": -0.01, "minutes": 10, "needs": ("pet",)},
-        {"event": "回了几条工作上的消息，把明天要用的东西理出来", "location": "书桌前", "emotion": "先清掉一件", "energy_rate": -0.03, "minutes": 25, "needs": ("job",)},
-        {"event": "把家里要添的东西列了张单子", "location": "客厅", "emotion": "心里有数", "energy_rate": -0.01, "minutes": 15, "needs": ("care",)},
+        {"event": "洗了把脸，把厨房台面擦了一遍", "location": "厨房", "emotion": "清爽了点", "energy_rate": -0.02, "minutes": 30},
+        {"event": "把攒着的几条消息回完", "location": "客厅", "emotion": "清掉一件事", "energy_rate": -0.02, "minutes": 30},
+        {"event": "下楼走了一圈，顺手把垃圾扔了", "location": "楼下", "emotion": "透了口气", "energy_rate": 0.02, "minutes": 30},
+        {"event": "烧了壶水，站在窗边慢慢喝完", "location": "厨房", "emotion": "缓了缓", "energy_rate": 0.01, "minutes": 30},
+        {"event": "把桌上的东西归了归位", "location": "书桌前", "emotion": "眼前清爽", "energy_rate": -0.01, "minutes": 30},
+        {"event": "给猫添了粮，把水碗洗了", "location": "厨房", "emotion": "顺手的事", "energy_rate": -0.01, "minutes": 30, "needs": ("pet",)},
+        {"event": "回了几条工作上的消息，把明天要用的东西理出来", "location": "书桌前", "emotion": "先清掉一件", "energy_rate": -0.03, "minutes": 30, "needs": ("job",)},
+        {"event": "把家里要添的东西列了张单子", "location": "客厅", "emotion": "心里有数", "energy_rate": -0.01, "minutes": 30, "needs": ("care",)},
     ),
     # 中：要坐下来做、要动手的一件完整的事
     (
@@ -685,7 +1025,7 @@ EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
         {"event": "戴上耳机听歌，躺着没动", "location": "卧室", "emotion": "缓过来一点", "energy_rate": 0.04, "minutes": 40, "wants": True},
         {"event": "坐在窗边看外面，发了一会儿呆", "location": "窗边", "emotion": "空落落的", "energy_rate": 0.02, "minutes": 30, "wants": True},
         {"event": "躺着刷手机，什么正事也没做", "location": "卧室", "emotion": "有点空", "energy_rate": 0.02, "minutes": 50, "wants": True},
-        {"event": "泡了杯东西，慢慢喝完", "location": "客厅", "emotion": "缓下来了", "energy_rate": 0.02, "minutes": 20, "wants": True},
+        {"event": "泡了杯东西，慢慢喝完", "location": "客厅", "emotion": "缓下来了", "energy_rate": 0.02, "minutes": 30, "wants": True},
         {"event": "把要做的事往后推了推，先缓了一会儿", "location": "客厅", "emotion": "不想动", "energy_rate": 0.03, "minutes": 40, "needs": ("job",), "wants": True},
         {"event": "猫凑过来，就顺手摸了半天", "location": "客厅", "emotion": "被哄好了", "energy_rate": 0.03, "minutes": 30, "needs": ("pet",), "wants": True},
     ),
@@ -1080,9 +1420,11 @@ def segment_prompt(
         # 等于告诉它一个动作也能占半小时；而 _segment_minutes 那边又有 15 分钟硬下限，
         # 两处一叠，「在沙发上喝东西」就必然被写成 30 分钟的一段。
         "3. minutes 要真的反映这件事要多久——是这件事本身占多久，不是把这一段时间填满：\n"
-        "   一件事十几二十分钟就做完，就写十几二十分钟，做完自然换下一件；\n"
+        "   一段是**一件有头有尾、说得出口的事**（做顿饭、出门办趟事、洗个澡、坐下来写点东西），"
+        f"清醒时最短 {SEGMENT_AWAKE_MIN_MINUTES} 分钟；\n"
         "   要坐下来做、要出门、要等人的事才写到 1~3 小时；\n"
         "   一个动作不算一件事：喝一口水、看一眼手机、回一句话撑不起一段，别单独成段——\n"
+        "   「把杯子放回厨房」「起身走去客厅」这种过渡动作也一样，并进前后那件事里；\n"
         "   要么接着上一段（continue），要么写成真的在做的样子（在厨房弄点吃的，而不是「喝东西」）；\n"
         "   一次出门可以是一整段（路上→店里→回来），也可以中途换成另一件事。\n"
         "   **别因为「反正要填一段时间」就往长的填。**\n"
@@ -1098,7 +1440,7 @@ def segment_prompt(
         "5. 她的一天是可以被打断的：\n"
         "   能被一件小事打断（快递到了下楼取、朋友顺路叫住、锅里水开了、看见一条想回的消息）；\n"
         "   也可以临时起意（突然想出去走走、拐进一家店、给谁打个电话）——\n"
-        "   这种段不用长，十几到四十分钟都正常，做完再回去继续原来那件事也行。\n"
+        "   这种段不用长，半小时到一小时都正常，做完再回去继续原来那件事也行。\n"
         "6. 别把一天排成流程模板（起床→上班→午休→下班→晚饭→睡觉那一条龙），"
         "每天也不该长得差不多。**午睡/小憩不是每天必须有的一站**："
         "没到那个困劲就别排睡，改成歇会儿、发发呆、听两首歌也行。\n"
@@ -1138,8 +1480,10 @@ def segment_prompt(
             "   如果上面给了【被打断之前】那一段，想回去接着做时输出 {\"resume\": true}。\n"
             if _susp_event else ""
         )
-        + f"4. minutes：这一段做多久。**{SEGMENT_MIN_MINUTES} 分钟也是一段**——洗把脸、"
-        "倒杯水、回条消息本来就是几分钟的事，写几分钟就行，别为了填满时间把它抬长；"
+        + f"4. minutes：这一段做多久。清醒时最短 {SEGMENT_AWAKE_MIN_MINUTES} 分钟——"
+        "一段是一件有头有尾、说得出口的事（做顿饭、出门办件事、洗个澡收拾好），"
+        "不是「倒杯水」「回条消息」这种一个动作，也不是「把杯子放回厨房」这种过渡动作——"
+        "那些并进前后那件事里，别单独成段；"
         "要坐下来做、要出门、要等人的事才写到 1~3 小时；"
         f"一般的事最长 {SEGMENT_MAX_MINUTES} 分钟；睡觉可以睡一整夜（最长 "
         f"{SEGMENT_SLEEP_MAX_MINUTES // 60} 小时，跨过半夜也没关系）。"
@@ -1251,7 +1595,9 @@ def _segment_minutes(raw: Mapping[str, Any], now_minute: int, sleeping: bool) ->
     if minutes is None:
         minutes = SEGMENT_DEFAULT_MINUTES
     cap = SEGMENT_SLEEP_MAX_MINUTES if sleeping else SEGMENT_MAX_MINUTES
-    return max(SEGMENT_MIN_MINUTES, min(cap, minutes))
+    # 睡段仍按 3 分钟收（一小觉合法）；清醒段的下限是 30 分钟（见常量处的实测）。
+    floor = SEGMENT_MIN_MINUTES if sleeping else SEGMENT_AWAKE_MIN_MINUTES
+    return max(floor, min(cap, minutes))
 
 
 def _ongoing_stem(text: str) -> str:
@@ -1495,12 +1841,12 @@ def parse_segment(
     want_continue = bool(want_continue) and bool(str(prev.get("event") or "").strip())
 
     # 原文留着判「是不是睡着」：截断之后，睡字常常正好被切掉（存的是 `_clip_event`
-    # 削过的 24 字，判睡一律看原文）。
+    # 削过的短句，判睡一律看原文）。存盘只做粗上限，24 字留到渲染时再削。
     raw_event = str(raw.get("event") or "").strip()
-    event = _clip_event(raw_event)
+    event = _clip_event(raw_event, limit=_EVENT_STORE_MAX)
     if want_continue:
         raw_event = str(prev.get("event") or "").strip()
-        event = _clip_event(raw_event)
+        event = _clip_event(raw_event, limit=_EVENT_STORE_MAX)
     if not event:
         return None
 
@@ -1626,6 +1972,23 @@ def in_scheduled_night(slots: list[Slot], moment: Any) -> bool:
 WAKE_AFTER_SLEEP_MIN_MINUTES = 240.0
 
 
+def _sleep_cap_minutes(cfg: Any) -> float:
+    """兜底单段睡眠的上限（分钟）：`max_sleep_hours` 与「该睡的量 + 60」取小。
+
+    旧写法只封顶 SEGMENT_SLEEP_MAX_MINUTES（9 小时），完全不理 `max_sleep_hours`：
+    用户把它调到 5 小时，兜底照样一次排 9 小时睡，soma 只能在中途强制唤醒——两边
+    各说各话（审核 A-5）。0 / 坏值仍按「自动」处理，不额外收紧。
+    """
+    cap = min(SEGMENT_SLEEP_MAX_MINUTES, int(_wake_up_minutes(cfg)) + 60)
+    try:
+        hard = float(getattr(cfg, "max_sleep_hours", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        hard = 0.0
+    if hard != hard or hard <= 0:
+        return float(cap)
+    return float(max(SEGMENT_MIN_MINUTES, min(cap, int(hard * 60))))
+
+
 def _wake_up_minutes(cfg: Any) -> float:
     """兜底判「睡够了」的时长：她需要的睡眠（`sleep_need_hours`），下限 4 小时。"""
     try:
@@ -1706,7 +2069,10 @@ def dynamic_segment(
             # 睡到生物钟夜结束（她的自然醒点）；跨午夜的部分由结转接到明天。
             night_end = window[1] if window is not None else now_minute
             logical_end = night_end if night_end > now_minute else night_end + DAY_MINUTES
-            minutes = max(SEGMENT_MIN_MINUTES, min(SEGMENT_SLEEP_MAX_MINUTES, logical_end - now_minute))
+            # 单段睡眠封顶「该睡的量 + 60 分钟」：夜间窗口被配成 18 小时时，
+            # 这一段会一路排到 720 分钟（12 小时），醒过来时一天已经过完。
+            cap = _sleep_cap_minutes(cfg)
+            minutes = max(SEGMENT_MIN_MINUTES, min(cap, logical_end - now_minute))
         else:
             # 不在生物钟夜里却还睡着（白天补觉、或生物钟夜里已经睡过点）：再睡多久
             # 按「还差多少才睡够」给，不写死 90 分钟（#67）。默认 need=480、窗口
@@ -1828,11 +2194,14 @@ class ScheduleService:
         self._last_outcome: str = ""
         # 质量闸计数（v3.0.6）：repeat=今天重复放行、invented=编造、rewrite=触发重写、
         # fallback=降级成中性段。会话内累计，只报计数不报分数（没有标注就没有分母）。
+        # template_fallback（3.1.0）：模型这次什么都没排出来、直接用了本地模板——
+        # 与 fallback 区分开，后者是质量闸主动降级，这条是生成失败（实测报告 P0-4）。
         self._quality: dict[str, int] = {
             "repeat": 0,
             "invented": 0,
             "rewrite": 0,
             "fallback": 0,
+            "template_fallback": 0,
         }
         # 失败退避的计时源：必须可注入，否则测试无法验证「退避窗口内不再投递」。
         self._monotonic = monotonic or time.monotonic
@@ -1969,9 +2338,12 @@ class ScheduleService:
         while j >= 0 and slot_sleeps(segs[j]) and slot_sleeps(segs[j + 1]):
             lo = parse_time(segs[j].get("start"))
             hi = parse_time(segs[j].get("end"))
-            if lo is None or hi is None or hi != cursor:
+            if lo is None or hi is None:
                 break
-            total += float(hi - lo)
+            # 接缝容差：1 分钟重叠 / 小空档仍算同一觉（见常量注释）。
+            if abs(float(cursor) - float(hi)) > SLEEP_CONTIGUITY_TOLERANCE_MINUTES:
+                break
+            total += float(max(0, hi - lo))
             cursor = lo
             j -= 1
         return total
@@ -3112,6 +3484,21 @@ class ScheduleService:
                         self._event_at = event_ts
             async with self._lock:
                 if slot is None and (active is None or force or not cfg.use_llm_schedule):
+                    # 为什么加日志（3.1.0）：这条分支原来一声不响——模型超时/解析
+                    # 失败/换事失败之后，日程被换成只含「睡一觉」的本地模板，用户
+                    # 看到的是一整天在睡觉，日志里却什么都没有（实测报告 P0-4）。
+                    # 只加日志与计数，回落行为本身不动：没模型可用时模板仍是唯一出路。
+                    # attempt_llm 为真才算「LLM 生成失败」；use_llm_schedule=False 的
+                    # 正常模板路径不告警，否则关掉大模型排程的部署会天天刷警告。
+                    # 被闸门挡回（预算/间隔/空闲静默）不算生成失败：那时模型根本
+                    # 没被问，模板是正常出路，报「失败」会天天误报。
+                    if attempt_llm and self._last_outcome != OUTCOME_GATED:
+                        self._bump_quality("template_fallback")
+                        if self._log:
+                            self._log.warning(
+                                f"[humanoid_core] 日程 LLM 生成失败，回落到只含睡眠的模板，"
+                                f"今日日程不可信（{self._scope.role_id}）：{self.last_error}"
+                            )
                     slot = dynamic_segment(
                         cfg, self._body_snapshot(), now_minute=minutes,
                         step=cfg.granularity_minutes, prev=prev, seed=self._seed(),

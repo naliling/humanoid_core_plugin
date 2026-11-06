@@ -28,8 +28,11 @@ FIXED_MOMENT = datetime(2026, 8, 22, 9, 0, tzinfo=TZ)
 
 
 def cfg(**overrides) -> HumanoidConfig:
+    # 3.1.0 起 schedule_quality_gate 默认关；本文件测的就是「生成后复审」这条链路，
+    # 显式打开，否则审查根本不会被调用（要测「关掉」的用例自己再传 False）。
     return HumanoidConfig.from_raw(
-        {"timezone_city": "北京", "schedule_change_chance": 0, **overrides}
+        {"timezone_city": "北京", "schedule_change_chance": 0,
+         "schedule_quality_gate": True, **overrides}
     )
 
 
@@ -167,7 +170,7 @@ class ReviewServiceTest(unittest.IsolatedAsyncioTestCase):
         await service.ensure_fresh()
         segs = service.segments()
         self.assertEqual(segs[0]["event"], "把杯子洗了", "用模型改好的那版")
-        self.assertEqual(segs[0]["end"], "09:06")
+        self.assertEqual(segs[0]["end"], "09:30", "改法也要过清醒下限（#311）")
         self.assertEqual(provider.calls, 1, "同一份回答里给了改法，不该再问一次")
 
     async def test_reason_verdict_sends_the_reason_into_the_rewrite(self):
@@ -239,15 +242,15 @@ class GapContinuityTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_gap_is_filled_right_away_despite_the_interval(self):
         service, provider, _gateway = self.build()
-        await service.ensure_fresh()  # 09:00-09:05 倒杯水
+        await service.ensure_fresh()  # 09:00-09:30 倒杯水（清醒下限 30）
         self.assertEqual(provider.calls, 1)
-        service._clock.advance(minutes=6)  # 09:06，手上没有任何一段
+        service._clock.advance(minutes=31)  # 09:31，手上没有任何一段
         self.assertTrue(service.refresh_due())
         provider.reply = seg_reply(event="回消息", minutes=30)
         self.assertTrue(await service.ensure_fresh())
         self.assertEqual(provider.calls, 2, "空档接续不该被 30 分钟间隔挡住")
         segs = service.segments()
-        self.assertEqual(segs[1]["start"], "09:05", "从上一段结束处接上，不留窟窿")
+        self.assertEqual(segs[1]["start"], "09:30", "从上一段结束处接上，不留窟窿")
         self.assertEqual(segs[1]["event"], "回消息")
 
     async def test_idle_silence_still_blocks_even_in_a_gap(self):
@@ -288,7 +291,7 @@ class FixedSegmentParseTest(unittest.TestCase):
         )
         self.assertIsNotNone(slot)
         self.assertEqual(slot["start"], "09:00")
-        self.assertEqual(slot["end"], "09:06")
+        self.assertEqual(slot["end"], "09:30", "6 分钟被抬到清醒下限 30（#311）")
 
 
 if __name__ == "__main__":

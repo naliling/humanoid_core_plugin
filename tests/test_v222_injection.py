@@ -288,12 +288,12 @@ class InjectionLayerTest(unittest.TestCase):
     def test_first_meeting_is_not_labelled_distant(self):
         """新认识的人第一面不该被说成「疏远/有距离」。
 
-        v2.27.2 起默认初始好感是 35（中性起点）——第一面说「不太熟/还在认识」是
-        正确的，但不能说成「关系疏远」「不常联系」（那是陌生人甚至反感档的词）。
-        本测试盯的是后者：35 起点不该滑到那两档。
+        v2.27.2 起默认初始好感是中性起点（3.1.0 起从 35 抬到 55）——第一面说
+        「不太熟/还在认识」是正确的，但不能说成「关系疏远」「不常联系」（那是陌生人
+        甚至反感档的词）。本测试盯的是后者：中性起点不该滑到那两档。
         """
         core = self.core()
-        self.assertEqual(core.config.mood_initial_affection, 35)
+        self.assertEqual(core.config.mood_initial_affection, 55)
         for uid in ("555", "777", "100000003", "100000004"):
             core.scope.user_state(uid)["mood"] = {
                 "affection": 35.0, "libido": 34.0, "aggression": 28.0,

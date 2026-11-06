@@ -87,13 +87,13 @@ class SchemaTest(unittest.TestCase):
             self.assertIn(key, self.schema)
 
     def test_field_count_is_pinned(self):
-        """字段数变化必须同步改这里（v3.0.7 = 137：删掉 mood_verbose_log）。
+        """字段数变化必须同步改这里（v3.1.0 = 138：新增 max_sleep_hours 睡眠硬上限）。
 
         面板项数在 README / main.py 的帮助文案里也被引用，字段增删时一并对齐，
         否则用户看到的「共 N 项」与面板实际数量对不上。
         """
-        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 137)
-        self.assertEqual(len(self.schema), 137)
+        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 138)
+        self.assertEqual(len(self.schema), 138)
 
     def test_input_state_throttle_keys_are_consistent(self):
         """v3.0.0 新增的两个「正在输入」节流项：类型/区间/默认值三处一致。"""

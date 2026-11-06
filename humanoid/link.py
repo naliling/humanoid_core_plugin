@@ -161,9 +161,18 @@ def build_contract(core: Any) -> dict[str, Any]:
     # 她实际的夜只算一次，`time` 块与 `routine` 块共用（同一份契约里不该有两个答案）。
     window = night_window(core, cfg)
     hour_of_day = now.hour + now.minute / 60.0
+    # 日程段几乎不标 wants（线上 6 个角色 wants_tagged 全是 0），拿她今天记下的
+    # 计划兜底「今天想做的事」；取不到就传 None，day 块里保持空列表（键照留）。
+    try:
+        _plans_getter = getattr(core.schedule, "_today_plans", None)
+        plans = _plans_getter() if callable(_plans_getter) else None
+    except Exception:
+        plans = None
     try:
         # 社交层拿这个去说「我刚从X回来」，不拿它就只能说「我在休息」。
-        day = day_phrases(slots, now_minutes, past_limit=3, future_limit=2)
+        day = day_phrases(
+            slots, now_minutes, past_limit=3, future_limit=2, plans=plans
+        )
     except Exception:
         day = {}
     feelings: list[str] = []
