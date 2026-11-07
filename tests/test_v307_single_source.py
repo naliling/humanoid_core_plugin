@@ -6,9 +6,8 @@
 - humanoid/prompt_builder.py 正在并行改动，import 它的中间态会让用例报
   TypeError 而不是这条闸门该报的错。
 
-约定：断言失败时消息里给「文件:行号: 该行原文」。
-**当前就红的闸门用 skipTest 标注并列出明细**（不改源码），由 lead 派修；
-报告见 audit/fix/b5/t1b-state-lint.md。
+约定：断言失败时消息里给「文件:行号: 该行原文」，闸门一律硬断言（不 skip）——
+红了就是真违规，改源码而不是标注待修；历史明细见 audit/fix/b5/t1b-state-lint.md。
 """
 
 import ast
@@ -206,11 +205,12 @@ class SingleSourceGateTest(unittest.TestCase):
             return [] if rel == self._CLOCK else _call_lines(path, "fromtimestamp")
 
         bad = _violations(check)
-        if bad:
-            self.skipTest(
-                "待修（R5 / B4）：datetime.fromtimestamp 只允许走 humanoid/clock.py，"
-                "以下位置仍在各自换算时区：\n" + "\n".join(bad)
-            )
+        self.assertEqual(
+            bad,
+            [],
+            "R5：datetime.fromtimestamp 只允许走 humanoid/clock.py，"
+            "以下位置仍在各自换算时区：\n" + "\n".join(bad),
+        )
 
     def test_stage_of_lives_only_in_state_snapshot(self):
         """R1：关系阶梯只在 relstage.py 定义，只许 state_snapshot.py 调用。

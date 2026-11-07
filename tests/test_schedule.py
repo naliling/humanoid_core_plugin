@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import tempfile
 import time
 import unittest
+import warnings
 from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -852,6 +854,50 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.calls, 1)
         self.assertEqual(service.source, SOURCE_LLM)
         await service.aclose()
+
+    async def test_request_refresh_closes_coroutine_when_spawn_raises(self):
+        """L-4：投递函数抛异常时协程必须 close，且返回 False（不能泄漏 + 谎报成功）。"""
+        service, _, log = self.build()
+
+        async def never_runs():
+            return True
+
+        coro = never_runs()
+        service.ensure_fresh = lambda **kw: coro
+
+        def boom(_coro, _name):
+            raise RuntimeError("投递失败")
+
+        service._spawn = boom
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ok = service.request_refresh(force=True)
+            gc.collect()
+
+        self.assertFalse(ok, "投递失败必须返回 False，不能报成功")
+        self.assertIsNone(service._task, "投递失败不该留下任务")
+        self.assertIsNone(coro.cr_frame, "协程必须被 close（否则永远不 await）")
+        self.assertEqual(
+            [w for w in caught if "never awaited" in str(w.message)],
+            [],
+            "泄漏的协程会触发 'coroutine was never awaited'",
+        )
+        self.assertIn("日程刷新投递失败", log.text("warning"))
+
+    async def test_request_refresh_closes_coroutine_when_spawn_returns_none(self):
+        """L-4：`_spawn` 返回 None（投递被丢弃）时同样 close 并返回 False。"""
+        service, _, _ = self.build()
+
+        async def never_runs():
+            return True
+
+        coro = never_runs()
+        service.ensure_fresh = lambda **kw: coro
+        service._spawn = lambda _coro, _name: None
+
+        self.assertFalse(service.request_refresh(force=True), "没拿到任务就不能报成功")
+        self.assertIsNone(service._task)
+        self.assertIsNone(coro.cr_frame, "spawn 返回 None 时同样要 close 协程")
 
     async def test_aclose_cancels_inflight(self):
         provider = FakeProvider("p", reply=seg_reply(), delay=5.0)

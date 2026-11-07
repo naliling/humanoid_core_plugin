@@ -32,6 +32,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import clock as _clock
+from .diagnostics import note_reason
 from .persona import PERSONA_PROMPT_MAX
 
 # 绝对门槛：38/50（76%）。这是**唯一**一处定义，面板/注入/文案一律引用它；
@@ -1707,6 +1708,9 @@ def evaluate(
     # P3：安全闸排在最前面，比一切都早。命中就不降档、不软化——
     # 未成年 / 血缘这两类人设**整条功能不生效**。
     if safety_reason:
+        # 原因码（v3.1.4）：安全闸一挡，整条功能都不生效——这是「她今天完全不主动」
+        # 最容易被误读成 bug 的原因，记下来供 `/拟人 诊断` 汇总。
+        note_reason("ccb_safety_blocked", safety_reason)
         return None
     # P1：她刚刚明确说过不要。这条与 coerced 是两件事——coerced 是「他越界」，
     # 这里是「她不想要」；两者都该挡住场景，但**不该**清掉场景状态
@@ -1732,6 +1736,9 @@ def evaluate(
         affection_rise=affection_rise,
         affection_deep=affection_deep,
     ):
+        # 原因码（v3.1.4）：数值门槛没过是**最常见的**静默不触发，不记就查不出
+        # 「好感够了为什么还没动静」。
+        note_reason("ccb_not_qualified", f"aff={affection:.0f} libido={libido:.0f}")
         return None
     if energy < CCB_ENERGY_MIN:
         return None
@@ -1742,6 +1749,8 @@ def evaluate(
     # 永远只在第三天出现。实测模拟里第 2 轮就被冷却挡回，satisfy 卡在 40。
     # 场景进行中（`in_scene`）不再受冷却约束；收场之后（stage 归零）冷却照旧生效。
     if not in_scene and last_at > 0 and (now - last_at) < CCB_COOLDOWN_SECONDS:
+        # 原因码（v3.1.4）：冷却期与「门槛不够」在用户看来一模一样，靠码区分。
+        note_reason("ccb_cooldown", f"{int(now - last_at)}s")
         return None
     # 进门判断：模型说"这一段在做什么"，关键词只在模型不可用时兜底。
     # 这一条排在数值门槛**之后**——先算"她够不够",再问"这会儿合不合适"。
@@ -1751,6 +1760,8 @@ def evaluate(
         return None
     # 一天封顶。门槛全中时它会一直亮着，不封顶就能一直刷下去。
     if turns_today >= CCB_DAILY_MAX:
+        # 原因码（v3.1.4）：一天封顶后当天不会再有任何触发，用户只会觉得「突然冷了」。
+        note_reason("ccb_daily_cap", f"{int(turns_today)}")
         return None
 
     band = _band_for(libido, eff_min)

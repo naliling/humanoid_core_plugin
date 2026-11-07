@@ -21,8 +21,10 @@
 
 from __future__ import annotations
 
-import random
+import hashlib
 from typing import Any, Iterable, Mapping, Sequence
+
+from ..opportunity import MATERIAL_TTL_SECONDS, anchor_key_for, make_card
 
 # ----------------------------------------------------------------------
 # 生活条件：人设正文里出现这些词，才认为她确实有工作/宠物/要照护的人/社交
@@ -152,6 +154,12 @@ MATERIALS: tuple[dict[str, Any], ...] = (
     _m("把手机里没用的截图和照片清了一遍", "家里", 15, 30, _WAKING, "手机", "life"),
     _m("把床单被套换下来洗了", "卧室", 30, 50, ("早上", "上午", "下午"), "床单", "life"),
     _m("烧了壶水，把杯子洗了，坐下来慢慢喝完", "厨房", 10, 20, _WAKING, "喝水", "life"),
+    _m("把阳台的花草搬出去晒了太阳，顺手浇了水", "阳台", 20, 40, _DAY, "花草", "life"),
+    _m("把换季的衣服翻出来，挑了几件能穿的", "卧室", 40, 70, _DAY, "换季", "life"),
+    _m("照着说明书把新买的小家电装好，试了试能用", "家里", 30, 60, _WAKING, "小家电", "life"),
+    _m("把书桌收拾出来，扔掉一袋没用的纸", "书桌前", 25, 45, _WAKING, "书桌", "life"),
+    _m("去菜市场转了一圈，挑了点当季的菜", "菜市场", 35, 60, ("早上", "上午"), "菜市场", "life"),
+    _m("把家里的药箱翻了一遍，过期的挑出来", "家里", 20, 40, _DAY, "药箱", "life"),
     # ---- 兴趣：只在人设里确实提到时发 ----
     _m("摊开本子画了一会儿，画到一半卡住了", "书桌前", 40, 90, _WAKING, "画画", "interest", interest="draw"),
     _m("戴上耳机听歌，跟着哼了几句", "家里", 20, 40, _WAKING, "听歌", "interest", interest="music"),
@@ -164,6 +172,12 @@ MATERIALS: tuple[dict[str, Any], ...] = (
     _m("写了一会儿东西，改了又删，最后留下两行", "书桌前", 40, 90, _WAKING, "写东西", "interest", interest="write"),
     _m("带着相机出门转了一圈，拍了几张", "外面", 60, 120, ("上午", "下午", "傍晚"), "拍照", "interest", interest="photo"),
     _m("把手边的东西拆了又装回去", "书桌前", 40, 80, _WAKING, "手工", "interest", interest="craft"),
+    _m("弹了会儿琴，把总弹错的那段练顺了", "客厅", 40, 80, _WAKING, "弹琴", "interest", interest="music"),
+    _m("临摹了一张画，画完贴在了墙上", "书桌前", 60, 120, _DAY, "临摹", "interest", interest="draw"),
+    _m("把攒着的剧看了两集，边看边记了两句台词", "客厅", 60, 120, ("下午", "傍晚", "夜里"), "看剧", "interest", interest="film"),
+    _m("照着教程做了个手工，做得歪歪扭扭", "书桌前", 60, 120, _DAY, "手作", "interest", interest="craft"),
+    _m("把旧照片扫进电脑，按年份分了文件夹", "书桌前", 45, 90, _DAY, "扫照片", "interest", interest="photo"),
+    _m("读完一本书的最后一章，合上书坐了会儿", "客厅", 40, 90, _WAKING, "读完书", "interest", interest="read"),
     # ---- 责任：工作 / 照护 / 宠物，同样只在人设有依据时发 ----
     _m("处理工作上的事，回了几封邮件", "书桌前", 40, 90, _WAKING, "工作", "duty", needs=("job",)),
     _m("把手上的活往前推了一段，中间歇了一次", "书桌前", 60, 120, _DAY, "干活", "duty", needs=("job",)),
@@ -172,11 +186,20 @@ MATERIALS: tuple[dict[str, Any], ...] = (
     _m("家里要照看的事忙了一阵才坐下", "家里", 60, 120, _DAY, "照看", "duty", needs=("care",)),
     _m("给猫添了粮，把水碗洗了", "厨房", 10, 20, _WAKING, "喂猫", "duty", needs=("pet",)),
     _m("带狗下楼转了一圈，回来给它擦了脚", "楼下", 25, 45, _WAKING, "遛狗", "duty", needs=("pet",)),
+    _m("把明天要用的材料整理好了，列了张单子", "书桌前", 30, 60, ("下午", "傍晚", "夜里"), "整理材料", "duty", needs=("job",)),
+    _m("回了客户的消息，把报价改了一版", "书桌前", 30, 60, ("上午", "下午"), "客户", "duty", needs=("job",)),
+    _m("去公司开了一下午的会，回来嗓子都哑了", "公司", 90, 180, ("上午", "下午"), "去公司", "duty", needs=("job",)),
+    _m("给家里老人打了电话，问了问身体", "家里", 15, 30, _WAKING, "问身体", "duty", needs=("care",)),
+    _m("带猫去宠物店剪了指甲，回来它躲了半天", "宠物店", 60, 120, _DAY, "剪指甲", "duty", needs=("pet",)),
     # ---- 社交：只在人设里提到有朋友/同学/室友/邻居时发 ----
     _m("跟朋友在楼下坐了会儿，聊到忘了时间", "楼下", 60, 110, ("下午", "傍晚", "夜里"), "朋友", "social", needs=("social",)),
     _m("回朋友的消息，聊着聊着聊久了", "家里", 20, 45, _WAKING, "回消息", "social", needs=("social",)),
     _m("朋友顺路过来，在门口说了会儿话", "门口", 15, 30, _WAKING, "串门", "social", needs=("social",)),
     _m("约了人一起吃饭，回来晚了一点", "外面", 90, 150, ("傍晚", "夜里"), "约饭", "social", needs=("social",)),
+    _m("和朋友约在咖啡馆坐了一下午，聊了很多", "咖啡馆", 90, 150, ("下午", "傍晚"), "咖啡馆", "social", needs=("social",)),
+    _m("室友做了饭，一起吃的时候聊了很久", "家里", 40, 80, ("中午", "傍晚", "夜里"), "一起吃", "social", needs=("social",)),
+    _m("在群里聊起来，最后约了周末见面", "家里", 20, 45, _WAKING, "群里", "social", needs=("social",)),
+    _m("帮邻居收了个快递，在门口说了会儿话", "门口", 10, 25, _WAKING, "帮邻居", "social", needs=("social",)),
     # ---- 歇着：什么都不干也是一种状态（注意：这里没有「睡一觉」）----
     _m("在沙发上躺着刷手机，什么正事也没做", "客厅", 20, 50, _WAKING, "刷手机", "rest", wants=True),
     _m("什么也不干，坐着发了会儿呆", "客厅", 15, 40, _WAKING, "发呆", "rest", wants=True),
@@ -184,6 +207,9 @@ MATERIALS: tuple[dict[str, Any], ...] = (
     _m("泡了杯东西，坐着慢慢喝完", "客厅", 20, 35, _WAKING, "泡茶", "rest", wants=True),
     _m("把窗户打开，站在阳台上吹了会儿风", "阳台", 10, 20, _WAKING, "吹风", "rest", wants=True),
     _m("把要做的事往后推了推，先缓了一会儿", "客厅", 20, 40, _WAKING, "拖延", "rest", wants=True),
+    _m("靠在沙发上看窗外，一下午没挪地方", "客厅", 40, 90, ("下午", "傍晚"), "看窗外", "rest", wants=True),
+    _m("给自己泡了壶茶，慢慢喝完才起身", "客厅", 30, 50, _WAKING, "泡壶茶", "rest", wants=True),
+    _m("躺在地毯上听了会儿歌，什么也没想", "家里", 30, 60, ("下午", "夜里"), "躺地毯", "rest", wants=True),
     # ---- 偶发：不常发生，但发生了就是一天里的一段 ----
     _m("在小区里走了一圈，看了看楼下那家店", "小区", 15, 30, _DAY, "散步", "rare"),
     _m("家里有个东西坏了，找工具弄了半天", "家里", 30, 60, _WAKING, "修理", "rare"),
@@ -191,11 +217,17 @@ MATERIALS: tuple[dict[str, Any], ...] = (
     _m("邻居敲门说了点事，站在门口聊了几句", "门口", 10, 20, _WAKING, "邻居", "rare", needs=("social",)),
     _m("翻出以前的照片看了一会儿", "家里", 20, 40, _WAKING, "旧照片", "rare", wants=True),
     _m("临时想起一件事，翻箱倒柜找了半天", "家里", 20, 45, _WAKING, "找东西", "rare"),
+    _m("楼上装修吵得不行，干脆出门躲了半天", "外面", 60, 120, _DAY, "装修", "rare"),
+    _m("在楼下碰到一只流浪猫，蹲下来喂了点东西", "楼下", 10, 25, _DAY, "流浪猫", "rare"),
+    _m("整理旧物翻到一封旧信，看了两遍", "家里", 20, 40, _WAKING, "旧信", "rare", wants=True),
+    _m("小区突然停水，拎着桶下楼接了一趟", "楼下", 20, 40, _DAY, "停水", "rare"),
     # ---- 夜里醒着（凌晨）：睡了半截又醒、或者干脆还没睡的时候 ----
     # 这一档原来没有：凌晨整池是空的，于是那个钟点一段素材都发不出来，
     # 模型又只剩「接着睡」一个选项。
     _m("起来倒了杯水，在窗边站了会儿", "窗边", 10, 25, ("凌晨", "夜里"), "起夜", "rest", wants=True),
     _m("在客厅坐着，翻了会儿手机", "客厅", 15, 40, ("凌晨", "夜里"), "夜里刷手机", "life"),
+    _m("半夜饿醒，起来煮了碗面吃完才回去", "厨房", 20, 35, ("凌晨", "夜里"), "半夜煮面", "life"),
+    _m("凌晨还醒着，在阳台站了会儿看天", "阳台", 10, 25, ("凌晨", "夜里"), "看天", "rest", wants=True),
 )
 
 # 每个档抽几条：均衡比总量重要——一整批全是家务，她这一天就只剩家务。
@@ -208,6 +240,171 @@ BAND_QUOTA: tuple[tuple[str, int], ...] = (
     ("rare", 1),
 )
 DEFAULT_COUNT = 10
+
+# ----------------------------------------------------------------------
+# 确定性轮换：同一天同一时段稳定，换一天换一批
+# ----------------------------------------------------------------------
+# 原来是 random.Random(seed) 洗牌：同一天稳定没问题，但「换一天换一批」靠的是洗牌
+# 结果碰巧不同，而且时段不进 seed，上午和下午拿到的是同一批的相对顺序。改成按
+# sha256 排序：排序键只由「角色 + 日期 + 时段 + 条目文本」决定，可复算、可测试，
+# 没有随机数状态，进程重启也不会漂。
+MATERIALS_USED_KEY = "materials_used"
+MATERIALS_USED_LIMIT = 128
+MATERIALS_USED_WINDOW_SECONDS = 7 * 24 * 3600.0
+
+
+def _seed_text(seed: Sequence[Any] | None, slot: str) -> str:
+    base = "|".join(str(x) for x in (seed or []))
+    return base + "|materials|" + str(slot or "")
+
+
+def _rank(seed_text: str, text: Any) -> str:
+    body = seed_text + "|" + str(text or "")
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _ordered(
+    items: Iterable[Mapping[str, Any]],
+    seed_text: str,
+    salt: str = "",
+) -> list[dict[str, Any]]:
+    """按 sha256 排一批素材：同 seed 同顺序，换日期/时段换顺序。"""
+    rows = [dict(item) for item in items if isinstance(item, Mapping)]
+    return sorted(rows, key=lambda item: _rank(seed_text + "|" + salt, item.get("event")))
+
+
+def _used_at(row: Mapping[str, Any]) -> float:
+    try:
+        return float(row.get("used_at") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def used_keys(
+    records: Any,
+    now_ts: Any,
+    *,
+    window: float = MATERIALS_USED_WINDOW_SECONDS,
+) -> set[str]:
+    """materials_used → 窗口期内用过的键（card_id 与 anchor_key）。
+
+    读侧必须 fail-open：没有记录、结构脏、时间戳不可解析，都当「没用过」——宁可
+    再提一次，也不要因为一条烂记录把整批素材筛空。
+    """
+    keys: set[str] = set()
+    if not isinstance(records, (list, tuple)):
+        return keys
+    try:
+        now = float(now_ts)
+    except (TypeError, ValueError):
+        return keys
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        used_at = _used_at(record)
+        if used_at <= 0.0:
+            continue
+        if now - used_at > float(window):
+            continue
+        for name in ("card_id", "anchor_key"):
+            text = str(record.get(name) or "").strip()
+            if text:
+                keys.add(text)
+    return keys
+
+
+def remember_used(
+    records: Any,
+    card: Mapping[str, Any],
+    now_ts: Any,
+    *,
+    limit: int = MATERIALS_USED_LIMIT,
+) -> list[dict[str, Any]]:
+    """把「这张卡用过了」记进 materials_used：同 card_id 覆盖，超上限丢最旧的。"""
+    rows: list[dict[str, Any]] = []
+    if isinstance(records, (list, tuple)):
+        for record in records:
+            if isinstance(record, Mapping):
+                rows.append(dict(record))
+    card_id = str(card.get("id") or "").strip()
+    anchor_key = str(card.get("anchor_key") or "").strip()
+    if not card_id and not anchor_key:
+        return rows
+    try:
+        used_at = float(now_ts)
+    except (TypeError, ValueError):
+        used_at = 0.0
+    deduped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = str(row.get("card_id") or "").strip() or str(row.get("anchor_key") or "").strip()
+        if not key:
+            continue
+        deduped[key] = row
+    deduped[card_id or anchor_key] = {
+        "card_id": card_id,
+        "anchor_key": anchor_key,
+        "used_at": used_at,
+    }
+    ordered = sorted(deduped.values(), key=_used_at)
+    if int(limit) <= 0:
+        return []
+    return ordered[-int(limit):]
+
+
+# ----------------------------------------------------------------------
+# 绑日程时段：这一段是上班 / 午休 / 睡觉时，别递冲突的素材
+# ----------------------------------------------------------------------
+SEGMENT_SLEEP_WORDS = ("睡", "小憩", "打盹", "午觉", "补觉", "赖床")
+SEGMENT_WORK_WORDS = (
+    "上班", "工作", "加班", "开会", "会议", "值班", "上课", "出差", "客户",
+    "项目", "赶稿", "写稿", "汇报", "店里",
+)
+SEGMENT_BREAK_WORDS = ("午休", "午间", "午饭", "吃饭", "用餐", "歇晌")
+
+_SEGMENT_BANDS: dict[str, tuple[str, ...]] = {
+    "sleep": ("rest",),
+    "work": ("duty", "interest"),
+}
+_SEGMENT_NIGHT_SLOTS = ("凌晨", "夜里")
+
+
+def segment_kind(text: Any, *, asleep: bool = False) -> str:
+    """当前日程段属于哪一类：sleep / work / break / ""（认不出就不筛）。"""
+    if asleep:
+        return "sleep"
+    body = str(text or "")
+    if any(word in body for word in SEGMENT_SLEEP_WORDS):
+        return "sleep"
+    if any(word in body for word in SEGMENT_WORK_WORDS):
+        return "work"
+    if any(word in body for word in SEGMENT_BREAK_WORDS):
+        return "break"
+    return ""
+
+
+def _segment_allows(item: Mapping[str, Any], kind: str) -> bool:
+    """日程段和素材档冲突时丢掉：睡着时别递「去菜市场」，上班时别递「收拾衣柜」。"""
+    if not kind:
+        return True
+    band = str(item.get("band") or "")
+    if kind == "break":
+        return band != "duty"
+    allowed = _SEGMENT_BANDS.get(kind)
+    if allowed is None:
+        return True
+    if band not in allowed:
+        return False
+    if kind == "sleep":
+        return bool(set(_SEGMENT_NIGHT_SLOTS) & set(item.get("slots") or ()))
+    return True
+
+
+def _used_item(item: Mapping[str, Any], used: set[str]) -> bool:
+    """这条素材的题眼是不是近 7 天已经用过（按 anchor_key 比）。"""
+    if not used:
+        return False
+    topic = str(item.get("topic") or "").strip() or str(item.get("event") or "")
+    return anchor_key_for("life", topic) in used
 
 
 def _topic_used(topic: str, recent: Iterable[str]) -> bool:
@@ -233,8 +430,12 @@ def materials_for(
     recent_events: Iterable[str] = (),
     count: int = DEFAULT_COUNT,
     extra: Sequence[Mapping[str, Any]] = (),
+    *,
+    used: Iterable[str] = (),
+    segment: str = "",
+    asleep: bool = False,
 ) -> list[dict[str, Any]]:
-    """抽一批「这个时候她可能做的事」：同一天稳定，不同天不同。
+    """抽一批「这个时候她可能做的事」：同一天同一时段稳定，换一天换一批。
 
     recent_events 是今天已经过完的段 + 昨天的收尾：题眼出现过的事不再发——否则
     模型每天看到的都是同一批素材，「她的一天高度雷同」这条老毛病就换了个来源。
@@ -242,26 +443,39 @@ def materials_for(
     extra 是这个角色专属的素材（role_materials 按人设生成的）：它们已经按人设筛过
     身份条件，进池后优先于内置条目——不然「她是谁」写进去的那些具体的事永远排在
     通用条目后面，等于没加。
+
+    used 是近 7 天已经用过的键（card_id / anchor_key，见 used_keys）：命中就跳过，
+    别每天把同一件事再推一遍。拿不到记录就传空——空集合等于不过滤（fail-open）。
+
+    segment 是当前日程段的文本、asleep 是契约里的深睡标记：睡着时只留「夜里醒着」
+    这类素材，上班时只留工作与自己的事，午休时把工作档拿掉。
     """
     caps = capabilities(persona_text)
     interests = interests_in(persona_text)
     slot = slot_name(now_minute)
     recent = [str(text or "") for text in recent_events or () if str(text or "").strip()]
-    rnd = random.Random("|".join(str(x) for x in (seed or [])) + "|materials")
+    seed_text = _seed_text(seed, slot)
+    kind = segment_kind(segment, asleep=asleep)
+    used_set = {str(key).strip() for key in (used or ()) if str(key or "").strip()}
 
     def usable(item: Mapping[str, Any]) -> bool:
         return (
             slot in tuple(item.get("slots") or ())
             and not _topic_used(str(item.get("topic") or ""), recent)
+            and _segment_allows(item, kind)
+            and not _used_item(item, used_set)
         )
 
-    role_pool = [dict(item) for item in extra if isinstance(item, Mapping) and usable(item)]
-    builtin_pool = [
-        item for item in MATERIALS
-        if usable(item) and _allowed(item, caps, interests)
-    ]
-    rnd.shuffle(role_pool)
-    rnd.shuffle(builtin_pool)
+    role_pool = _ordered(
+        (item for item in extra if isinstance(item, Mapping) and usable(item)),
+        seed_text,
+        "role",
+    )
+    builtin_pool = _ordered(
+        (item for item in MATERIALS if usable(item) and _allowed(item, caps, interests)),
+        seed_text,
+        "builtin",
+    )
     pool = role_pool + builtin_pool
     by_band: dict[str, list[dict[str, Any]]] = {}
     for item in pool:
@@ -281,8 +495,8 @@ def materials_for(
         buckets: dict[str, list[dict[str, Any]]] = {}
         for item in rest:
             buckets.setdefault(str(item["band"]), []).append(item)
-        for items in buckets.values():
-            rnd.shuffle(items)
+        for band, items in buckets.items():
+            buckets[band] = _ordered(items, seed_text, "back:" + band)
         order = [band for band, _ in BAND_QUOTA if band in buckets]
         while len(picked) < count and order:
             alive: list[str] = []
@@ -295,19 +509,36 @@ def materials_for(
                 if len(picked) >= count:
                     break
             order = alive
-    rnd.shuffle(picked)
+    picked = _ordered(picked, seed_text, "out")
+    if not picked and kind == "work":
+        # 上班段可能一条都不剩：人设里没有工作/兴趣条件时，duty 与 interest 两档
+        # 整个被 _allowed 筛掉，时段再筛一次就是空批。这时宁可递一批不挑时段的
+        # 素材，也别让她上班那几小时一张证据卡都没有。睡觉段不走这条兜底——
+        # 睡着时递「去菜市场」比空着更糟。
+        return materials_for(
+            seed,
+            persona_text,
+            now_minute,
+            recent_events,
+            count,
+            extra,
+            used=used,
+            segment="",
+            asleep=False,
+        )
     return picked[: max(1, int(count))]
 
 
 def material_minutes(item: dict[str, Any], seed: list[Any] | None = None) -> int:
     """这一条今天按多少分钟给（区间内取一个，同一天稳定）。"""
     lo, hi = item.get("minutes") or (15, 30)
-    if int(hi) <= int(lo):
-        return int(lo)
-    rnd = random.Random(
-        "|".join(str(x) for x in (seed or [])) + "|" + str(item.get("event") or "")
-    )
-    return rnd.randint(int(lo), int(hi))
+    lo, hi = int(lo), int(hi)
+    if hi <= lo:
+        return lo
+    digest = hashlib.sha256(
+        ("|".join(str(x) for x in (seed or [])) + "|" + str(item.get("event") or "")).encode("utf-8")
+    ).hexdigest()
+    return lo + int(digest[:16], 16) % (hi - lo + 1)
 
 
 def render_materials(items: Sequence[dict[str, Any]], seed: list[Any] | None = None) -> str:
@@ -317,3 +548,88 @@ def render_materials(items: Sequence[dict[str, Any]], seed: list[Any] | None = N
         minutes = material_minutes(item, seed)
         rows.append("  - " + str(item["event"]) + "（" + str(item["location"]) + "，约 " + str(minutes) + " 分钟）")
     return "\n".join(rows)
+
+
+# ----------------------------------------------------------------------
+# 证据卡：把素材翻成「社交层能直接用的卡」
+# ----------------------------------------------------------------------
+# 素材原本只给日程生成用（event/location/minutes/slots）。社交层要拿它当由头
+# 主动开口，还需要三样东西：这条是**哪一类**素材（中文出处，念得出来）、
+# 什么时候采集的、到什么时候就不该再说了。这三样统一由 humanoid.opportunity
+# 的卡片形状承载，这里只负责把一条素材翻过去。
+BAND_SOURCES: dict[str, str] = {
+    "life": "生活素材",
+    "interest": "兴趣",
+    "duty": "责任",
+    "social": "社交",
+    "rest": "歇着",
+    "rare": "偶发",
+}
+
+
+def material_source(item: Mapping[str, Any]) -> str:
+    """这条素材的出处标签（未知档按「生活素材」）。"""
+    return BAND_SOURCES.get(str(item.get("band") or ""), BAND_SOURCES["life"])
+
+
+def material_card(
+    item: Mapping[str, Any],
+    *,
+    captured_at: Any,
+    seed: Sequence[Any] | None = None,
+    ttl: Any = None,
+) -> dict[str, Any]:
+    """把一条素材翻成证据卡（形状见 humanoid.opportunity）。
+
+    `captured_at` 由调用方给（通常是契约生成时刻，按小时取整）：素材是「她这样的人
+    今天还可能做」的事，采集时间说的是「什么时候想到的」，不是「什么时候发生的」。
+    `anchor_key` 用题眼（topic）：今天做过「洗衣」就不再发「洗衣」，两处指的是同一件事。
+    """
+    event = str(item.get("event") or "").strip()
+    location = str(item.get("location") or "").strip()
+    minutes = material_minutes(dict(item), seed)
+    detail = (
+        location + "，大概 " + str(minutes) + " 分钟"
+        if location
+        else "大概 " + str(minutes) + " 分钟"
+    )
+    topic = str(item.get("topic") or "").strip() or event
+    return make_card(
+        kind="life",
+        title=event,
+        detail=detail,
+        source=material_source(item),
+        captured_at=captured_at,
+        ttl=MATERIAL_TTL_SECONDS if ttl is None else ttl,
+        anchor_key=anchor_key_for("life", topic),
+    )
+
+
+def materials_as_cards(
+    items: Iterable[Mapping[str, Any]],
+    *,
+    captured_at: Any,
+    seed: Sequence[Any] | None = None,
+    skip: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """一批素材 → 一批卡。坏条目单条丢弃，不因为一条坏的让整批作废。
+
+    skip 是近 7 天已经用过的键（card_id / anchor_key），命中就丢：只按题眼过滤不
+    够——旧记录里可能只有 card_id，所以这里拿卡自己的 id 再兜一次。
+    """
+    skip_set = {str(key).strip() for key in (skip or ()) if str(key or "").strip()}
+    cards: list[dict[str, Any]] = []
+    for item in items or ():
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            card = material_card(item, captured_at=captured_at, seed=seed)
+        except (TypeError, ValueError):
+            continue
+        if skip_set and (
+            str(card.get("id") or "") in skip_set
+            or str(card.get("anchor_key") or "") in skip_set
+        ):
+            continue
+        cards.append(card)
+    return cards

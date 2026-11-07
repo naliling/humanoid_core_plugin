@@ -22,6 +22,8 @@ import asyncio
 import time
 from typing import Any, Dict, Tuple
 
+from .diagnostics import note_reason
+
 # 任务表里的每一条：任务、停止信号、上一次上报时间。
 _Entry = Tuple[asyncio.Task, asyncio.Event]
 
@@ -130,6 +132,9 @@ class InputStateNotifier:
             return
         _, user_id = self.is_supported(event)
         if not user_id:
+            # 原因码（v3.1.4）：「正在输入」是纯装饰，不支持时静默跳过是设计；但用户
+            # 反馈「她这里不显示正在输入」时需要知道是平台/私聊/API 哪一类不支持。
+            note_reason("input_state_unsupported", str(getattr(event, "unified_msg_origin", "") or ""))
             return
         client = getattr(getattr(event, "bot", None), "api", None)
         if client is None:

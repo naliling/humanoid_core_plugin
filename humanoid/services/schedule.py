@@ -3395,10 +3395,20 @@ class ScheduleService:
             return False
         coro = self.ensure_fresh(force=force, ignore_cooldown=ignore_cooldown)
         name = f"humanoid-schedule-refresh-{self._scope.role_id}"
-        if self._spawn:
-            self._task = self._spawn(coro, name)
-        else:
-            self._task = asyncio.create_task(coro, name=name)
+        try:
+            task = self._spawn(coro, name) if self._spawn else asyncio.create_task(coro, name=name)
+        except Exception as exc:
+            # 投递失败时协程没人会 await：不 close 就留着「never awaited」的泄漏。
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            if self._log:
+                self._log.warning(f"[humanoid_core] 日程刷新投递失败: {exc}")
+            return False
+        if task is None:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return False
+        self._task = task
         return True
 
     async def ensure_fresh(

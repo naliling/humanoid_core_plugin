@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from typing import Any
 
 from astrbot.api import logger
@@ -325,6 +326,223 @@ def _chain_pick(
         if provider is not None:
             return f"{GLOBAL_LABEL}({resolver.id_of(provider)})"
     return "无可用模型 → 按身体与钟点现算一段（不调模型）"
+
+
+# ─── 跳过原因码（v3.1.4） ─────────────────────────────────────────────
+#
+# 为什么要记：humanoid 里「这一轮什么都没发生」的分支很多——安全闸挡住 ccb、
+# 冷却期、每日上限、注入块拼不出内容、后台任务在收到停止信号后不再起……它们
+# 全都只是 `return None` / `return ""`，日志里一个字都没有。用户看到的现象是
+# 「她今天好像不太理我」，而排查时没有任何线索。
+#
+# 这里**只做观测**：每个关键早退点写一个稳定的机器码进内存环，`/拟人 诊断`
+# 汇总最近 24 小时出现最多的几个。不落盘（诊断是排查入口，不是账本）、
+# 不改行为、满了丢最旧的（内存有界，长时间运行也不会涨）。
+
+REASON_BUFFER_SIZE = 512
+REASON_WINDOW_SECONDS = 86400.0
+_REASON_BUFFER: deque = deque(maxlen=REASON_BUFFER_SIZE)
+
+# 码是给机器看的，报告是给人看的：用户看「/你的状态」时不该对着一串英文猜。
+# 没登记的码原样显示（新增码忘了登记也不会把报告弄坏）。
+REASON_LABELS = {
+    "closing_silence": "收尾静默：对方只是重复道别，这轮没再回",
+    "closing_prompt": "收尾提示：跳不过模型，只提醒她别再追一句",
+    "inject_empty": "本轮没有可注入的背景",
+    "ccb_safety_blocked": "CCB 被安全策略挡下（未成年/血缘人设）",
+    "ccb_not_qualified": "CCB 的好感或欲望没到门槛",
+    "ccb_cooldown": "CCB 还在冷却",
+    "ccb_daily_cap": "CCB 今日次数已用完",
+    "input_state_unsupported": "「正在输入」不支持这个会话",
+    "background_after_stop": "停止后仍有后台任务被拉起",
+    "opportunity_used": "本轮把具体可提的事递进了上下文（带出处与时效）",
+    "opportunity_expired": "有由头但已过期，被丢掉了（宁可少一条，不给过时的）",
+    "opportunity_missing": "这一轮没有任何可指认的具体的事（只能少说，不要编）",
+    "greeting_opportunity": "本轮把问候窗口翻成了可提的由头（只给时机，不代表对方刚醒）",
+    "share_provenance_missing": "她最近主动说过的话找不到出处（不补细节，不编）",
+    "materials_used": "本轮把生活素材摆进了上下文，并记进 7 天去重台账",
+}
+
+# 证据卡三码是「每轮都会记一次」的状态码（有卡 / 全过期 / 一张都没有），
+# 不是「这轮跳过了什么」：混进 reason_report 的 top 会让它们凭条数长期霸榜，
+# 把真正让她不回话的原因（CCB 冷却、收尾静默……）挤下去。所以它们照样进环、
+# 照样有中文文案，只是默认不参与跳过原因排名——要看就传 include_context=True。
+CONTEXT_CODES = frozenset({
+    "opportunity_used",
+    "opportunity_expired",
+    "opportunity_missing",
+    # v3.1.6：同样是「每轮都可能记一次」的上下文状态，不是跳过原因。
+    "greeting_opportunity",
+    "share_provenance_missing",
+    # v3.1.7：素材去重台账的写入，同样是每轮可能记一次的状态码。
+    "materials_used",
+})
+
+
+def note_reason(code: str, detail: str = "") -> None:
+    """记一次「这轮为什么没做某事」。code 是稳定的机器码（英文小写下划线）。
+
+    为什么不直接写日志：这些分支都在热路径上（每条消息、每次后台循环），写日志
+    会把正常日志淹掉；环缓冲只在用户主动看诊断时才被读出来。
+    """
+    text = str(code or "").strip()
+    if not text:
+        return
+    try:
+        _REASON_BUFFER.append({
+            "code": text[:48],
+            "detail": str(detail or "")[:80],
+            "ts": time.time(),
+        })
+    except Exception:  # pragma: no cover - 纯内存操作，理论上不会失败
+        pass
+
+
+def clear_reasons() -> None:
+    """清空环缓冲（测试与「看过了」用；不影响任何行为）。"""
+    _REASON_BUFFER.clear()
+
+
+def _ago_text(seconds: float) -> str:
+    """把「多少秒以前」说成人话；看不懂就返回空串，绝不抛。"""
+    try:
+        value = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return ""
+    if value < 90:
+        return f"{int(value)} 秒"
+    if value < 5400:
+        return f"{int(value // 60)} 分钟"
+    return f"{int(value // 3600)} 小时"
+
+
+def reason_report(
+    now: float | None = None,
+    window_seconds: float = REASON_WINDOW_SECONDS,
+    include_context: bool = False,
+) -> dict:
+    """最近一段时间里各类跳过原因的次数，按次数降序。
+
+    返回 `{"window_seconds", "total", "capacity", "stored", "top"}`，`top` 里每项是
+    `{"code", "count", "last_at", "last_detail"}`。窗口按时间戳过滤（不是按条数），
+    所以 24 小时前的记录自动不计入，也不需要后台清理。
+
+    `include_context=True` 时把证据卡三码（CONTEXT_CODES）也算进来——它们每轮都会
+    记一次，属于上下文状态而不是跳过原因，默认排除，免得把真原因挤下榜首。
+    """
+    try:
+        moment = time.time() if now is None else float(now)
+    except (TypeError, ValueError):
+        moment = time.time()
+    try:
+        window = max(0.0, float(window_seconds))
+    except (TypeError, ValueError):
+        window = REASON_WINDOW_SECONDS
+    floor = moment - window
+    counts: dict[str, dict] = {}
+    for item in list(_REASON_BUFFER):
+        ts = float(item.get("ts") or 0.0)
+        if ts < floor:
+            continue
+        code = str(item.get("code") or "")
+        if not code:
+            continue
+        if not include_context and code in CONTEXT_CODES:
+            continue
+        bucket = counts.get(code)
+        if bucket is None:
+            counts[code] = {
+                "code": code,
+                "count": 1,
+                "last_at": ts,
+                "last_detail": str(item.get("detail") or ""),
+            }
+        else:
+            bucket["count"] += 1
+            if ts >= bucket["last_at"]:
+                bucket["last_at"] = ts
+                bucket["last_detail"] = str(item.get("detail") or "")
+    top = sorted(
+        counts.values(), key=lambda item: (-item["count"], -item["last_at"], item["code"])
+    )
+    return {
+        "window_seconds": window,
+        "total": sum(item["count"] for item in top),
+        "capacity": REASON_BUFFER_SIZE,
+        "stored": len(_REASON_BUFFER),
+        "top": top,
+    }
+
+
+def reason_lines(
+    now: float | None = None,
+    window_seconds: float = REASON_WINDOW_SECONDS,
+    limit: int = 5,
+) -> list[str]:
+    """诊断报告里的【跳过原因码】小节。**没有记录就返回空列表**。
+
+    为什么要「没有就不出现」：报告本身已经有七八段，绝大多数部署根本不会碰到
+    这些分支；空小节只会让真正重要的告警更难被看见。
+    """
+    try:
+        report = reason_report(now=now, window_seconds=window_seconds)
+    except Exception:  # pragma: no cover - 观测代码不许把诊断页弄挂
+        return []
+    top = report["top"][: max(1, int(limit or 5))]
+    if not top:
+        return []
+    moment = time.time() if now is None else float(now)
+    hours = report["window_seconds"] / 3600.0
+    lines = [f"【跳过原因码】最近 {hours:.0f} 小时共 {report['total']} 次"]
+    for item in top:
+        detail = f"：{item['last_detail']}" if item["last_detail"] else ""
+        label = REASON_LABELS.get(item["code"], "")
+        suffix = f" —— {label}" if label else ""
+        lines.append(
+            f"- {item['code']} ×{item['count']}"
+            f"（{_ago_text(moment - item['last_at'])}前{detail}）{suffix}"
+        )
+    lines.append("  （只在进程内存里记；重启即清空，不落盘）")
+    return lines
+
+
+def evidence_lines(
+    now: float | None = None,
+    window_seconds: float = REASON_WINDOW_SECONDS,
+) -> list[str]:
+    """诊断报告里的【证据卡】小节：有卡可用 / 全过期 / 一张都没有各多少次。
+
+    为什么单列而不并进【跳过原因码】：这三码每轮都会记一次（见 CONTEXT_CODES），
+    并进去会凭条数霸榜。单列一行既能看到「她最近是不是一直在没素材地聊」，
+    又不影响跳过原因的排序。同样**没有记录就不出现**，不给报告添空行。
+    """
+    try:
+        report = reason_report(
+            now=now, window_seconds=window_seconds, include_context=True
+        )
+    except Exception:  # pragma: no cover - 观测代码不许把诊断页弄挂
+        return []
+    counts = {
+        str(item.get("code") or ""): int(item.get("count") or 0)
+        for item in report["top"]
+        if item.get("code") in CONTEXT_CODES
+    }
+    if not counts:
+        return []
+    hours = report["window_seconds"] / 3600.0
+    parts = []
+    for code, text in (
+        ("opportunity_used", "有卡可用"),
+        ("opportunity_expired", "全过期"),
+        ("opportunity_missing", "一张都没有"),
+        ("greeting_opportunity", "问候时机"),
+        ("share_provenance_missing", "出处缺失"),
+        ("materials_used", "素材记档"),
+    ):
+        count = counts.get(code, 0)
+        if count:
+            parts.append(f"{text} ×{count}")
+    return [f"【证据卡】最近 {hours:.0f} 小时：{'、'.join(parts)}"]
 
 
 def build_report(
@@ -669,6 +887,16 @@ def _build_report_body(
         f"- 大模型日程 {'开启' if cfg.use_llm_schedule else '关闭'}"
         f"，调试日志 {'开启' if cfg.debug_mode else '关闭'}",
     ]
+
+    # 跳过原因码（v3.1.4）：只在有记录时才出现，不给既有报告添空行。
+    reasons = reason_lines()
+    if reasons:
+        lines += [""] + reasons
+
+    # 证据卡状态（v3.1.5）：与跳过原因分开——这三码每轮都记，并进上面会把真原因挤掉。
+    evidence = evidence_lines()
+    if evidence:
+        lines += [""] + evidence
 
     if not available:
         lines += ["", "→ 请先在 AstrBot 的「服务提供商」里配置至少一个对话模型。"]

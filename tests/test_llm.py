@@ -1071,6 +1071,56 @@ class DailyBudgetSurvivesRestart(unittest.TestCase):
         self.assertFalse(b.check("schedule").allowed,
                          "B 只在启动时读过一次账本 = A 之后用的那次不算数")
 
+    def test_ledger_write_retries_a_transient_replace_failure(self):
+        """L-5：`os.replace` 被瞬时占用时重试，最终落盘且不留 `.tmp`。
+
+        旧实现一次失败就放弃（`except OSError: return`），临时文件还留在目录里：
+        这一轮用量丢了，下次目录扫描还会把半个账本当账本。
+        """
+        import json
+        import os as _os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        ledger = Path(tempfile.mkdtemp()) / "llm_usage.json"
+        gate = self._gate(ledger)
+        real_replace = _os.replace
+        calls = []
+
+        def flaky_replace(src, dst, *args, **kwargs):
+            calls.append((src, dst))
+            if len(calls) == 1:
+                raise OSError(13, "拒绝访问")     # 杀软/索引短暂持有目标文件
+            return real_replace(src, dst, *args, **kwargs)
+
+        with mock.patch("humanoid.llm.os.replace", side_effect=flaky_replace):
+            gate.consume("schedule")
+
+        self.assertEqual(len(calls), 2, "第一次失败后必须重试一次")
+        payload = json.loads(ledger.read_text(encoding="utf-8"))
+        self.assertEqual(payload["used"], 1, "重试成功后必须真的落盘")
+        self.assertEqual(gate.used_today, 1)
+        leftovers = sorted(p.name for p in ledger.parent.iterdir() if p.name.endswith(".tmp"))
+        self.assertEqual(leftovers, [], "临时文件必须清理干净")
+
+    def test_ledger_write_gives_up_quietly_and_cleans_tmp(self):
+        """L-5：重试也失败时不许抛、不许抬内存同步位，且不留下 `.tmp`。"""
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        ledger = Path(tempfile.mkdtemp()) / "llm_usage.json"
+        gate = self._gate(ledger)
+        with mock.patch("humanoid.llm.os.replace", side_effect=OSError(13, "拒绝访问")):
+            gate.consume("schedule")            # 不许把异常抛给调用方
+
+        self.assertFalse(ledger.exists(), "没替换成功就不该有账本文件")
+        self.assertEqual(gate.used_today, 1, "内存里这一笔仍要算，否则会超发")
+        self.assertEqual(gate._synced_used, 0, "没落盘就不能抬同步位，差额下次补")
+        leftovers = sorted(p.name for p in ledger.parent.iterdir() if p.name.endswith(".tmp"))
+        self.assertEqual(leftovers, [], "失败的临时文件必须清理")
+
 
 class RetryableJudgementTest(unittest.TestCase):
     """`_is_retryable` 看的是 HTTP 状态语义，不是错误文本里的裸数字。

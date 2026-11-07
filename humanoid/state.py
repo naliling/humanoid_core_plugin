@@ -257,6 +257,9 @@ class StateStore:
             self._error(f"状态文件读取失败，已停止写盘以免覆盖原文件: {exc}")
             return
 
+        # 读到了就顺手收紧权限：老版本写下的文件是 644，不该等到下一次落盘才修。
+        _tighten_permissions(self._path)
+
         try:
             raw = json.loads(_decode_bytes(data))
             if not isinstance(raw, dict):
@@ -1218,6 +1221,20 @@ def _scrub_nonfinite(value: Any) -> int:
     return changed
 
 
+def _tighten_permissions(path: Path) -> None:
+    """把状态文件与它所在目录收紧到只有本人可读（POSIX 600 / 700）。
+
+    状态里存着对方原话片段与私聊摘要（见 README「数据与边界」），默认的 644/755
+    在多用户机器上等于同机其他账号都能读。Windows 的 chmod 只能切只读位、没有
+    「其他用户不可读」的等价语义，所以只在 posix 上做；加固失败也不该连累落盘。
+    """
+    if os.name != "posix":
+        return
+    for target, mode in ((path, 0o600), (path.parent, 0o700)):
+        with contextlib.suppress(OSError):
+            os.chmod(target, mode)
+
+
 def _atomic_write(path: Path, payload: str) -> bool:
     """原子写。返回值 = 是否为了写成功而替换过 payload 里的坏字符。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1243,6 +1260,8 @@ def _atomic_write(path: Path, payload: str) -> bool:
             scrubbed = True
             _write(payload.encode("utf-8", "replace").decode("utf-8"))
         _replace_with_retry(tmp, path)
+        # 新文件是 open() 按 umask 建出来的（常见 644）：落盘后立刻收紧。
+        _tighten_permissions(path)
     except BaseException:
         # 失败分支别留下半截临时文件（下次启动的目录扫描会被它误导）。
         with contextlib.suppress(OSError):

@@ -223,6 +223,28 @@ def _event_kind(weight: float, kind: str = "") -> str:
     return "有点冷"
 
 
+_USER_MESSAGE_BLOCK = re.compile(
+    r"(<user_message[^>]*>)(.*?)(</user_message>)", re.DOTALL
+)
+_SPOKE_TEXT = re.compile(r"她说「[^」]*」")
+
+
+def _redact_prompt_for_log(prompt: str) -> str:
+    """日志用的 prompt：结构照打，聊天内容抹掉。
+
+    debug_mode 下原来打的是**完整** prompt：`<user_message>` 里是群聊原文，
+    「她说」那几行是她自己说过的话，等于把聊天内容长期写进 astrbot.log，
+    同机任何能读日志的账号都能看到。排查要的是「送了几条、各多长」，
+    不是内容本身。
+    """
+
+    def _hide(match: re.Match[str]) -> str:
+        return f"{match.group(1)}[已脱敏 {len(match.group(2))} 字]{match.group(3)}"
+
+    text = _USER_MESSAGE_BLOCK.sub(_hide, prompt)
+    return _SPOKE_TEXT.sub("她说「已脱敏」", text)
+
+
 DIMENSIONS = (
     ("affection", "base_affection", AFFECTION_RANGE),
     ("libido", "base_libido", LIBIDO_RANGE),
@@ -2909,7 +2931,9 @@ class MoodService:
             parts.append("（只当背景。对方没接住的那几行，是这件事里最该被计入的部分。）")
         prompt = "\n".join(parts)
         if cfg.debug_mode and self._log:
-            self._log.info(f"[humanoid_core] 情绪分析请求: {prompt}")
+            self._log.info(
+                "[humanoid_core] 情绪分析请求: " + _redact_prompt_for_log(prompt)
+            )
 
         result = await self._gateway.generate(
             prompt=prompt,

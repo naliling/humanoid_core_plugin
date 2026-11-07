@@ -9,6 +9,7 @@ import json
 import os
 import random
 import re
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -626,19 +627,46 @@ class CallGate:
                 "used": total,
                 "by_purpose": by_purpose,
             }
+            # 临时名带 pid + 线程号：固定的 `.tmp` 会让两个实例/线程互相搬走对方的内容
+            # （A 写完 B 又写，A 的 replace 把 B 的正文搬走）。与 state._atomic_write 同款。
+            tmp = f"{self._ledger_path}.{os.getpid()}.{threading.get_ident()}.tmp"
             try:
                 # 先写临时文件再改名：写到一半掉电时留下半个文件，明天就再也读不回来了。
-                tmp = f"{self._ledger_path}.tmp"
                 with open(tmp, "w", encoding="utf-8") as fh:
                     json.dump(payload, fh, ensure_ascii=False)
-                os.replace(tmp, self._ledger_path)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                self._replace_ledger_with_retry(tmp)
             except OSError:
                 # 没写进磁盘就别抬内存里的同步位：下一次落盘要把这份差额补上。
+                # 失败的临时文件必须清掉，否则下次目录扫描会把它当半个账本。
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
                 return
             self._used_today = total
             self._synced_used = total
             self._used_by_purpose = dict(by_purpose)
             self._synced_by_purpose = dict(by_purpose)
+
+    def _replace_ledger_with_retry(self, tmp: str) -> None:
+        """`os.replace` 带短退避重试（L-5）。
+
+        杀软/索引/同步工具会短暂持有目标文件，一次失败就等于这一轮用量没落盘。
+        账本是在调用热路径上同步写的，退避只能到几十毫秒——state 里那套
+        0.1→1.6 秒的指数退避是给写盘线程用的，照搬会卡住事件循环。仍失败就
+        抛给调用方清 tmp、不抬同步位（对外行为与旧版一致：不抛给上层）。
+        """
+        last: Exception | None = None
+        for attempt in range(3):
+            if attempt:
+                time.sleep(0.02 * attempt)      # 0.02 / 0.04 秒
+            try:
+                os.replace(tmp, self._ledger_path)
+                return
+            except OSError as exc:
+                last = exc
+        if last is not None:
+            raise last
 
     def _character_city(self) -> str:
         """预算按哪个城市的自然日切：角色级覆盖优先，其次全局配置。"""

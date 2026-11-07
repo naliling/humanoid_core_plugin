@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import __version__
+from . import anchors
 from . import contract as _contract
 from . import state_snapshot as _snapshot
 from .clock import in_deep_window, in_night_window
@@ -311,6 +312,26 @@ def build_contract(core: Any) -> dict[str, Any]:
             "user_ccb_aftercare_until": "roles.<bid>.users.<uid>.ccb_aftercare_until",
         },
     }
+    # ─── 证据卡（v3.1.5）：由头 / 素材 ─────────────────────
+    #
+    # 社交层主动开口缺的不是「她在休息」这种状态，而是「她今天确实有什么」。由头
+    # （`opportunities`）是既成事实翻成的卡：今天做过什么、正在做什么、想做什么、
+    # 什么没做完、刚发生了什么；素材（`materials`）是「她这样的人今天还可能做」的
+    # 那 45 条生活素材翻成的卡，用来问「要不要去楼下走走」。两者形状见
+    # `humanoid.opportunity`：id / kind / title / detail / source / captured_at /
+    # expires_at / anchor_key。
+    #
+    # **整段 try/except**：卡是锦上添花，任何一处翻车（人设读不到、素材表坏了、
+    # 某个角色的 scope 形状不对）都只让这两个键变成空列表。绝不能让它把整份契约
+    # 带崩——Core 的契约一没了，社交层就整片瞎掉。两个键**永远都在**（没有就是空
+    # 列表）：对方按「键在不在」判新旧版本，缺键与空列表是两件事。
+    try:
+        _blocks = anchors.contract_blocks(core, contract, now=now)
+        contract["opportunities"] = list(_blocks.get("opportunities") or [])
+        contract["materials"] = list(_blocks.get("materials") or [])
+    except Exception:
+        contract["opportunities"] = []
+        contract["materials"] = []
     # ─── 握手三键（契约 v2）：只加不改 ───────────────────
     #
     # 设计意图：社交层以前只能靠 `v >= 1` 猜「对面是不是新版本」，字段对不上时静默

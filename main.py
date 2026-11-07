@@ -44,7 +44,8 @@ from .humanoid.config import (
     HumanoidConfig,
     plan_default_migrations,
 )
-from .humanoid.diagnostics import config_error_banner
+from .humanoid.diagnostics import config_error_banner, note_reason
+from .humanoid import closing as _closing
 from .humanoid.engine import HumanoidEngine
 from .humanoid.llm import CallGate, LLMGateway, ProviderResolver
 from .humanoid.persona import PersonaSource
@@ -254,6 +255,20 @@ COMMAND_NAMES = (
 )
 
 
+def _mask_id(value: Any) -> str:
+    """日志里的账号标识：留前 3 后 2，中间打码（审核 L-9）。
+
+    QQ 号是能定位到真人的标识，debug 日志同样会落盘、同样会被整份贴出去求助，
+    所以不只在非 debug 下打码——日志里根本没有需要完整 QQ 号的场景。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 5:
+        return "***"
+    return f"{text[:3]}***{text[-2:]}"
+
+
 def _is_command_message(text: str, wake_command: bool = True) -> bool:
     """这条（已被唤醒阶段剪掉前缀的）消息是不是一次**真的要执行的指令**。
 
@@ -350,6 +365,346 @@ def _append_injected_parts(req: Any, blocks: list[str]) -> str:
     return ""
 
 
+# -------------------- 注入侧证据卡（v3.1.5） --------------------
+#
+# 为什么加：模型以前只拿到「此刻的她」与身体事实，聊天里没有任何**具体的事**可提，
+# 主动开口时只能编——编出来的日程、天气、承诺经不起追问。core 侧已经算好了证据卡
+# （humanoid/opportunity.py：日程/未完事项/天气/节日/生活素材……），这里只做一件事：
+# 把卡连同**出处、采集时间、剩余有效期**拼成一段可读的上下文。有出处的话才敢说，
+# 没有就明说没有——沉默地少一块，模型照样会编。
+
+_EVIDENCE_TITLE = "【她此刻可以提的具体的事】"
+_EVIDENCE_EMPTY_TITLE = "【暂时没有可指认的具体的事】"
+#: 一次最多列几条：机会 ≤5、素材 ≤8，全列出来会把这轮提示词撑长；由头是「挑着说」，
+#: 不是清单朗读，10 条足够覆盖一天里真正记得住的事。
+_EVIDENCE_LIMIT = 10
+
+
+def _clock_text(ts: float) -> str:
+    """把 epoch 说成「今天 14:20」/「11-06 14:20」；坏值返回空串，绝不抛。"""
+    try:
+        moment = time.localtime(float(ts))
+    except (TypeError, ValueError, OSError):
+        return ""
+    try:
+        today = time.strftime("%Y-%m-%d")
+    except Exception:  # pragma: no cover - 纯本地格式化，理论上不会失败
+        today = ""
+    clock = time.strftime("%H:%M", moment)
+    if today and time.strftime("%Y-%m-%d", moment) == today:
+        return f"今天 {clock}"
+    return time.strftime("%m-%d ", moment) + clock
+
+
+def _span_text(seconds: float) -> str:
+    """「还剩多久」说成人话；坏值返回空串。"""
+    try:
+        value = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return ""
+    if value < 90:
+        return f"{int(value)} 秒"
+    if value < 5400:
+        return f"{int(value // 60)} 分钟"
+    if value < 86400:
+        return f"{int(value // 3600)} 小时"
+    return f"{int(value // 86400)} 天"
+
+
+def _evidence_note(
+    opportunities: Any, materials: Any, now: float | None = None
+) -> dict:
+    """拼【她此刻可以提的具体的事】这一块。
+
+    返回 `{"text", "used", "expired"}`：`used` 是真正写进上下文的条数，
+    `expired` 是因为过了 `expires_at` 被丢掉的条数（调用方按它记原因码）。
+
+    为什么过期就丢：一条已经过时的由头比没有更糟——她会拿「下午要去图书馆」
+    去聊晚上八点的天。宁可少一条，也不给她一条已经不作数的事实。
+    为什么一条都没有也要写一句：空着不写的话，模型看到上下文里没有这一节，
+    仍会照旧编；明说「没有」比沉默更管用。
+    """
+    try:
+        moment = time.time() if now is None else float(now)
+    except (TypeError, ValueError):
+        moment = time.time()
+    rows = []
+    expired = 0
+    # 机会是「确实有的事」，素材是「她这样的人今天可能想做的事」——两者混排但必须能分辨，
+    # 否则模型会把「可能想散步」说成「我今天散步了」，又变成一条经不起追问的假话。
+    pool = [(False, item) for item in list(opportunities or [])]
+    pool += [(True, item) for item in list(materials or [])]
+    for is_material, card in pool:
+        if not isinstance(card, dict):
+            continue
+        title = str(card.get("title") or "").strip()
+        if not title:
+            continue
+        try:
+            expires = float(card.get("expires_at") or 0.0)
+        except (TypeError, ValueError):
+            expires = 0.0
+        if expires and expires <= moment:
+            expired += 1
+            continue
+        rows.append((card, title, expires, is_material))
+    if not rows:
+        return {
+            "text": _EVIDENCE_EMPTY_TITLE
+            + "\n那就少说，不要编——没有由头就别硬找话题，宁可只回一句。",
+            "used": 0,
+            "expired": expired,
+        }
+    lines = [
+        _EVIDENCE_TITLE,
+        "这些是她今天确实有的事或真可能做的事。只能从下面挑着说，不要编别的；"
+        "每条末尾是它的出处和时效。",
+    ]
+    for card, title, expires, is_material in rows[:_EVIDENCE_LIMIT]:
+        source = str(card.get("source") or "").strip() or "生活素材"
+        detail = str(card.get("detail") or "").strip()
+        line = f"- [{source}] {title}"
+        if is_material:
+            line += "（她可能想做，不是已经做了）"
+        if detail:
+            line += f"：{detail}"
+        try:
+            captured = float(card.get("captured_at") or 0.0)
+        except (TypeError, ValueError):
+            captured = 0.0
+        notes = []
+        clock = _clock_text(captured) if captured else ""
+        if clock:
+            notes.append(f"采集于{clock}")
+        if expires:
+            notes.append(f"还剩{_span_text(expires - moment)}")
+        if notes:
+            line += "（" + "，".join(notes) + "）"
+        lines.append(line)
+    return {"text": "\n".join(lines), "used": min(len(rows), _EVIDENCE_LIMIT), "expired": expired}
+
+
+# -------------------- 问候时机与出处（v3.1.6） --------------------
+#
+# 为什么加：v3.1.5 把「她今天确实有的事」递进了上下文，可「现在正是能开口的时机」
+# 只活在推理层——模型知道该开口，手上却没有一条能指认的由头，于是又回到空泛的
+# 「在干嘛」。另外她上一轮主动说过的话，被追问时缺出处，模型只能顺着编。
+# 两件事都只做「有则带上，没有不编」：拿不到就少这一块，绝不补细节。
+
+_GREETING_SOURCE = "问候时机"
+
+
+def _card_alive(card: Any, moment: float) -> bool:
+    """这张卡此刻还有效吗（没有 expires_at 也算有效）。"""
+    if not isinstance(card, dict):
+        return False
+    try:
+        expires = float(card.get("expires_at") or 0.0)
+    except (TypeError, ValueError):
+        expires = 0.0
+    return not expires or expires > moment
+
+
+def _greeting_cards(core: Any, now: float | None = None) -> list[dict]:
+    """把问候窗口翻成证据卡；函数不存在 / 契约取不到 → `[]`（整块不注入）。
+
+    为什么整段兜底：`anchors.greeting_opportunities` 是 core 侧同时在写的新函数，
+    老版本或半升级状态下可能根本不存在；一张问候卡拿不到，绝不该把这一轮的注入
+    和回复一起拖垮。
+    """
+    try:
+        from .humanoid import anchors as _anchors
+    except Exception:  # 半升级状态：模块都还没有
+        return []
+    fn = getattr(_anchors, "greeting_opportunities", None)
+    if not callable(fn):
+        return []
+    scope = getattr(core, "scope", None)
+    getter = getattr(scope, "get_self", None)
+    if not callable(getter):
+        return []
+    try:
+        contract = getter("contract")
+    except Exception:
+        return []
+    if not isinstance(contract, dict) or not contract:
+        return []
+    try:
+        cards = fn(contract, now=now)
+    except TypeError:
+        # 老签名没有 now 关键字：退回只传契约，仍然失败就整块放弃。
+        try:
+            cards = fn(contract)
+        except Exception:
+            return []
+    except Exception:
+        return []
+    out: list[dict] = []
+    for card in list(cards or []):
+        if not isinstance(card, dict):
+            continue
+        item = dict(card)
+        item.setdefault("kind", "greeting")
+        # 出处固定写「问候时机」：窗口只提供时机，不代表对方刚醒或刚吃完饭，
+        # 模型不该拿它当事实细节去展开。
+        item["source"] = _GREETING_SOURCE
+        out.append(item)
+    return out
+
+
+def _merge_cards(*groups: Any) -> list[dict]:
+    """按 id（没有就按 anchor_key + 来源 + 标题）去重合并。
+
+    为什么去重：问候卡有可能同时出现在落盘契约的 opportunities 里，两处都收就会
+    让模型看到同一件事两遍，反而更像在念清单。
+    """
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for group in groups:
+        for card in list(group or []):
+            if not isinstance(card, dict):
+                continue
+            key = str(card.get("id") or "").strip()
+            if not key:
+                key = "|".join(
+                    (
+                        str(card.get("anchor_key") or ""),
+                        str(card.get("source") or ""),
+                        str(card.get("title") or ""),
+                    )
+                )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(card)
+    return merged
+
+
+def _note_materials_used(core: Any, cards: Any, now: float | None = None) -> int:
+    """把本轮真的摆到提示词里的素材记进 materials_used（v3.1.7）。
+
+    为什么记在注入侧、而不是等「她真的把这件事说出口」再记：Core 看不到 social 发出去
+    的正文，能确定的事实只有「这张卡这一轮出现在她眼前的材料里」。保守去重的代价是
+    偶尔少提一件旧事，收益是同一件小事不会被连着几天反复端上来——后者才是用户抱怨
+    的那一面。整个函数 fail-open：记不进去只是少了去重，绝不影响这一轮回复。
+    """
+    items = [card for card in list(cards or []) if isinstance(card, dict)]
+    if not items:
+        return 0
+    scope = getattr(core, "scope", None)
+    getter = getattr(scope, "get_self", None)
+    updater = getattr(scope, "update_self", None)
+    if not (callable(getter) and callable(updater)):
+        return 0
+    try:
+        from .humanoid.services import life_material
+    except Exception:  # 老版本没有这个模块：只是少了去重
+        return 0
+    try:
+        moment = float(now) if now is not None else time.time()
+    except (TypeError, ValueError):
+        moment = time.time()
+    try:
+        rows = getter(life_material.MATERIALS_USED_KEY, [])
+        for card in items:
+            rows = life_material.remember_used(rows, card, moment)
+        updater(life_material.MATERIALS_USED_KEY, rows)
+    except Exception:
+        return 0
+    return len(items)
+
+def _signals_row(core: Any, role_id: str) -> dict:
+    """读信号文件里属于这个角色的那一份；读不到给 `{}`（不猜，也不抛）。"""
+    signals = getattr(core, "signals", None)
+    reader = getattr(signals, "read", None)
+    if not callable(reader):
+        return {}
+    try:
+        payload = reader()
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    by_bid = payload.get("by_bid")
+    if role_id and isinstance(by_bid, dict) and by_bid:
+        row = by_bid.get(str(role_id))
+        return row if isinstance(row, dict) else {}
+    return payload
+
+
+def _provenance_line(
+    core: Any, role_id: str, cards: Any, now: float | None = None
+) -> dict:
+    """她最近一次主动开口的出处：`{"line": str, "missing": bool}`。
+
+    为什么只补出处、不重复原话：那句原话已经进了她的「说过的话」，这里再抄一遍，
+    模型会以为她刚又说了一次。追问时缺的从来不是原话，是**这句话从哪来的**。
+    `missing=True` 表示「她确实刚主动说过，但出处找不到」——调用方记一个诊断码，
+    上下文里什么都不写（不编出处）。
+    """
+    row = _signals_row(core, role_id)
+    if not row:
+        return {"line": "", "missing": False}
+    if not str(row.get("last_proactive_text") or "").strip():
+        return {"line": "", "missing": False}
+    try:
+        moment = time.time() if now is None else float(now)
+    except (TypeError, ValueError):
+        moment = time.time()
+    try:
+        at = float(row.get("last_proactive_at") or 0.0)
+    except (TypeError, ValueError):
+        at = 0.0
+    # 一天以前开的口不必带出处：追问发生在「刚聊过」的窗口里，把一天前的由头
+    # 拽回当下只会跑题。
+    if at <= 0 or moment - at > 86400.0:
+        return {"line": "", "missing": False}
+    # v3.1.6 口径（core-materials）：出处收在一个 provenance 字典里，键恰好
+    # card_id / source / captured_at；扁平 last_proactive_* 只作为老数据的兜底。
+    prov = row.get("provenance")
+    if not isinstance(prov, dict):
+        prov = row.get("last_proactive_provenance")
+    if not isinstance(prov, dict):
+        prov = {}
+    card_id = str(prov.get("card_id") or row.get("last_proactive_card_id") or "").strip()
+    source = str(prov.get("source") or row.get("last_proactive_source") or "").strip()
+    captured = 0.0
+    for raw in (prov.get("captured_at"), row.get("last_proactive_captured_at")):
+        try:
+            value = float(raw or 0.0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            captured = value
+            break
+    title = ""
+    if card_id:
+        for card in list(cards or []):
+            if not isinstance(card, dict):
+                continue
+            if str(card.get("id") or "") != card_id:
+                continue
+            title = str(card.get("title") or "").strip()
+            source = source or str(card.get("source") or "").strip()
+            if captured <= 0:
+                try:
+                    captured = float(card.get("captured_at") or 0.0)
+                except (TypeError, ValueError):
+                    captured = 0.0
+            break
+    # 按 core-materials 的口径：card_id 与 source 都空就是「没出处」，不猜也不补。
+    if not (source or title):
+        return {"line": "", "missing": True}
+    where = f"[{source}]" if source else ""
+    what = title or "（只记到出处，没记到具体由头）"
+    clock = _clock_text(captured) if captured > 0 else ""
+    tail = f"（采集于{clock}）" if clock else ""
+    return {
+        "line": f"- 她上次主动开口的由头：{where}{what}{tail}；追问时就按这个说，别补细节。",
+        "missing": False,
+    }
+
+
 def _inject_mark(req: Any) -> str:
     """这次请求的注入标记键。绑 id(req)：宿主换了请求对象就该重新注入。"""
     return f"_hc_injected_req_{id(req)}"
@@ -402,6 +757,25 @@ def _request_holds_blocks(req: Any, blocks: Any) -> bool:
     if isinstance(prompt, str):
         haystack += prompt
     return all(block in haystack for block in wanted)
+
+
+def _event_has_media(event: Any) -> bool:
+    """这条消息带没带图片/语音/文件。
+
+    为什么不能只看 message_str：AstrBot 把非文本消息转成占位符的写法随版本变。
+    所以先看消息链里有没有非 Plain/Text 组件，再退回占位符正则——判错的代价是
+    「带附件的一轮被当成纯收尾」，宁可多回一句。
+    """
+    try:
+        chain = getattr(getattr(event, "message_obj", None), "message", None)
+        if chain:
+            for comp in chain:
+                name = type(comp).__name__.lower()
+                if name and "plain" not in name and "text" not in name:
+                    return True
+    except Exception:
+        pass
+    return _closing.has_media_text(getattr(event, "message_str", ""))
 
 
 def _resolve_data_root(context: Any = None) -> Path:
@@ -727,6 +1101,10 @@ class HumanoidCore(Star):
         # 注入通道（temp_parts/contexts/system_prompt/空）：给 /拟人 诊断 与测试看。
         self._inject_channel = ""
         self._inject_fallback_warned = False
+        # 收尾守卫（v3.1.4）：会话 → 最近几条来去的轻量记录。宿主的会话历史只有
+        # role/content、没有时刻，而「她上一句是多久以前说的」正是收尾判定必须知道的
+        # 事（窗口外就该正常回）。只进内存，重启即清空——清空只会让判定退回放行。
+        self._closing_windows: dict[str, _closing.DialogueWindow] = {}
         # 只提示一次的失败（注入两段各自降级用）：每轮重放都刷同一条 warning 没有意义。
         self._warned_once: set[str] = set()
         # 写回侧：每个角色最近一次**已经写过**的过程名，以及最近 24 小时写了几条。
@@ -1859,6 +2237,61 @@ class HumanoidCore(Star):
         self._warned_once.add(key)
         logger.warning(f"{LOG_PREFIX} {message}")
 
+    # -------------------- 收尾守卫（v3.1.4） --------------------
+
+    def _closing_window(self, event: AstrMessageEvent) -> _closing.DialogueWindow:
+        """按会话拿一份来去记录；没有就建一份。
+
+        为什么按 unified_msg_origin 分：同一个角色在私聊和好几个群里说话，收尾是
+        **每个会话各自**的事——A 群说完晚安不该影响 B 群的判断。
+        """
+        origin = str(getattr(event, "unified_msg_origin", "") or "")
+        bucket = self._closing_windows.get(origin)
+        if bucket is None:
+            # 会话数随群数增长，超过 64 个就丢最早的（dict 保序，够用且不用额外结构）。
+            if len(self._closing_windows) >= 64:
+                self._closing_windows.pop(next(iter(self._closing_windows)), None)
+            bucket = _closing.DialogueWindow()
+            self._closing_windows[origin] = bucket
+        return bucket
+
+    def _closing_decision(self, event: AstrMessageEvent, text: str):
+        """这一轮是不是「多余的收尾」。
+
+        同一条消息的请求会被工具循环重放（见 inject_context 里的说明），所以结论按
+        event 缓存：重放时直接复用，不重复记 `in`、也不重复记原因码。
+        """
+        try:
+            cached = _event_extra(event, "_hc_closing_decision", None)
+            if isinstance(cached, dict):
+                return cached
+            cfg = self._config
+            bucket = self._closing_window(event)
+            now = time.time()
+            bucket.record("in", text, now)
+            decision = _closing.closing_decision(
+                current_text=text,
+                dialogue=bucket.entries(),
+                at=now,
+                has_media=_event_has_media(event),
+                window_seconds=getattr(
+                    cfg, "closing_guard_window_seconds", _closing.DEFAULT_WINDOW_SECONDS
+                ),
+                enabled=bool(getattr(cfg, "closing_guard_enabled", True)),
+            )
+            _set_event_extra(event, "_hc_closing_decision", decision)
+            return decision
+        except Exception as exc:  # 守卫坏了只是少挡一轮，绝不能影响正常回复
+            logger.debug(f"{LOG_PREFIX} 收尾判定失败，本轮按正常回复处理: {exc}")
+            return None
+
+    def _closing_record_out(self, event: AstrMessageEvent, text: str) -> None:
+        """记下她**真正发出去**的话，供下一轮判断「她是不是已经收过尾了」。"""
+        try:
+            self._closing_window(event).record("out", text, time.time())
+        except Exception as exc:
+            logger.debug(f"{LOG_PREFIX} 记录她的收尾失败: {exc}")
+
     # -------------------- LLM 请求注入钩子 --------------------
 
     @filter.on_llm_request()
@@ -1898,10 +2331,10 @@ class HumanoidCore(Star):
                     if callable(stopper):
                         stopper()
                     logger.debug(
-                        f"{LOG_PREFIX} 兄弟 bot {user_id} 互聊额度用完，挡下这一轮"
+                        f"{LOG_PREFIX} 兄弟 bot {_mask_id(user_id)} 互聊额度用完，挡下这一轮"
                     )
                     return
-                logger.debug(f"{LOG_PREFIX} 兄弟 bot {user_id} 互聊放行")
+                logger.debug(f"{LOG_PREFIX} 兄弟 bot {_mask_id(user_id)} 互聊放行")
             # 同一条消息的这次请求会被**重放**：工具循环每跑一轮工具都会再进这个钩子，
             # 失败重试也会。宿主不会替我们清掉上次追加的临时块，于是「此刻的她」与身体
             # 事实会在同一轮上下文里叠成两份，模型看到两遍同一段背景。判据：
@@ -1914,6 +2347,47 @@ class HumanoidCore(Star):
             if _request_holds_blocks(req, _event_extra(event, mark)):
                 logger.debug(f"{LOG_PREFIX} 同一请求重放且注入还在，跳过重复注入")
                 return
+            # ─── 收尾守卫（v3.1.4）───
+            # 为什么加：她是被动回复——对方说「晚安」她回「晚安」，对方再回一句「晚安」
+            # 她又得回，真人不会这样。判定是纯函数（humanoid/closing.py），这里只做两件事：
+            # 能硬跳过就跳过这一轮模型（`stop_event`，光 return 挡不住），跳不过就塞一句
+            # 短提示、**绝不吞消息**（fail-open：宁可多回一句，不能漏掉用户的话）。
+            closing_note = ""
+            # 整段包起来：守卫坏了只是少挡一轮，绝不能让这一轮的注入也一起丢掉
+            # （fail-open 的底线是「用户的话必须被看见」）。
+            try:
+                decision = self._closing_decision(event, text)
+                if decision is not None:
+                    reason = str(decision.get("reason") or "")
+                    prompt_on = bool(
+                        getattr(self._config, "closing_guard_prompt_enabled", True)
+                    )
+                    if decision.get("suppress_reply"):
+                        stopper = getattr(event, "stop_event", None)
+                        if callable(stopper):
+                            stopper()
+                            note_reason("closing_silence", reason)
+                            logger.debug(
+                                f"{LOG_PREFIX} 收尾守卫挡下这一轮（{reason}）："
+                                "对方这句只是收尾，她上一句已经收过尾了"
+                            )
+                            return
+                        # 跳不掉就退一步：仍然把「已经收过尾了」告诉她，但不吞消息。
+                        closing_note = _closing.closing_instruction(
+                            {**decision, "suppress_reply": False},
+                            prompt_enabled=prompt_on,
+                        )
+                        if closing_note:
+                            note_reason("closing_prompt", f"{reason}:fail_open")
+                    else:
+                        closing_note = _closing.closing_instruction(
+                            decision, prompt_enabled=prompt_on
+                        )
+                        if closing_note:
+                            note_reason("closing_prompt", reason)
+            except Exception as exc:  # 守卫自身异常：当作没有提示，照常注入与回复
+                logger.debug(f"{LOG_PREFIX} 收尾守卫异常，本轮按正常回复处理: {exc}")
+                closing_note = ""
             said = text
             # 她今天要办的事（v3.0.10）：只从这句话里抽「带明确日期、主语是她」的原话
             # 片段存下来，日程生成时再递进去。抽不出来是常态（大部分人聊天不提日期），
@@ -1984,7 +2458,84 @@ class HumanoidCore(Star):
                     "state_note",
                     f"「此刻的她」生成失败，本轮只注入身体事实: {exc}",
                 )
-            blocks = [block for block in (state_note, injection) if block]
+            # ─── 注入侧证据卡（v3.1.5）───
+            # 为什么放在这三块之后：它是**可选的由头**，不是她的处境本身；没有卡时
+            # 也只写一句「暂时没有」，不挤占前面的事实块。整段 fail-open——卡取不到
+            # 就只少这一块，绝不影响上面的注入与这一轮回复。
+            evidence_note = ""
+            try:
+                if bool(getattr(self._config, "opportunity_evidence_enabled", True)):
+                    facade = get_core_facade()
+                    # 门面拿不到（插件还没起来）时**不写「没有」**：那会变成一句假话。
+                    if facade is not None:
+                        cards = {"opportunities": [], "materials": []}
+                        for key in ("opportunities", "materials"):
+                            try:
+                                cards[key] = getattr(facade, key)(role_id)
+                            except Exception as exc:
+                                logger.debug(f"{LOG_PREFIX} 取证据卡 {key} 失败: {exc}")
+                        # ─── 问候时机（v3.1.6）───
+                        # 为什么单独取：问候窗口只说明「现在能开口」，不是既成事实，
+                        # 契约里不会混进 opportunities；core 侧函数还没落盘时整块跳过。
+                        greeting_alive = 0
+                        if bool(
+                            getattr(self._config, "greeting_opportunity_enabled", True)
+                        ):
+                            greeting_cards = _greeting_cards(core)
+                            if greeting_cards:
+                                moment = time.time()
+                                greeting_alive = sum(
+                                    1
+                                    for card in greeting_cards
+                                    if _card_alive(card, moment)
+                                )
+                                cards["opportunities"] = _merge_cards(
+                                    cards["opportunities"], greeting_cards
+                                )
+                        evidence = _evidence_note(
+                            cards["opportunities"], cards["materials"]
+                        )
+                        evidence_note = str(evidence.get("text") or "")
+                        # 三个码分别对应「有卡可用」「有卡但全过期」「一张都没有」，
+                        # 排查「她为什么在编」时先看这里。
+                        if evidence.get("used"):
+                            note_reason("opportunity_used", f"{evidence['used']} 条")
+                        elif evidence.get("expired"):
+                            note_reason(
+                                "opportunity_expired", f"{evidence['expired']} 条已过期"
+                            )
+                        else:
+                            note_reason("opportunity_missing", f"group={is_group}")
+                        if greeting_alive:
+                            note_reason("greeting_opportunity", f"{greeting_alive} 条")
+                        if cards["materials"]:
+                            used_now = _note_materials_used(core, cards["materials"])
+                            if used_now:
+                                note_reason("materials_used", f"{used_now} 条")
+                        # ─── 她上次主动开口的出处（v3.1.6）───
+                        # 追问时最缺的从来不是原话（原话已经在她「说过的话」里），
+                        # 是这句话从哪来的；有就带上，找不到只记码、上下文一个字不补。
+                        provenance = _provenance_line(
+                            core,
+                            role_id,
+                            list(cards["opportunities"]) + list(cards["materials"]),
+                        )
+                        if provenance.get("line"):
+                            evidence_note = (
+                                f"{evidence_note}\n{provenance['line']}".strip()
+                            )
+                        elif provenance.get("missing"):
+                            note_reason(
+                                "share_provenance_missing", f"group={is_group}"
+                            )
+            except Exception as exc:  # 证据卡坏了只是少一段由头，绝不能连累回复
+                logger.debug(f"{LOG_PREFIX} 证据卡生成失败，本轮不注入这一块: {exc}")
+                evidence_note = ""
+            blocks = [
+                block
+                for block in (state_note, injection, closing_note, evidence_note)
+                if block
+            ]
             if blocks:
                 # 框架句在 system_prompt 里说的是「以下是她当前的**真实处境**」。
                 # 两块都空时留着它，模型收下一句宣告却一条事实都拿不到——它会自己编。
@@ -2011,6 +2562,11 @@ class HumanoidCore(Star):
                         f"{LOG_PREFIX} 当前 AstrBot 不支持临时内容块（mark_as_temp），"
                         f"注入已降级为 {channel} 通道；建议升级 AstrBot 到 4.24+"
                     )
+
+            else:
+                # 三块都空：这一轮模型拿不到任何背景（事实块被预算裁空、状态块抛异常、
+                # 也没有收尾提示）。记一个码，排查「她像失忆」时才有据可查。
+                note_reason("inject_empty", f"group={is_group}")
 
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 注入失败: {e}")
@@ -2045,6 +2601,8 @@ class HumanoidCore(Star):
             # 否则跨 bot 互聊的每句话都在改她的关系数值（审核 跨插件契约 12）。
             if self._is_sibling_peer(event):
                 return
+            # 收尾守卫：记下她这句，下一轮判断「她是不是已经收过尾了」。
+            self._closing_record_out(event, text)
             # P1：她**自己说出口**的话也进 ccb 的账。原来只有用户那一路
             # （`core.on_message`），她先开口或她在场景里说的，一条都不算。
             # 这一笔同时也是社交层「她多久前开过口」的唯一来源，所以放在情绪闸门
@@ -2110,6 +2668,8 @@ class HumanoidCore(Star):
             # 与 on_llm_response 同一道出站判据：兄弟 bot 的回复不进情绪/好感账。
             if self._is_sibling_peer(event):
                 return
+            # 收尾守卫：同一条口径——她真正发出去的话都记，下一轮判定才准。
+            self._closing_record_out(event, text)
             # P1：与 on_llm_response 同一条口径。note_occurrence 自带 60 秒去重，
             # 两条路径都走到时只算一次。它也是「她多久前开过口」的唯一来源，
             # 所以放在情绪闸门之前（mood 关掉时照样要记）。
@@ -2315,8 +2875,11 @@ class HumanoidCore(Star):
                     source.note_umo(core.role_id, umo)
                     if not source.cached_name(core.role_id):
                         await source.persona(core.role_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                # 以前这里是 `pass`：人设预热失败被完全吞掉，症状是「她不知道自己
+                # 叫什么」却查不出原因。预热不是主路径，失败照旧不拦这一轮，
+                # 但至少留一行可查（审核 L-6）。
+                logger.debug(f"{LOG_PREFIX} 人设预热失败，本轮跳过: {exc}")
             step = "记账（情绪/身体/过程）"
             core.on_message(
                 user_id, text, is_group=is_group, umo=umo, is_command=is_command,

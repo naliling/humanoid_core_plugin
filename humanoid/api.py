@@ -46,6 +46,7 @@ import json
 import math
 from typing import Any, Dict, List, Optional
 
+from . import anchors as _anchors
 from . import contract as _contract
 from . import link as _link
 from .state_snapshot import aggression_default as _aggression_default
@@ -261,6 +262,76 @@ class CoreFacade:
         if isinstance(body, dict) and body:
             return contract, body
         return contract, _contract.as_block(body)
+
+    # ─── 证据卡（v3.1.5）────────────────────────────────
+
+    def _cards(self, core: Any, key: str) -> List[Dict[str, Any]]:
+        """取一份证据卡：落盘契约里**有卡**就用它，没有就现算一次。
+
+        为什么不是「一律现算」：契约里的卡是 `link.build_contract` 生成的，和日程、
+        天气、事件同一时刻、同一口径；门面自己现算会拿到另一套（种子按小时取整所以
+        内容一样，但 `captured_at` 会不同，社交层「这条用过了」的记账就对不上）。
+        旧 Core 落盘的契约没有这两个键，那时才现算——**只为了升级当天不至于全空**。
+
+        契约里是空列表时也现算：空列表可能是「今天真没素材」，也可能是刚升级、
+        落盘还没刷新；现算一次，仍为空就如实返回空。
+        """
+        raw = core.scope.get_self("contract")
+        contract = raw if isinstance(raw, dict) else {}
+        stored = contract.get(key)
+        if isinstance(stored, list) and stored:
+            return [dict(card) for card in stored if isinstance(card, dict)]
+        if not contract:
+            return []
+        try:
+            blocks = _anchors.contract_blocks(core, contract)
+        except Exception as exc:
+            self._debug(f"证据卡现算失败: {exc}")
+            return []
+        fresh = blocks.get(key)
+        if not isinstance(fresh, list):
+            return []
+        return [dict(card) for card in fresh if isinstance(card, dict)]
+
+    def opportunities(self, role_id: str) -> List[Dict[str, Any]]:
+        """主动开口的**由头**：她今天确实有的事（v3.1.5，只加不改）。
+
+        每张卡是 `{id, kind, purpose, title, detail, source, captured_at,
+        expires_at, anchor_key}`。
+
+        * `id` 稳定：同一件事跨轮、跨进程同一个 id，社交层拿它记「这条用过了」；
+        * `anchor_key` 稳定：同一件事的不同说法共用一个键（今天做过「洗衣」就不再
+          拿「洗衣」当由头），去重比文本比对靠谱；
+        * `expires_at`：过了这个点就不该再说（天气 3 小时、刚发生的事 2 小时、
+          日程 6 小时、节日 24 小时）。**已过期的卡不会出现在这里**——社交层不必
+          自己判，但判了也无害。
+
+        门面失效 / 角色不存在 / 任何异常 → `[]`（契约缺失不等于「她没有事」）。
+        """
+        core = self._core(role_id)
+        if core is None:
+            return []
+        try:
+            return self._cards(core, "opportunities")
+        except Exception as exc:
+            self._debug(f"opportunities 失败: {exc}")
+            return []
+
+    def materials(self, role_id: str) -> List[Dict[str, Any]]:
+        """**生活素材**卡：她这样的人今天还可能做的事（v3.1.5，只加不改）。
+
+        与 `opportunities` 同形，但语义是「还没发生、她真可能做」：拿它问「要不要去
+        楼下走走」，比编一条假事实开口更像人。有效期 8 小时，种子按「角色 + 日期」、
+        钟点按小时取整——同一小时内两次调用内容一致，不会让契约每分钟重写。
+        """
+        core = self._core(role_id)
+        if core is None:
+            return []
+        try:
+            return self._cards(core, "materials")
+        except Exception as exc:
+            self._debug(f"materials 失败: {exc}")
+            return []
 
     def brief(
         self,

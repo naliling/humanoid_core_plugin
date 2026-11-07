@@ -16,6 +16,7 @@ from . import ccb as _ccb
 from . import outfit
 from . import species
 from .clock import Clock, format_state_timestamp
+from .diagnostics import note_reason
 from .config import HumanoidConfig
 from .link import SocialSignals, build_contract
 from .llm import LLMGateway, ProviderResolver
@@ -872,6 +873,9 @@ class HumanoidCoreInstance:
         的取消名单里，会一直活着并继续写 state.json。
         """
         if self._stop_event.is_set():
+            # 原因码（v3.1.4）：卸载竞态里被丢掉的后台任务以前完全无声，排查「日程/循环
+            # 怎么停了」时看不到任何痕迹。
+            note_reason("background_after_stop", name)
             # 不 close 掉会报 "coroutine ... was never awaited"
             if asyncio.iscoroutine(coro):
                 coro.close()
@@ -1380,6 +1384,10 @@ class HumanoidCoreInstance:
             # 新块要等身体/天气顺带变化才可能落盘——升级后社交层可能几小时读不到名字。
             # `/拟人 设置 穿搭` 单独改 outfit 也同理：必须让它触发一次重写。
             "identity", "outfit",
+            # v3.1.5 新增的两个证据卡块（由头 / 素材）。与上面同一个道理：旧 state 里
+            # 没有这两键时，其余键都没变 → 直接 return previous，社交层就永远读不到
+            # 卡，而且不报错。
+            "opportunities", "materials",
         )
         try:
             if isinstance(previous, dict) and all(previous.get(key) == contract.get(key) for key in keys):

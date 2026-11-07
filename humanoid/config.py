@@ -538,6 +538,26 @@ class HumanoidConfig:
     schedule_interrupt_cooldown_minutes: int = 60
     schedule_interrupt_on_call: bool = True
 
+    # v3.1.4：收尾沉默守卫（见 humanoid/closing.py）。她已经在窗口内用「晚安」这类话
+    # 收过尾、对方也只回了句「晚安」时，不再补一条同义道别——线上复现过一整屏「晚安」
+    # 来回。关掉退回旧行为：用户道晚安，她照答。
+    closing_guard_enabled: bool = True
+    closing_guard_window_seconds: int = 1800
+    # 每轮给模型的短提示（「上一轮你已经道过晚安」）。关掉只保留静默判定。
+    closing_guard_prompt_enabled: bool = True
+
+    # v3.1.5：注入侧证据卡（见 humanoid/opportunity.py、main.py 的 _evidence_note）。
+    # 为什么加：以前上下文里只有「此刻的她」和身体事实，没有**具体可提的事**，模型
+    # 主动开口时只能编。开：每轮把 core 侧算好的卡连同出处与剩余有效期递进去；关：
+    # 这一块完全不出现，上下文回到 v3.1.4 的样子。
+    opportunity_evidence_enabled: bool = True
+
+    # v3.1.6：问候机会（见 humanoid/anchors.greeting_opportunities）。为什么加：问候窗口
+    # 原来只活在推理层——模型知道「现在适合开口」，却拿不到一条可指认的由头，于是开口
+    # 只能空泛地问「在干嘛」。开：把窗口翻成 kind=greeting 的卡并进证据卡块（source 写
+    # 「问候时机」）；关：问候卡不出现，证据卡回到 v3.1.5 的样子。
+    greeting_opportunity_enabled: bool = True
+
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any] | None) -> HumanoidConfig:
         src: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
@@ -761,6 +781,13 @@ class HumanoidConfig:
             schedule_interrupt_quiet_minutes=i("schedule_interrupt_quiet_minutes", 0, 720),
             schedule_interrupt_cooldown_minutes=i("schedule_interrupt_cooldown_minutes", 0, 720),
             schedule_interrupt_on_call=b("schedule_interrupt_on_call"),
+            # v3.1.4：收尾沉默守卫（区间与 schema 的 minimum/maximum 一致）。
+            closing_guard_enabled=b("closing_guard_enabled"),
+            closing_guard_window_seconds=i("closing_guard_window_seconds", 60, 7200),
+            closing_guard_prompt_enabled=b("closing_guard_prompt_enabled"),
+            # v3.1.5：注入侧证据卡总开关（默认开，关掉整块不出现）。
+            opportunity_evidence_enabled=b("opportunity_evidence_enabled"),
+        greeting_opportunity_enabled=b("greeting_opportunity_enabled"),
         )
         if cfg.night_mode_enabled and cfg.night_start_hour == cfg.night_end_hour:
             # 起止相同 = 窗口长度 0 = **没有夜里**（不是「全天算夜里」）：睡眠债不再累积、
