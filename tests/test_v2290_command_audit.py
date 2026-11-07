@@ -80,6 +80,7 @@ class CommandRegistrationTest(unittest.TestCase):
 
     def test_the_plugin_registers_nine_plus_thirteen_commands(self):
         top, grouped = _registered_from_source()
+        # v3.1.10：10 → 9，`/查看昵称` 的顶层别名去掉，只留在「拟人」组里。
         self.assertEqual(len(top), 9, f"顶层指令数变了：{sorted(top)}")
         # v2.28.11 多了 `/拟人 时间 城市`（设置她的城市），12 → 13。
         self.assertEqual(len(grouped), 13, f"管理指令数变了：{sorted(grouped)}")

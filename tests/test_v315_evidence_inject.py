@@ -1,9 +1,17 @@
-"""v3.1.5：注入侧证据卡。
+"""v3.1.5：注入侧证据卡；v3.1.9 重做呈现层。
 
-钉三件事：卡的字段怎么进上下文（出处 / 采集时间 / 剩余有效期）、**过期的卡一定不
-进去**、一条都没有时要明说「没有，不要编」而不是沉默。再加接线层：开关关掉整块
-不出现、真注入了才记 `opportunity_used`、全过期记 `opportunity_expired`、
-一张没有记 `opportunity_missing`。
+钉三件事：卡怎么进上下文、**过期的卡一定不进去**、一条都没有时要明说「没有，不要编」
+而不是沉默。再加接线层：开关关掉整块不出现、真注入了才记 `opportunity_used`、
+全过期记 `opportunity_expired`、一张没有记 `opportunity_missing`。
+
+## v3.1.9 为什么把出处 / 采集时间 / 剩余有效期从行里拿掉
+
+旧行是 `- [生活素材] 去楼下超市把缺的东西补上（她可能想做，不是已经做了）：超市，
+大概 55 分钟（采集于09-26 13:00，还剩7 小时）`——一行 60 字，一半是免责声明和倒计时。
+模型读到的是一张**待办清单**，于是用清单的口吻回话：「好的，那你可以去超市」。
+
+现在每行只留 `- {title}：{detail}`，出处与时效交给「只有 2 小时内采集的才标（刚刚）」
+这一条规则兜底：新鲜的才值得提，旧的干脆不提。引导语也从两句压成一句。
 
 为什么这些边界值得钉：证据卡是「她说话有据可查」的唯一来源，它一旦退化成
 「有什么说什么」，模型就会拿一条三小时前的由头聊现在——比没有由头更假。
@@ -63,7 +71,7 @@ class EvidenceNoteTests(unittest.TestCase):
             opportunities or [], materials or [], self.NOW if now is None else now
         )
 
-    def test_card_line_carries_source_clock_and_ttl(self):
+    def test_card_line_is_title_plus_detail_without_bookkeeping(self):
         card = _card(
             "下午去图书馆还书",
             detail="顺路买杯咖啡",
@@ -76,11 +84,29 @@ class EvidenceNoteTests(unittest.TestCase):
         self.assertEqual(result["expired"], 0)
         text = result["text"]
         self.assertIn("【她此刻可以提的具体的事】", text)
-        self.assertIn("[日程]", text, "每条要带出处，不然模型不知道这话从哪来")
-        self.assertIn("下午去图书馆还书", text)
-        self.assertIn("顺路买杯咖啡", text, "detail 是这句话真正的细节")
-        self.assertIn("采集于", text)
-        self.assertIn("还剩2 小时", text, "剩余有效期要说人话")
+        self.assertIn("- 下午去图书馆还书：顺路买杯咖啡", text, "行格式是「标题：细节」")
+        # 说明书腔的四个来源全部清掉。
+        self.assertNotIn("[日程]", text, "出处不再进正文")
+        self.assertNotIn("采集于", text)
+        self.assertNotIn("还剩", text)
+        self.assertNotIn("她可能想做", text)
+        self.assertNotIn("分钟", text)
+        # 采集于 10 分钟前：够新鲜，行尾标「（刚刚）」；有效期不写。
+        self.assertIn("（刚刚）", text)
+        self.assertEqual(result["shown"], [card])
+
+    def test_old_card_gets_no_freshness_mark(self):
+        card = _card("上周去了趟花市", captured_at=self.NOW - 3 * 3600)
+        text = self._note([card])["text"]
+        self.assertIn("上周去了趟花市", text)
+        self.assertNotIn("（刚刚）", text, "超过 2 小时的就不该再假装刚发生")
+
+    def test_lead_is_one_sentence(self):
+        card = _card("还书", captured_at=self.NOW - 60)
+        text = self._note([card])["text"]
+        lead = [line for line in text.splitlines() if line.startswith("这些是")]
+        self.assertEqual(len(lead), 1)
+        self.assertEqual(lead[0], "这些是今天真有的、可能做的事，挑一件说，别编。")
 
     def test_materials_are_listed_after_opportunities(self):
         opp = _card("还书", expires_at=self.NOW + 3600)
@@ -94,8 +120,10 @@ class EvidenceNoteTests(unittest.TestCase):
 
         self.assertEqual(result["used"], 0)
         self.assertEqual(result["expired"], 0)
-        self.assertIn("【暂时没有可指认的具体的事】", result["text"])
-        self.assertIn("不要编", result["text"], "没有由头时必须明说，沉默挡不住编造")
+        self.assertIn("【暂时没有特别的事】", result["text"])
+        self.assertIn("别硬找由头", result["text"], "没有由头时必须明说，沉默挡不住编造")
+        # v3.1.9：不再教她「宁可只回一句」——那是让她少说话，不是让她说得像人。
+        self.assertNotIn("宁可只回一句", result["text"])
 
     def test_expired_card_is_dropped(self):
         card = _card("昨天去看电影", expires_at=self.NOW - 1)
@@ -104,7 +132,7 @@ class EvidenceNoteTests(unittest.TestCase):
         self.assertEqual(result["used"], 0)
         self.assertEqual(result["expired"], 1)
         self.assertNotIn("昨天去看电影", result["text"], "过时的由头比没有更假")
-        self.assertIn("【暂时没有可指认的具体的事】", result["text"])
+        self.assertIn("【暂时没有特别的事】", result["text"])
 
     def test_expired_is_counted_even_when_others_are_usable(self):
         good = _card("还书", expires_at=self.NOW + 600)
@@ -127,7 +155,7 @@ class EvidenceNoteTests(unittest.TestCase):
         result = self._note([None, {}, {"title": "   "}, "不是字典", {"title": None}])
 
         self.assertEqual(result["used"], 0)
-        self.assertIn("【暂时没有可指认的具体的事】", result["text"])
+        self.assertIn("【暂时没有特别的事】", result["text"])
 
     def test_list_is_capped(self):
         cards = [
@@ -135,9 +163,12 @@ class EvidenceNoteTests(unittest.TestCase):
         ]
         result = self._note(cards)
 
+        # v3.1.9：上限从 10 降到 6——8 条 × 60 字里一半是模板，占的是 token，
+        # 换来的是模型把清单当任务列表。
+        self.assertEqual(main_module._EVIDENCE_LIMIT, 6)
         self.assertEqual(result["used"], main_module._EVIDENCE_LIMIT)
         self.assertEqual(
-            sum(1 for line in result["text"].splitlines() if line.startswith("- [")),
+            sum(1 for line in result["text"].splitlines() if line.startswith("- ")),
             main_module._EVIDENCE_LIMIT,
         )
 
@@ -212,7 +243,7 @@ class EvidenceWiringTest(unittest.IsolatedAsyncioTestCase):
             for item in self.diag.reason_report(include_context=True)["top"]
         ]
 
-    async def test_cards_reach_the_request_with_source_and_ttl(self) -> None:
+    async def test_cards_reach_the_request_without_bookkeeping(self) -> None:
         now = time.time()
         self._use_facade(
             _FakeFacade(
@@ -227,8 +258,9 @@ class EvidenceWiringTest(unittest.IsolatedAsyncioTestCase):
         text = injected_text(req)
         self.assertIn("【她此刻可以提的具体的事】", text)
         self.assertIn("下午去图书馆还书", text)
-        self.assertIn("[日程]", text)
-        self.assertIn("还剩", text)
+        self.assertIn("（刚刚）", text, "一分钟前采集的，行尾标新鲜")
+        self.assertNotIn("[日程]", text, "出处不再进正文")
+        self.assertNotIn("还剩", text, "倒计时不再进正文")
         self.assertIn("opportunity_used", self._codes())
 
     async def test_no_cards_tells_her_to_say_less(self) -> None:
@@ -237,8 +269,8 @@ class EvidenceWiringTest(unittest.IsolatedAsyncioTestCase):
         await self.star.inject_context(FakeEvent("今天怎么样"), req)
 
         text = injected_text(req)
-        self.assertIn("【暂时没有可指认的具体的事】", text)
-        self.assertIn("不要编", text)
+        self.assertIn("【暂时没有特别的事】", text)
+        self.assertIn("别硬找由头", text)
         self.assertIn("opportunity_missing", self._codes())
 
     async def test_expired_cards_are_not_injected(self) -> None:
@@ -255,7 +287,7 @@ class EvidenceWiringTest(unittest.IsolatedAsyncioTestCase):
         text = injected_text(req)
         self.assertNotIn("昨天去看电影", text)
         self.assertNotIn("想下楼走走", text)
-        self.assertIn("【暂时没有可指认的具体的事】", text)
+        self.assertIn("【暂时没有特别的事】", text)
         self.assertIn("opportunity_expired", self._codes())
 
     async def test_switch_off_removes_the_block_entirely(self) -> None:
@@ -266,7 +298,7 @@ class EvidenceWiringTest(unittest.IsolatedAsyncioTestCase):
 
         text = injected_text(req)
         self.assertNotIn("【她此刻可以提的具体的事】", text)
-        self.assertNotIn("【暂时没有可指认的具体的事】", text)
+        self.assertNotIn("【暂时没有特别的事】", text)
         self.assertTrue(text.strip(), "关掉证据卡不该连其他注入一起丢")
         self.assertFalse(
             [code for code in self._codes() if code.startswith("opportunity_")],

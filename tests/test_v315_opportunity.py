@@ -217,11 +217,18 @@ class MaterialCardTest(unittest.TestCase):
         unknown = dict(self.ITEM, band="没这个档")
         self.assertEqual(life_material.material_source(unknown), "生活素材")
 
-    def test_card_uses_topic_as_anchor_and_location_in_detail(self):
+    def test_card_uses_topic_as_anchor_and_sensory_detail(self):
+        # v3.1.9：detail 不再是「地点，大概 N 分钟」这种说明书腔，而是一句能影响
+        # 语气的画面细节（sensory）；地点留给 render_materials 那种纯文本渲染。
         item = life_material.material_card(self.ITEM, captured_at=NOW, seed=["bot1", "2026-08-22"])
         self.assertEqual(item["title"], self.ITEM["event"])
         self.assertEqual(item["anchor_key"], opportunity.anchor_key_for("life", "买菜"))
-        self.assertIn("超市", item["detail"])
+        detail = item["detail"]
+        self.assertTrue(detail, "detail 不该为空")
+        self.assertGreaterEqual(len(detail), 4)
+        self.assertLessEqual(len(detail), 20)
+        self.assertNotIn("分钟", detail)
+        self.assertEqual(detail, life_material.sensory_line(self.ITEM, ["bot1", "2026-08-22"]))
 
     def test_bad_items_are_dropped_one_by_one(self):
         good = life_material.material_card(self.ITEM, captured_at=NOW)

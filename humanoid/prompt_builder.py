@@ -173,7 +173,7 @@ def short_name(raw: str) -> str:
     * **纯英文/数字不动**：`Regnator` / `hanhandouya` / `Luture` 本来就是全称，
       硬缩成 `Regn` 反而像系统截断。
 
-    只影响「怎么称呼」，不动存下来的昵称本身（`/查看昵称` 还是全名）。
+    只影响「怎么称呼」，不动存下来的昵称本身（`/拟人 查看昵称` 还是全名）。
     """
     name = str(raw or "").strip()
     if not name or len(name) <= _CALL_NAME_MAX:
@@ -697,6 +697,127 @@ class PromptBuilder:
             if got:
                 lines.append(got)
         return lines
+
+    def _body_lines(
+        self,
+        user_id: str,
+        interest: Dict[str, float],
+        agency: Dict[str, float],
+        text: str = "",
+    ) -> List[str]:
+        """身体这一块的**判断句**：周期感觉 + 一条倾向，合成一句。
+
+        为什么合并（v3.1.9）：v3.1.8 这里是四五句并列——「我这几天人挺有精神，
+        皮肤也顺眼」「前面聊的还能接上」「我这会儿还挺专注」「我现在很闲」。每一句
+        都是真的，但四句排在一起就是一张状态表：模型读完只知道「她状态良好、有空」，
+        写出来的话也就只剩总结（「我今天还挺闲的」）。
+
+        人不会同时报四条状态。所以这里只留两句：周期那句（一天之内不变），加一条
+        最相关的倾向。剩下的交给 `_sensory_line`——判断少一点，细节多一点。
+
+        倾向取**最后一条**：`_tendency_lines` 的顺序是「想不想接 → 注意力在哪 →
+        有多少闲」，越靠后越贴近「她这会儿有没有空说话」，那正是模型最需要知道、
+        又最容易读成任务指令之外的那一件事。
+        """
+        lines: List[str] = []
+        cycle = self._cycle_line(text)
+        if cycle:
+            lines.append(cycle)
+        tendency = self._tendency_lines(agency, interest, self._seed(user_id))
+        if tendency:
+            lines.append(tendency[-1])
+        return lines
+
+    def _sensory_line(
+        self,
+        now: Any,
+        body: Dict[str, Any],
+        style: str,
+        seed: List[Any],
+    ) -> str:
+        """一句**只能影响语气**的感官细节，每轮最多一条。
+
+        为什么要有（v3.1.9）：这个插件不生成台词，只给模型「她此刻是什么样」。可
+        v3.1.8 给的每一样都是**判断**（有精神 / 专注 / 很闲），判断是可以直接念出来
+        的——模型于是把注入原样翻译成台词，听起来像在念仪表盘。真人说「在吗」的时候
+        不会先想「我现在很闲」，她只知道「手边的水已经温了」。这种细节进不了台词，
+        但会让语气落地。
+
+        组合：时段（必选）× 天气 × 身体档位 × 穿搭。**确定性抽签**：种子含角色、
+        今天、用户、时段、天气档，所以同一天同一时段稳定换、跨天会变——她不会今天
+        下午和明天下午是同一个下午。
+
+        句式上有一条硬禁止：「我感到 / 我觉得 / 我心里」。那是内心独白，模型会直接
+        复述成一句台词（「我觉得屋里有点闷」）；只写外部可感的细节，它才只能拿去
+        调整语气。
+        """
+        try:
+            hour = int(getattr(now, "hour"))
+        except (AttributeError, TypeError, ValueError):
+            return ""
+        slot = _sensory_slot(hour)
+        weather_key = _sensory_weather_key(self._weather_snapshot())
+        options: List[str] = list(_SENSORY_SLOT_LINES.get(slot, ()))
+        options.extend(_SENSORY_WEATHER_LINES.get(weather_key, ()))
+        options.extend(_sensory_body_lines(body))
+        options.extend(_sensory_style_lines(style))
+        if not options:
+            return ""
+        line = pick(
+            "sensory_line",
+            [*(seed or []), slot, weather_key],
+            options,
+        )
+        return str(line or "")
+
+    def _ongoing_hint_line(self, busy: bool = False) -> str:
+        """她手上有没有一件事还没放下——只说**有没有**，不说是什么。
+
+        为什么要有（v3.1.9 / P2）：具体日程只在对方问「在干嘛」时才给（`_asks_about_now`
+        那道门），于是绝大多数轮次里她只知道「很闲」。「手上有件事」这个信息量很小，
+        但它决定了她说「等我一下」还是「现在就聊」——而具体是哪件事一旦写出来，
+        模型就会当成话头去念。
+
+        不写具体内容，也不和「她手上还有件事没完：<什么事>」抢：那句由 `_open_lines`
+        出（life_log 的未完事项），带内容；这句只给状态，两者互补。
+
+        「有没有事」看两个来源：日程当前时段有没有事件（她正处在某件事中间），
+        以及 `ongoing_tasks()`（跨天跟着她的待办）。两处都不写进这句话——只说
+        「有」还是「空」，具体内容一写出来就会被当成话头念。
+        """
+        if not busy:
+            try:
+                busy = bool(
+                    [text for text in (self._core.schedule.ongoing_tasks() or [])
+                     if str(text).strip()]
+                )
+            except Exception:
+                busy = False
+        if not busy:
+            try:
+                # 用 active_segment 而不是 current_slot：后者拿不到段时会返回一个
+                # 「自由活动」的中性段（不编造她在做什么，但也不能用来判断「有没有事」），
+                # 于是每一轮都会变成「手上有件事」。active_segment 只在真有覆盖当前
+                # 时刻的段时返回，正是「她正处在某件事中间」。
+                busy = self._core.schedule.active_segment() is not None
+            except Exception:
+                busy = False
+        return "手上还有件事没放下，不是急事" if busy else "这会儿手上是空的"
+
+    def _weather_snapshot(self) -> Dict[str, Any]:
+        """当前天气快照；取不到就是空 dict（感官句会自动退化成只有时段那一档）。"""
+        try:
+            weather = self._core.snapshot(refresh=False).get("weather")
+        except Exception:
+            return {}
+        return weather if isinstance(weather, dict) else {}
+
+    def _outfit_text(self) -> str:
+        """她这会儿穿什么（取不到就是空串）。感官句用它决定「腿上有点凉」这类细节。"""
+        try:
+            return str(self._core.outfit_text() or "")
+        except Exception:
+            return ""
 
     def _emotion_line(
         self,
@@ -1513,7 +1634,10 @@ class PromptBuilder:
             # 用「会话」而不是「旁边」：群成员可能分布在不同城市，说「旁边」等于
             # 给了距离断言，模型会当成贴身盯着，害羞就变成戒备。
             return ["群聊，这个会话里还有别人" if cfg.enable_chat_awareness else "群聊"]
-        return ["私聊，只有她和TA"]
+        # v3.1.9：「私聊，只有她和TA」是**系统视角**的描述（谁在场、还剩谁），模型
+        # 读到的是「这是一个封闭场景」的设定说明，于是开场白先交代环境。换成
+        # 「在跟TA私聊」——同一件事，但它是她此刻的处境，不是一份场景清单。
+        return ["在跟TA私聊"]
 
     def _background_lines(self, key: str = "") -> List[str]:
         """她此刻身处的世界：几点、几号、周几、季节、她在哪个城市、外头什么天。
@@ -1526,21 +1650,16 @@ class PromptBuilder:
         cfg = self.config
         lines: List[str] = []
         now = self._core.clock.now()
-        # 精确到秒（v2.28.1）。
+        # 精确到分钟（v3.1.9）。
         #
-        # 为什么是秒：这段是**每轮重发的临时块**，两条消息之间常常只隔几十秒。
-        # 只给「15:20」时，她分不清对方是 15:20:05 还是 15:20:55 说的——
-        # 「刚说完」和「快半小时了」在她的时间里是同一时刻。
-        #
-        # 为什么不用担心她念出来：秒只在她**真的需要提时间**时才有分辨率，
-        # 而「要不要提」早已由 system_prompt 的框架句管着（「它们是背景，
-        # 不是要拿出来讲的内容；对方没问起时，它们只影响你怎么说话」）。
-        # 钟点本身没有变，只是多了一根更细的刻度——就像给人一块表，
-        # 不是命令她逢人就报时。
+        # 为什么不再给秒：秒是**系统账本**的刻度，不是人嘴里的时间。模型读到
+        # 「13:03:47」，写出来的就是「现在都 13 点 03 分了」这种报时句；而她真正
+        # 需要知道的只是「这会儿是下午一点刚过」。分钟够她判断是「刚说完」还是
+        # 「聊了半个钟头」，又不会让秒被念出来。
         #
         # 仍然不报「上午/下午/晚上」这类时段词：那才是真的会被当成打招呼由头的
         # （无论几点都回一句「下午好呀」）。
-        line = f"现在是{now.strftime('%H:%M:%S')}"
+        line = f"现在是{now.strftime('%H:%M')}"
         try:
             today = self._core.snapshot(refresh=False).get("today") or ""
         except Exception:
@@ -2018,11 +2137,22 @@ class PromptBuilder:
         )
         if feelings:
             sents.append((feelings, 8.0, _meta("feelings")))
-        # P2：生理周期的感觉。与体感分开成组：它一天之内不变，不该和「这一轮
-        # 身上什么样」挤进同一组去互斥（同组只会留一条）。
-        cycle = self._cycle_line(text)
-        if cycle:
-            sents.append((cycle, 7.5, _meta("cycle", "cycle")))
+        # 身体这一块的判断句：周期感觉 + 一条倾向，**合成一句**（v3.1.9）。
+        # v3.1.8 这里是两句并列（周期一句、倾向一句），再往前是四五句——读起来是
+        # 一张状态表，模型会把它翻译成总结（「我今天还挺闲的」）。
+        body_judgement = self._body_lines(user_id, interest, agency, text)
+        if body_judgement:
+            sents.append((self._sentence(body_judgement), 7.5, _meta("body")))
+        # 感官细节：只能影响语气、不能直接复述的一句，每轮最多一条（v3.1.9）。
+        # 它排得很靠后（5.5），预算紧时先丢它——判断比细节重要，但细节才是「像人」。
+        sensory = self._sensory_line(
+            self._core.clock.now(),
+            (snap.get("soma") or {}),
+            self._outfit_text(),
+            self._seed(user_id),
+        )
+        if sensory:
+            sents.append((sensory, 5.5, _meta("sensory")))
         night = self._sentence(self._night_lines())
         if night:
             sents.append((night, 8.0, _meta("night", "", "sleep_window")))
@@ -2058,11 +2188,6 @@ class PromptBuilder:
         )
         if situ:
             sents.append((self._sentence(situ), 7.0, _meta("behavior")))
-        tendency = self._sentence(
-            self._tendency_lines(agency, interest, self._seed(user_id))
-        )
-        if tendency:
-            sents.append((tendency, 6.5, _meta("tendency")))
 
         # medium 档：精力够高时身边句整句消失，形状每条消息都在变。
         hands = self._state_lines(snap, detailed=False)
@@ -2071,9 +2196,14 @@ class PromptBuilder:
         memory = self._sentence(self._memory_lines(user_id, detailed=False))
         if memory:
             sents.append((memory, 6.0, _meta("memory")))
-        opens = self._sentence(self._open_lines(user_id, is_group))
+        opens_lines = self._open_lines(user_id, is_group)
+        opens = self._sentence(opens_lines)
         if opens:
             sents.append((opens, 6.0, _meta("opens")))
+        # P2：手上有没有一件事还没放下——只说有没有，不说是什么（v3.1.9）。
+        hint = self._ongoing_hint_line(busy=bool(opens_lines))
+        if hint:
+            sents.append((hint, 5.0, _meta("ongoing_hint")))
         linked = self._memory_link_line(memory_text)
         if linked:
             sents.append((linked, 6.0, _meta("memory_link")))
@@ -2117,10 +2247,19 @@ class PromptBuilder:
         feelings = self._sentence(self._feelings_lines(MAX_FEELINGS_FULL, 0.0, text=text))
         if feelings:
             sents.append((feelings, 8.0, _meta("feelings")))
-        # 与 medium 档同一句（P2）：周期只给感觉，不改数值。
-        cycle = self._cycle_line(text)
-        if cycle:
-            sents.append((cycle, 7.5, _meta("cycle", "cycle")))
+        # 与 medium 档同一句（v3.1.9）：周期只给感觉，与一条倾向合成一句。
+        body_judgement = self._body_lines(user_id, interest, agency, text)
+        if body_judgement:
+            sents.append((self._sentence(body_judgement), 7.5, _meta("body")))
+        # 与 medium 档同一句：感官细节，只影响语气、不能直接复述。
+        sensory = self._sensory_line(
+            self._core.clock.now(),
+            (snap.get("soma") or {}),
+            self._outfit_text(),
+            self._seed(user_id),
+        )
+        if sensory:
+            sents.append((sensory, 5.5, _meta("sensory")))
         night = self._sentence(self._night_lines())
         if night:
             sents.append((night, 8.0, _meta("night", "", "sleep_window")))
@@ -2150,17 +2289,17 @@ class PromptBuilder:
         )
         if situ:
             sents.append((self._sentence(situ), 7.0, _meta("behavior")))
-        tendency = self._sentence(
-            self._tendency_lines(agency, interest, self._seed(user_id))
-        )
-        if tendency:
-            sents.append((tendency, 6.5, _meta("tendency")))
         memory = self._sentence(self._memory_lines(user_id, detailed=True))
         if memory:
             sents.append((memory, 6.0, _meta("memory")))
-        opens = self._sentence(self._open_lines(user_id, is_group))
+        opens_lines = self._open_lines(user_id, is_group)
+        opens = self._sentence(opens_lines)
         if opens:
             sents.append((opens, 6.0, _meta("opens")))
+        # 与 medium 档同一句（v3.1.9 / P2）：手上有没有一件事还没放下。
+        hint = self._ongoing_hint_line(busy=bool(opens_lines))
+        if hint:
+            sents.append((hint, 5.0, _meta("ongoing_hint")))
         linked = self._memory_link_line(memory_text)
         if linked:
             sents.append((linked, 6.0, _meta("memory_link")))
@@ -2206,13 +2345,16 @@ class PromptBuilder:
             ))
         if not facts:
             return ""
-        # 抬头只留版本号，不再写 `uid=`。
+        # 抬头只留 `MARK_PREFIX`，**不带版本号**（v3.1.9）。
         #
-        # 那个 `uid={_uid_tag(role_id)}` 打的是**角色 id**（机器人自己），不是用户的，
-        # 而且只取末 8 位——所有人看到的都是同一串 `uid=12345678`，模型则把它当成
-        # 一个真实存在的编号。它不是任何东西的 id，只是给模型的一条假事实；
-        # 真正需要它的地方（区分不同角色的块）由 `MARK_PREFIX` 本身就够了。
-        header = f"{MARK_PREFIX} {MARK_VERSION}〕"
+        # v13 那版抬头是「〔我现在的身体 v13〕」。那个 `v13` 是**我们自己**的格式
+        # 版本号：模型每轮读到 `v13`，就多了一个「这是一份被注入的资料、现在第 13
+        # 版」的元视角，而它对「像不像人」没有任何帮助。版本号改成只活在常量里
+        # （诊断页与测试仍能读），正文不再出现。
+        #
+        # 抬头本身必须留着：它是这块事实的识别符，旧块靠 `MARK_PREFIX` 前缀清掉，
+        # 认不出来就会一轮一轮往上叠（test_v222_injection 有这条断言）。
+        header = f"{MARK_PREFIX}〕"
         budget = max(200, int(cfg.inject_token_budget))
         # 取舍只有一个出口（P-03 / P-04 / P-07 / P-14）：条件过滤 → key 去重 →
         # 组内互斥 → 近似文本去重 → token 预算 + 档位字数红线。以前这里是手写的
@@ -2330,3 +2472,108 @@ def _short_weather(weather: Dict[str, Any]) -> str:
     if not env or is_notice(env):
         return ""
     return env.replace("天气：", "", 1)
+
+
+# ----------------------------------------------------------------------
+# 感官细节的措辞池（v3.1.9）
+# ----------------------------------------------------------------------
+# 每一条都必须是**外部可感**的：看得见、听得见、碰得到。不写「我感到」「我觉得」
+# ——那是内心独白，模型会直接复述成一句台词。长度控制在 6~14 字，太长会被当成
+# 一句要念出来的描述。
+_SENSORY_SLOT_LINES: Dict[str, Tuple[str, ...]] = {
+    "凌晨": ("屋里静得能听见冰箱响", "眼睛还发涩，灯显得刺眼", "手边的水早凉透了"),
+    "早上": ("窗帘缝里透进来的光有点白", "屋里还留着被窝的暖气味", "手指刚碰过凉水"),
+    "上午": ("窗开着一条缝，风是温的", "屋里有点闷，水已经不烫了", "桌上的光晃了一下"),
+    "中午": ("外头的光白得晃眼", "身上有点黏", "饭后的困劲还没散"),
+    "下午": ("窗外有车过去", "屋里有点闷，手边的水已经温了", "刚洗完手，指尖还凉"),
+    "傍晚": ("天色开始发灰", "屋里没开灯，东西都看不太清", "窗外的人声多起来了"),
+    "夜里": ("屏幕的光照在脸上", "屋里只剩台灯那一圈亮", "脚有点凉"),
+}
+
+_SENSORY_WEATHER_LINES: Dict[str, Tuple[str, ...]] = {
+    "rain": ("雨点打在窗上，一阵一阵的", "外头湿气重，屋里也潮"),
+    "snow": ("窗外白得发亮", "屋里烘得脸有点干"),
+    "wind": ("风一阵一阵的，窗帘动了下", "窗户缝里有点凉风"),
+    "hot": ("屋里闷着，风扇转也不顶用", "坐着也出一层薄汗"),
+    "cold": ("手有点僵", "呵了口气，玻璃上起雾"),
+    "clear": ("日头晒得地板发白", "光落在桌面上，很亮"),
+    "cloud": ("天色灰着，看不出几点", "屋里一直是那个亮度"),
+}
+
+#: 身体档位对应的细节：低 → 高。取不到精力时这一档整段不出（宁可不给，也不编）。
+_SENSORY_BODY_LOW: Tuple[str, ...] = ("后背有点僵", "眼皮发沉")
+_SENSORY_BODY_MID: Tuple[str, ...] = ("肩膀有点紧", "坐久了腰有点酸")
+_SENSORY_BODY_HIGH: Tuple[str, ...] = ("身上有点热", "手指敲着桌沿")
+
+
+def _sensory_slot(hour: int) -> str:
+    """钟点 → 时段名（与 life_material.SLOT_NAMES 同一套边界）。"""
+    if hour < 5:
+        return "凌晨"
+    if hour < 9:
+        return "早上"
+    if hour < 12:
+        return "上午"
+    if hour < 14:
+        return "中午"
+    if hour < 18:
+        return "下午"
+    if hour < 21:
+        return "傍晚"
+    return "夜里"
+
+
+def _sensory_weather_key(weather: Dict[str, Any]) -> str:
+    """天气 → 一个粗档（雨/雪/风/热/冷/晴/阴）。认不出就不给这一档。"""
+    text = _short_weather(weather) if isinstance(weather, dict) else ""
+    if not text:
+        return ""
+    for word, key in (("雨", "rain"), ("雪", "snow"), ("风", "wind")):
+        if word in text:
+            return key
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if match:
+        try:
+            temp = float(match.group(0))
+        except ValueError:
+            temp = None
+        if temp is not None:
+            if temp >= 30.0:
+                return "hot"
+            if temp <= 8.0:
+                return "cold"
+    if "晴" in text:
+        return "clear"
+    if "云" in text or "阴" in text:
+        return "cloud"
+    return ""
+
+
+def _sensory_body_lines(body: Dict[str, Any]) -> Tuple[str, ...]:
+    """按精力档位给一条身体细节。取不到精力就不给（宁可少一句，不编一句）。"""
+    if not isinstance(body, dict):
+        return ()
+    try:
+        energy = body.get("energy")
+        value = float(energy.get("value", 0.0) or 0.0) if isinstance(energy, dict) else float(energy or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        return ()
+    if value <= 0.0:
+        return ()
+    if value < 35.0:
+        return _SENSORY_BODY_LOW
+    if value > 78.0:
+        return _SENSORY_BODY_HIGH
+    return _SENSORY_BODY_MID
+
+
+def _sensory_style_lines(style: str) -> Tuple[str, ...]:
+    """按穿搭给一条细节。只认得出厚/薄两类，认不出就不给。"""
+    text = str(style or "")
+    if not text:
+        return ()
+    if any(word in text for word in ("外套", "大衣", "毛衣", "羽绒", "厚")):
+        return ("领口有点闷", "袖子挽到了小臂")
+    if any(word in text for word in ("裙", "短袖", "背心", "薄")):
+        return ("腿上有点凉", "胳膊上起了层小疙瘩")
+    return ()

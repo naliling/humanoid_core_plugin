@@ -206,7 +206,8 @@ class FinishTest(unittest.TestCase):
         """
         block = self.finish([("甲" * 20, 10.0)])
         head = block.split("\n", 1)[0]
-        self.assertEqual(head, f"{MARK_PREFIX} {MARK_VERSION}〕")
+        # v3.1.9：抬头只留标记，不带版本号——`v13` 对模型只是一串无意义的编号。
+        self.assertEqual(head, f"{MARK_PREFIX}〕")
         self.assertNotIn("uid=", head, "不要再把角色 id 冒充成 uid")
 
     def test_the_body_is_one_line(self):

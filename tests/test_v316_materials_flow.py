@@ -229,7 +229,11 @@ class SegmentBindingTest(unittest.TestCase):
     def test_sleep_segment_does_not_fall_back(self):
         # 睡觉段没有兜底：把中午能用的 rest 档全部当成「已经做过」，睡段就真的空了。
         # 如果兜底也覆盖 sleep，这里会退回不挑时段的池子、混进生活素材。
-        recent = ("刷手机", "发呆", "泡茶", "泡壶茶", "吹风", "拖延")
+        # v3.1.9：rest 档扩了 6 条通用条目，写死几个 topic 已经盖不住整档；
+        # 直接从池子里取所有 rest/rare 条目的 topic 当成「今天已经做过」，保住原意。
+        recent = tuple(
+            item["topic"] for item in lm.MATERIALS if item["band"] in ("rest", "rare")
+        )
         items = lm.materials_for(
             ["bot1", "2026-08-22"], PERSONA, 13 * 60, recent, 10, segment="睡觉", asleep=True
         )
@@ -297,8 +301,10 @@ class CardStabilityTest(unittest.TestCase):
 
 class PoolTest(unittest.TestCase):
     def test_pool_is_big_enough_to_rotate(self):
+        # 池子要够大，否则每天抽到同一批。v3.1.9 加了 21 条无人设门槛的通用条目
+        # （覆盖 7 个时段），从 78 条涨到 99 条，上限跟着抬到 120。
         self.assertGreaterEqual(len(lm.MATERIALS), 75)
-        self.assertLessEqual(len(lm.MATERIALS), 90)
+        self.assertLessEqual(len(lm.MATERIALS), 120)
 
     def test_every_band_has_room(self):
         counts = {}

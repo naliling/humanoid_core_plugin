@@ -356,7 +356,10 @@ class GreetingWiringTest(unittest.IsolatedAsyncioTestCase):
         text = injected_text(req)
         self.assertIn("【她此刻可以提的具体的事】", text)
         self.assertIn("早安窗口", text, "问候窗口要变成一条能指认的由头")
-        self.assertIn("[问候时机]", text, "出处固定写「问候时机」，不是既成事实")
+        # v3.1.9：行里不再带出处标记（`[问候时机]` 那种括号已经被拿掉），
+        # 但「窗口只提供时机、不宣布对方状态」这条语义不变。
+        self.assertNotIn("[问候时机]", text)
+        self.assertIn("（刚刚）", text, "一分钟前采集的窗口算新鲜")
         self.assertNotIn("你刚醒", text, "窗口只提供时机，不许替对方宣布状态")
         self.assertIn("greeting_opportunity", self._codes())
 

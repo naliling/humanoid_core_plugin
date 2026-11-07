@@ -60,36 +60,32 @@ DATA_SUBDIR = ("plugin_data", "humanoid_core")
 
 HELP_TEXT = f"""📖 人形化核心伴侣 指令列表 (v{__version__})
 
-查状态的指令**直接打，不带前缀**：
+查状态（不用前缀，直接打）：
+/你的状态 —— 精力、身体轴、生理、天气、日程、关系、注意力
+/亲密状态 —— 她对你的亲密状态（只在私聊）
+/好感度 —— 你的情绪档案；管理员加「排行榜」看所有人排名
+/情绪详情 —— 含基线值与交互轮次
+/情绪日志 —— 最近的情绪波动记录
+/查看日程 —— 她今天已经过出来的日程
+/时间 大阪 —— 查那个城市现在几点；不带城市就用她所在的城市
+/叫我 小灵 —— 设她对你的称呼（最多 32 字）
+/拟人帮助 —— 显示这份帮助
 
-/你的状态 - 精力、身体轴（困意/睡眠债/饥饿/不适）、生理、天气、日程、关系、注意力
-/亲密状态 - 她对你的亲密状态：亲近欲/门槛/场景阶段/余韵/冷却/能不能进（私聊）
-/查看日程 - 她今天过出来的日程（动态现排，不预排未来）
-/时间 城市 - 查看指定城市当前时间
-/好感度 - 情绪档案总览（管理员加「排行榜」看所有人的排名）
-/情绪详情 - 含基线值与交互轮次
-/情绪日志 - 情绪波动记录
-/叫我 昵称 - 设置她对你的称呼（没设过时她会自动认一次，认过之后不再改）
-/拟人帮助 - 显示本帮助
+管理员（都要 /拟人 前缀）：
+/拟人 时间 大阪 —— 改她所在的城市（只影响当前这个 bot；写「默认」跟随全局）
+/拟人 设置 —— 看常用项；/拟人 设置 城市 大阪 改一项，立即生效
+/拟人 参照名称 小雨 —— 注入里代表她的名字（写「清除」跟随人设）
+/拟人 诊断 —— 模型链、时区、上下文大小、状态文件、冷却状态
+/拟人 重载 —— 重新读配置文件，不用重启插件
 
-下面这些是管理员指令，挂在「拟人」组下，要打 /拟人 前缀：
-
-管理员：改配置
-/拟人 时间 - 设置她所在的城市（时区）：/拟人 时间 大阪
-/拟人 设置 - 看常用项；写成「/拟人 设置 间隔 30」就改一项，立即生效
-/拟人 参照名称 名字 - 设定注入里代表她的名字（默认跟人设里的名字）
-/拟人 诊断 - 排查模型选择、时区是否生效、上下文多大、状态文件多大
-/拟人 重载 - 重载插件配置
-
-管理员：动数据
-/拟人 重置日程 - 立即重新决定她当前这一段
-/拟人 日程打断 - 让她立刻放下手上的事，重新决定现在做什么（换一件事）
-/拟人 日程继续 - 让她把手上的事接着做下去（把当前这一段往后延长）
-/拟人 重置状态 - 重置精力、社交能量与生理周期
-/拟人 重置情绪 - 把**你自己**的情绪重置到初始值
-/拟人 设置好感度 数值 - 手动设置自己的好感度（0-100）
-/拟人 批量好感度 QQ:数值 - 批量导入（逗号分隔）
-/拟人 查看昵称 - 所有用户设置的昵称"""
+/拟人 重置日程 —— 立刻重排当前这一段
+/拟人 日程打断 —— 让她放下手上的事，换一件做
+/拟人 日程继续 —— 把手上这件事往后延长
+/拟人 重置状态 —— 精力、社交能量、生理周期回初始值
+/拟人 重置情绪 —— 把你自己的情绪重置到初始值
+/拟人 设置好感度 88 —— 设你自己的好感度（0-100）
+/拟人 批量好感度 111:30,222:40 —— 批量导入（逗号分隔）
+/拟人 查看昵称 —— 所有用户设的称呼（人多只显示前 30 个）"""
 
 NO_PERMISSION = "❌ 权限不足，该指令仅管理员可用。"
 
@@ -269,6 +265,66 @@ def _mask_id(value: Any) -> str:
     return f"{text[:3]}***{text[-2:]}"
 
 
+#: 单条指令回复的字符上限（v3.1.9）。
+#:
+#: 为什么要有这条：AstrBot 的 respond 阶段会把「过长的纯文本」转成合并转发的 Node
+#: 再交给 NapCat，而那条路径在部分版本上直接抛
+#: `TypeError: Cannot read properties of undefined (reading 'resId')`——用户看到的是
+#: 「指令报错」，其实指令已经执行完，只是发不出去。昵称列表就是被这个打死的：
+#: 几十个用户 × 一行 20 多字，实测 55771 字符。
+#:
+#: 截断的代价是少看几行，不截断的代价是整条回复消失。所以宁可截断并明说「还有多少」。
+COMMAND_OUTPUT_CHARS = 1500
+#: 昵称列表最多显示多少行。
+NICKNAME_ROWS = 30
+
+
+def _clip_lines(lines: Any, limit: int, more_note: str | None = None) -> str:
+    """把多行输出截到 `limit` 行，末尾补一句「还有多少没显示」。
+
+    `more_note` 用 `{rest}` 占位剩余行数；不传就用默认文案。
+    """
+    items = [str(line) for line in list(lines or [])]
+    limit = max(1, int(limit))
+    if len(items) <= limit:
+        return "\n".join(items)
+    rest = len(items) - limit
+    tail = (more_note or "……还有 {rest} 行没显示").format(rest=rest)
+    return "\n".join(items[:limit] + [tail])
+
+
+def _clip_text(text: Any, limit: int = COMMAND_OUTPUT_CHARS,
+               more_note: str | None = None) -> str:
+    """把一整段指令输出压到 `limit` 字符以内。
+
+    先按行保留（尽量不切断句子），行本身超长时再硬截——昵称那种「QQ → 名字」一行
+    就可能上百字符，光按行数限不住。
+    """
+    body = str(text or "")
+    limit = max(1, int(limit))
+    if len(body) <= limit:
+        return body
+    lines = body.splitlines()
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > limit - 40:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    rest = max(0, len(lines) - len(kept))
+    if not kept:
+        # 第一行自己就超了预算（昵称列表一行可能几百字符）：硬截第一行，
+        # 不能返回一句「还有 N 行没显示」把正文整段吞掉。
+        head = lines[0] if lines else ""
+        return head[: max(1, limit - 1)] + "…"
+    tail = (more_note or "……还有 {rest} 行没显示").format(rest=rest)
+    out = "\n".join(kept + [tail])
+    if len(out) > limit:
+        out = out[: max(1, limit - 1)] + "…"
+    return out
+
+
 def _is_command_message(text: str, wake_command: bool = True) -> bool:
     """这条（已被唤醒阶段剪掉前缀的）消息是不是一次**真的要执行的指令**。
 
@@ -370,14 +426,30 @@ def _append_injected_parts(req: Any, blocks: list[str]) -> str:
 # 为什么加：模型以前只拿到「此刻的她」与身体事实，聊天里没有任何**具体的事**可提，
 # 主动开口时只能编——编出来的日程、天气、承诺经不起追问。core 侧已经算好了证据卡
 # （humanoid/opportunity.py：日程/未完事项/天气/节日/生活素材……），这里只做一件事：
-# 把卡连同**出处、采集时间、剩余有效期**拼成一段可读的上下文。有出处的话才敢说，
-# 没有就明说没有——沉默地少一块，模型照样会编。
+# 把卡拼成一段可读的上下文。有的话才敢说，没有就明说没有——沉默地少一块，模型照样会编。
+#
+# v3.1.9 改的是**呈现**：以前每行都带出处、采集时间、剩余有效期和「她可能想做」的
+# 免责声明，模型读完先学会的是「交代来路」。现在每行只剩「标题：一句细节」，
+# 由头是拿来开口的，不是拿来汇报的。
 
 _EVIDENCE_TITLE = "【她此刻可以提的具体的事】"
-_EVIDENCE_EMPTY_TITLE = "【暂时没有可指认的具体的事】"
-#: 一次最多列几条：机会 ≤5、素材 ≤8，全列出来会把这轮提示词撑长；由头是「挑着说」，
-#: 不是清单朗读，10 条足够覆盖一天里真正记得住的事。
-_EVIDENCE_LIMIT = 10
+_EVIDENCE_EMPTY_TITLE = "【暂时没有特别的事】"
+#: 空卡时那一句（v3.1.9）。原来写「宁可只回一句」——那是在教她**少说话**，
+#: 而模型读到「宁可只回一句」往往理解成「这轮可以敷衍」。现在只交代一件事：
+#: 没有由头就别硬找，想到什么说什么。
+_EVIDENCE_EMPTY_HINT = "想到什么说什么，别硬找由头。"
+#: 引导语只留一句（v3.1.9）。v3.1.8 这里是「这些是她今天确实有的事或真可能做的事。
+#: 只能从下面挑着说，不要编别的；每条末尾是它的出处和时效。」——两句话里一半是
+#: 免责声明，模型读完先学会的是「我要交代出处」。出处与时效现在不进正文。
+_EVIDENCE_LEAD = "这些是今天真有的、可能做的事，挑一件说，别编。"
+#: 一次最多列几条（v3.1.9：10 → 6）。机会 ≤5、素材 ≤8，全列出来会把这轮提示词
+#: 撑长；由头是「挑着说」，不是清单朗读。6 条足够覆盖一天里真正记得住的事，
+#: 又不至于让模型把整块读成待办清单。
+_EVIDENCE_LIMIT = 6
+#: 采集时间在 2 小时以内的，行尾加一个「（刚刚）」；更早的不再标时间。
+#: 为什么还要这一档：她刚记下的事说「刚弄完」才自然；而「采集于09-26 13:00，
+#: 还剩7 小时」是**系统账本**，模型会把它当成一句要交代的说明。
+_EVIDENCE_FRESH_SECONDS = 2 * 3600.0
 
 
 def _clock_text(ts: float) -> str:
@@ -450,38 +522,39 @@ def _evidence_note(
         rows.append((card, title, expires, is_material))
     if not rows:
         return {
-            "text": _EVIDENCE_EMPTY_TITLE
-            + "\n那就少说，不要编——没有由头就别硬找话题，宁可只回一句。",
+            "text": _EVIDENCE_EMPTY_TITLE + "\n" + _EVIDENCE_EMPTY_HINT,
             "used": 0,
             "expired": expired,
+            "shown": [],
         }
-    lines = [
-        _EVIDENCE_TITLE,
-        "这些是她今天确实有的事或真可能做的事。只能从下面挑着说，不要编别的；"
-        "每条末尾是它的出处和时效。",
-    ]
-    for card, title, expires, is_material in rows[:_EVIDENCE_LIMIT]:
-        source = str(card.get("source") or "").strip() or "生活素材"
+    # 行格式（v3.1.9）：`- {title}：{detail}`。
+    #
+    # 原来每行是 `- [生活素材] 去楼下超市把缺的东西补上（她可能想做，不是已经做了）：
+    # 超市，大概 55 分钟（采集于09-26 13:00，还剩7 小时）`——60 个字里有一半是
+    # 免责声明和倒计时。那是**仪表盘**：模型读到「采集于/还剩」，就学会了在回复里
+    # 交代信息来路。现在出处、时效、可能性都不进正文，只留「标题：一句细节」，
+    # 唯一保留的时间信息是「（刚刚）」——因为「刚弄完」是她真的会用到的说法。
+    lines = [_EVIDENCE_TITLE, _EVIDENCE_LEAD]
+    shown = []
+    for card, title, _expires, _is_material in rows[:_EVIDENCE_LIMIT]:
         detail = str(card.get("detail") or "").strip()
-        line = f"- [{source}] {title}"
-        if is_material:
-            line += "（她可能想做，不是已经做了）"
-        if detail:
-            line += f"：{detail}"
+        line = f"- {title}：{detail}" if detail else f"- {title}"
         try:
             captured = float(card.get("captured_at") or 0.0)
         except (TypeError, ValueError):
             captured = 0.0
-        notes = []
-        clock = _clock_text(captured) if captured else ""
-        if clock:
-            notes.append(f"采集于{clock}")
-        if expires:
-            notes.append(f"还剩{_span_text(expires - moment)}")
-        if notes:
-            line += "（" + "，".join(notes) + "）"
+        # 「（刚刚）」只给机会卡。素材卡每轮都是现造的 captured_at=now，
+        # 给它们打「刚刚」等于每行都挂一个，反而又变成噪声。
+        if (not _is_material) and captured and 0.0 <= moment - captured < _EVIDENCE_FRESH_SECONDS:
+            line += "（刚刚）"
         lines.append(line)
-    return {"text": "\n".join(lines), "used": min(len(rows), _EVIDENCE_LIMIT), "expired": expired}
+        shown.append(dict(card))
+    return {
+        "text": "\n".join(lines),
+        "used": len(shown),
+        "expired": expired,
+        "shown": shown,
+    }
 
 
 # -------------------- 问候时机与出处（v3.1.6） --------------------
@@ -580,6 +653,39 @@ def _merge_cards(*groups: Any) -> list[dict]:
     return merged
 
 
+def _scope_write(scope: Any, key: str, value: Any) -> bool:
+    """把一段台账写回 role scope，**三种签名都兼容**。
+
+    为什么需要这个（v3.1.9 发现的老 bug）：真实 `RoleScope.update_self(**kwargs)`
+    只收关键字参数，而 v3.1.7 起 `_note_materials_used` 一直按 `updater(key, rows)`
+    位置调用——`TypeError` 被外层的 `except Exception: return 0` 吞掉，于是
+    `materials_used` 在线上**从来没写进去过**（测试里用的假 scope 恰好是位置参数
+    签名，所以一直是绿的）。同一件事现在有三个台账要走同一条写路径，所以收在这里：
+    先按关键字（真实实现），再按位置（旧假实现），最后退回 `set_self`。
+    """
+    updater = getattr(scope, "update_self", None)
+    if callable(updater):
+        try:
+            updater(**{key: value})
+            return True
+        except TypeError:
+            try:
+                updater(key, value)
+                return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+    setter = getattr(scope, "set_self", None)
+    if callable(setter):
+        try:
+            setter(key, value)
+            return True
+        except Exception:
+            return False
+    return False
+
+
 def _note_materials_used(core: Any, cards: Any, now: float | None = None) -> int:
     """把本轮真的摆到提示词里的素材记进 materials_used（v3.1.7）。
 
@@ -608,10 +714,157 @@ def _note_materials_used(core: Any, cards: Any, now: float | None = None) -> int
         rows = getter(life_material.MATERIALS_USED_KEY, [])
         for card in items:
             rows = life_material.remember_used(rows, card, moment)
-        updater(life_material.MATERIALS_USED_KEY, rows)
+        if not _scope_write(scope, life_material.MATERIALS_USED_KEY, rows):
+            return 0
     except Exception:
         return 0
     return len(items)
+
+
+# -------------------- 素材落成事实（v3.1.9） --------------------
+#
+# 为什么加：卡片上写「去楼下超市把缺的东西补上」，模型只能把它当**可能的由头**说
+# （「我可能等会儿去趟超市」）；可下一句她又说「我刚从超市回来」，两轮之后自己都
+# 记不清到底去没去。人不是这样过日子的：做过就是做过。
+#
+# 三步：
+# 1. 注入时把真正摆到她眼前的素材卡记进 `evidence_shown`（每张卡 + 用户 + 时间）；
+# 2. 她发出消息后，拿这条素材的题眼/双字关键词跟正文比对，命中 ≥2 个就记进
+#    `materials_done`（life_material.note_done）；
+# 3. 随后 3 轮里以「已经做了」的形式（`今天下午去楼下超市把缺的东西补上了`）再递
+#    一次，并从「可能想做」那一批里剔掉。
+#
+# 判定放在出站钩子里，因为 Core 看不到模型生成的正文。整个链路 fail-open：记不进去
+# 只是少了一次「已经做了」，绝不影响这一轮回复。
+_EVIDENCE_SHOWN_KEY = "evidence_shown"
+_EVIDENCE_SHOWN_TTL = 3600.0
+_EVIDENCE_SHOWN_LIMIT = 24
+
+
+def _remember_evidence(
+    core: Any, user_id: str, cards: Any, now: float | None = None
+) -> int:
+    """把本轮真的摆到她眼前的素材卡记下来，等她说出口时对账。"""
+    items = [card for card in list(cards or []) if isinstance(card, dict)]
+    if not items:
+        return 0
+    scope = getattr(core, "scope", None)
+    getter = getattr(scope, "get_self", None)
+    updater = getattr(scope, "update_self", None)
+    if not (callable(getter) and callable(updater)):
+        return 0
+    try:
+        moment = float(now) if now is not None else time.time()
+    except (TypeError, ValueError):
+        moment = time.time()
+    try:
+        rows = getter(_EVIDENCE_SHOWN_KEY, [])
+        kept = []
+        for row in list(rows or []):
+            if not isinstance(row, dict):
+                continue
+            try:
+                at = float(row.get("at") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if moment - at < _EVIDENCE_SHOWN_TTL:
+                kept.append(row)
+        for card in items:
+            kept.append({"user_id": str(user_id or ""), "at": moment, "card": dict(card)})
+        if not _scope_write(scope, _EVIDENCE_SHOWN_KEY, kept[-_EVIDENCE_SHOWN_LIMIT:]):
+            return 0
+    except Exception:
+        return 0
+    return len(items)
+
+
+def _match_evidence_said(
+    core: Any, user_id: str, text: str, now: float | None = None
+) -> int:
+    """她这句话有没有真的提到某条素材；提到就记成「已经做了」。
+
+    阈值与判定都在 `life_material.material_mentioned` 里（≥2 个实词命中），这里只
+    负责取台账、写台账。返回记下的条数（诊断页用）。
+    """
+    body = str(text or "")
+    if not body.strip():
+        return 0
+    scope = getattr(core, "scope", None)
+    getter = getattr(scope, "get_self", None)
+    updater = getattr(scope, "update_self", None)
+    if not (callable(getter) and callable(updater)):
+        return 0
+    try:
+        from .humanoid.services import life_material
+    except Exception:
+        return 0
+    try:
+        moment = float(now) if now is not None else time.time()
+    except (TypeError, ValueError):
+        moment = time.time()
+    try:
+        rows = getter(_EVIDENCE_SHOWN_KEY, [])
+        mine = [
+            row for row in list(rows or [])
+            if isinstance(row, dict)
+            and str(row.get("user_id") or "") == str(user_id or "")
+            and isinstance(row.get("card"), dict)
+        ]
+        cards = [row["card"] for row in mine]
+        hits = life_material.material_mentioned(body, cards)
+        if not hits:
+            return 0
+        try:
+            minute = time.localtime(moment).tm_hour * 60 + time.localtime(moment).tm_min
+            slot = life_material.slot_name(minute)
+        except Exception:
+            slot = ""
+        done = getter(life_material.MATERIALS_DONE_KEY, [])
+        for card in hits:
+            done = life_material.note_done(done, card, moment, slot=slot)
+        if not _scope_write(scope, life_material.MATERIALS_DONE_KEY, done):
+            return 0
+        # 命中的卡从「等对账」里删掉：同一件事不该在下一句里再被记一次。
+        hit_keys = {str(card.get("anchor_key") or "") for card in hits}
+        rest = [
+            row for row in list(rows or [])
+            if not (isinstance(row, dict) and str(row.get("card", {}).get("anchor_key") or "") in hit_keys)
+        ]
+        _scope_write(scope, _EVIDENCE_SHOWN_KEY, rest)
+    except Exception:
+        return 0
+    return len(hits)
+
+
+def _done_material_cards(
+    core: Any, now: float | None = None
+) -> tuple[list, set]:
+    """把「已经做了」的素材翻成卡片，并把台账扣掉一轮。
+
+    返回 `(cards, keys)`：`keys` 是仍然有效的题眼集合，调用方用它把同名素材从
+    「可能想做」那一批里剔掉——同一件事不能既是「可能去做」又是「已经做了」。
+    """
+    scope = getattr(core, "scope", None)
+    getter = getattr(scope, "get_self", None)
+    updater = getattr(scope, "update_self", None)
+    if not (callable(getter) and callable(updater)):
+        return [], set()
+    try:
+        from .humanoid.services import life_material
+    except Exception:
+        return [], set()
+    try:
+        moment = float(now) if now is not None else time.time()
+    except (TypeError, ValueError):
+        moment = time.time()
+    try:
+        rows = getter(life_material.MATERIALS_DONE_KEY, [])
+        cards, updated, keys = life_material.done_cards(rows, moment)
+        _scope_write(scope, life_material.MATERIALS_DONE_KEY, updated)
+    except Exception:
+        return [], set()
+    return cards, keys
+
 
 def _signals_row(core: Any, role_id: str) -> dict:
     """读信号文件里属于这个角色的那一份；读不到给 `{}`（不猜，也不抛）。"""
@@ -1374,9 +1627,9 @@ class HumanoidCore(Star):
     # 有使用者反馈这比早期版本难用——早期就是直接 `/状态`。
     #
     # 现在分成两层：
-    #   · **所有人能用的 8 个走顶层**，恢复成 `/你的状态`、`/查看日程`、`/拟人帮助`…
+    #   · **所有人能用的 9 个走顶层**，恢复成 `/你的状态`、`/查看日程`、`/拟人帮助`…
     #     不带任何前缀。
-    #   · **管理员的 10 个留在「拟人」组里**（`/拟人 设置`），它们本来就不该随手可用，
+    #   · **管理员的 13 个留在「拟人」组里**（`/拟人 设置`），它们本来就不该随手可用，
     #     多一层前缀反而是好事。
     #
     # 当初担心过「三个同名 `@command_group` 会不会互相覆盖」，所以才把所有指令塞进
@@ -1384,32 +1637,29 @@ class HumanoidCore(Star):
 
     @filter.command_group("拟人")
     def humanoid_group(self):
-        """人形化核心伴侣 · 管理指令（全部需要管理员）
+        """人形化核心伴侣 · 管理员指令（都要 /拟人 前缀）
 
-        改配置：参照名称 / 诊断 / 设置 / 重载
+        改配置：时间 / 参照名称 / 诊断 / 设置 / 重载
         动数据：重置日程 / 日程打断 / 日程继续 / 重置状态 / 重置情绪 / 设置好感度 / 批量好感度 / 查看昵称
-
-        查状态的指令不带前缀，直接用：/你的状态 /亲密状态 /好感度 /情绪详情 /情绪日志
-        /查看日程 /时间 /叫我 /拟人帮助
+        查状态不用前缀：/你的状态 /亲密状态 /好感度 /情绪详情 /情绪日志 /查看日程 /时间 /叫我 /拟人帮助
         """
 
+    # 每条指令的参数都从 event.message_str 自己解析（支持中文空格与多词值）；签名里
+    # 那几个带默认值的参数只为让指令树和文档显示真实参数名，缺省时框架传默认值，
+    # 不影响行为——真正的解析仍在函数体里。
     @filter.command("你的状态")
     async def cmd_status(self, event: AstrMessageEvent):
-        """查看当前角色的完整状态（精力、身体轴、生理、天气、日程、过程、社交能量等）。"""
+        """用法：/你的状态（精力、身体轴、生理、天气、日程、关系、注意力）"""
         core = self._core(event)
         # 群聊里 `status_lines` 会自己隐掉「亲密」段：ccb 在群里是硬闸，
         # 面板也不该有那一屏（用户明确要求群里一句话都不许露）。
-        yield event.plain_result("\n".join(
+        yield event.plain_result(_clip_text("\n".join(
             core.status_lines(self._sender(event), is_group=not _is_private_chat(event))
-        ))
+        )))
 
     @filter.command("亲密状态")
     async def cmd_intimacy_status(self, event: AstrMessageEvent):
-        """查看她对你的亲密状态：亲近欲离门槛多远、在不在场景里、余韵/冷却、能不能进。
-
-        只在私聊里回答：这是「她这会儿想不想」的明细，群里说出来既冒犯也没意义
-        （ccb 本身在群里就是硬闸）。
-        """
+        """用法：/亲密状态（只在私聊：亲近欲、门槛、场景阶段、余韵、冷却、能不能进）"""
         if not _is_private_chat(event):
             yield event.plain_result("亲密状态只在私聊里看。")
             return
@@ -1420,8 +1670,8 @@ class HumanoidCore(Star):
         yield event.plain_result(core.intimacy_text(self._sender(event)))
 
     @filter.command("好感度")
-    async def cmd_mood(self, event: AstrMessageEvent):
-        """查看当前用户的好感度；带「排行榜」看所有人的排名（管理员）。"""
+    async def cmd_mood(self, event: AstrMessageEvent, argument: str = ""):
+        """用法：/好感度（你的情绪档案）；/好感度 排行榜 看所有人的排名（管理员）"""
         if not self._config.mood_enabled:
             yield event.plain_result("情绪系统未开启。")
             return
@@ -1431,14 +1681,14 @@ class HumanoidCore(Star):
                 yield event.plain_result(NO_PERMISSION)
                 return
             core = self._core(event)
-            yield event.plain_result(self.engine.affection_ranking_text(core))
+            yield event.plain_result(_clip_text(self.engine.affection_ranking_text(core)))
             return
         core = self._core(event)
         yield event.plain_result(core.mood.profile_text(self._sender(event)))
 
     @filter.command("情绪详情")
     async def cmd_mood_detail(self, event: AstrMessageEvent):
-        """查看详细情绪档案，包含基线值和交互轮次。"""
+        """用法：/情绪详情（含基线值与交互轮次）"""
         if not self._config.mood_enabled:
             yield event.plain_result("情绪系统未开启。")
             return
@@ -1447,22 +1697,22 @@ class HumanoidCore(Star):
 
     @filter.command("情绪日志")
     async def cmd_mood_log(self, event: AstrMessageEvent):
-        """查看最近的情绪波动记录（事件列表）。"""
+        """用法：/情绪日志（最近的情绪波动记录）"""
         if not self._config.mood_log_enabled:
             yield event.plain_result("❌ 情绪日志未启用。")
             return
         core = self._core(event)
-        yield event.plain_result(core.mood.logs_text(self._sender(event)))
+        yield event.plain_result(_clip_text(core.mood.logs_text(self._sender(event))))
 
     @filter.command("查看日程")
     async def cmd_view_schedule(self, event: AstrMessageEvent):
-        """查看今日完整的日程表。"""
+        """用法：/查看日程（她今天已经过出来的日程）"""
         core = self._core(event)
-        yield event.plain_result(core.schedule_text())
+        yield event.plain_result(_clip_text(core.schedule_text()))
 
     @filter.command("时间")
-    async def cmd_time(self, event: AstrMessageEvent):
-        """查看指定城市（或当前机器人生效城市）的当前时间、星期和节日。"""
+    async def cmd_time(self, event: AstrMessageEvent, city: str = ""):
+        """用法：/时间 大阪（查那个城市现在几点）；不带城市就用她所在的城市"""
         # 默认用当前 bot 的生效城市（含角色级时区覆盖），而不是全局配置：
         # 两个机器人各自「/时间」得到的是各自城市的时间。
         city = _arg_after(event.message_str, "时间") or self._core(event).clock.city
@@ -1476,8 +1726,8 @@ class HumanoidCore(Star):
             yield event.plain_result(text)
 
     @filter.command("叫我")
-    async def cmd_set_nickname(self, event: AstrMessageEvent):
-        """设置 AI 对你的称呼（昵称）。"""
+    async def cmd_set_nickname(self, event: AstrMessageEvent, nickname: str = ""):
+        """用法：/叫我 小灵（设她对你的称呼，最多 32 字）"""
         nickname = _arg_after(event.message_str, "叫我")
         core = self._core(event)
         user_id = self._sender(event)
@@ -1513,13 +1763,11 @@ class HumanoidCore(Star):
             yield event.plain_result(f"✅ 记住了，以后叫你：{cleaned}")
 
     @humanoid_group.command("参照名称")
-    async def cmd_set_char_name(self, event: AstrMessageEvent):
-        """管理员：设定注入里代表这个角色的名字。
-
-        注入里现在不写「她」，写这个名字——模型在 system_prompt 里认的是「你叫XX」，
-        于是「小雨今天有点堵」它当成自己说的话，「她今天有点堵」它当成在转述别人的事。
-        名字要先用管理员设的（这里），没设才跟随人设里的名字。
-        """
+    async def cmd_set_char_name(self, event: AstrMessageEvent, name: str = ""):
+        """用法：/拟人 参照名称 小雨（写「清除」恢复跟随人设，最多 24 字）"""
+        # 注入里不写「她」而写这个名字：模型在 system_prompt 里认「你叫XX」，
+        # 于是「小雨今天有点堵」它当成自己说的话，「她今天有点堵」它当成在转述别人的事。
+        # 名字先用管理员设的（这里），没设才跟随人设。
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1563,14 +1811,14 @@ class HumanoidCore(Star):
 
     @filter.command("拟人帮助")
     async def cmd_help(self, event: AstrMessageEvent):
-        """显示所有指令的帮助信息。"""
+        """用法：/拟人帮助（列出全部指令和用法）"""
         yield event.plain_result(HELP_TEXT)
 
     # -------------------- 管理员指令 --------------------
 
     @humanoid_group.command("诊断")
     async def cmd_diagnose(self, event: AstrMessageEvent):
-        """诊断模型链配置、冷却状态、日程生成情况等。"""
+        """用法：/拟人 诊断（模型链、时区、上下文大小、状态文件、冷却状态）"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1587,7 +1835,8 @@ class HumanoidCore(Star):
         banner = config_error_banner(self._config_box.load_error)
         if banner:
             text = "\n".join(banner) + "\n" + text
-        yield event.plain_result(text)
+        # 诊断项会越加越多（每加一个子系统就多几行），同样要压到一条消息能发出去。
+        yield event.plain_result(_clip_text(text))
 
     # 面板上 89 项、AstrBot 又不支持分组，改一个城市要翻半天。这一条命令只管常用那几项，
     # 进阶项仍然去面板改——两边改的是同一份配置文件。
@@ -1614,12 +1863,10 @@ class HumanoidCore(Star):
     }
 
     @humanoid_group.command("时间")
-    async def cmd_set_city(self, event: AstrMessageEvent):
-        """`/拟人 时间 大阪`：设置她所在的城市（时区），只改当前这个机器人。
-
-        与 `/时间 城市` 分工：那条谁都能用、只是**查**别处的时间；
-        这条是管理员**改**她的城市（决定作息、天气、季节）。
-        """
+    async def cmd_set_city(self, event: AstrMessageEvent, city: str = ""):
+        """用法：/拟人 时间 大阪（改她所在的城市，只影响当前这个 bot；写「默认」跟随全局）"""
+        # 与顶层 /时间 城市 分工：那条谁都能用、只是查别处的时间；
+        # 这条是管理员改她的城市（决定作息、天气、季节）。
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1647,8 +1894,8 @@ class HumanoidCore(Star):
             )
 
     @humanoid_group.command("设置")
-    async def cmd_settings(self, event: AstrMessageEvent):
-        """`/拟人 设置` 看常用项；`/拟人 设置 城市 大阪` 改一项，改完立即生效。"""
+    async def cmd_settings(self, event: AstrMessageEvent, item: str = ""):
+        """用法：/拟人 设置 看常用项；/拟人 设置 城市 大阪 改一项，立即生效"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1656,7 +1903,7 @@ class HumanoidCore(Star):
         argument = _arg_after(raw, "拟人 设置", "拟人设置")
         core = self._core(event)
         if not argument:
-            yield event.plain_result(self._settings_summary(core))
+            yield event.plain_result(_clip_text(self._settings_summary(core)))
             return
         parts = argument.replace("=", " ").replace("：", " ").split(None, 1)
         key_word = parts[0] if parts else ""
@@ -1839,7 +2086,7 @@ class HumanoidCore(Star):
 
     @humanoid_group.command("重载")
     async def cmd_reload(self, event: AstrMessageEvent):
-        """热重载插件配置，无需重启。"""
+        """用法：/拟人 重载（重新读配置文件，不用重启插件）"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1875,7 +2122,7 @@ class HumanoidCore(Star):
 
     @humanoid_group.command("重置日程")
     async def cmd_reset_schedule(self, event: AstrMessageEvent):
-        """立即强制重新决定当前这一段（绕过冷却）。"""
+        """用法：/拟人 重置日程（立刻重排当前这一段，绕过冷却）"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1901,7 +2148,7 @@ class HumanoidCore(Star):
 
     @humanoid_group.command("日程打断")
     async def cmd_schedule_interrupt(self, event: AstrMessageEvent):
-        """让她立刻放下手上的事，重新决定现在做什么（换一件，不是继续）。"""
+        """用法：/拟人 日程打断（让她放下手上的事，换一件做）"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1924,7 +2171,7 @@ class HumanoidCore(Star):
 
     @humanoid_group.command("日程继续")
     async def cmd_schedule_continue(self, event: AstrMessageEvent):
-        """让她把手上的事接着做下去（把当前这一段往后延长，不另外生成）。"""
+        """用法：/拟人 日程继续（把手上这件事往后延长，不重新生成）"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1946,7 +2193,7 @@ class HumanoidCore(Star):
 
     @humanoid_group.command("重置状态")
     async def cmd_reset_state(self, event: AstrMessageEvent):
-        """重置精力、社交能量和生理周期至初始值。"""
+        """用法：/拟人 重置状态（精力、社交能量、生理周期回初始值）"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1956,7 +2203,7 @@ class HumanoidCore(Star):
 
     @humanoid_group.command("重置情绪")
     async def cmd_reset_mood(self, event: AstrMessageEvent):
-        """重置当前用户的情绪至初始值。"""
+        """用法：/拟人 重置情绪（把你自己在她那里的情绪重置到初始值）"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1965,8 +2212,8 @@ class HumanoidCore(Star):
         yield event.plain_result(f"✅ 好感度 {r['affection']:.0f}，亲近欲 {r['libido']:.0f}，攻击性 {r['aggression']:.0f}")
 
     @humanoid_group.command("设置好感度")
-    async def cmd_set_affection(self, event: AstrMessageEvent):
-        """手动设置当前用户的好感度（0-100）。"""
+    async def cmd_set_affection(self, event: AstrMessageEvent, value: str = ""):
+        """用法：/拟人 设置好感度 88（0-100，设的是你自己的好感度）"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -1983,8 +2230,8 @@ class HumanoidCore(Star):
         yield event.plain_result(f"✅ 好感度已设为 {v:.0f}")
 
     @humanoid_group.command("批量好感度")
-    async def cmd_batch_affection(self, event: AstrMessageEvent):
-        """批量导入好感度（格式：QQ:数值, QQ:数值）。"""
+    async def cmd_batch_affection(self, event: AstrMessageEvent, pairs: str = ""):
+        """用法：/拟人 批量好感度 111:30,222:40（逗号分隔，数值 0-100）"""
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -2005,7 +2252,10 @@ class HumanoidCore(Star):
 
     @humanoid_group.command("查看昵称")
     async def cmd_list_nicknames(self, event: AstrMessageEvent):
-        """列出所有用户设置的昵称。"""
+        """用法：/拟人 查看昵称（列出所有用户设的称呼，人多只显示前 30 个）"""
+        # 输出必须截断：一行一个用户，几十个人就是几万字符，AstrBot 会转成合并转发，
+        # NapCat 部分版本直接抛 `Cannot read properties of undefined (reading 'resId')`
+        # ——指令执行成功，用户看到的却是报错。
         if not self._is_admin(event):
             yield event.plain_result(NO_PERMISSION)
             return
@@ -2014,11 +2264,14 @@ class HumanoidCore(Star):
         if not names:
             yield event.plain_result("📭 暂无昵称。")
             return
+        rows = list(names.items())
         lines = [
             f"{uid} → {name}（{'自动认定' if source == 'auto' else '用户自设'}）"
-            for uid, (name, source) in names.items()
+            for uid, (name, source) in rows[:NICKNAME_ROWS]
         ]
-        yield event.plain_result("📋 昵称列表：\n" + "\n".join(lines))
+        if len(rows) > NICKNAME_ROWS:
+            lines.append(f"……共 {len(rows)} 个，只显示前 {NICKNAME_ROWS} 个")
+        yield event.plain_result(_clip_text("📋 昵称列表：\n" + "\n".join(lines)))
 
     # -------------------- 输入状态（正在输入） --------------------
     #
@@ -2492,10 +2745,30 @@ class HumanoidCore(Star):
                                 cards["opportunities"] = _merge_cards(
                                     cards["opportunities"], greeting_cards
                                 )
+                        # ─── 已经做了的素材（v3.1.9）───
+                        # 卡片只能写「可能想做」，可她一旦说出口「我刚从超市回来」，
+                        # 这件事就该落成事实：随后 3 轮以「今天下午去楼下超市把缺的
+                        # 东西补上了」的形式再递一次，同时从「可能想做」那一批里剔掉
+                        # ——同一件事不能既是「可能去做」又是「已经做了」。
+                        done_cards, done_keys = _done_material_cards(core)
+                        if done_cards:
+                            cards["opportunities"] = _merge_cards(
+                                cards["opportunities"], done_cards
+                            )
+                            note_reason("materials_done", f"{len(done_cards)} 条")
+                        if done_keys:
+                            cards["materials"] = [
+                                card
+                                for card in cards["materials"]
+                                if str(card.get("anchor_key") or "") not in done_keys
+                            ]
                         evidence = _evidence_note(
                             cards["opportunities"], cards["materials"]
                         )
                         evidence_note = str(evidence.get("text") or "")
+                        # 把这一轮真的摆到她眼前的素材记下来，等她开口时对账。
+                        if evidence.get("shown"):
+                            _remember_evidence(core, user_id, evidence["shown"])
                         # 三个码分别对应「有卡可用」「有卡但全过期」「一张都没有」，
                         # 排查「她为什么在编」时先看这里。
                         if evidence.get("used"):
@@ -2608,6 +2881,10 @@ class HumanoidCore(Star):
             # 这一笔同时也是社交层「她多久前开过口」的唯一来源，所以放在情绪闸门
             # 之前：mood 关掉时它照样要记（core_instance.py 里这笔也在 ccb 闸前）。
             core.note_her_words(user_id, text, is_group=is_group)
+            # 素材对账（v3.1.9）：她刚才提没提卡片上那件事？提了就记成「已经做了」，
+            # 之后 3 轮按既成事实给，不再当「可能想去做」。同样放在情绪闸门之前——
+            # mood 关掉时这件事也真的发生了，账不能丢。
+            _match_evidence_said(core, user_id, text)
             if not core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
                                       in_group=cfg.mood_enabled_in_group):
                 return
@@ -2674,6 +2951,9 @@ class HumanoidCore(Star):
             # 两条路径都走到时只算一次。它也是「她多久前开过口」的唯一来源，
             # 所以放在情绪闸门之前（mood 关掉时照样要记）。
             core.note_her_words(user_id, text, is_group=is_group)
+            # 素材对账（v3.1.9）：与 on_llm_response 同一条口径。台账里命中的卡会
+            # 被删掉，所以两条路径都走到时同一件事只记一次。
+            _match_evidence_said(core, user_id, text)
             if not core.mood.readable(user_id, is_group, enabled=cfg.mood_enabled,
                                       in_group=cfg.mood_enabled_in_group):
                 return

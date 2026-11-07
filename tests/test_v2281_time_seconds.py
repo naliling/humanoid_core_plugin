@@ -1,20 +1,26 @@
-"""v2.28.1：注入里的绝对时间精确到秒，但模型不该把它念出来。
+"""v3.1.9：注入里的绝对时间回到**分钟级**，秒不再出现。
 
-用户原话：「把时间每次注入上下文的变成 精确到秒的 但是记住不要让模型会念出来
-把这个时间注入让模型知道是几点但是可以知道 不要让他每次都念出来」。
+## 为什么从秒退回分
 
-## 为什么是秒
+v2.28.1 曾经把钟点精确到秒，理由是「两条消息常常只隔几十秒，只给 15:20 时她分不清
+对方是 15:20:05 还是 15:20:55 说的」。这个理由本身没错，但它算错了账：
 
-「此刻的她」那段是**每轮重发的临时块**（`mark_as_temp()`，不落会话历史），
-两条消息之间常常只隔几十秒。只给「15:20」时，她分不清对方是 15:20:05 还是
-15:20:55 说的——「刚说完」和「快半小时了」在她的时间里是同一时刻。
+- 「隔了多久」这件事由 `_behavior_lines` 单独说（「TA 刚才离开了一会儿」），不需要
+  靠钟点去减；
+- 秒是一个**机器读数**：`13:03:00` 这种形状只会出现在日志、监控和仪表盘里，人不会
+  这样记自己的时间。它给整段注入定了调——模型读到的是一份「状态报告」，于是照着
+  报告的语气说话；
+- 实测里没有任何一轮因为多了秒而变得更像人，反而每一轮都多背了 3 个字符的机器味。
+
+所以 v3.1.9 起改回 `13:03`。本文件继续钉住两件事：钟点**必须跟着钟走**（不是写死的
+字符串），以及它**只能出现在【我现在的情况】这条临时块里**，不许溜进事实块——在那儿
+它会被当成「要回应的内容」，她就该报时了。
 
 ## 为什么不用担心她念出来
 
 「要不要提时间」这件事**不由这一行管**，而由 system_prompt 的框架句管：
 `build_framing()` 里已经写着「它们是背景，不是要拿出来讲的内容；对方没问起时，
-它们只影响你怎么说话」。秒只是把钟点的刻度改细了，没有把任何东西提升成
-「要讲的内容」——就像给人一块表，不是命令她逢人就报时。
+它们只影响你怎么说话」。改刻度没有把任何东西提升成「要讲的内容」。
 
 真正会被念出来的是另一类词：「上午/下午/晚上」这种时段词（无论几点都回一句
 「下午好呀」）。那条禁令保持不变，本文件也盯着它。
@@ -37,7 +43,7 @@ from humanoid.state import StateStore
 from .fakes import FakeContext, FrozenClock, RecordingLogger
 
 TZ = ZoneInfo("Asia/Shanghai")
-# 秒取 33：非零、非整十，免得测试被「写死的 :00」骗过去。
+# 秒取 33：非零、非整十——如果哪天又有人把秒拼回去，这条会立刻变红。
 MOMENT = datetime(2026, 8, 22, 15, 20, 33, tzinfo=TZ)
 
 
@@ -69,28 +75,26 @@ def world_text(core) -> str:
     return core.prompt_builder.background_note()
 
 
-class TimeToSecondsTest(unittest.TestCase):
-    """注入里的绝对钟点带秒。"""
+class TimeToMinutesTest(unittest.TestCase):
+    """注入里的绝对钟点精确到分。"""
 
-    def test_clock_line_has_seconds(self) -> None:
+    def test_clock_line_is_minute_precise(self) -> None:
         text = world_text(core_with())
-        self.assertIn("现在是15:20:33", text, f"注入里的钟点没有秒：{text}")
+        self.assertIn("现在是15:20", text, f"注入里的钟点不是分钟级：{text}")
 
-    def test_seconds_track_the_clock(self) -> None:
-        """换个非零秒，确认不是把 :00 或 :33 写死的。"""
+    def test_seconds_are_gone(self) -> None:
+        """钟点后面不许再跟 `:33`——秒是机器读数，不是她会记的时间。"""
+        text = world_text(core_with())
+        self.assertNotIn("15:20:33", text, f"注入里还带着秒：{text}")
+        self.assertNotIn(":33", text)
+
+    def test_minutes_track_the_clock(self) -> None:
+        """换个非整点，确认不是把 15:20 写死的。"""
         text = world_text(core_with(datetime(2026, 8, 22, 9, 7, 41, tzinfo=TZ)))
-        self.assertIn("现在是09:07:41", text, f"秒没有跟着钟走：{text}")
+        self.assertIn("现在是09:07", text, f"分钟没有跟着钟走：{text}")
+        self.assertNotIn("09:07:41", text)
 
-    def test_minute_precision_still_holds(self) -> None:
-        """「15:20」这个前缀仍然成立：只加秒，不改钟点本身。
-
-        既有测试（test_v2151_freedom / test_v216_facts）断言的是「15:20」，
-        这条钉住它们不会因为这档改动变红。
-        """
-        text = world_text(core_with())
-        self.assertIn("15:20", text)
-
-    def test_seconds_reach_the_state_note(self) -> None:
+    def test_clock_line_reaches_the_state_note(self) -> None:
         """这段要真的进上下文，不只是 background_note() 里有。
 
         走向是：background_note() -> main._state_note() -> build_state_note() ->
@@ -101,9 +105,10 @@ class TimeToSecondsTest(unittest.TestCase):
 
         core = core_with()
         note = build_state_note(world_line=core.prompt_builder.background_note())
-        self.assertIn("15:20:33", note)
+        self.assertIn("15:20", note)
+        self.assertNotIn("15:20:33", note)
 
-    def test_seconds_stay_out_of_the_fact_block(self) -> None:
+    def test_clock_line_stays_out_of_the_fact_block(self) -> None:
         """时间不许溜进事实块：在那儿它会被当成「要回应的内容」而不是背景。"""
         core = core_with()
         core.mood.set_nickname("42", "小鱼")
@@ -112,14 +117,14 @@ class TimeToSecondsTest(unittest.TestCase):
         self.assertNotIn("15:20", text)
 
     def test_date_and_weekday_unchanged(self) -> None:
-        """只改钟点，日期与周几不动。"""
+        """只改钟点的刻度，日期与周几不动。"""
         text = world_text(core_with())
         self.assertIn("今天是2026-08-22", text)
         self.assertIn("今天周六", text)
 
 
 class NotRecitedTest(unittest.TestCase):
-    """秒不许被变成「要念出来」的内容。"""
+    """钟点不许被变成「要念出来」的内容。"""
 
     def test_framing_still_calls_it_background(self) -> None:
         """授权口径不变：框架句仍然把它定为背景。"""
@@ -128,11 +133,7 @@ class NotRecitedTest(unittest.TestCase):
         self.assertIn("对方没问起", FRAMING_TEXT)
 
     def test_framing_mentions_no_clock_at_all(self) -> None:
-        """框架句里不许出现任何跟「报时」有关的字眼。
-
-        test_v2151_freedom 已全局盯着「不要/必须/别/控制」这类词；这里补一条更具体的：
-        不许因为加了秒就多出一句「请报出准确时间」之类的话。
-        """
+        """框架句里不许出现任何跟「报时」有关的字眼。"""
         for phrase in ("报出", "准确时间", "精确到", "念出", "说出时间", "告知时间",
                        "几点", "钟点", "秒"):
             self.assertNotIn(phrase, FRAMING_TEXT,

@@ -167,7 +167,9 @@ class BehaviourUnchangedTest(unittest.TestCase):
 
     def test_the_default_body_still_says_the_same_facts(self):
         body = _body()
-        for fact in ("私聊", "我内心：", "前面聊的还能接上"):
+        # v3.1.9：身体块压成「周期 + 最相关的一条倾向」，所以「前面聊的还能接上」
+        # 与「还挺专注」不再都出现在默认正文里，留的是最后一条倾向「我现在很闲」。
+        for fact in ("在跟TA私聊", "我内心：", "我现在很闲"):
             self.assertIn(fact, body)
 
     def test_cooling_still_appears_once(self):
