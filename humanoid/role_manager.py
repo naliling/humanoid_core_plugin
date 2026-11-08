@@ -15,6 +15,10 @@ LOG_PREFIX = "[humanoid_core]"
 #: 太长则一个偶发失败要等一整个间隔。
 RETRY_SECONDS = 30.0
 
+#: 巡检间隔：多久查一次「该起的角色没起」「循环死了没」。
+#: 取和 RETRY_SECONDS 一样的值，让失败重试最迟半分钟一次。
+SUPERVISE_SECONDS = 30.0
+
 
 class RoleManager:
     """管理所有角色实例。"""
@@ -45,23 +49,43 @@ class RoleManager:
         # 启动失败的实例留在 _instances 里（消息还得能用它读状态），但后台循环没跑：
         # 这里记下失败时刻，下一次 get_or_create 在退避期后重试 start()。
         self._failed_at: dict[str, float] = {}
+        # 巡检协程：进程活着、插件也活着，但角色循环悄悄死掉时，只有它能兜住。
+        self._supervisor: asyncio.Task | None = None
+
+    def _new_instance(self, role_id: str) -> HumanoidCoreInstance:
+        """建一个角色实例并放进缓存（**不启动**）。"""
+        instance = HumanoidCoreInstance(
+            role_id=role_id,
+            state_store=self._state_store,
+            config_provider=self._config_provider,
+            logger=self._log,
+            stop_event=self._stop_event,
+            resolver=self._resolver,
+            gateway=self._gateway,
+            fetch_json=self._fetch_json,
+            data_root=self._data_root,
+            persona_source=self._persona_source,
+        )
+        self._instances[role_id] = instance
+        self._log.info(f"{LOG_PREFIX} 创建角色实例: {role_id}")
+        return instance
+
+    def _known_role_ids(self) -> list[str]:
+        """状态里出现过的角色 id（冷启动预热用）。"""
+        try:
+            roles = (self._state_store.data or {}).get("roles") or {}
+        except Exception:
+            return []
+        ids: list[str] = []
+        for rid in roles:
+            rid = str(rid or "")
+            if rid and rid not in ids:
+                ids.append(rid)
+        return ids
 
     def get_or_create(self, role_id: str) -> HumanoidCoreInstance:
         if role_id not in self._instances:
-            instance = HumanoidCoreInstance(
-                role_id=role_id,
-                state_store=self._state_store,
-                config_provider=self._config_provider,
-                logger=self._log,
-                stop_event=self._stop_event,
-                resolver=self._resolver,
-                gateway=self._gateway,
-                fetch_json=self._fetch_json,
-                data_root=self._data_root,
-                persona_source=self._persona_source,
-            )
-            self._instances[role_id] = instance
-            self._log.info(f"{LOG_PREFIX} 创建角色实例: {role_id}")
+            self._new_instance(role_id)
             # AstrBot 启动插件时可能尚未出现任何消息，因此 start() 运行时
             # 实例列表为空。后续首次收到消息创建角色后，也必须启动该角色的
             # 日程/过程/天气/社交后台循环，否则这些功能会“看起来存在但不运行”。
@@ -131,11 +155,82 @@ class RoleManager:
     def get_all(self) -> list[HumanoidCoreInstance]:
         return list(self._instances.values())
 
+    async def _supervise(self) -> None:
+        """定期巡检：该起没起的角色重试启动，死掉的后台循环重新拉起来。
+
+        原来这两件事都只发生在「恰好又收到这个角色的消息」时：启动失败要等
+        下一条消息才重试，循环异常退出则**永远**不重启。进程活着、插件活着、
+        状态文件正常，但没有任何循环在跑——而且没有任何东西会把它修好。
+        """
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=SUPERVISE_SECONDS)
+                return
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            try:
+                self._sweep()
+            except Exception as exc:
+                self._log.warning(f"{LOG_PREFIX} 角色巡检出错: {exc!r}")
+
+    def _sweep(self) -> None:
+        """跑一轮巡检（同步、不 await：只做 create_task 级别的重启）。"""
+        if not self._started:
+            return
+        now = time.monotonic()
+        for role_id, failed_at in list(self._failed_at.items()):
+            if now - failed_at < RETRY_SECONDS:
+                continue
+            if role_id not in self._instances:
+                self._failed_at.pop(role_id, None)
+                continue
+            self._failed_at.pop(role_id, None)
+            self._log.info(f"{LOG_PREFIX} 重试启动角色 {role_id}")
+            self._try_start(role_id)
+        for role_id, instance in list(self._instances.items()):
+            try:
+                restarted = instance.restart_dead_loops()
+            except Exception as exc:
+                self._log.warning(
+                    f"{LOG_PREFIX} 角色 {role_id} 检查后台循环时出错: {exc!r}"
+                )
+                continue
+            if restarted:
+                self._log.warning(
+                    f"{LOG_PREFIX} 角色 {role_id} 的后台循环异常退出，已重新拉起: "
+                    + "、".join(restarted)
+                )
+
     async def start(self):
         self._stop_event.clear()
         self._started = True
-        for inst in self._instances.values():
-            await inst.start()
+        # 冷启动预热（v3.1.12）：后台循环原来只有一个启动入口——「收到该角色的消息」
+        # （`main._core` → `get_or_create`）。插件加载时 `_instances` 是空的，于是
+        # 重启之后只要没人在这几个角色下说过话，她的日程/身体/过程/天气/社交循环
+        # 一个都不会跑：`last_tick` 冻在关机那一刻，`today_date` 停在前天，
+        # `schedule_source` 永远是 template。实测线上一个角色就这样静了 4 天，
+        # 还被误判成「一直在睡」。状态里出现过的角色都是真实在用的角色，加载时
+        # 就该把循环起起来，而不是等人来敲一下。
+        for role_id in self._known_role_ids():
+            if role_id not in self._instances:
+                self._new_instance(role_id)
+        for inst in list(self._instances.values()):
+            try:
+                await inst.start()
+            except Exception as exc:
+                # 一个角色起不来不该拖垮整排角色：记下失败时刻交给巡检重试，
+                # 其余角色照常跑。（原来这里直接上抛，`initialize()` 整体回滚，
+                # 于是所有角色一起不跑。）
+                self._failed_at[str(inst.role_id)] = time.monotonic()
+                self._log.warning(
+                    f"{LOG_PREFIX} 角色 {inst.role_id} 启动失败，稍后重试: {exc!r}"
+                )
+        if self._supervisor is None or self._supervisor.done():
+            self._supervisor = asyncio.create_task(
+                self._supervise(), name="humanoid-role-supervisor"
+            )
 
     async def stop(self):
         """停掉所有角色实例。
@@ -151,6 +246,17 @@ class RoleManager:
         self._instances.clear()
         # 实例都没了，失败记录也没意义：留着会让下次 get_or_create 误以为要退避重试。
         self._failed_at.clear()
+        # 巡检协程必须在这里停：它还持有 `_instances` 的引用，晚一步就可能对着
+        # 正在被停的实例拉新循环。
+        if self._supervisor is not None:
+            self._supervisor.cancel()
+            try:
+                await self._supervisor
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self._log.warning(f"{LOG_PREFIX} 角色巡检任务退出时出错: {exc!r}")
+            self._supervisor = None
         # 「正在启动」的角色任务不在 `_instances` 的遍历范围里，必须单独取消并 await，
         # 否则 stop() 返回后它们还在启动。
         starting = [t for t in self._start_tasks if not t.done()]

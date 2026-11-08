@@ -1105,6 +1105,30 @@ class ThrottleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.retry_after, 0.0, "节流不该进退避")
         self.assertEqual(service.last_error, "", "节流不是错误，不该挂在诊断里")
 
+    async def test_no_chat_providers_does_not_enter_backoff(self):
+        """v3.1.13：AstrBot 刚启动、对话模型还没注册完时，日程别烧 30 分钟退避。
+
+        以前按「配置错」处理：记硬失败 + provider 冷却 30 分钟，于是每次重启后头半小时
+        日程生成全挂、回落模板，社交层拿到的素材就变成「睡一觉 / 侧躺 / 喝水」。
+        """
+        conf, gate, _provider = self.build(llm_idle_silence_minutes=0)
+        tmp = Path(tempfile.mkdtemp()) / "state.json"
+        store = ScopeStore(tmp)
+        store.load(FIXED_MOMENT.strftime("%Y-%m-%d"), conf.cycle_length)
+        log = RecordingLogger()
+        ctx = FakeContext(chat_providers=[])
+        resolver = ProviderResolver(ctx, log)
+        clock = FrozenClock(FIXED_MOMENT)
+        service = ScheduleService(
+            store.scope, lambda: conf, clock, logger=log, monotonic=gate._mono
+        )
+        service.set_resolver_gateway(
+            resolver, LLMGateway(resolver, lambda: conf, log, gate._mono, gate=gate)
+        )
+        await service.ensure_fresh(force=True, ignore_cooldown=True)
+        self.assertEqual(service.retry_after, 0.0, "还没有可用模型时不该进退避")
+        self.assertTrue(service.last_error, "失败原因要留着，方便排查")
+
     def build_and_service(self, conf, gate, provider):
         tmp = Path(tempfile.mkdtemp()) / "state.json"
         store = ScopeStore(tmp)

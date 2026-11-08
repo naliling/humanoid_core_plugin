@@ -1038,7 +1038,13 @@ class HumanoidCoreInstance:
                     self.mood.note_said(user_id, text, now)
 
         self.energy.advance()
-        if not is_command:
+        # 群消息不计入体力消耗（v3.1.12）：她在一个群里潜水、听别人聊天，不等于
+        # 她在陪人说话——下面第 1068 行 `soma.note_chat` 早就是这个判据（注释：
+        # 「群聊里潜水不等于被陪」），体力/社交能量却没跟着走。
+        # 后果是实测出来的：71 个群的背景流量一天就能把她扣到 0，于是真正需要她
+        # 开口的私聊被社交层的 20 分硬闸（`gate_energy_floor`）先挡掉，4 个角色里
+        # 3 个「饿死」。体力该反映**她自己的活动量**，不是群里别人说话的总量。
+        if not is_command and not is_group:
             self.energy.consume_for_message()
 
         # 聊天频率感靠这个计数：TA今天话不少/很少，中间档不给。指令不该算「话」。
@@ -1056,7 +1062,8 @@ class HumanoidCoreInstance:
         if cfg.soma_enabled and not is_command:
             self.soma.note_message()
 
-        if cfg.social_energy_enabled and not is_command:
+        if cfg.social_energy_enabled and not is_command and not is_group:
+            # 同上：社交能量是「她还剩多少耐心陪人聊」，不是「群里今天有多少条」。
             self.social.consume_for_message()
 
         # 衰减只对**已有档案**的人做。decay_user 以前无条件执行，而它内部第一步是
@@ -2625,10 +2632,58 @@ class HumanoidCoreInstance:
             lines.append("（正在决定下一段…）")
         return "\n".join(lines)
 
-    async def start(self) -> bool:
-        """起 5 个后台循环；返回是否真的起来了。
+    def _loop_specs(self):
+        """后台循环清单：(协程工厂, 任务名)。
 
-        `stop()` 之后 `_stop_event` 一直置着，`_spawn_background` 会把 5 个循环全部
+        抽成一张表是为了让「重启死循环」和「启动」用同一份名单——两处各写一份
+        迟早会漏掉新加的循环。
+        """
+        return (
+            (self._social_loop, "social-recovery"),
+            (self._weather_loop, "weather-refresh"),
+            (self._schedule_loop, "schedule-refresh"),
+            (self._body_loop, "body-tick"),
+            (self._process_loop, "process-tick"),
+            (self._maintenance_loop, "data-maintenance"),
+        )
+
+    def _live_loop_names(self) -> set[str]:
+        """当前真正在跑（未结束）的循环名。"""
+        prefix = f"humanoid-{self.role_id}-"
+        names: set[str] = set()
+        for task in list(self._tasks):
+            if task.done():
+                continue
+            name = task.get_name()
+            if name.startswith(prefix):
+                names.add(name[len(prefix):])
+        return names
+
+    def restart_dead_loops(self) -> list[str]:
+        """把异常退出、已经不在跑的后台循环重新拉起来，返回重启了哪些。
+
+        原来 `_on_task_done` 只打一条 warning：某个循环抛异常死掉之后 `_started`
+        还是 True，`get_or_create` 看到实例在缓存里就什么都不做，于是这个角色
+        剩下的循环还活着、死掉的那个**永远不回来**，也没有第二条日志会提到它。
+        实测线上就是这么来的：日程四天没刷新（`schedule_source` 一直停在
+        template）、身体循环停摆 20 小时（`last_tick` 冻住），而进程、插件、
+        state.json 看上去全都正常。
+        """
+        if not self._started or self._stop_event.is_set():
+            return []
+        live = self._live_loop_names()
+        restarted: list[str] = []
+        for factory, name in self._loop_specs():
+            if name in live:
+                continue
+            if self._spawn_background(factory(), name) is not None:
+                restarted.append(name)
+        return restarted
+
+    async def start(self) -> bool:
+        """起 6 个后台循环；返回是否真的起来了。
+
+        `stop()` 之后 `_stop_event` 一直置着，`_spawn_background` 会把 6 个循环全部
         拦下，而 `_started` 已经被置 True——调用方以为「启动成功」，后续再 start() 也
         被上面那句挡掉、永远起不来。所以这里明确报失败（False）并记 warning，
         不再是一条静悄悄的 info。
@@ -2652,15 +2707,8 @@ class HumanoidCoreInstance:
         self._started = True
         spawned: list[asyncio.Task] = []
         try:
-            for coro, name in (
-                (self._social_loop(), "social-recovery"),
-                (self._weather_loop(), "weather-refresh"),
-                (self._schedule_loop(), "schedule-refresh"),
-                (self._body_loop(), "body-tick"),
-                (self._process_loop(), "process-tick"),
-                (self._maintenance_loop(), "data-maintenance"),
-            ):
-                task = self._spawn_background(coro, name)
+            for factory, name in self._loop_specs():
+                task = self._spawn_background(factory(), name)
                 if task is not None:  # 停止信号竞态窗口里会返回 None
                     spawned.append(task)
             self.schedule.current_slots()

@@ -192,6 +192,20 @@ class GatewayTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("typo_id", log.text("warning"))
         self.assertIn("p2", log.text("warning"))
 
+    async def test_no_providers_at_all_does_not_enter_cooldown(self):
+        # v3.1.13：启动早期 AstrBot 还没注册对话模型时，不能按「配置错」进 30 分钟
+        # provider 冷却——那样每次重启后头半小时日程生成全挂、回落模板，社交层拿到
+        # 的素材就变成「睡一觉 / 侧躺 / 喝水」。结果带 retry_soon，日程据此不退避。
+        ctx = FakeContext(chat_providers=[])
+        gw, _log = self.build(ctx)
+        res = await gw.generate(
+            prompt="hi", chain=(("首选模型", "p1"),), allow_global=False, timeout=5
+        )
+        self.assertFalse(res.ok)
+        self.assertEqual(res.outcome, OUTCOME_NOT_FOUND)
+        self.assertTrue(res.retry_soon)
+        self.assertEqual(gw.cooldown_remaining("p1"), 0.0)
+
     async def test_primary_timeout_falls_back_to_secondary(self):
         slow = FakeProvider("slow", delay=5.0)
         fast = FakeProvider("fast", reply="OK")

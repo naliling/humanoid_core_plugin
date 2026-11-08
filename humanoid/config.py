@@ -464,8 +464,8 @@ class HumanoidConfig:
     # 校准方法：把「每条扣多少 × 每小时消息数」和「每分钟回血 × 60」放一起看——
     # 只有消耗速率**大于**回血速率，她才会真的累下去。0.5/条 + 1.0/分钟下，
     # 一小时 140 条 ≈ 扣 70、回 60，净掉 10；安静下来约 100 分钟回满。
-    social_energy_consumption_per_msg: float = 0.5
-    social_energy_recovery_per_minute: float = 1.0
+    social_energy_consumption_per_msg: float = 0.1
+    social_energy_recovery_per_minute: float = 3.0
     social_energy_reset_hour: int = 0
     social_energy_recovery_interval_seconds: int = 60
 
@@ -974,6 +974,13 @@ LEGACY_SCHEDULE_PROMPT_EXTRA = "休闲日常，愉快的生活。"
 # v2.27.2 之前的初始好感默认值。46 起步偏亲（叠加当时的单句 2 分收益，“几个指令”就能起两度）；
 # 改成中性起点 35。
 LEGACY_MOOD_INITIAL_AFFECTION = 46
+# v3.1.0 又把初始好感从 35 提到 55：35 比插件自己的亲密门槛（`ccb_affection_min`
+# =50）还低 15 分，新用户起步就够不到。但 AstrBot 只补缺不覆盖，老用户的 35 会
+# 一直留着；而 46 被归进「用户合法选择」只提醒不改，35 更没机会动。实测线上就是
+# 停在 35：4127 个用户里 4086 个从没有过情绪档案，有档案的也普遍卡在 35 附近。
+# 35 只作为默认值存在过（v2.27.2 → v3.1.0），没有任何一版把它当推荐值，所以
+# 按「可判定的旧默认」处理，一次性迁到当前默认。
+LEGACY_MOOD_INITIAL_AFFECTION_NEUTRAL = 35
 # v2.14 之前的周期恢复倍率是 6 段；现在按 8 个阶段取值，6 段会被 `_phase_multipliers`
 # 整表退回默认并**每次启动刷一条 WARN**（现网 6 个日志合计 114 次），用户自定义的 6 个
 # 倍率永久失效。长度=6 与现在的语义严格冲突（6 个数写不出 8 段），可以判定为旧格式
@@ -989,6 +996,10 @@ _USER_CHOICE_LEGACY_DEFAULTS: dict[str, Any] = {
     "mood_initial_affection": LEGACY_MOOD_INITIAL_AFFECTION,
     "schedule_max_slots": LEGACY_SCHEDULE_MAX_SLOTS,
     "schedule_prompt_extra": LEGACY_SCHEDULE_PROMPT_EXTRA,
+    # v3.1.12：群消息不再耗电，社交能量的消耗/回血默认值也一起放宽（0.5→0.1、
+    # 1.0→3.0）。老用户盘上还是旧值，AstrBot 只补缺不覆盖，所以只提醒不代改。
+    "social_energy_consumption_per_msg": 0.5,
+    "social_energy_recovery_per_minute": 1.0,
 }
 # **不收枚举项**：`inject_activity_context` 的 `"low"` 不在 `INJECT_MODES` 里，
 # `from_raw` 会把它判成非法值并退回 `"medium"`；把它列在「用户合法选择」里，等于
@@ -1098,6 +1109,22 @@ def plan_default_migrations(
         logger.info(
             "energy_recovery_phase_multipliers 仍是旧版 6 段格式：已迁移为 8 段默认值 %r",
             changes["energy_recovery_phase_multipliers"],
+        )
+
+    # 35 是「中性起点」时代的默认值，只在 v2.27.2→v3.1.0 之间作为出厂值存在过，
+    # 而它低于插件自己的亲密门槛，等于新用户起步就够不到功能。这一类能判定是
+    # 旧默认（不是推荐值），按可判定类迁移。
+    if (
+        "mood_initial_affection" not in skip
+        and _looks_like_legacy_default(
+            src.get("mood_initial_affection"), LEGACY_MOOD_INITIAL_AFFECTION_NEUTRAL
+        )
+    ):
+        changes["mood_initial_affection"] = DEFAULTS.mood_initial_affection
+        logger.info(
+            "mood_initial_affection 仍是旧默认值 35（低于亲密门槛 %r）：已迁移为新默认 %r",
+            getattr(DEFAULTS, "ccb_affection_min", None),
+            changes["mood_initial_affection"],
         )
 
     # ── 用户合法选择类：保留现值，只提醒 ────────────────────────────

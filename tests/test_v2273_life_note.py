@@ -23,6 +23,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime
+import re
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -47,7 +48,21 @@ def _boom_name_of(uid):
     raise RuntimeError("查名字炸了")
 
 # 指令词：这一层是**事实**，不是对模型的要求（`test_v2151_freedom` 盯的是同一个口径）。
-FORBIDDEN = ("不要", "必须", "别", "务必", "别忘了", "记得")
+FORBIDDEN = ("不要", "必须", "务必", "别忘了", "记得")
+# 「别」不能裸着做子串匹配：`body_sense` 的短语池里有「我这几天特别想有人挨着」，
+# 「特别」里的「别」会被当成指令词，于是同一个仓库在不同时间点跑出红灯
+# （2026-11-09 00:04 实测 3 failed / 3110 passed，23:54 却是全绿）。
+# 只认「别」当动词前缀的用法：前面不是「特/分/个/类/级/告/性/区/差/识/派」的一部分。
+_FORBIDDEN_RE = re.compile(r"(?<![特分个类级告性区差识派])别")
+
+
+def _forbidden_in(text: str) -> str:
+    """返回命中的第一个指令词，没有就返回空串。"""
+    for word in FORBIDDEN:
+        if word in text:
+            return word
+    hit = _FORBIDDEN_RE.search(text)
+    return hit.group(0) if hit else ""
 
 
 def item(text: str, uid: str = "10001", at: float = NOW) -> dict:
@@ -157,8 +172,8 @@ class LifeLogTest(unittest.TestCase):
     def test_rendered_text_is_facts_not_orders(self):
         merged = life_log.merge_open([], [item("他上次说的那个面试"), item("要给他回的那封信")], NOW)
         text = "\n".join(life_log.render_lines(merged, NOW))
-        for word in FORBIDDEN:
-            self.assertNotIn(word, text, f"渲染里出现了指令词「{word}」")
+        hit = _forbidden_in(text)
+        self.assertFalse(hit, f"渲染里出现了指令词「{hit}」")
 
     def test_no_trailing_period(self):
         """片段不带句号：事实块由 `_sentence` 用「，」拼句、`_finish` 末尾统一补「。」。
@@ -387,8 +402,8 @@ class FactsBlockShapeTest(unittest.TestCase):
     def test_no_forbidden_words(self):
         self.h.publish("他上次说的那个面试")
         block = self.h.block()
-        for word in FORBIDDEN:
-            self.assertNotIn(word, block, f"注入里出现了指令词「{word}」")
+        hit = _forbidden_in(block)
+        self.assertFalse(hit, f"注入里出现了指令词「{hit}」")
 
 
 class StateNoteOngoingTest(unittest.TestCase):

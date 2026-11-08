@@ -350,8 +350,8 @@ class ConfigLayerGuardsTest(unittest.TestCase):
             HumanoidConfig.from_raw({"energy_consumption_per_msg": 50.0}).energy_consumption_per_msg,
             0.9,
         )
-        # 默认值（v2.27.38 校准：0.05 → 0.5，见 config.py 里的换算说明）
-        self.assertEqual(HumanoidConfig().social_energy_consumption_per_msg, 0.5)
+        # 默认值（v2.27.38 校准：0.05 → 0.5；v3.1.12 群消息不再耗电后放宽到 0.1）
+        self.assertEqual(HumanoidConfig().social_energy_consumption_per_msg, 0.1)
 
     def test_schedule_persona_max_chars_still_goes_through_the_int_helper(self):
         """全文件唯一曾经不走 i() 的字段：坏值以前会一路冒到 initialize()，插件加载失败。"""

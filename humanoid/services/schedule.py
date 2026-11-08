@@ -3784,6 +3784,17 @@ class ScheduleService:
                 if self._log and cfg.debug_mode:
                     self._log.info(f"[humanoid_core] 日程被节流跳过: {result.detail}")
                 return None
+            if getattr(result, "retry_soon", False):
+                # v3.1.13：此刻还没有可用的对话模型（典型是 AstrBot 刚启动、provider 还没
+                # 注册完），不是模型坏了。不进 30 分钟退避——那样每次重启后头半小时日程
+                # 生成全挂、回落模板，社交层拿到的素材就变成「睡一觉 / 侧躺 / 喝水」。
+                self.last_error = result.summary()
+                self._last_outcome = outcome
+                if self._log and cfg.debug_mode:
+                    self._log.info(
+                        f"[humanoid_core] 日程暂缓（{self._scope.role_id}）：{result.detail}"
+                    )
+                return None
             self.last_error = result.summary()
             self._fail_backoff(cfg)
             if self._log:

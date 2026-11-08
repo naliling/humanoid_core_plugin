@@ -207,6 +207,10 @@ class LLMResult:
     detail: str = ""
     elapsed: float = 0.0
     attempts: tuple[Attempt, ...] = field(default_factory=tuple)
+    # v3.1.13：这次失败是「此刻还没有可用的对话模型」（典型是 AstrBot 刚启动、provider
+    # 还没注册完），不是模型坏了也不是配置写错了。调用方（日程）据此**不进退避**，
+    # 下一轮直接重试，否则每次重启后的头半小时日程生成全挂、回落模板。
+    retry_soon: bool = False
 
     def summary(self) -> str:
         if self.ok:
@@ -1055,8 +1059,15 @@ class LLMGateway:
 
             provider = self._resolver.resolve_global(umo) if is_global else self._resolver.resolve(configured_id)
             if provider is None:
+                ready = bool(self._resolver.available_ids())
                 attempts.append(Attempt(label, configured_id, OUTCOME_NOT_FOUND, self._not_found_detail(is_global)))
                 self._warn_not_found(purpose, label, configured_id, is_global)
+                if not ready:
+                    # v3.1.13：一个可用 id 都没有 = AstrBot 还没注册对话模型（典型是刚启动）。
+                    # 这不是「配置错」，别进 30 分钟冷却：否则每次重启后头半小时日程生成
+                    # 全挂、回落模板，社交层拿到的素材就变成「睡一觉 / 侧躺 / 喝水」。
+                    # 真正的重试由调用方按 retry_soon 决定（见返回处）。
+                    continue
                 if not is_global:
                     self._enter_cooldown(configured_id, purpose)
                 continue
@@ -1146,6 +1157,7 @@ class LLMGateway:
             outcome=chosen.outcome if chosen else OUTCOME_NO_CANDIDATE,
             detail=chosen.detail if chosen else "",
             attempts=tuple(attempts),
+            retry_soon=not self._resolver.available_ids(),
         )
         self._last_results[purpose] = result
         return result
