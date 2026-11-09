@@ -1024,7 +1024,7 @@ EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
         {"event": "靠在椅背上放空，什么也没干", "location": "客厅", "emotion": "什么都没想", "energy_rate": 0.03, "minutes": 30, "wants": True},
         {"event": "戴上耳机听歌，躺着没动", "location": "卧室", "emotion": "缓过来一点", "energy_rate": 0.04, "minutes": 40, "wants": True},
         {"event": "坐在窗边看外面，发了一会儿呆", "location": "窗边", "emotion": "空落落的", "energy_rate": 0.02, "minutes": 30, "wants": True},
-        {"event": "躺着刷手机，什么正事也没做", "location": "卧室", "emotion": "有点空", "energy_rate": 0.02, "minutes": 50, "wants": True},
+        {"event": "在沙发上躺着，翻了两页书就放下了", "location": "卧室", "emotion": "有点空", "energy_rate": 0.02, "minutes": 50, "wants": True},
         {"event": "泡了杯东西，慢慢喝完", "location": "客厅", "emotion": "缓下来了", "energy_rate": 0.02, "minutes": 30, "wants": True},
         {"event": "把要做的事往后推了推，先缓了一会儿", "location": "客厅", "emotion": "不想动", "energy_rate": 0.03, "minutes": 40, "needs": ("job",), "wants": True},
         {"event": "猫凑过来，就顺手摸了半天", "location": "客厅", "emotion": "被哄好了", "energy_rate": 0.03, "minutes": 30, "needs": ("pet",), "wants": True},
@@ -1359,14 +1359,14 @@ def segment_prompt(
     rule_no += 1
     extra_rules += (
         f"{rule_no}. 勤快不是默认值：人设没写她勤快/自律，就别把一天排满工作、学习、家务；\n"
-        "   懒散、拖延、躺一天、刷手机、临时改主意都是正常的一天。\n"
+        "   懒散、拖延、躺一天、临时改主意都是正常的一天。\n"
     )
     if prev_sleep:
         rule_no += 1
         extra_rules += (
             f"{rule_no}. 她刚醒，上一段是睡眠：不必马上起。\n"
             "   没急事、睡得不够、或人设不勤快，可以先赖床、回笼觉、"
-            "在被窝里刷一会儿手机——这也是她的一天。\n"
+            "在被窝里多赖一会儿——这也是她的一天。\n"
         )
     if pressure_crossed:
         rule_no += 1
@@ -1423,7 +1423,7 @@ def segment_prompt(
         "   一段是**一件有头有尾、说得出口的事**（做顿饭、出门办趟事、洗个澡、坐下来写点东西），"
         f"清醒时最短 {SEGMENT_AWAKE_MIN_MINUTES} 分钟；\n"
         "   要坐下来做、要出门、要等人的事才写到 1~3 小时；\n"
-        "   一个动作不算一件事：喝一口水、看一眼手机、回一句话撑不起一段，别单独成段——\n"
+        "   一个动作不算一件事：喝一口水、看一眼窗外、回一句话撑不起一段，别单独成段——\n"
         "   「把杯子放回厨房」「起身走去客厅」这种过渡动作也一样，并进前后那件事里；\n"
         "   要么接着上一段（continue），要么写成真的在做的样子（在厨房弄点吃的，而不是「喝东西」）；\n"
         "   一次出门可以是一整段（路上→店里→回来），也可以中途换成另一件事。\n"
@@ -1767,6 +1767,36 @@ def _review_prompt(
     return "\n".join(lines)
 
 
+
+# ---- 设备词：不进日程 ----
+# 为什么加（v3.1.12 补丁）：验收层把「手机/屏幕」判成打破第四面墙（她活在对话里，
+# 不活在设备里），而日程素材池原来自己就在写「躺着刷手机」「屏幕的光照在脸上」。
+# 模型照着素材写 → 社交层整条判掉 → 私聊一条也发不出去（实测一天 15 条尝试全被拦）。
+# 所以两头一起改：素材/提示词不再教她玩手机，这里再把模型自己编出来的设备词换掉。
+_DEVICE_SWAPS: tuple[tuple[str, str], ...] = (
+    ("刷手机", "翻两页书"),
+    ("看手机", "看看窗外"),
+    ("玩手机", "翻两页书"),
+    ("手机", "手边的东西"),
+    ("屏幕", "窗玻璃"),
+    ("电脑", "桌上的本子"),
+    ("平板", "桌上的本子"),
+    ("键盘", "桌上的本子"),
+    ("鼠标", "桌上的本子"),
+    ("充电器", "插座"),
+)
+
+
+def scrub_device_text(text: str) -> str:
+    """把设备词换成不涉及设备的具体说法（保持句子还能读）。"""
+    out = str(text or "")
+    if not out:
+        return out
+    for bad, good in _DEVICE_SWAPS:
+        if bad in out:
+            out = out.replace(bad, good)
+    return out
+
 def parse_segment(
     raw: Any,
     *,
@@ -1792,7 +1822,7 @@ def parse_segment(
     prev = prev or {}
     # 回去接着做被打断之前那件事：continue 与 resume 同时出现时以 resume 优先。
     susp = suspended if isinstance(suspended, Mapping) else {}
-    suspended_event = _clip_event(str((susp or {}).get("event") or ""))
+    suspended_event = scrub_device_text(_clip_event(str((susp or {}).get("event") or "")))
     want_resume = _truthy_flag(raw.get("resume")) and bool(suspended_event)
     if want_resume:
         # 挂起记录里带着解析时的睡着判定：醒来前被打断的那件事可能没有睡词。
@@ -1847,6 +1877,10 @@ def parse_segment(
     if want_continue:
         raw_event = str(prev.get("event") or "").strip()
         event = _clip_event(raw_event, limit=_EVENT_STORE_MAX)
+    # 设备词不进日程：模型自己编出来的「手机/屏幕」也在这里换掉，
+    # 不然社交层验收会整条判掉（素材池已经先改过一轮）。
+    raw_event = scrub_device_text(raw_event)
+    event = scrub_device_text(event)
     if not event:
         return None
 
