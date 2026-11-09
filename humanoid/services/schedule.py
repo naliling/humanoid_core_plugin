@@ -990,12 +990,12 @@ EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
     # 短：半小时上下就完事，做完自然换下一件
     (
         {"event": "洗了把脸，把厨房台面擦了一遍", "location": "厨房", "emotion": "清爽了点", "energy_rate": -0.02, "minutes": 30},
-        {"event": "把攒着的几条消息回完", "location": "客厅", "emotion": "清掉一件事", "energy_rate": -0.02, "minutes": 30},
+        {"event": "把攒着的几件小事做完，桌子顺手擦了一遍", "location": "客厅", "emotion": "清掉一件事", "energy_rate": -0.02, "minutes": 30},
         {"event": "下楼走了一圈，顺手把垃圾扔了", "location": "楼下", "emotion": "透了口气", "energy_rate": 0.02, "minutes": 30},
         {"event": "烧了壶水，站在窗边慢慢喝完", "location": "厨房", "emotion": "缓了缓", "energy_rate": 0.01, "minutes": 30},
         {"event": "把桌上的东西归了归位", "location": "书桌前", "emotion": "眼前清爽", "energy_rate": -0.01, "minutes": 30},
         {"event": "给猫添了粮，把水碗洗了", "location": "厨房", "emotion": "顺手的事", "energy_rate": -0.01, "minutes": 30, "needs": ("pet",)},
-        {"event": "回了几条工作上的消息，把明天要用的东西理出来", "location": "书桌前", "emotion": "先清掉一件", "energy_rate": -0.03, "minutes": 30, "needs": ("job",)},
+        {"event": "把明天要用的东西理出来，单据按顺序码好", "location": "书桌前", "emotion": "先清掉一件", "energy_rate": -0.03, "minutes": 30, "needs": ("job",)},
         {"event": "把家里要添的东西列了张单子", "location": "客厅", "emotion": "心里有数", "energy_rate": -0.01, "minutes": 30, "needs": ("care",)},
     ),
     # 中：要坐下来做、要动手的一件完整的事
@@ -1022,7 +1022,7 @@ EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
     # 歇着：什么都不干也是一种状态，但它是「歇着」，不是一个动作
     (
         {"event": "靠在椅背上放空，什么也没干", "location": "客厅", "emotion": "什么都没想", "energy_rate": 0.03, "minutes": 30, "wants": True},
-        {"event": "戴上耳机听歌，躺着没动", "location": "卧室", "emotion": "缓过来一点", "energy_rate": 0.04, "minutes": 40, "wants": True},
+        {"event": "听着窗外的声音，躺着没动", "location": "卧室", "emotion": "缓过来一点", "energy_rate": 0.04, "minutes": 40, "wants": True},
         {"event": "坐在窗边看外面，发了一会儿呆", "location": "窗边", "emotion": "空落落的", "energy_rate": 0.02, "minutes": 30, "wants": True},
         {"event": "在沙发上躺着，翻了两页书就放下了", "location": "卧室", "emotion": "有点空", "energy_rate": 0.02, "minutes": 50, "wants": True},
         {"event": "泡了杯东西，慢慢喝完", "location": "客厅", "emotion": "缓下来了", "energy_rate": 0.02, "minutes": 30, "wants": True},
@@ -1438,7 +1438,7 @@ def segment_prompt(
         # 「中途被打断/临时起意」以前完全没有：每段都像一件排好的任务，
         # 做完了才换。真人不是这样的——她会被事情打断、会临时想干点别的。
         "5. 她的一天是可以被打断的：\n"
-        "   能被一件小事打断（快递到了下楼取、朋友顺路叫住、锅里水开了、看见一条想回的消息）；\n"
+        "   能被一件小事打断（快递到了下楼取、朋友顺路叫住、锅里水开了、窗外有只猫叫了一声）；\n"
         "   也可以临时起意（突然想出去走走、拐进一家店、给谁打个电话）——\n"
         "   这种段不用长，半小时到一小时都正常，做完再回去继续原来那件事也行。\n"
         "6. 别把一天排成流程模板（起床→上班→午休→下班→晚饭→睡觉那一条龙），"
@@ -1482,7 +1482,7 @@ def segment_prompt(
         )
         + f"4. minutes：这一段做多久。清醒时最短 {SEGMENT_AWAKE_MIN_MINUTES} 分钟——"
         "一段是一件有头有尾、说得出口的事（做顿饭、出门办件事、洗个澡收拾好），"
-        "不是「倒杯水」「回条消息」这种一个动作，也不是「把杯子放回厨房」这种过渡动作——"
+        "不是「倒杯水」「洗把脸」这种一个动作，也不是「把杯子放回厨房」这种过渡动作——"
         "那些并进前后那件事里，别单独成段；"
         "要坐下来做、要出门、要等人的事才写到 1~3 小时；"
         f"一般的事最长 {SEGMENT_MAX_MINUTES} 分钟；睡觉可以睡一整夜（最长 "
@@ -1749,7 +1749,7 @@ def _review_prompt(
     lines.append("只判一件事：这一段接上去说不说得通。看五点：")
     lines.append("- 时间：上一段结束到这一段开始，够不够她收拾、走路、准备？（她不会瞬移）")
     lines.append("- 地点：从上一段的地点到这里，是不是可能？（在家要去外面得出门，外面回来要进门）")
-    lines.append("- 时长：这个动作值不值得这么久？（倒杯水、回一条消息不该占半小时；通勤、做饭、开会才可能长）")
+    lines.append("- 时长：这个动作值不值得这么久？（倒杯水、洗把脸不该占半小时；通勤、做饭、开会才可能长）")
     lines.append("- 事实：有没有凭空多出来的家人、宠物、同事、预约、约定？")
     lines.append("- 重复：是不是把上一段同一件事换个说法又排了一遍？")
     if persona_text.strip():
@@ -1784,6 +1784,15 @@ _DEVICE_SWAPS: tuple[tuple[str, str], ...] = (
     ("键盘", "桌上的本子"),
     ("鼠标", "桌上的本子"),
     ("充电器", "插座"),
+    # v3.1.14：光删「手机/屏幕」不够——模型会从「回消息」「打字」再推回设备。
+    # 实测 16:17 / 16:54 两条破冰都是这么写出来的（「翅膀托着手机给姐姐打字」）。
+    ("打字", "慢慢写字"),
+    ("发消息", "说两句话"),
+    ("回消息", "回话"),
+    ("看消息", "看看窗外"),
+    ("消息", "话"),
+    ("耳机", "窗户"),
+    ("充电线", "线绳"),
 )
 
 

@@ -246,12 +246,12 @@ class GapContinuityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.calls, 1)
         service._clock.advance(minutes=31)  # 09:31，手上没有任何一段
         self.assertTrue(service.refresh_due())
-        provider.reply = seg_reply(event="回消息", minutes=30)
+        provider.reply = seg_reply(event="整理书架", minutes=30)
         self.assertTrue(await service.ensure_fresh())
         self.assertEqual(provider.calls, 2, "空档接续不该被 30 分钟间隔挡住")
         segs = service.segments()
         self.assertEqual(segs[1]["start"], "09:30", "从上一段结束处接上，不留窟窿")
-        self.assertEqual(segs[1]["event"], "回消息")
+        self.assertEqual(segs[1]["event"], "整理书架")
 
     async def test_idle_silence_still_blocks_even_in_a_gap(self):
         """空档不是免死金牌：没人跟她说话时，照样一次都不许调。"""

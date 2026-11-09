@@ -23,7 +23,12 @@ from humanoid import prompt_builder
 from humanoid.services import life_material, schedule
 from humanoid.services.schedule import EXAMPLE_BANDS, parse_segment, scrub_device_text
 
-DEVICE_WORDS = ("手机", "屏幕", "电脑", "平板", "键盘", "鼠标", "充电器")
+DEVICE_WORDS = (
+    "手机", "屏幕", "电脑", "平板", "键盘", "鼠标", "充电器",
+    # v3.1.14：只删「手机/屏幕」不够——模型会从「回消息」「打字」「戴耳机」
+    # 再推回设备。实测 16:17/16:54 两条破冰就是这么写出来的。
+    "打字", "消息", "耳机", "充电线",
+)
 
 
 class MaterialsNeverMentionDevicesTest(unittest.TestCase):
@@ -59,6 +64,13 @@ class ScrubTest(unittest.TestCase):
 
     def test_empty_safe(self):
         self.assertEqual(scrub_device_text(""), "")
+
+    def test_message_semantics_scrubbed(self):
+        # 线上原文：「翅膀托着手机给姐姐打字外头晴得晃眼才1℃」
+        out = scrub_device_text("翅膀托着手边的东西给姐姐打字")
+        for word in ("手机", "打字", "消息"):
+            self.assertNotIn(word, out, f"清洗后仍含「{word}」：{out}")
+        self.assertNotIn("消息", scrub_device_text("把攒着的几条消息回完"))
 
 
 class ParseSegmentScrubsTest(unittest.TestCase):

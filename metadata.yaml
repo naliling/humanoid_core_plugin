@@ -17,7 +17,7 @@ desc: |
   群里同样生效（默认群消息不做情绪分析，可单独打开）；另含默认关闭的亲密场景模拟等进阶项，详见 README。
 
   配置不复杂，真正要改的就那几项，额外的都标着【进阶】。
-version: 3.1.13
+version: 3.1.14
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.24.0"
