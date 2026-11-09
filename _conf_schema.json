@@ -1302,6 +1302,24 @@
     },
     "collapsed": true
   },
+  "mood_group_llm_interval_messages": {
+    "description": "【进阶】群聊多少条消息触发一次模型情绪分析",
+    "hint": "群聊单独一个更宽的间隔：群消息占全部入站消息的九成以上，和私聊共用同一个值会让分析调用翻十倍。群聊只跟踪已经有档案的熟人（陌生人不建档）",
+    "type": "int",
+    "default": 20,
+    "minimum": 1,
+    "maximum": 200,
+    "slider": {
+      "min": 1,
+      "max": 200,
+      "step": 5
+    },
+    "condition": {
+      "mood_enabled": true,
+      "mood_use_llm_for_delta": true
+    },
+    "collapsed": true
+  },
   "mood_update_timeout": {
     "description": "【进阶】情绪请求超时(秒)",
     "hint": "单次模型情绪分析最多等多久；调大更不容易超时。",
@@ -1494,7 +1512,7 @@
   },
   "mood_enabled_in_group": {
     "description": "【进阶】群聊也算情绪",
-    "hint": "关：群消息不做情绪分析（私聊始终生效）；开：群里每人各自积累好感。这里只挡群里的新分析，私聊过的人在群里仍读得到她的情绪",
+    "hint": "关：群里只跟已经有情绪档案的熟人（陌生人在群里说一句不建档）；开：群里所有人各自积累好感。私聊始终生效",
     "type": "bool",
     "default": false,
     "condition": {

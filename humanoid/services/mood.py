@@ -24,6 +24,24 @@ from ..recall import MAX_SNIPPETS, note_said, recall_lines
 from ..wording import pick
 from ..role_scope import RoleScope
 
+# 待分析消息缓冲按会话分开（3.1.15）。旧版是 `record["llm_batch"]` 一个平表，
+# 同一个人的私聊 / A 群 / B 群混成一批送给模型。
+LLM_BATCH_BY_SESSION_KEY = "llm_batch_by_session"
+# 每个会话各自的「攒了几条」计数（旧字段 `messages_since_llm` 保留兼容，但不再
+# 作为触发判据：群 A 攒满去分析群 B 的空批，就是跨群混批的另一半原因）。
+MESSAGES_SINCE_BY_SESSION_KEY = "messages_since_by_session"
+
+
+def _batch_fingerprint(batch) -> str:
+    """这批消息的短指纹：日志里能对上「分析的是哪几条」，但不落原文。"""
+    try:
+        import hashlib
+        joined = "\x1f".join(str(x) for x in (batch or []))
+        return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:10]
+    except Exception:
+        return "-"
+
+
 NEGATIVE_PATTERN = re.compile(
     r"(傻|蠢|笨|白痴|废物|垃圾|去死|死吧|滚蛋|操|妈|逼|贱|恶心|讨厌|恨|烦|骂|吵|滚|弱智|脑残|sb|煞笔)",
     re.IGNORECASE,
@@ -1171,6 +1189,49 @@ class MoodService:
         self._scope.set_user(user_id, "spoke_log", rows)
         return rows
 
+    # ── 结束语义（3.1.15）──────────────────────────────────────
+    #
+    # 「她说过、对方还没接」这件事原来只能靠**对方再发一条消息**来关闭
+    # （`close_last_spoke` 只看有没有新消息，跟内容无关）。于是用户说
+    # 「已经解决了」「不用继续」「我自己来」，账上那条照样 pending，注入里
+    # 继续写「她说过…对方还没回应」，社交层 2.5~14 小时内把同一件事再问一遍。
+    # 这里补上「TA 说这事到此为止」这一侧。
+    END_INTENT_PATTERN = re.compile(
+        r"(已经解决|已解决|解决了|修好了|我自己来|不用继续|别问了|别说了|"
+        r"到此为止|先这样|不用你|别管了|不用管了|结束了|不用了|算了)"
+    )
+
+    def end_intent_at(self, user_id: str) -> float:
+        """TA 最后一次说「这事到此为止」的时间；没有就是 0。纯查询，不建条目。"""
+        try:
+            return float(self._scope.peek_user(user_id, "end_intent_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def note_end_intent(self, user_id: str, text: str, now: float | None = None) -> bool:
+        """TA 说「这事到此为止」→ 把她挂着的话头全部收掉，并记下这个时间点。
+
+        收的是**全部** pending，不只是最后一条：用户说「都解决了」的时候，
+        三条挂着的话头一起失效才对。`landed=False` 保留「她说了但没落地」这个
+        事实，只是不再当作「还在等回应」。
+        """
+        body = str(text or "").strip()
+        if not body or not self.END_INTENT_PATTERN.search(body):
+            return False
+        stamp = self._time() if now is None else float(now)
+        rows = [r for r in self.spoke(user_id) if isinstance(r, dict)]
+        changed = False
+        for row in rows:
+            if row.get("pending"):
+                row["pending"] = False
+                row["landed"] = False
+                changed = True
+        if changed:
+            self._scope.set_user(user_id, "spoke_log", rows)
+        self._scope.set_user(user_id, "end_intent_at", stamp)
+        self._scope.mark_dirty()
+        return True
+
     def recall_lines(self, user_id: str, max_items: int = 2) -> list[str]:
         """给注入用的一行：TA 之前说过什么。没记过就是空。"""
         return recall_lines(self.said(user_id), self._time(), max_items=max_items)
@@ -1743,9 +1804,13 @@ class MoodService:
         return True
 
     async def update_from_message(self, user_id: str, text: str, *args, **kwargs) -> Optional[Delta]:
-        return await self.update_from_message_async(user_id, text)
+        # 位置参数是老签名（敏感度 / 权重）留下的，一律忽略；`umo` / `is_group`
+        # 只接受关键字——否则第三个位置参数会被当成 umo，把批次分到错误的桶里。
+        return await self.update_from_message_async(user_id, text, **kwargs)
 
-    async def update_from_message_async(self, user_id: str, text: str) -> Optional[Delta]:
+    async def update_from_message_async(
+        self, user_id: str, text: str, umo: str = "", is_group: bool = False
+    ) -> Optional[Delta]:
         cfg = self.config
         if not cfg.mood_enabled or not text:
             return None
@@ -1762,8 +1827,35 @@ class MoodService:
                 record = self.profile(user_id)
                 user_state = self._scope.user_state(user_id)
 
-            messages_since = int(record.get("messages_since_llm", 0)) + 1
+            # 计数按会话分开（3.1.15）：群 A 攒满 20 条不该去分析私聊里那 2 条。
+            # `umo` 为空时退回旧字段，与改动前完全一致。
+            counters = None
+            session_key = self._batch_key(umo)
+            if session_key:
+                counters = record.get(MESSAGES_SINCE_BY_SESSION_KEY)
+                if not isinstance(counters, dict):
+                    counters = {}
+                    record[MESSAGES_SINCE_BY_SESSION_KEY] = counters
+                try:
+                    messages_since = int(counters.get(session_key, 0) or 0) + 1
+                except (TypeError, ValueError):
+                    messages_since = 1
+            else:
+                try:
+                    messages_since = int(record.get("messages_since_llm", 0) or 0) + 1
+                except (TypeError, ValueError):
+                    messages_since = 1
             interval = max(1, cfg.mood_llm_interval_messages)
+            if is_group:
+                # 群聊单独一个更宽的间隔：群消息占全部入站消息九成以上，
+                # 和私聊共用 4 条一次会让分析调用翻十倍。
+                try:
+                    group_interval = int(
+                        getattr(cfg, "mood_group_llm_interval_messages", interval) or interval
+                    )
+                except (TypeError, ValueError):
+                    group_interval = interval
+                interval = max(interval, group_interval)
             should_call_llm = cfg.mood_use_llm_for_delta and messages_since >= interval
             if should_call_llm and base_delta.affection <= LLM_SKIPPABLE_AFFECTION:
                 # 本地已经判死了（骂人/重话），模型的结果到了也会被 `_resolve_delta`
@@ -1777,6 +1869,8 @@ class MoodService:
             # 计数先累加，真正调了模型才归零。跳过时**保留**：这一轮没分析，
             # 攒着的条数要留着，下一条消息到了还按同一条路再判一次
             # （万一下一条不是骂人，就该让模型说话）。
+            if counters is not None:
+                counters[session_key] = messages_since
             record["messages_since_llm"] = messages_since
             # 消息**正文**要每条都攒。
             #
@@ -1785,9 +1879,11 @@ class MoodService:
             # 这是个很安静的 bug：提示词写着「合起来」，请求里只有一个标签，
             # 单测不看请求内容就发现不了。
             if not should_call_llm:
-                self._append_llm_batch(user_id, text)
+                self._append_llm_batch(user_id, text, umo=umo)
             else:
                 record["messages_since_llm"] = 0
+                if counters is not None:
+                    counters[session_key] = 0
             # 用户又说话了 → 上一条她说的话有人接了。两个分支都要做：原来只在
             # 「不调模型」那条里关，正好凑够条数触发分析的那条用户消息就漏了，
             # 她那句话会永远挂着「对方还没回应」。
@@ -1811,25 +1907,37 @@ class MoodService:
             # 对最后一句的反应。
             # 锁内读出来，await 之后再锁内结算——中间不让别人插进来改缓冲
             async with lock:
-                batch = self._peek_llm_batch(user_id, text)
+                batch = self._peek_llm_batch(user_id, text, umo=umo)
                 # 发起请求这一刻的判定世代。等待期间 `reset()` / `set_affection()`
                 # 会把它推前一格，回来时对不上就说明这批结果属于「重置前的那个人」。
                 judge_gen = self._judge_gen(self._scope.user_state(user_id).get("mood"))
             llm_delta = await self._llm_delta(user_id, batch)
+            # 落一行「这批到底是哪几条」（3.1.15）：原来只有 llm.py 那句「成功，用时
+            # N s」，没有会话、没有条数、没有指纹，出问题只能靠时间戳猜。失败也要
+            # 落——`llm_delta is None` 以前是完全静默的。
+            if self._log is not None:
+                try:
+                    where = f"session={umo or user_id} 条数={len(batch)} 指纹={_batch_fingerprint(batch)}"
+                    if llm_delta is None:
+                        self._log.warning(f"[humanoid_core] 情绪分析未返回结果：{where}")
+                    else:
+                        self._log.info(f"[humanoid_core] 情绪分析批次：{where}")
+                except Exception:
+                    pass
             async with lock:
                 stale = self._judgment_stale(user_id, judge_gen)
                 if stale:
                     # 作废：结果丢掉，这批消息按「已消费」语义丢弃——等待期间新
                     # append 进来的要留着。**不能**走 ok=False：那条路会把整批
                     # 放回缓冲，重置前攒的消息下一轮又会被送去分析。
-                    self._settle_llm_batch(user_id, True, batch)
+                    self._settle_llm_batch(user_id, True, batch, umo=umo)
                     if cfg.debug_mode and self._log is not None:
                         self._log.info(
                             f"[humanoid_core] {user_id}: 判定世代已变，"
                             "丢弃在飞的情绪分析结果"
                         )
                 else:
-                    self._settle_llm_batch(user_id, llm_delta is not None, batch)
+                    self._settle_llm_batch(user_id, llm_delta is not None, batch, umo=umo)
 
         async with lock:
             user_state = self._scope.user_state(user_id)
@@ -1886,7 +1994,33 @@ class MoodService:
             return True
         return self._judge_gen(record) != judge_gen
 
-    def _peek_llm_batch(self, user_id: str, text: str) -> list[str]:
+    @staticmethod
+    def _batch_key(umo: str) -> str:
+        """一批消息属于哪个会话。"""
+        return str(umo or "")
+
+    def _batch_slot(self, record: dict, umo: str):
+        """待分析缓冲落在哪：(容器, 键)。
+
+        缓冲原来挂在 `record["llm_batch"]` 上——键里没有 umo，于是同一个人的私聊、
+        A 群、B 群的话全混进同一批送给模型。实测她对着一个私聊对象说「你在群里
+        跟别人聊得挺欢」，因为那批里混着群消息。
+
+        `umo` 为空时退回旧字段：那是「调用方没有会话信息」的老路径，语义就是
+        「这个人的所有消息」，与改动前完全一致。
+        """
+        key = str(umo or "")
+        if not key:
+            if not isinstance(record.get("llm_batch"), list):
+                record["llm_batch"] = []
+            return record, "llm_batch"
+        data = record.get(LLM_BATCH_BY_SESSION_KEY)
+        if not isinstance(data, dict):
+            data = {}
+            record[LLM_BATCH_BY_SESSION_KEY] = data
+        return data, key
+
+    def _peek_llm_batch(self, user_id: str, text: str, umo: str = "") -> list[str]:
         """读出这批消息（旧的在前），**不清空缓冲**。
 
         取和清空必须分开：`_llm_delta` 是一次网络调用，中间要让出事件循环。
@@ -1897,8 +2031,9 @@ class MoodService:
         record = self._scope.user_state(user_id).get("mood")
         if not isinstance(record, dict):
             return [str(text or "")]
+        container, slot = self._batch_slot(record, umo)
         try:
-            buf = [str(x or "") for x in (record.get("llm_batch") or [])]
+            buf = [str(x or "") for x in (container.get(slot) or [])]
         except (TypeError, ValueError):
             buf = []
         batch = [x for x in buf[-cap:] if x.strip()]
@@ -1908,7 +2043,7 @@ class MoodService:
         return batch[-cap:] or [body or "（空）"]
 
     def _settle_llm_batch(
-        self, user_id: str, ok: bool, batch: Optional[list] = None
+        self, user_id: str, ok: bool, batch: Optional[list] = None, umo: str = ""
     ) -> None:
         """模型给结果了就把这批清掉；**没给结果就整批放回去**，等下一轮一起分析。
 
@@ -1920,28 +2055,39 @@ class MoodService:
             return
         if not ok:
             cap = max(1, int(self.config.mood_llm_batch_max))
+            container, slot = self._batch_slot(record, umo)
             try:
-                record["llm_batch"] = [str(x) for x in (batch or []) if str(x).strip()][-cap:]
+                container[slot] = [
+                    str(x) for x in (batch or []) if str(x).strip()
+                ][-cap:]
             except (TypeError, ValueError):
-                record["llm_batch"] = []
+                container[slot] = []
             record["messages_since_llm"] = 0    # 重新攒，别在同一个阈值上反复触发
+            if umo:
+                try:
+                    counters = record.get(MESSAGES_SINCE_BY_SESSION_KEY)
+                    if isinstance(counters, dict):
+                        counters[str(umo)] = 0
+                except Exception:
+                    pass
             self._scope.mark_dirty()
             return
         # 只删这一批分析过的，别把等待模型期间新攒进来的也清掉：
         # `_llm_delta` 是一次网络调用，中途对方又发一条就会 append 进缓冲，
         # 整表清空等于把那条静默丢掉（本地 delta 仍生效，所以看不出来）。
         consumed = [str(x) for x in (batch or []) if str(x).strip()]
+        container, slot = self._batch_slot(record, umo)
         try:
-            current = [str(x) for x in (record.get("llm_batch") or []) if str(x).strip()]
+            current = [str(x) for x in (container.get(slot) or []) if str(x).strip()]
         except (TypeError, ValueError):
             current = []
         for item in consumed:
             if item in current:
                 current.remove(item)
-        record["llm_batch"] = current[-max(1, int(self.config.mood_llm_batch_max)):]
+        container[slot] = current[-max(1, int(self.config.mood_llm_batch_max)):]
         self._scope.mark_dirty()
 
-    def _append_llm_batch(self, user_id: str, text: str) -> None:
+    def _append_llm_batch(self, user_id: str, text: str, umo: str = "") -> None:
         """攒一条消息进待分析缓冲（每条消息都攒，不等到触发那一刻才取）。"""
         body = str(text or "").strip()
         if not body:
@@ -1950,12 +2096,13 @@ class MoodService:
         if not isinstance(record, dict):
             return
         cap = max(1, int(self.config.mood_llm_batch_max))
+        container, slot = self._batch_slot(record, umo)
         try:
-            buf = [str(x or "") for x in (record.get("llm_batch") or [])]
+            buf = [str(x or "") for x in (container.get(slot) or [])]
         except (TypeError, ValueError):
             buf = []
         buf.append(body)
-        record["llm_batch"] = buf[-cap:]
+        container[slot] = buf[-cap:]
         self._scope.mark_dirty()
 
     def _spoke_lines(self, user_id: str, max_items: int = 3) -> List[str]:
@@ -3116,6 +3263,8 @@ class MoodService:
         # 重置前攒着的那批消息属于「重置前」：留着的话下一轮会把它们送去分析，
         # 结果又落回重置后的档案——等于没重置干净。
         record.pop("llm_batch", None)
+        record.pop(LLM_BATCH_BY_SESSION_KEY, None)
+        record.pop(MESSAGES_SINCE_BY_SESSION_KEY, None)
         # 推进判定世代：此刻正在等模型返回的那一批结果直接作废（见 `_judgment_stale`）。
         self._bump_judge_gen(record)
         user_state = self._scope.user_state(user_id)

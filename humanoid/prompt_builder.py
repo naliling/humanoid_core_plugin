@@ -1583,6 +1583,18 @@ class PromptBuilder:
                 ]
             except Exception:
                 pass
+            # TA 说过「这事到此为止」→ 那之前的未完事不再回灌（3.1.15）。
+            # 只丢**属于 TA 的**旧条目；无归属的那类（她自己的事）不动。
+            try:
+                cutoff = self._core.mood.end_intent_at(mine)
+                if cutoff > 0:
+                    items = [
+                        item for item in items
+                        if str((item or {}).get("uid") or "") != mine
+                        or float((item or {}).get("at", 0) or 0) >= cutoff
+                    ]
+            except Exception:
+                pass
             if not items:
                 return []
         try:
@@ -1610,7 +1622,18 @@ class PromptBuilder:
         没记下称呼就整行不提：旧版写「还没问过TA叫什么」，模型把它当成待办，
         逢人就追问名字。现在没名字就只叫「TA」，要名字交给自动认定去拿。"""
         try:
-            nickname = sanitize_name(self._core.mood.nickname(user_id))
+            nickname = ""
+            if is_group:
+                # 群里优先用名片名（3.1.15）：`nickname` 是「她认定的称呼」，可能
+                # 是自动认定抓错的结果——实测群 1042481523 里她把对方叫成
+                # 「一个人类」，因为她自己连着 17 轮回复都以「一个人类。❤️」结尾，
+                # 自动认定把她的口头禅当成了对方的名字。名片名是消息自带的，
+                # 每轮都在更新，不会被她的口癖带偏。
+                # 用户 `/叫我` 显式设过的称呼仍然优先——那是本人的要求。
+                if self._core.mood.nickname_source(user_id) != "user":
+                    nickname = sanitize_name(self._core.mood.display_name(user_id))
+            if not nickname:
+                nickname = sanitize_name(self._core.mood.nickname(user_id))
         except Exception:
             return ""
         if not nickname:

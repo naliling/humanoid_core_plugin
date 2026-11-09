@@ -880,7 +880,17 @@ class HumanoidCoreInstance:
             if asyncio.iscoroutine(coro):
                 coro.close()
             return None
-        task = asyncio.create_task(coro, name=f"humanoid-{self.role_id}-{name}")
+        try:
+            task = asyncio.create_task(coro, name=f"humanoid-{self.role_id}-{name}")
+        except RuntimeError:
+            # 没有运行中的事件循环。同步调用路径会走到这里（测试里直接调
+            # `on_message`、或停止之后残留的回调），create_task 会抛
+            # "no running event loop" 把整条消息处理链炸掉——而消息本身已经
+            # 处理完了，只是这次后台分析没跑。记一条原因码就够，不要抛。
+            note_reason("background_no_loop", name)
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            return None
         self._tasks.add(task)
         task.add_done_callback(self._on_task_done)
         return task
@@ -918,6 +928,15 @@ class HumanoidCoreInstance:
         cfg = self.config
 
         self.note_umo(umo)
+
+        # 「这事到此为止」先收账，再谈情绪（3.1.15）：话头是话头，情绪是情绪，
+        # 情绪层关着的时候，她挂着的那句「对方还没回应」照样得能关掉。
+        # 群聊也要收——她在群里追问过的人，在群里说「解决了」同样该算数。
+        if not is_command:
+            try:
+                self.mood.note_end_intent(user_id, text)
+            except Exception:
+                pass
 
         # 有人来找她了：给日程一个「要不要停下手上的事」的时机。
         # 只记账不重排——真正要不要重排由 refresh_due 与闸门（频率/预算/冷却）决定。
@@ -1034,7 +1053,7 @@ class HumanoidCoreInstance:
                 })
                 # 记住 TA 说过什么：注入里一句「TA之前说过『我猫今天吐了』」就能让她像个
                 # 一直在听的人，而不是每条都重新认识你。本地采样，零额外调用。
-                if cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group):
+                if self._mood_tracks(user_id, is_group):
                     self.mood.note_said(user_id, text, now)
 
         self.energy.advance()
@@ -1060,7 +1079,10 @@ class HumanoidCoreInstance:
                 self._scope.set_self("daily_msg_count", count + 1)
 
         if cfg.soma_enabled and not is_command:
-            self.soma.note_message()
+            # 群聊的唤醒增益单独算（3.1.15）：同一条消息会被群里每一个角色各记一次，
+            # 71 个群一天几万条下来，四个角色的 arousal 全部顶死在 100 —— 身体状态
+            # 失去区分度，注入里永远写「很兴奋」。群里潜水本来也不该跟私聊一样被撩起来。
+            self.soma.note_message(is_group=is_group)
 
         if cfg.social_energy_enabled and not is_command and not is_group:
             # 同上：社交能量是「她还剩多少耐心陪人聊」，不是「群里今天有多少条」。
@@ -1077,7 +1099,7 @@ class HumanoidCoreInstance:
             # 指令不算陪伴。
             self.soma.note_chat(now)
         if not is_command:
-            self._dispatch_async(user_id, text, is_group=is_group)
+            self._dispatch_async(user_id, text, is_group=is_group, umo=umo)
 
     # ─── 社交层兜底字段（v3.0.0，联动 P2-5）──────────────────
 
@@ -1156,11 +1178,9 @@ class HumanoidCoreInstance:
         body = str(text or "").strip()
         if not body:
             return False
-        cfg = self.config
         # 情绪层没开时日程也不该凭空知道她被骂了——同一个开关，同一个口径。
-        if not cfg.mood_enabled:
-            return False
-        if is_group and not cfg.mood_enabled_in_group:
+        # 群聊口径与情绪层保持一致（3.1.15）：只跟已经有档案的熟人。
+        if not self._mood_tracks(user_id, is_group):
             return False
 
         try:
@@ -1194,12 +1214,37 @@ class HumanoidCoreInstance:
         except Exception:
             return False
 
-    def _dispatch_async(self, user_id: str, text: str, is_group: bool = False):
-        cfg = self.config
-        mood_allowed = cfg.mood_enabled and (not is_group or cfg.mood_enabled_in_group)
-        if mood_allowed:
+    def _mood_tracks(self, user_id: str, is_group: bool) -> bool:
+        """这条消息该不该进情绪层。
+
+        `mood_enabled_in_group=False` 的本意是**不给群里的人建档**（旧实现里
+        `decay_user` 的 `user_state()` 读一眼就建条目，71 个群的背景流量能凭空
+        攒出几千份空壳档案）。但它顺手把「群里的话她也听得见」一起关掉了：
+        实测 29 小时窗口里群聊情绪分析 0 次、私聊 77 次，而群消息占全部入站
+        消息的九成以上——她在群里被骂一整天情绪不动，回到私聊才一次性补上。
+
+        现在把两件事拆开：群里照常跟踪，但**只跟已经有档案的人**（私聊聊过的
+        熟人）。陌生人照样不建档，所以状态文件不会重新长回来。
+        """
+        if not self.config.mood_enabled:
+            return False
+        if not is_group:
+            return True
+        if self.config.mood_enabled_in_group:
+            return True
+        try:
+            return bool(self.mood.has_profile(user_id))
+        except Exception:
+            return False
+
+    def _dispatch_async(
+        self, user_id: str, text: str, is_group: bool = False, umo: str = ""
+    ):
+        if self._mood_tracks(user_id, is_group):
             self._spawn_background(
-                self.mood.update_from_message_async(user_id, text),
+                self.mood.update_from_message_async(
+                    user_id, text, umo=umo, is_group=is_group
+                ),
                 "mood-update"
             )
         # 用 should_refresh() 而不是 is_stale()：这一行是**每条消息**都会走的，

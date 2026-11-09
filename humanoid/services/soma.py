@@ -1264,9 +1264,17 @@ class SomaService:
         self._set("arousal", self._get("arousal", 50.0) + 6.0)
         self._persist_if_changed()
 
-    def note_message(self) -> None:
+    # 群消息的唤醒增益（3.1.15）。同一条消息会被群里每个角色各记一次，71 个群
+    # 一天几万条下来，四个角色的 arousal 全部顶死在 100 —— 身体状态失去区分度，
+    # 注入里永远写「很兴奋」。群里潜水本来也不该跟私聊被点名一样撩起来。
+    GROUP_MESSAGE_AROUSAL = 0.4
+    AROUSAL_CEIL = 100.0
+
+    def note_message(self, is_group: bool = False) -> None:
         """每条消息：久坐计时不动，只推一点身体唤醒（与 note_chat 的 +6 同向）。"""
-        self._set("arousal", self._get("arousal", 50.0) + 1.5)
+        delta = self.GROUP_MESSAGE_AROUSAL if is_group else 1.5
+        current = self._get("arousal", 50.0)
+        self._set("arousal", min(current + delta, self.AROUSAL_CEIL))
         self._persist_if_changed()
 
     def note_proactive(self, at: float) -> None:

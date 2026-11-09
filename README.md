@@ -4,7 +4,7 @@
 > 不是一句人设，是一整天的生活。
 > 插件负责她的身体、日程、情绪和关系背景；怎么说话，仍然由大模型按人设自己决定。
 
-![version](https://img.shields.io/badge/version-v3.1.14-2563eb?style=flat-square)
+![version](https://img.shields.io/badge/version-v3.1.15-2563eb?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -71,7 +71,7 @@
 - **未完事项** —— 记着手上还开着的事，最多三条、最多放 4 天；
 - **对话间隔** —— 知道你多久没来，但不逼她问「你去哪了」；
 - **同机 bot** —— 可以聊；同一对 bot 默认 600 秒内最多 3 轮（可配），真人一开口就清零；
-- **群聊** —— 群里一样有身体和日程；默认群消息不做情绪分析（可在面板打开「群聊也算情绪」），管理指令在群里对非管理员回一句「权限不足」；
+- **群聊** —— 群里一样有身体和日程；群消息也会进情绪分析，只跟已经有情绪档案的人（陌生人在群里说一句不建档），间隔比私聊宽（面板「群聊情绪分析间隔」，默认 20 条），管理指令在群里对非管理员回一句「权限不足」；
 - **环境模式** —— 可以把整个插件限定在私聊或群聊（面板「生效范围」，默认两边都生效）。
 
 ### 亲密场景（默认关闭，进阶）
@@ -158,7 +158,7 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 
 ### 关键配置项
 
-面板上共 143 项（多数带【进阶】标记），这里列真正需要动的：
+面板上共 144 项（多数带【进阶】标记），这里列真正需要动的：
 
 | 项 | 默认 | 什么时候调 |
 | --- | --- | --- |
@@ -193,7 +193,8 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 | `cooling_affection` | 10 | 好感低于它就进入冷静期 |
 | `cooling_minutes` | 15 | 冷静期语气持续多久（分钟） |
 | `cooling_no_proactive_days` | 3 | 冷静期里不主动找 TA 的天数 |
-| `mood_llm_interval_messages` | 4 | 每人每几条消息用模型分析一次情绪（**按人算**） |
+| `mood_llm_interval_messages` | 4 | 私聊里每几条消息用模型分析一次情绪（**按会话算**） |
+| `mood_group_llm_interval_messages` | 20 | 群聊里每几条消息用模型分析一次情绪（群聊单独更宽的间隔，只跟已有档案的人） |
 
 改完面板里的进阶项，用 `/拟人 重载` 刷新；`/拟人 设置` 改的项立即生效。
 

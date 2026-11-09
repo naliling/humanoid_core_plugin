@@ -430,6 +430,10 @@ class HumanoidConfig:
     # 为什么改默认（3.1.0）：10 条才送一次分析，配合 delta_cap=2 时，一段十几条的
     # 对话里情绪只更新一两次，用户感觉「她根本没反应」。4 条一次，单轮成本可控。
     mood_llm_interval_messages: int = 4
+    # 群聊单独一个更宽的间隔（3.1.15）。群消息占全部入站消息的九成以上，和私聊
+    # 共用同一个间隔的话，光是群里别人聊天就会把分析调用翻十倍。群聊只跟踪
+    # 已经有档案的熟人（`core_instance._mood_tracks`），间隔放宽到 20。
+    mood_group_llm_interval_messages: int = 20
     # 攒到间隔就触发时，一次最多把这么多条合起来分析（旧的在前）
     mood_llm_batch_max: int = 10
     # 每条截多少字进分析（10 条加起来仍可控）
@@ -736,6 +740,7 @@ class HumanoidConfig:
             # 手改 JSON 写成 "false"/"0" 会把 ccb 开关**意外打开**。
             ccb=b("ccb"),
             mood_llm_interval_messages=i("mood_llm_interval_messages", 1, 100),
+            mood_group_llm_interval_messages=i("mood_group_llm_interval_messages", 1, 200),
             mood_llm_batch_max=i("mood_llm_batch_max", 1, 30),
             mood_llm_message_chars=i("mood_llm_message_chars", 50, 2000),
             mood_enabled_in_group=b("mood_enabled_in_group"),
