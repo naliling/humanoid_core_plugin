@@ -5,7 +5,7 @@ v3 变更：支持多角色独立 Core 状态 + 过程系统。
 
 from __future__ import annotations
 
-__version__ = "3.1.12"
+__version__ = "3.1.13"
 
 LOG_PREFIX = "[humanoid_core]"
 
