@@ -54,7 +54,7 @@ def cfg(**overrides) -> HumanoidConfig:
     # 「生成 + 审查」这条链路本身，所以显式打开，别让默认值变化把被测对象改掉。
     return HumanoidConfig.from_raw(
         {"timezone_city": "北京", "schedule_change_chance": 0,
-         "schedule_quality_gate": True, **overrides})
+         **overrides})
 
 
 def today() -> str:
@@ -544,7 +544,9 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_change_truncates_previous_segment(self):
         provider = FakeProvider("p", reply=seg_reply(event="改海报", minutes=90))
-        service, _, _ = self.build(cfg(schedule_provider_name="p"), [provider])
+        service, _, _ = self.build(
+            cfg(schedule_provider_name="p", schedule_time_granularity="15min"), [provider]
+        )
         await service.ensure_fresh()  # 09:00-10:30 改海报
         service._clock.advance(minutes=40)  # 09:40
         provider.reply = seg_reply(event="去公司楼下取快递", minutes=30)
@@ -1081,18 +1083,16 @@ class ThrottleTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(service.refresh_due(), "该轮到生成而没轮到，测试前提不成立")
             await service.ensure_fresh()
 
-        # v3.0.11 起，一段日程要问两次模型：生成一次、审查一次（【审查这一段】）。
-        # 两次都真实消耗预算——预算的意义就是「一天最多花多少次调用」，
-        # 审查也是调用，所以这里按 2 次/段算。
-        total = lambda: provider.calls + provider.review_calls
+        # v3.1.28 起模型自审层删了：一段日程只问一次模型（生成那一次）。
+        total = lambda: provider.calls
         for expected in range(1, 6):
             await one_round(expected - 1)
             self.assertEqual(provider.calls, expected)
-            self.assertEqual(total(), 2 * expected, "每段生成一次、审查一次")
+            self.assertEqual(total(), expected, "v3.1.28 起一段只问一次模型")
         # 预算花光之后：照样轮到她该排日程（refresh_due 为真），但一次都不许再调。
         for extra in range(5):
             await one_round(5 + extra)
-        self.assertEqual(provider.calls, 5, "5 个 bot 加起来也只能花掉 10 次预算")
+        self.assertEqual(provider.calls, 10, "5 个 bot 加起来也只能花掉 10 次预算")
         self.assertEqual(total(), 10, "预算上限管的是真实调用次数，审查也算")
         self.assertEqual(gate.used_today, 10)
 

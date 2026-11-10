@@ -850,6 +850,10 @@ class EmotionLayer:
         if not was_in_scene:
             _ccb.log_clear(user_state)
             user_state["ccb_peak_depth"] = 0.0
+            # 进场第一句要接得上她刚才在做的事（v3.1.18，B 的读侧）：这里只存一句，
+            # 由 `_with_scene_note` 在开头 15 分钟内带上；过期就不再提。
+            user_state["ccb_bg"] = self._schedule_bg_line(moment)
+            user_state["ccb_bg_at"] = float(moment)
             # F5：当日次数 = 今天开了几场（进场时 +1），不是「推进了几格」。
             # 原来每推进一格 +1，而一场要 4 格——面板上的「今天 3 次」其实是
             # 「推进了 3 格」，也就是同一次事情还没做完就已经记了 3 次。
@@ -912,6 +916,26 @@ class EmotionLayer:
         except Exception:
             return text
 
+    def _schedule_bg_line(self, moment: float) -> str:
+        """进场时她刚才在做什么（v3.1.18，B 的读侧）。
+
+        只取一句、只在这一场开头用。`current_slot()` 已经过滤掉脏段，脏了会回
+        中性「自由活动」——那种空话不递。拿不到就返回空串。
+        """
+        try:
+            schedule = getattr(self._core, "schedule", None)
+            slot = schedule.current_slot() if schedule is not None else None
+        except Exception:  # noqa: BLE001 - 拿不到就不提
+            return ""
+        if not isinstance(slot, dict):
+            return ""
+        event = str(slot.get("event") or "").strip()
+        if not event or event in ("自由活动", "歇着", "发呆", "随意"):
+            return ""
+        if event.startswith("在"):
+            return f"刚才{event}"
+        return f"刚才在{event}"
+
     def _with_scene_note(self, text: str, user_state: Dict[str, Any],
                          moment: float, user_id: str) -> str:
         """把「姿势 / 位置 / 深度判断 / 阶段」压成一个短语挂到内心话后面。
@@ -966,7 +990,16 @@ class EmotionLayer:
         # P4 验收：不用「·」拼，读感像读数，用「，」更自然
         # ccb.scene_note 内部还是用「·」拼的，我们把它替换掉
         scene = scene.replace("·", "，")
-        note = "，".join(part for part in (scene, feeling) if part)
+        # 进场那一句：她刚才在做什么（v3.1.18）。只在这一场开头 15 分钟内给——
+        # 之后场景本身就是「正在发生的事」，再提就成了复述。
+        bg = ""
+        try:
+            bg_at = _num(user_state.get("ccb_bg_at"), 0.0)
+            if bg_at > 0 and 0.0 <= moment - bg_at <= 900.0:
+                bg = str(user_state.get("ccb_bg") or "")
+        except Exception:  # noqa: BLE001
+            bg = ""
+        note = "，".join(part for part in (bg, scene, feeling) if part)
         return f"{text}（{note}）" if note else text
 
 

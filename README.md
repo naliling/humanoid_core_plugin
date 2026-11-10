@@ -4,7 +4,7 @@
 > 不是一句人设，是一整天的生活。
 > 插件负责她的身体、日程、情绪和关系背景；怎么说话，仍然由大模型按人设自己决定。
 
-![version](https://img.shields.io/badge/version-v3.1.15-2563eb?style=flat-square)
+![version](https://img.shields.io/badge/version-v3.1.34-2563eb?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -158,7 +158,7 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 
 ### 关键配置项
 
-面板上共 144 项（多数带【进阶】标记），这里列真正需要动的：
+面板上共 143 项（多数带【进阶】标记），这里列真正需要动的：
 
 | 项 | 默认 | 什么时候调 |
 | --- | --- | --- |
@@ -167,7 +167,6 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 | `auto_nickname` | 开 | 从消息自带的名字认一次称呼；含数字/emoji/占位词一律不认 |
 | `auto_identify_user` | 关 | 开则注入里用真名区分「她」和「对方」 |
 | `use_llm_schedule` | 开 | 关掉则日程改用本地模板（更省额度，情节也更死板） |
-| `schedule_quality_gate` | 关 | 生成后质量闸：今天排过的别再排、人设里没有的身份/家人/宠物不许凭空出现；判中了先重写一次，仍不合格就换成中性处境词。默认关：它是模型二次自审，实测误判会把整天日程降级成模板 |
 | `schedule_continue_minutes` | 45 | `/拟人 日程继续` 一次把当前这一段往后延长多久 |
 | `schedule_pause_ttl_minutes` | 180 | 被打断的事保留多久（期间她可以自己回去接着做） |
 | `schedule_interrupt_quiet_minutes` | 45 | 距上一条私聊至少隔这么久才算「有人来访」；0 = 每条私聊都算（多人部署慎用） |

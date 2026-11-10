@@ -652,7 +652,7 @@ def _build_report_body(
         f"，今天已过出 {schedule_status.get('slots', 0)} 段（滚动分段，未来不预排）"
     )
     quality = schedule_status.get("quality")
-    if isinstance(quality, dict) and cfg.schedule_quality_gate:
+    if isinstance(quality, dict):
         # 只报计数，不报分数：没有标注就没有分母，「自然度 7/10」是编出来的。
         lines.append(
             "- 质量闸: "
@@ -660,8 +660,6 @@ def _build_report_body(
             f"，重复放行 {int(quality.get('repeat', 0) or 0)} 段"
             f"，编造降级 {int(quality.get('invented', 0) or 0)} 段"
         )
-    elif isinstance(quality, dict):
-        lines.append("- 质量闸: 已关闭（schedule_quality_gate=false）")
     active = str(schedule_status.get("active") or "")
     if active:
         lines.append(f"- 当前段: {active}")

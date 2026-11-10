@@ -35,13 +35,13 @@ class PanelClaimTest(unittest.TestCase):
 
     def test_schema_is_flat_and_counts_match_the_documented_numbers(self):
         schema = _schema()
-        self.assertEqual(len(schema), 144, "顶层项数变了，CHANGELOG 那句 144 项要跟着改")
+        self.assertEqual(len(schema), 143, "顶层项数变了，CHANGELOG 那句 143 项要跟着改")
         conditional = sum(
             1
             for item in schema.values()
             if isinstance(item, dict) and "condition" in item
         )
-        self.assertEqual(conditional, 94, "带 condition 的项数变了，文档里的 94 要跟着改")
+        self.assertEqual(conditional, 93, "带 condition 的项数变了，文档里的 93 要跟着改")
         # AstrBot 只把 type == object 的项渲染成 config-section；没有 object 就没有分组。
         grouped = [
             key
@@ -53,7 +53,7 @@ class PanelClaimTest(unittest.TestCase):
     def test_changelog_panel_sentence_matches_the_flat_schema(self):
         changelog = _read("CHANGELOG.md")
         self.assertIn(
-            "面板是一整块列表，不做分组；144 项里 94 项跟着各自的主开关显隐。",
+            "面板是一整块列表，不做分组；143 项里 93 项跟着各自的主开关显隐。",
             changelog,
             "面板描述被改动或删掉了：M-4 的修法就是这一句，别让它悄悄漂回去",
         )

@@ -274,16 +274,16 @@ class QualityGateTest(unittest.TestCase):
         self.assertEqual(len(gateway.prompts), 1, "接着做同一件事被当成了重复")
         self.assertEqual(status["quality"]["repeat"], 0)
 
-    def test_the_gate_can_be_turned_off(self):
+    def test_deterministic_checks_always_run(self):
+        """v3.1.28：闸门开关删了，确定性检查（重复/编造/睡眠）常开。"""
         service, _ = _service(
             datetime(2026, 8, 22, 9, 0, tzinfo=TZ),
             persona_text="她是一名插画师",
-            schedule_quality_gate=False,
         )
         gateway = ScriptedGateway([seg_reply(event="下午去接孩子放学")])
         status = self._run(service, gateway)
-        self.assertEqual(len(gateway.prompts), 1)
-        self.assertEqual(status["quality"]["rewrite"], 0)
+        self.assertEqual(len(gateway.prompts), 2, "编造要重写一次")
+        self.assertEqual(status["quality"]["rewrite"], 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

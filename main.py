@@ -55,6 +55,7 @@ from .humanoid.clock import Clock
 from .humanoid.input_state import InputStateNotifier
 from .humanoid.sibling_chat import SiblingChatGuard
 from .humanoid import memory_link
+from .humanoid import reply_guard
 
 DATA_SUBDIR = ("plugin_data", "humanoid_core")
 
@@ -1110,6 +1111,62 @@ _ACT_HEADS = (
 _NOUN_EVENTS = {"睡眠": "睡着了"}
 
 
+# 「她自己的情况」只在对方问到她本人时才给（v3.1.18）：跟「她此刻在做什么」同一个
+# 道理——她一直知道自己的日子，但每轮都报备就成了表演。这里给的是事实（今天做过哪几
+# 件事、睡了多久），不是「你要表现出累」这种指令；说不说由她自己定。
+_ASKS_ABOUT_SELF = (
+    "你今天", "今天怎么样", "过得怎么样", "过得如何", "都做了什么", "做了些什么",
+    "累不累", "累吗", "困不困", "饿不饿", "睡得好", "睡好没", "睡够", "身体",
+    "心情", "感觉怎么样", "还好吗", "难受吗", "不舒服吗", "是不是累了",
+)
+
+
+def _asks_about_self(said: str) -> bool:
+    """对方这句话是不是在问她本人（不是问她这会儿在忙什么）。"""
+    text = (said or "").strip()
+    if not text:
+        return False
+    return any(word in text for word in _ASKS_ABOUT_SELF)
+
+
+def _self_state_line(core: Any) -> str:
+    """她今天到现在是什么样的一天：做过哪几件事、睡了多久。
+
+    只给事实，不给「所以你现在应该显得很累」这种指令——知不知道是一回事，说不说
+    是她自己的事。拿不到就返回空串，这一段就不出现。
+    """
+    parts: list[str] = []
+    try:
+        segs = core.schedule.display_segments() or []
+    except Exception:
+        segs = []
+    done: list[str] = []
+    for seg in segs[-8:]:
+        if not isinstance(seg, dict):
+            continue
+        if seg.get("status") or seg.get("sleep"):
+            continue
+        event = str(seg.get("event") or "").strip()
+        if event and event not in done:
+            done.append(event)
+    if done:
+        parts.append("今天到现在做过的事：" + "、".join(done[-5:]))
+    try:
+        snap = core.soma.snapshot() or {}
+        last = float(snap.get("last_sleep_hours") or 0.0)
+        debt = float(snap.get("sleep_debt") or 0.0)
+        if last > 0:
+            line = f"昨夜睡了 {last:g} 小时"
+            if debt >= 0.5:
+                line += f"，这两天还欠着 {debt:g} 小时"
+            parts.append(line)
+    except Exception:
+        pass
+    if not parts:
+        return ""
+    return "她自己的情况：" + "；".join(parts)
+
+
 def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "",
                 is_group: bool = False, said: str = "") -> str:
     """I1/I2：算「此刻的她」那一段（关系阶段 + 心境 + 手头未完的事 + 外界 + 穿搭）。
@@ -1168,6 +1225,14 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
                     day = f"她这会儿{head}" + (f"（{loc}）" if loc else "")
             except Exception:
                 day = ""
+        # 她自己的情况（v3.1.18）：只在对方问到她本人时给；问「在做什么」时不重复给
+        # ——那一条已经由上面 day 覆盖。日程是她自己的，她一直知道；报备才需要理由。
+        self_line = ""
+        if _asks_about_self(said) and not _asks_about_now(said):
+            try:
+                self_line = _self_state_line(core)
+            except Exception:
+                self_line = ""
         # 她手上还没做完的那几件事（`ongoing_tasks`，跨天跟着她）也进这一段。
         # 它本来就只被送去社交侧，从没进过普通对话的注入——于是她「手头正压着件事」
         # 这件事，在跟人聊天时根本不在场。放这里是**免费的**：这一段本来就是每轮重发的
@@ -1218,6 +1283,7 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
                 ("state_stage", stage, 9.0),
                 ("state_tone", tone, 8.0),
                 ("state_day", day, 7.0),
+                ("state_self", self_line, 6.8),
                 ("state_ongoing", ongoing_line, 6.5),
                 ("state_style", style, 6.0),
                 ("state_world", world, 3.0),
@@ -2844,6 +2910,46 @@ class HumanoidCore(Star):
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 注入失败: {e}")
 
+    # -------------------- 出站复读拦截 --------------------
+
+    def _guard_reply(self, core: Any, user_id: str, response: Any, text: str) -> str:
+        """把她自己刚说过的地点/句子从这一条回复里删掉（v3.1.31）。
+
+        线上实例：同一个「我在厨房呢」连着三轮、「刚在沙发养神呢」连着四轮。
+        模型不会变通，那就别让它念——按「这一句在最近三条里已经出现过」删句，
+        删完不空才生效，一句不剩就原样发（宁可复读，不发空消息）。
+
+        只删不写：不换词、不生成新内容，所以不会造出「手边的东西」那种含糊话。
+        `response` 可写时把 `completion_text` 一起改掉，宿主发出去的就是删过的版本。
+        """
+        try:
+            try:
+                recent = [
+                    str(row.get("text", ""))
+                    for row in (core.mood.spoke(user_id) or [])
+                    if isinstance(row, dict)
+                ]
+            except Exception:
+                recent = []
+            if not recent:
+                return text
+            new_text, dropped = reply_guard.trim_repeats(text, recent)
+            if not dropped or not new_text or new_text == text:
+                return text
+            if isinstance(getattr(response, "completion_text", None), str):
+                try:
+                    response.completion_text = new_text
+                except Exception:
+                    return text
+            logger.info(
+                f"{LOG_PREFIX} 出站复读拦截：删掉 {len(dropped)} 句（"
+                + "、".join(dropped)[:60]
+                + "）"
+            )
+            return new_text
+        except Exception:
+            return text
+
     # -------------------- LLM 响应钩子 --------------------
 
     @filter.on_llm_response()
@@ -2874,6 +2980,9 @@ class HumanoidCore(Star):
             # 否则跨 bot 互聊的每句话都在改她的关系数值（审核 跨插件契约 12）。
             if self._is_sibling_peer(event):
                 return
+            # 出站复读拦截（v3.1.31）：她自己最近说过的话（同一个地点、同一句），
+            # 这一条里不再原样念一遍。放在兄弟 bot 判据之后——别人的话不归我们改。
+            text = self._guard_reply(core, user_id, response, text)
             # 收尾守卫：记下她这句，下一轮判断「她是不是已经收过尾了」。
             self._closing_record_out(event, text)
             # P1：她**自己说出口**的话也进 ccb 的账。原来只有用户那一路

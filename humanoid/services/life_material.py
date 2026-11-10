@@ -26,6 +26,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from ..opportunity import MATERIAL_TTL_SECONDS, anchor_key_for, make_card
 from ..wording import pick
+from .schedule_content import species_issues
 
 # ----------------------------------------------------------------------
 # 生活条件：人设正文里出现这些词，才认为她确实有工作/宠物/要照护的人/社交
@@ -173,14 +174,14 @@ MATERIALS: tuple[dict[str, Any], ...] = (
     _m("摊开本子画了一会儿，画到一半卡住了", "书桌前", 40, 90, _WAKING, "画画", "interest", interest="draw"),
     _m("开着窗听外面的动静，跟着哼了几句", "家里", 20, 40, _WAKING, "听歌", "interest", interest="music"),
     _m("窝在沙发上看书，看到一段停下来想了会儿", "客厅", 40, 90, _WAKING, "看书", "interest", interest="read"),
-    _m("开了一局游戏，输了又开一局", "书桌前", 30, 90, _WAKING, "游戏", "interest", interest="game"),
+    _m("把棋子摆开，自己跟自己下了一局", "书桌前", 30, 90, _WAKING, "下棋", "interest", interest="game"),
     _m("出去跑了一圈，回来出了一身汗", "外面", 40, 80, ("早上", "傍晚", "夜里"), "跑步", "interest", interest="sport"),
     _m("照着食谱试了一个新做法，厨房弄乱了", "厨房", 50, 90, ("中午", "傍晚"), "下厨", "interest", interest="cook"),
     _m("给阳台的花浇水，把枯叶剪掉", "阳台", 15, 30, _DAY, "浇花", "interest", interest="plant"),
     _m("找了一部片子看，看完还坐着没动", "客厅", 90, 150, ("下午", "傍晚", "夜里"), "看片", "interest", interest="film"),
     _m("写了一会儿东西，改了又删，最后留下两行", "书桌前", 40, 90, _WAKING, "写东西", "interest", interest="write"),
     _m("带着相机出门转了一圈，拍了几张", "外面", 60, 120, ("上午", "下午", "傍晚"), "拍照", "interest", interest="photo"),
-    _m("把手边的东西拆了又装回去", "书桌前", 40, 80, _WAKING, "手工", "interest", interest="craft"),
+    _m("把桌上的小盒子拆了又装回去", "书桌前", 40, 80, _WAKING, "手工", "interest", interest="craft"),
     _m("弹了会儿琴，把总弹错的那段练顺了", "客厅", 40, 80, _WAKING, "弹琴", "interest", interest="music"),
     _m("临摹了一张画，画完贴在了墙上", "书桌前", 60, 120, _DAY, "临摹", "interest", interest="draw"),
     _m("把攒着的剧看了两集，边看边记了两句台词", "客厅", 60, 120, ("下午", "傍晚", "夜里"), "看剧", "interest", interest="film"),
@@ -189,16 +190,16 @@ MATERIALS: tuple[dict[str, Any], ...] = (
     _m("读完一本书的最后一章，合上书坐了会儿", "客厅", 40, 90, _WAKING, "读完书", "interest", interest="read"),
     # ---- 责任：工作 / 照护 / 宠物，同样只在人设有依据时发 ----
     _m("处理工作上的事，回了几封邮件", "书桌前", 40, 90, _WAKING, "工作", "duty", needs=("job",)),
-    _m("把手上的活往前推了一段，中间歇了一次", "书桌前", 60, 120, _DAY, "干活", "duty", needs=("job",)),
+    _m("把账本摊在桌上，一行行对完，中间起来倒了杯水", "书桌前", 60, 120, _DAY, "对账", "duty", needs=("job",)),
     _m("开了个会，会后又对了一遍细节", "书桌前", 45, 90, ("上午", "下午"), "开会", "duty", needs=("job",)),
-    _m("给家里打了个电话，说了会儿近况", "家里", 15, 30, _WAKING, "电话", "duty", needs=("care",)),
+    _m("给家里写了封信，说了会儿近况", "家里", 15, 30, _WAKING, "写信", "duty", needs=("care",)),
     _m("家里要照看的事忙了一阵才坐下", "家里", 60, 120, _DAY, "照看", "duty", needs=("care",)),
     _m("给猫添了粮，把水碗洗了", "厨房", 10, 20, _WAKING, "喂猫", "duty", needs=("pet",)),
     _m("带狗下楼转了一圈，回来给它擦了脚", "楼下", 25, 45, _WAKING, "遛狗", "duty", needs=("pet",)),
     _m("把明天要用的材料整理好了，列了张单子", "书桌前", 30, 60, ("下午", "傍晚", "夜里"), "整理材料", "duty", needs=("job",)),
     _m("把报价单改了一版，数字核了两遍", "书桌前", 30, 60, ("上午", "下午"), "改报价", "duty", needs=("job",)),
     _m("去公司开了一下午的会，回来嗓子都哑了", "公司", 90, 180, ("上午", "下午"), "去公司", "duty", needs=("job",)),
-    _m("给家里老人打了电话，问了问身体", "家里", 15, 30, _WAKING, "问身体", "duty", needs=("care",)),
+    _m("给家里老人写了封信，问了问身体", "家里", 15, 30, _WAKING, "问身体", "duty", needs=("care",)),
     _m("带猫去宠物店剪了指甲，回来它躲了半天", "宠物店", 60, 120, _DAY, "剪指甲", "duty", needs=("pet",)),
     # ---- 社交：只在人设里提到有朋友/同学/室友/邻居时发 ----
     _m("跟朋友在楼下坐了会儿，聊到忘了时间", "楼下", 60, 110, ("下午", "傍晚", "夜里"), "朋友", "social", needs=("social",)),
@@ -211,7 +212,7 @@ MATERIALS: tuple[dict[str, Any], ...] = (
     _m("帮邻居收了个快递，在门口说了会儿话", "门口", 10, 25, _WAKING, "帮邻居", "social", needs=("social",)),
     # ---- 歇着：什么都不干也是一种状态（注意：这里没有「睡一觉」）----
     _m("在沙发上躺着，翻了两页书就放下了", "客厅", 20, 50, _WAKING, "躺沙发", "rest", wants=True, sensory="书扣在胸口"),
-    _m("什么也不干，坐着发了会儿呆", "客厅", 15, 40, _WAKING, "发呆", "rest", wants=True, sensory="盯着墙上一块影子"),
+    _m("窝在沙发里把毯子裹到下巴，听着窗外的风声打盹", "客厅", 15, 40, _WAKING, "打盹", "rest", wants=True, sensory="毯子有太阳晒过的味道"),
     _m("靠在窗边晒太阳，眼睛都眯起来了", "窗边", 20, 40, ("早上", "上午", "下午"), "晒太阳", "rest", wants=True, sensory="背上晒得发烫"),
     _m("泡了杯东西，坐着慢慢喝完", "客厅", 20, 35, _WAKING, "泡茶", "rest", wants=True, sensory="水汽还没散"),
     _m("把窗户打开，站在阳台上吹了会儿风", "阳台", 10, 20, _WAKING, "吹风", "rest", wants=True, sensory="窗帘被风掀起一角"),
@@ -468,6 +469,7 @@ def materials_for(
     used: Iterable[str] = (),
     segment: str = "",
     asleep: bool = False,
+    species: str = "",
 ) -> list[dict[str, Any]]:
     """抽一批「这个时候她可能做的事」：同一天同一时段稳定，换一天换一批。
 
@@ -483,6 +485,10 @@ def materials_for(
 
     segment 是当前日程段的文本、asleep 是契约里的深睡标记：睡着时只留「夜里醒着」
     这类素材，上班时只留工作与自己的事，午休时把工作档拿掉。
+
+    species 是她的物种（`pony`/`beast`/…，见 species.py）：这个池子是照着人写的，
+    里面有「把门口的鞋摆整齐」「把头发吹干」这种只有人才做得了的事。小马角色拿到
+    这类素材就会照抄进日程——素材层的错必须在这里拦，不能等生成完再改词。
     """
     caps = capabilities(persona_text)
     interests = interests_in(persona_text)
@@ -498,6 +504,7 @@ def materials_for(
             and not _topic_used(str(item.get("topic") or ""), recent)
             and _segment_allows(item, kind)
             and not _used_item(item, used_set)
+            and not species_issues(str(item.get("event") or ""), species)
         )
 
     role_pool = _ordered(
@@ -617,9 +624,9 @@ def material_source(item: Mapping[str, Any]) -> str:
 # `sensory` 就用它；没写的（兴趣/责任/社交这类只在人设有依据时才发的）按档位从
 # 模板池里抽一句——宁可句子泛一点，也不要再退回「大概 N 分钟」。
 SENSORY_TEMPLATES: dict[str, tuple[str, ...]] = {
-    "life": ("手上还有点湿", "身上出了点薄汗", "手边的东西挪了个位置", "衣服上沾了点灰"),
-    "rest": ("手边的东西放着没动", "屋里静得能听见自己呼吸", "坐的这块有点陷下去"),
-    "duty": ("肩上有点发紧", "眼睛盯得有点发干", "手边堆着几张纸"),
+    "life": ("手上还有点湿", "身上出了点薄汗", "桌上的杯子挪了个位置", "衣服上沾了点灰"),
+    "rest": ("桌上的杯子放着没动", "屋里静得能听见自己呼吸", "坐的这块有点陷下去"),
+    "duty": ("肩上有点发紧", "眼睛盯得有点发干", "桌上堆着几张纸"),
     "social": ("嘴角还带着点笑", "说话说得嗓子有点干", "耳边还留着刚才的动静"),
     "rare": ("手上还沾着点灰", "心里还惦记着刚才那下", "屋里比平时乱一点"),
     "interest": ("手上还留着刚才的劲", "眼睛有点发酸", "肩颈僵着没松开"),

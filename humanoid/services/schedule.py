@@ -13,7 +13,7 @@ import math
 import random
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from ..clock import Clock
@@ -21,6 +21,11 @@ from ..config import HumanoidConfig
 from ..jsonx import extract_json_array, extract_json_object
 from ..llm import OUTCOME_GATED, OUTCOME_OK, LLMGateway, LLMResult, ProviderResolver
 from ..persona import PERSONA_PROMPT_MAX, Persona, truncate
+from ..role_basics import PROFILE_KEY as BASICS_KEY
+from ..role_basics import age_at as _basics_age
+from ..role_basics import merge_missing as _basics_merge
+from ..role_basics import parse_basics as _basics_parse
+from ..role_basics import render_basics as _basics_render
 from ..role_scope import RoleScope
 from ..slots import (
     DAY_MINUTES,
@@ -38,10 +43,26 @@ from ..wording import pick
 from .habit import archive_day, habit_lines, history_of, render_habits
 from .life_material import (
     CAPABILITY_WORDS as _EXAMPLE_NEEDS,
+    material_minutes,
     materials_for,
     render_materials,
 )
 from .plans import load_plans, note_plans, render_plans
+from .schedule_content import (
+    build_slate,
+    clean_slots as _clean_slots,
+    content_issues,
+    fix_hint as _content_fix_hint,
+    is_clean as _content_ok,
+    is_displayable as _displayable,
+    low_info_issues,
+    object_issues as _life_object_issues,
+    render_slate as _render_slate,
+    overall_mood,
+    slate_block as _slate_block,
+    species_issues,
+    species_note,
+)
 from .role_materials import (
     ROLE_MATERIALS_COUNT,
     ROLE_MATERIALS_MIN,
@@ -61,7 +82,61 @@ SOURCE_TEMPLATE = "template"
 SOURCE_LLM = "llm"
 MIN_RETRY_BACKOFF_SECONDS = 60.0
 
+#: 单飞闸/后台任务的卡住阈值（秒，v3.1.20）。模型或网关挂住时 `_generating` 与
+#: `_task` 都不会复位，后台每 30 秒都被这两道闸挡回，时间线从此不再推进——
+#: 实测就是「角色明明在跑，日程停在几小时前」。超时后强制复位/取消，下一轮重来。
+GENERATION_STALL_SECONDS = 600.0
+
+#: 空档自愈补的是 `dynamic_segment` 的处境词（「安静待着」「忙自己的事」）。没人说话时
+#: 闸门按「空闲静默」一直挡着模型，自愈就会一段接一段地补下去，一整天全是处境词——
+#: 时间线是连续的，但里面没有一件真事。这里给补位后的那一段留一次「让模型真正接班」
+#: 的机会：只要当前这段是自愈补出来的处境段，就允许越过空闲静默一次，一小时最多一次
+#: （每日预算照旧，预算用完就等明天）。只越过空闲静默，不越过预算与卡住保护。
+HEAL_CATCHUP_SECONDS = 3600.0
+HEAL_CATCHUP_WINDOW_SECONDS = 900.0
+# 整段都还是本地兜底（重载后 `_healed_at` 丢了）时，给模型接手一次的限频。
+# 一小时太紧：这类角色没人说话，一小时内根本轮不到它；四小时够把一整天的
+# 处境段换成真事，又不至于每轮都去砸模型。
+HEAL_IDLE_CATCHUP_SECONDS = 4 * 3600.0
+# 接班限频的落盘键：只在内存里的话，每次重载都会多送一次模型调用。
+HEAL_GEN_KEY = "schedule_heal_gen_wall"
+# 旧状态清理（v3.1.28）：设备词/含糊词曾经写进日程，读的时候过滤不够，
+# 得在 state 里真的删掉。跑过一次就记版本，别每次启动都扫。
+PURGE_KEY = "schedule_purged_v"
+PURGE_VERSION = 7
+# 被下一段从中间截断时，剩下的那一小截值不值得留（v3.1.29）。
+# 3 分钟的「把窗户打开」不是一段生活，是拼接留下的碎渣；短于这个数就把整段
+# 撤掉（睡眠段例外：觉不能被删），免得日程里出现「太短」的段。
+MIN_TRUNCATED_STUB_MINUTES = 15
+
 SLEEP_EVENT = "睡眠"
+
+#: 质量闸计数的落盘键（v3.1.17）：跨重启累计，不随会话清空。
+QUALITY_STATS_KEY = "schedule_quality_stats"
+#: 计数项全集（v3.1.30）：角色一建起来就把这些键写成 0，`status()` 里读到的不是空表。
+#: 只在命中时写的话，从没触发过闸的角色永远是「没有计数」，看起来像没在统计。
+QUALITY_KEYS = (
+    "repeat",           # 当天重复了上一段
+    "invented",         # 事件里的事实没有依据（编造）
+    "rewrite",          # 触发了一次重写
+    "fallback",         # 用候选/处境词顶替了模型那一段
+    "template_fallback",  # 模板兜底（旧路径，保留计数位）
+    "stall",            # 生成卡住被复位
+    "low_info",         # 空话（「忙自己的事」这类）
+    "content",          # 设备 / 含糊 / 私事
+    "content_final",    # 最终硬闸拦下
+)
+#: 被质量闸拒过的写法（v3.1.17）：下次摆候选时过滤掉，免得同一句被反复重新发明。
+REJECTS_KEY = "schedule_rejects"
+REJECTS_MAX = 12
+
+#: 她自己的私事（v3.1.18）：只有真的发生过才记一条，不进日程、不喂给生成。
+#: 写进日程会被下一轮生成当素材，于是同一件事反复重演——那就成了「每晚都有」。
+INTIMATE_KEY = "schedule_intimate"
+#: 同一天最多记几条：这不是计数任务，是「今天有没有过」这一层记性。
+INTIMATE_MAX_PER_DAY = 4
+#: 记完之后多久之内不再提（分钟）：身体需要缓，日程也不该连着两段都写这个。
+INTIMATE_REST_MINUTES = 180
 
 # 一段的时长边界：最短 3 分钟；清醒的事最长 3 小时；一觉最长 12 小时（跨午夜）。
 #
@@ -428,6 +503,10 @@ def _clean_dreams(raw: Any) -> list[str]:
                 break
         text = text[:DREAM_MAX_CHARS]
         if not text or text in out:
+            continue
+        if content_issues(text):
+            # 梦里出现手机/屏幕，或「手边的东西」这种含糊说法：这条梦不要。
+            # 梦会进 `/查看日程` 与提示词，留着就是又一个回流口（v3.1.16）。
             continue
         out.append(text)
         if len(out) >= DREAM_MAX_ITEMS:
@@ -966,6 +1045,21 @@ def body_reference_block(body: dict[str, Any] | None, now_text: str) -> str:
         lines.append(f"- 睡眠债：{body['sleep_debt']} 小时（连续缺觉累积，越高越需要补觉）")
     if "last_sleep_hours" in body:
         lines.append(f"- 昨晚睡了：{body['last_sleep_hours']} 小时")
+    # v3.1.17：soma 的 9 个活值全部递进来。之前只给 6 个，冷/不适/亲近/想说话
+    # 这几项在生成日程时根本看不见，模型只能靠猜。
+    if "discomfort" in body:
+        lines.append(f"- 身体不适：{body['discomfort']}/100（越高越难受，别让她硬撑）")
+    if "chill" in body:
+        lines.append(f"- 觉得冷：{body['chill']}/100（越高越想添件衣服、喝口热的）")
+    if "arousal" in body:
+        lines.append(
+            f"- 身体想要亲近的程度：{body['arousal']}/100"
+            "（影响她愿不愿意靠近人，不影响她要不要做事）"
+        )
+    if "social_desire" in body:
+        lines.append(f"- 想跟人说话的程度：{body['social_desire']}/100（越高越想找人聊两句）")
+    if "asleep" in body:
+        lines.append("- 这会儿她是睡着的" if body.get("asleep") else "- 这会儿她是醒着的")
     if body.get("cycle"):
         lines.append(f"- 生理周期：{body['cycle']}")
     return "\n".join(lines) + "\n\n"
@@ -1001,11 +1095,11 @@ EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
     # 中：要坐下来做、要动手的一件完整的事
     (
         {"event": "做了点吃的，吃完把锅洗了", "location": "厨房", "emotion": "踏实", "energy_rate": 0.04, "minutes": 55},
-        {"event": "把手头的事往下推了一段，中间歇了一次", "location": "书桌前", "emotion": "有点进展", "energy_rate": -0.05, "minutes": 75},
+        {"event": "把摊在桌上的稿纸理成一叠，一行行改下去", "location": "书桌前", "emotion": "有点进展", "energy_rate": -0.05, "minutes": 75},
         {"event": "洗了个澡，把头发吹干，换了身衣服", "location": "浴室", "emotion": "松下来", "energy_rate": 0.05, "minutes": 45},
         {"event": "去楼下超市把缺的东西补上", "location": "超市", "emotion": "例行公事", "energy_rate": -0.06, "minutes": 50},
         {"event": "把攒下的衣服洗了晾好，顺手把地也扫了", "location": "家里", "emotion": "屋里清爽了", "energy_rate": -0.05, "minutes": 60},
-        {"event": "把手上的活儿收了个尾，顺手记下明天要接的地方", "location": "书桌前", "emotion": "告一段落", "energy_rate": -0.06, "minutes": 80, "needs": ("job",)},
+        {"event": "把写好的稿子收进抽屉，顺手记下明天要接的地方", "location": "书桌前", "emotion": "告一段落", "energy_rate": -0.06, "minutes": 80, "needs": ("job",)},
         {"event": "带狗下楼转了一圈，回来给它擦了脚", "location": "楼下", "emotion": "被拽着走", "energy_rate": -0.04, "minutes": 40, "needs": ("pet",)},
         {"event": "收拾了一遍屋子，把该洗的泡上了", "location": "家里", "emotion": "屋里清爽了", "energy_rate": -0.05, "minutes": 60, "needs": ("care",)},
         {"event": "跟人聊了一阵，把要说的事说完了", "location": "客厅", "emotion": "说开了", "energy_rate": -0.03, "minutes": 45, "needs": ("social",)},
@@ -1021,7 +1115,7 @@ EXAMPLE_BANDS: tuple[tuple[dict[str, Any], ...], ...] = (
     ),
     # 歇着：什么都不干也是一种状态，但它是「歇着」，不是一个动作
     (
-        {"event": "靠在椅背上放空，什么也没干", "location": "客厅", "emotion": "什么都没想", "energy_rate": 0.03, "minutes": 30, "wants": True},
+        {"event": "靠在椅背上闭着眼歇了会儿，窗外的光落在膝盖上", "location": "客厅", "emotion": "什么都没想", "energy_rate": 0.03, "minutes": 30, "wants": True},
         {"event": "听着窗外的声音，躺着没动", "location": "卧室", "emotion": "缓过来一点", "energy_rate": 0.04, "minutes": 40, "wants": True},
         {"event": "坐在窗边看外面，发了一会儿呆", "location": "窗边", "emotion": "空落落的", "energy_rate": 0.02, "minutes": 30, "wants": True},
         {"event": "在沙发上躺着，翻了两页书就放下了", "location": "卧室", "emotion": "有点空", "energy_rate": 0.02, "minutes": 50, "wants": True},
@@ -1150,6 +1244,9 @@ def segment_prompt(
     # 今天的素材（v3.0.10）：这个钟点她可能做的事，已按人设与近期去重筛过。
     # 只给可能性，不给「所以该做什么」——挑哪件、做多久还是她的事。
     materials: str = "",
+    # 候选清单（v3.1.16）：已经过筛、带编号的「可以选的事」，整段渲染好递进来。
+    # 生成方式从「自由写」改成「选着写」——候选里没有设备、没有含糊占位词。
+    slate: str = "",
     # 今天已经睡了多少（分钟）：判断这一段要不要睡时的客观输入。0 表示不给这一段。
     day_sleep_minutes: int = 0,
     # 过去几周她自己长出来的习惯（v3.0.10）：只在她真的重复过时才给，空串表示没有。
@@ -1157,6 +1254,18 @@ def segment_prompt(
     # 她自己在对话里说过的「今天要办的事」（v3.0.10）：只认带明确日期/时间的计划，
     # 已经从原话里抽好、按天存过。空表表示没有——那就只当普通的一天。
     plans: list[str] | None = None,
+    # 她今天整体是什么心境（v3.1.18）：一句状态 + 一句依据，只来自她自己的身体，
+    # 不看任何一个人的好感。空串表示今天没有明显偏向，prompt 里连标题都不出现。
+    mood: str = "",
+    # 最近三小时里有过私事时的一句身体状态（v3.1.18）：只写「身子还软着」这类，
+    # 不写细节、不当素材——日程里不排这种事。
+    intimate: str = "",
+    # 她的物种（v3.1.33）：认出非人形时给一句「她是天马，没有手指和鞋」。空串
+    # 表示还没认出来或是人形——那就不加这一段，旧调用一个字都不变。
+    species: str = "",
+    # 她的基本信息（v3.1.33）：名字、年龄、生日。年龄是按生日现算的，跨年自己长，
+    # 不靠改状态。空串表示这份档案还没有。
+    basics: str = "",
 ) -> str:
     """只决定「从现在起的这一段」：不排一整天，不提前安排以后的事。
 
@@ -1306,6 +1415,9 @@ def segment_prompt(
         "不用逐条回应。\n\n"
         if materials else ""
     )
+    # 候选清单（v3.1.16）：摆出来的都是过筛的具体事，模型可以直接选编号。
+    # 没有候选时这一段整块消失——旧调用（测试、社交层）一个字都不变。
+    slate_section = slate if slate else ""
     # 她自己的习惯（v3.0.10）：过去几周她这个钟点常做什么、一般几点起睡。
     # 用户原话：「没有从她过去几周日程长出来的习惯」——生成侧以前只看得到今天和
     # 昨天，每天从零挑事，于是天天那几件。习惯只说明她偏向怎么过，不替她决定今天。
@@ -1339,10 +1451,27 @@ def segment_prompt(
     except (TypeError, ValueError):
         _pressure = 0.0
     pressure_crossed = bool(body_pressure) or _pressure >= CHANGE_TRIGGER_SLEEP_PRESSURE
-    # 「怎么决定」从 9 起顺延。9/10 是每个角色都该看到的规则（凌晨也是她的一天、
-    # 勤快不是默认值）；后面两条只在对应处境下出现，编号顺延，免得平时白占 prompt。
+    # 「怎么决定」从 9 起顺延。9 是设备/含糊词的硬规则（v3.1.16）；10/11 是每个
+    # 角色都该看到的规则（凌晨也是她的一天、勤快不是默认值）；后面两条只在对应
+    # 处境下出现，编号顺延，免得平时白占 prompt。
     rule_no = 9
     extra_rules = (
+        # 设备词与含糊词（v3.1.16）：旧做法是生成完再替换（手机→手边的东西），
+        # 换出来的含糊词又被注入回提示词，模型再补回具体物，循环往复。规则写在
+        # 生成前，并明说「别写手边的东西」——那个词本身就在教模型偷懒。
+        f"{rule_no}. 她的世界没有手机、电脑、屏幕这类东西，也没有「手边的东西」这种含糊说法：\n"
+        "   要写手里有事，就写具体的东西（书、本子、杯子、碗、毛线、纸、窗外的树）；\n"
+        "   别写「手边的东西」「某个东西」——读者不知道那是什么，模型自己也会把它补回手机。\n"
+    )
+    rule_no += 1
+    extra_rules += (
+        # 私事不进日程（v3.1.18）：日程会被下一轮生成当素材，写进去就会反复重演。
+        # 只禁「排进日程」，不禁她在别处说自己想要什么——那是另一条线。
+        f"{rule_no}. 日程里不写亲密/性这类事：那是她自己的私事，不排进日常，"
+        "也不许用替换词把它写进去。\n"
+    )
+    rule_no += 1
+    extra_rules += (
         # 当天去重（v3.0.6）：history_block 早就把今天过完的时段列出来了，但从没说过
         # 「别再排一遍」。于是「上午在厨房弄吃的」到下午能再出现一次——看起来不是
         # 她过日子，是模型在填表。
@@ -1387,6 +1516,29 @@ def segment_prompt(
             "不困就做点别的（上面那些素材里挑一件，或者她自己想做的事）。\n"
         )
 
+    # 整体心境（v3.1.18）：一句状态加一句依据。它和身体读数一样是输入，
+    # 不是「所以写成什么样」的指令——怎么写还是她自己的事。
+    mood_block = ""
+    if mood:
+        mood_block = f"【她今天整体】{mood}\n\n"
+    # 身上的状态（v3.1.18）：最近有过私事时只给「身子还软着」这一句，
+    # 不写发生了什么；没有就是空串。
+    intimate_block = ""
+    if intimate:
+        intimate_block = f"【她身上的状态】{intimate}\n\n"
+    # 她的身体形态（v3.1.33）：物种档案早就认出了小马，日程链路却一直按人写。
+    # 只陈述事实（没有手指、没有鞋），不给「所以你要写……」的清单。
+    species_block = ""
+    if species:
+        species_block = (
+            "【她的身体】" + species + "\n"
+            "  这一段写她做什么时，动作得是这具身体做得到的。\n\n"
+        )
+    # 她的基本信息（v3.1.33）：名字、年龄、生日。年龄是现算的，不写进状态也不改。
+    basics_block = ""
+    if basics:
+        basics_block = f"【她的基本信息】{basics}\n\n"
+
     return (
         persona_block(persona, cfg.schedule_persona_max_chars)
         # 人设线索紧跟在人设原文后面：模型先读到「她是谁」，再读从这段文字里
@@ -1397,9 +1549,13 @@ def segment_prompt(
         + prev_line
         + "\n"
         + body_reference_block(body, now_text)
+        + basics_block
+        + species_block
+        + mood_block
         + frame_block
         + sleep_block
         + materials_block
+        + slate_section
         + habits_block
         + plans_block
         + world_block
@@ -1408,6 +1564,7 @@ def segment_prompt(
         + night_line
         + interrupt_line
         + event_line
+        + intimate_block
         + asleep_heard_block
         + switch_block
         + suspended_block
@@ -1479,6 +1636,12 @@ def segment_prompt(
         + (
             "   如果上面给了【被打断之前】那一段，想回去接着做时输出 {\"resume\": true}。\n"
             if _susp_event else ""
+        )
+        + (
+            # 选着写（v3.1.16）：候选清单里已经过筛，选编号比自己写更稳。
+            "   想用【可以选的事】里某一条，就写 \"pick\": 编号（再补 emotion / energy_rate "
+            "即可，location 与 minutes 不写就按那条来）。\n"
+            if slate_section else ""
         )
         + f"4. minutes：这一段做多久。清醒时最短 {SEGMENT_AWAKE_MIN_MINUTES} 分钟——"
         "一段是一件有头有尾、说得出口的事（做顿饭、出门办件事、洗个澡收拾好），"
@@ -1646,13 +1809,34 @@ _FACT_CHECKS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
 )
 
 
+#: 口语变形里最常挡在触发词前面的几个虚字（v3.1.17）。
+#:
+#: 触发词写的是「开会」「上班」，模型写的是「开了个会」「上了一天班」——
+#: 子串匹配直接落空，编造就漏过去了（实测：`去公司开了个会` 判不出来）。
+#: 只在**事件文本**这一侧去掉这些字再比；依据原文不动，免得把「养了」压成「养」
+#: 之后跟人设里的「养花」撞上，把没有宠物的人判成有宠物。
+_FACT_NOISE_RE = re.compile(r"[了着过个]")
+
+
+def _fact_text(text: str) -> str:
+    """把「开了个会」「上了一天班」压回词干，专供触发词匹配。
+
+    「一天/半天/整天」这类量词夹在动词和名词中间（上了一天班），
+    光去虚字还剩「上一天班」，触发词「上班」照样匹配不到，所以一并抹掉。
+    """
+    body = _FACT_NOISE_RE.sub("", str(text or ""))
+    for word in ("一天", "半天", "整天", "一整天"):
+        body = body.replace(word, "")
+    return body
+
+
 def invented_facts(event: str, evidence: str) -> list[str]:
     """事件里出现的、依据里找不到出处的身份/关系/约定词（没有就返回空列表）。
 
     `evidence` 为空时一律返回空：**「人设没读到」不等于「人设里没有这只猫」**，
     没有依据文本就没有判定基准，这时候不判比误判好。
     """
-    text = str(event or "")
+    text = _fact_text(event)
     basis = str(evidence or "")
     if not text or not basis:
         return []
@@ -1672,6 +1856,15 @@ def _event_key(text: str) -> str:
     return _ongoing_stem(cleaned)
 
 
+def _content_codes(issues: Sequence[str]) -> list[str]:
+    """从 issue 列表里挑出设备/含糊/物种那几条（`设备:手机` / `含糊:手边` / `物种:鞋`）。"""
+    return [
+        str(code)
+        for code in issues
+        if str(code).startswith(("设备:", "含糊:", "物种:"))
+    ]
+
+
 def _quality_fix_block(issues: list[str], invented: list[str], reason: str = "") -> str:
     """重写时追加的那一段：只说哪里不对，不重写整份规则（规则已经在上面的 prompt 里）。
 
@@ -1681,6 +1874,9 @@ def _quality_fix_block(issues: list[str], invented: list[str], reason: str = "")
     lines = ["", "【上一版没通过】"]
     if "repeat" in issues:
         lines.append("- 上面【今天到这会她已经过完的时段】里已经有这件事了，换一件别的。")
+    content = _content_codes(issues)
+    if content:
+        lines.append(_content_fix_hint(content))
     if invented:
         lines.append(
             "- 这件事里的"
@@ -1713,98 +1909,47 @@ def _slot_minutes(slot: Mapping[str, Any]) -> int:
     return hi - lo
 
 
-def _review_prompt(
-    *,
-    now_text: str,
-    prev: Mapping[str, Any] | None,
-    slot: Mapping[str, Any],
-    persona_text: str,
-) -> str:
-    """审查这一段的提示词（v3.0.11）：只判「接不接得上」，不合格就顺手改好。
-
-    为什么要有这一步：规则写在生成 prompt 里是「请求」，模型写完不会回头检查。
-    而「上一段 09:05 在卧室结束，这一段 09:06 在超市」「倒杯水占了半小时」这种
-    错，只有把两段摆在一起才看得见。判不通过时不降级成中性段，而是让它按自己
-    说出的原因改一版——判定与修改由同一个模型完成，改完直接用。
-    """
-    lines = ["【审查这一段】"]
-    lines.append(f"现在 {now_text}。")
-    if prev:
-        lines.append(
-            "她刚过完的上一段："
-            f"{str(prev.get('event') or '').strip()}"
-            f"（{str(prev.get('location') or '家中').strip()}，"
-            f"{str(prev.get('start') or '')}–{str(prev.get('end') or '')}）"
-        )
-    else:
-        lines.append("今天还没有上一段。")
-    lines.append(
-        "这一版生成的下一段："
-        f"{str(slot.get('event') or '').strip()}"
-        f"（{str(slot.get('location') or '家中').strip()}，"
-        f"{str(slot.get('start') or '')}–{str(slot.get('end') or '')}，"
-        f"约 {_slot_minutes(slot)} 分钟）"
-    )
-    lines.append("")
-    lines.append("只判一件事：这一段接上去说不说得通。看五点：")
-    lines.append("- 时间：上一段结束到这一段开始，够不够她收拾、走路、准备？（她不会瞬移）")
-    lines.append("- 地点：从上一段的地点到这里，是不是可能？（在家要去外面得出门，外面回来要进门）")
-    lines.append("- 时长：这个动作值不值得这么久？（倒杯水、洗把脸不该占半小时；通勤、做饭、开会才可能长）")
-    lines.append("- 事实：有没有凭空多出来的家人、宠物、同事、预约、约定？")
-    lines.append("- 重复：是不是把上一段同一件事换个说法又排了一遍？")
-    if persona_text.strip():
-        lines.append("")
-        lines.append("她是谁（判断依据，不要照抄）：")
-        lines.append(persona_text.strip()[:600])
-    lines.append("")
-    lines.append('合格就只回 {"ok": true}。')
-    lines.append(
-        '不合格就回 {"ok": false, "reason": "一句话说清哪里不对", '
-        '"fixed": {"event": "改好的事", "location": "地点", "minutes": 20}}——'
-        "能留的都留着，只改不对的地方，时长按这件事本身算。"
-    )
-    lines.append("只输出一个 JSON 对象，不要解释。")
-    return "\n".join(lines)
 
 
 
 # ---- 设备词：不进日程 ----
-# 为什么加（v3.1.12 补丁）：验收层把「手机/屏幕」判成打破第四面墙（她活在对话里，
-# 不活在设备里），而日程素材池原来自己就在写「躺着刷手机」「屏幕的光照在脸上」。
-# 模型照着素材写 → 社交层整条判掉 → 私聊一条也发不出去（实测一天 15 条尝试全被拦）。
-# 所以两头一起改：素材/提示词不再教她玩手机，这里再把模型自己编出来的设备词换掉。
-_DEVICE_SWAPS: tuple[tuple[str, str], ...] = (
-    ("刷手机", "翻两页书"),
-    ("看手机", "看看窗外"),
-    ("玩手机", "翻两页书"),
-    ("手机", "手边的东西"),
-    ("屏幕", "窗玻璃"),
-    ("电脑", "桌上的本子"),
-    ("平板", "桌上的本子"),
-    ("键盘", "桌上的本子"),
-    ("鼠标", "桌上的本子"),
-    ("充电器", "插座"),
-    # v3.1.14：光删「手机/屏幕」不够——模型会从「回消息」「打字」再推回设备。
-    # 实测 16:17 / 16:54 两条破冰都是这么写出来的（「翅膀托着手机给姐姐打字」）。
-    ("打字", "慢慢写字"),
-    ("发消息", "说两句话"),
-    ("回消息", "回话"),
-    ("看消息", "看看窗外"),
-    ("消息", "话"),
-    ("耳机", "窗户"),
-    ("充电线", "线绳"),
-)
+# 为什么曾经有替换器（v3.1.12 补丁）：验收层把「手机/屏幕」判成打破第四面墙（她活在
+# 对话里，不活在设备里），而日程素材池原来自己就在写「躺着刷手机」「屏幕的光照在脸上」。
+# 当时的做法是生成完再换词（手机→手边的东西、屏幕→窗玻璃、消息→话）。
+#
+# v3.1.16 删掉这套替换器：它把具体物换成含糊词，含糊词又被写进日程、再注入回提示词，
+# 模型看到含糊词就自己补回具体物，再被换一次——禁词表越加越长，句子越改越病句
+# （「给姐姐发消息」→「给姐姐发话」）。现在改成两头：
+#   · 生成前：`schedule_content.build_slate` 把过筛的候选摆出来让模型选；
+#   · 生成后：`schedule_content.content_issues` 只判定，不合格重写一次，
+#     仍不合格降级成处境词，脏文本绝不写进状态。
 
 
-def scrub_device_text(text: str) -> str:
-    """把设备词换成不涉及设备的具体说法（保持句子还能读）。"""
-    out = str(text or "")
-    if not out:
-        return out
-    for bad, good in _DEVICE_SWAPS:
-        if bad in out:
-            out = out.replace(bad, good)
-    return out
+def _pick_from_slate(
+    raw: Mapping[str, Any], slate: Sequence[Mapping[str, Any]] | None
+) -> Mapping[str, Any] | None:
+    """模型用 `pick` 选了候选清单里的第几条（编号从 1 起）。选不到返回 None。
+
+    编号读不出来或越界都当没选：宁可让它自己写的那版走质量闸，也不要猜错一条。
+    """
+    if not slate:
+        return None
+    value: Any = raw.get("pick")
+    if value in (None, ""):
+        for key in ("choice", "option", "index", "选"):
+            if raw.get(key) not in (None, ""):
+                value = raw.get(key)
+                break
+    if value in (None, ""):
+        return None
+    try:
+        index = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if 1 <= index <= len(slate):
+        return slate[index - 1]
+    return None
+
 
 def parse_segment(
     raw: Any,
@@ -1813,6 +1958,7 @@ def parse_segment(
     step: int = 1,
     prev: Slot | None = None,
     suspended: Slot | dict | None = None,
+    slate: Sequence[Mapping[str, Any]] | None = None,
 ) -> Slot | None:
     """把模型返回的这一段规范化成一个 slot。
 
@@ -1823,6 +1969,10 @@ def parse_segment(
     `resume=true`（优先级高于 continue）时用 `suspended` 里那件被打断的事重建
     这一段的开头：start = 现在，minutes = 剩余分钟数（下限 SEGMENT_MIN_MINUTES），地点/心情/进度
     沿用。没有 `suspended` 时 resume 不生效，按普通回复解析。
+
+    `slate`（v3.1.16）：生成前递给模型的那份候选清单。模型回 `{"pick": 3}` 时按
+    编号取回事件/地点/时长，它自己另写的字段优先。这里**不做设备词替换**——脏文本
+    由质量闸判定、重写、降级处理，解析层只管结构与时间。
     """
     if isinstance(raw, list):
         raw = _pick_from_array(raw, now_minute)
@@ -1831,7 +1981,7 @@ def parse_segment(
     prev = prev or {}
     # 回去接着做被打断之前那件事：continue 与 resume 同时出现时以 resume 优先。
     susp = suspended if isinstance(suspended, Mapping) else {}
-    suspended_event = scrub_device_text(_clip_event(str((susp or {}).get("event") or "")))
+    suspended_event = _clip_event(str((susp or {}).get("event") or ""))
     want_resume = _truthy_flag(raw.get("resume")) and bool(suspended_event)
     if want_resume:
         # 挂起记录里带着解析时的睡着判定：醒来前被打断的那件事可能没有睡词。
@@ -1879,6 +2029,19 @@ def parse_segment(
         want_continue = want_continue.strip().lower() in ("true", "1", "yes", "是", "继续")
     want_continue = bool(want_continue) and bool(str(prev.get("event") or "").strip())
 
+    # 选着写（v3.1.16）：模型可以只回 {"pick": 3}，事件/地点/时长按候选清单取。
+    # 它自己另写的字段优先——「选了一条，但改了个更贴她的说法」是允许的。
+    picked = _pick_from_slate(raw, slate) if not want_continue else None
+    if picked is not None:
+        merged = dict(picked)
+        for key, value in raw.items():
+            if key in ("pick", "choice", "option", "index", "选"):
+                continue
+            if value in (None, "", 0, 0.0, [], {}):
+                continue
+            merged[key] = value
+        raw = merged
+
     # 原文留着判「是不是睡着」：截断之后，睡字常常正好被切掉（存的是 `_clip_event`
     # 削过的短句，判睡一律看原文）。存盘只做粗上限，24 字留到渲染时再削。
     raw_event = str(raw.get("event") or "").strip()
@@ -1886,10 +2049,6 @@ def parse_segment(
     if want_continue:
         raw_event = str(prev.get("event") or "").strip()
         event = _clip_event(raw_event, limit=_EVENT_STORE_MAX)
-    # 设备词不进日程：模型自己编出来的「手机/屏幕」也在这里换掉，
-    # 不然社交层验收会整条判掉（素材池已经先改过一轮）。
-    raw_event = scrub_device_text(raw_event)
-    event = scrub_device_text(event)
     if not event:
         return None
 
@@ -2152,13 +2311,16 @@ def dynamic_segment(
             event = pick("seg_morning", seed_key, ("醒神", "赖床"))
             emotion, rate, minutes = "清醒中", -0.05, 60
         elif 9 <= hour < 12:
-            event = pick("seg_forenoon", seed_key, ("忙自己的事", "手头有东西要处理"))
+            # 上午的处境词换成**具体的小事**：旧版给「忙自己的事 / 手头有东西要处理」，
+            # 读起来像活动其实什么也没说，还会被读者追着问「在忙什么」（v3.1.29）。
+            event = pick("seg_forenoon", seed_key, ("把桌子擦了", "把碗洗了", "把衣服叠好", "整理一下抽屉"))
             emotion, rate, minutes = "专注", -0.07, 90
         elif 12 <= hour < 14:
             event = pick("seg_noon", seed_key, ("吃饭", "吃午饭"))
             emotion, rate, minutes = "放松", 0.08, 45
         elif 14 <= hour < 18:
-            event = pick("seg_afternoon", seed_key, ("做事", "忙手里的活"))
+            # 同上：下午也给具体的事，不再用「做事 / 忙手里的活」这种空话（v3.1.29）。
+            event = pick("seg_afternoon", seed_key, ("把地扫了", "把菜择好", "擦一遍窗台", "收拾一下厨房"))
             emotion, rate, minutes = "平稳", -0.06, 90
         elif 18 <= hour < 20:
             event = pick("seg_evening_meal", seed_key, ("做饭", "弄吃的"))
@@ -2245,9 +2407,21 @@ class ScheduleService:
             "rewrite": 0,
             "fallback": 0,
             "template_fallback": 0,
+            "content": 0,
+            "content_final": 0,
+            "low_info": 0,
         }
         # 失败退避的计时源：必须可注入，否则测试无法验证「退避窗口内不再投递」。
         self._monotonic = monotonic or time.monotonic
+        # 卡住看门狗（v3.1.20）：`_generating` 与 `_task` 的开始时刻。0 表示没在跑。
+        self._generating_since = 0.0
+        self._task_since = 0.0
+        # 空档接班（v3.1.21）：上一次自愈补位的时刻、上一次「越过空闲静默让模型接班」的时刻。
+        self._healed_at = 0.0
+        self._heal_gen_at = 0.0
+        # 决策层已经放行、等 `ensure_fresh` 真的去调模型时再落「接班过」的时间戳。
+        self._catch_up_armed = False
+        self._restore_heal_marks()
         # 日程得按她是谁来排：递一个 async () -> Persona 进来，不递就不读人设。
         self._persona = persona_provider
         # 身体参考数值的来源：递一个 () -> dict 进来，每次决策现取活值。
@@ -2504,7 +2678,7 @@ class ScheduleService:
                 seen = float(item.get("at", 0.0) or 0.0)
             except (TypeError, ValueError):
                 seen = 0.0
-            if text and seen >= cutoff:
+            if text and seen >= cutoff and _content_ok(text):
                 items.append((seen, text))
         # 超量时留**最近**报的几件：旧写法直接取列表前三个，而列表按插入顺序排，
         # 留下的正好是最旧的三件——最该被顶掉的反倒先喂给模型。
@@ -2522,7 +2696,8 @@ class ScheduleService:
         「她主动停止报告」的条目生效：同一件事一直报就一直续命，别的条目也跟着续命。
         """
         text = str((slot or {}).get("ongoing", "") or "").strip()[:40]
-        if not text:
+        if not text or not _content_ok(text):
+            # 跨天任务会一路跟到明天、每段都塞回提示词：脏的那条不记。
             return
         raw = self._scope.get_self(self.ONGOING_KEY)
         items = [i for i in raw if isinstance(i, dict)] if isinstance(raw, list) else []
@@ -2555,7 +2730,9 @@ class ScheduleService:
         carry = self._carry_slot()
         if carry is not None:
             segs = segs + [carry]
-        return segs
+        # 旧存档里的脏段（设备词/含糊词）不进这一份：契约、社交层、日框、梦都从这里取，
+        # 漏一段就等于把「用蹄子夹着手边的东西」再喂出去一次（v3.1.16）。
+        return self._clean(segs)
 
     def _covering(self, segs: list[Slot], minutes: int) -> Slot | None:
         for slot in segs:
@@ -2587,6 +2764,10 @@ class ScheduleService:
         `segs` 传入时按已排序处理。
         """
         ordered = self._ordered_segments() if segs is None else segs
+        # 旧存档里可能留着设备词/含糊词：读路径一律当它不存在（v3.1.16）。
+        # 不然这句话会被拼成「她这一段在做『用蹄子夹着手边的东西』」再喂回模型，
+        # 模型照着补全，替换器再换一次——就是那个永动机。
+        ordered = [item for item in ordered if self._shown(item)]
         for item in ordered:
             lo = parse_time(item.get("start"))
             hi = parse_time(item.get("end"))
@@ -2601,16 +2782,32 @@ class ScheduleService:
         if minutes is None:
             now = self._clock.now()
             minutes = now.hour * 60 + now.minute
-        return self._covering(self.segments(), minutes)
+        slot = self._covering(self.segments(), minutes)
+        if slot is not None and not self._shown(slot):
+            # 旧存档里留着设备词/含糊词的那一段，不算「她此刻在做的事」（v3.1.16）：
+            # 宁可当成还没决定，也不把「用蹄子夹着手边的东西」当成当前活动念出去。
+            return None
+        return slot
+
+    def display_segments(self) -> list[Slot]:
+        """给用户看的那一份（`/查看日程`、状态面板）：旧存档里的脏段不列出来。
+
+        存储不动、历史不篡改，只是不再把旧版本的设备词/含糊词念给用户看。
+        """
+        return self._clean(self.segments())
 
     def last_segment(self) -> Slot | None:
         segs = self._ordered_segments()
         return segs[-1] if segs else None
 
     def current_slot(self, minutes: int | None = None) -> Slot:
-        """旧接口：拿不到段时给一个中性「自由活动」，不编造她在做什么。"""
+        """旧接口：拿不到段时给一个中性「自由活动」，不编造她在做什么。
+
+        段里若还留着设备词/含糊词（旧版存档），也当拿不到——宁可给中性的
+        「自由活动」，也不把「用蹄子夹着手边的东西」念出去（v3.1.16）。
+        """
         slot = self.active_segment(minutes)
-        if slot is not None:
+        if slot is not None and self._shown(slot):
             return slot
         now = self._clock.now()
         stamp = now.hour * 60 + now.minute
@@ -2628,7 +2825,7 @@ class ScheduleService:
         now = self._clock.now()
         minutes = now.hour * 60 + now.minute
         slot = self.active_segment(minutes)
-        if slot is None:
+        if slot is None or not self._shown(slot):
             return {}
         lo = parse_time(slot.get("start"))
         hi = parse_time(slot.get("end"))
@@ -2692,6 +2889,83 @@ class ScheduleService:
             return [self._scope.role_id]
 
     # ------------------------------------------------------------------
+    # 她是谁：身体形态（物种）与基础信息（年龄/生日）
+    # ------------------------------------------------------------------
+
+    SPECIES_KEY = "species"
+
+    def _species_profile(self) -> dict[str, Any]:
+        """物种档案（`core_instance.species_profile()` 存进来的那份，认不出就空）。"""
+        try:
+            profile = self._scope.get_self(self.SPECIES_KEY)
+        except Exception:
+            return {}
+        return dict(profile) if isinstance(profile, dict) else {}
+
+    def _species_kind(self) -> str:
+        """物种类型（`pony`/`beast`/…）；认不出来返回空串，空串等于什么都在不判。"""
+        return str(self._species_profile().get("kind") or "")
+
+    def _species_text(self) -> str:
+        """「她是天马（角、翅膀、四蹄）。没有手指、没有鞋…」——人形时是空串。"""
+        profile = self._species_profile()
+        traits = profile.get("traits")
+        return species_note(
+            str(profile.get("kind") or ""),
+            str(profile.get("label") or ""),
+            traits if isinstance(traits, (list, tuple)) else (),
+        )
+
+    def _basics(self) -> dict[str, Any]:
+        try:
+            stored = self._scope.get_self(BASICS_KEY)
+        except Exception:
+            return {}
+        return dict(stored) if isinstance(stored, dict) else {}
+
+    def _ensure_basics(self, persona: Persona | None) -> dict[str, Any]:
+        """第一次读到她的人设时，把认得出的年龄/生日/名字落进状态（只补空键）。
+
+        只在**生成段**时调（拿到 persona 的地方），读路径一次都不写状态。年龄本身
+        不落库：`role_basics.age_at()` 每次按生日现算，所以过生日、跨年它自己就变。
+        """
+        current = self._basics()
+        if persona is None or not getattr(persona, "usable", False):
+            return current
+        parsed = _basics_parse(
+            str(getattr(persona, "prompt", "") or ""),
+            name=str(getattr(persona, "name", "") or ""),
+            today=self._clock.today_str(),
+        )
+        if not parsed:
+            return current
+        merged = _basics_merge(current, parsed)
+        if merged != current:
+            try:
+                self._scope.set_self(BASICS_KEY, merged)
+            except Exception:
+                return current
+        return merged
+
+    def _basics_text(self) -> str:
+        return _basics_render(self._basics(), self._clock.today_str())
+
+    def _clean(self, slots: Any) -> list[Slot]:
+        """读路径统一过滤：设备/含糊/空话，再按她的物种挡一遍（v3.1.33）。"""
+        return _clean_slots(slots, kind=self._species_kind())
+
+    def _shown(self, slot: Slot) -> bool:
+        """这一段能不能念出去（含物种判定）。"""
+        return _displayable(slot, kind=self._species_kind())
+
+    def basics_info(self) -> dict[str, Any]:
+        """给面板/诊断看的一份：档案 + 现算的年龄。"""
+        stored = self._basics()
+        info = dict(stored)
+        info["age"] = _basics_age(stored, self._clock.today_str())
+        return info
+
+    # ------------------------------------------------------------------
     # 日框：每天开头定一句「今天大概是什么日子」，之后每段都带着它
     # ------------------------------------------------------------------
 
@@ -2701,7 +2975,11 @@ class ScheduleService:
     def _cached_day_frame(self) -> str:
         if str(self._scope.get_self(self.DAY_FRAME_DATE_KEY, "") or "") != self._clock.today_str():
             return ""
-        return str(self._scope.get_self(self.DAY_FRAME_KEY, "") or "").strip()
+        frame = str(self._scope.get_self(self.DAY_FRAME_KEY, "") or "").strip()
+        if content_issues(frame):
+            # 旧版本存下来的脏日框：当没有，别天天往提示词里塞。
+            return ""
+        return frame
 
     def _fallback_day_frame(self) -> str:
         """模型不可用时的确定句：星期 + 节日 + 天气。"""
@@ -2724,6 +3002,9 @@ class ScheduleService:
         if self._cached_day_frame():
             return
         frame = str(text or "").strip().strip("\"'“”「」 　")[:60] or self._fallback_day_frame()
+        if content_issues(frame):
+            # 日框每天都会进提示词：脏的一句换成确定句，别让它一直回流。
+            frame = self._fallback_day_frame()
         self._scope.update_self(
             **{self.DAY_FRAME_KEY: frame, self.DAY_FRAME_DATE_KEY: self._clock.today_str()}
         )
@@ -2797,7 +3078,8 @@ class ScheduleService:
         stored = self._scope.get_self(self.PREV_DAY_KEY)
         if not isinstance(stored, list):
             return []
-        return [slot for slot in stored if isinstance(slot, dict)]
+        # 旧版日程里可能留着设备词/含糊词：过滤掉，别再喂回 prompt（v3.1.16）。
+        return self._clean([slot for slot in stored if isinstance(slot, dict)])
 
     def _sleep_today(self, minutes: int) -> int:
         """今天到现在她一共睡了多久（分钟）。
@@ -2823,10 +3105,10 @@ class ScheduleService:
         today = self._clock.today_str()
         if str(self._scope.get_self("today_date", "") or "") == today:
             segs = self.segments()
-            done = [
+            done = self._clean([
                 slot for slot in segs
                 if (parse_time(slot.get("end")) or 0) <= minutes
-            ]
+            ])
             if done:
                 return done, "今天到这会她已经过完的时段"
             # 今天还没过完任何一段（刚跨过零点、结转的那截觉还罩着现在）：接上昨天的
@@ -2837,7 +3119,7 @@ class ScheduleService:
             if previous:
                 return previous, "昨天的收尾（刚跨过零点）"
             return done, "今天到这会她已经过完的时段"
-        stored = self._stored_slots()
+        stored = self._clean(self._stored_slots())
         return stored, "昨天的收尾（刚跨过零点）"
 
     # ------------------------------------------------------------------
@@ -3087,6 +3369,10 @@ class ScheduleService:
         event = str(raw.get("event") or "").strip()
         if not event:
             return {}
+        if content_issues(event):
+            # 旧版本留下的脏挂起（设备词/含糊词）：清掉，别让它被 resume 回 prompt。
+            self._clear_suspended()
+            return {}
         try:
             at = float(raw.get("at") or 0.0)
         except (TypeError, ValueError):
@@ -3123,7 +3409,9 @@ class ScheduleService:
             "event": _clip_event(event),
             "location": str(raw.get("location") or "").strip()[:16],
             "emotion": str(raw.get("emotion") or "").strip()[:12],
-            "ongoing": str(raw.get("ongoing") or "").strip()[:40],
+            "ongoing": (
+                "" if content_issues(str(raw.get("ongoing") or "")) else str(raw.get("ongoing") or "").strip()[:40]
+            ),
             "wants": bool(raw.get("wants")),
             "remaining_minutes": min(remaining, DAY_MINUTES),
             # 被截断那段的能量速率（#70）：resume 分支拿它当默认值。快照不带上就等于
@@ -3276,7 +3564,81 @@ class ScheduleService:
             due = self._roll_change()
         else:
             due = self._roll_peek()
-        return due and self._gate_allows()
+        if not due:
+            return False
+        return self._due_gate_or_catch_up(active, roll=roll)
+
+    def _due_gate_or_catch_up(self, active: Slot | None, *, roll: bool) -> bool:
+        """本来该决定、但闸门不让：只有「自愈补出来的处境段」可以越过空闲静默一次。"""
+        if self._gate_allows():
+            return True
+        if roll and self._gap_catch_up(active):
+            # 只**记一个待办**，不在这里记「已经接班过」：`ensure_fresh` 拿锁后还会再问
+            # 一次 `refresh_due()`，这里要是先把 `_heal_gen_at` 写掉，那一次就会判 False，
+            # 接班永远走不到模型（v3.1.21 的初版就栽在这一步）。
+            self._catch_up_armed = True
+            return True
+        return False
+
+    def _gap_catch_up(self, active: Slot | None) -> bool:
+        """自愈补出来的处境段，够不够资格让模型越过空闲静默接手一次。
+
+        只看四件事：这段确实是刚补出来的（`_healed_at` 在窗口内，或没有补位时刻但
+        是处境段）、距离补位没过 `HEAL_CATCHUP_WINDOW_SECONDS`、距上一次接班已过
+        `HEAL_CATCHUP_SECONDS`、闸门拒绝的原因**只是**空闲静默。预算用完不算
+        （额度绕不得），还没到最小间隔也不算（那条本来就是补位该绕的）。
+
+        v3.1.23 起补位给的是具体事而不是处境词，所以「是不是处境段」不再是前提：
+        刚补出来的那段不管长什么样，都该被模型接手一次。
+        """
+        if not getattr(self.config, "use_llm_schedule", False):
+            return False
+        if not isinstance(active, dict):
+            return False
+        now = float(self._monotonic())
+        if self._healed_at:
+            # 刚补出来的那一段（具体事或处境词都算）：给模型一次接手的机会。
+            # `_healed_at` 为 0 说明这段是进程重启前补的（内存里没有补位时刻），
+            # 那就只有处境段算——具体事多半是模型自己写的，不该再问一遍。
+            if now - self._healed_at > HEAL_CATCHUP_WINDOW_SECONDS:
+                # 补位太久了，那一段已经是「旧安排」。
+                return False
+        elif not active.get("status") and self.source == SOURCE_LLM:
+            # 来源是本地兜底时，具体事也是自愈补的（重载后 `_healed_at` 丢了），
+            # 不能因为「它看起来像模型写的」就把接班资格取消掉。
+            return False
+        limit = HEAL_CATCHUP_SECONDS
+        if not self._healed_at and self.source != SOURCE_LLM:
+            limit = HEAL_IDLE_CATCHUP_SECONDS
+        if self._heal_gen_at and now - self._heal_gen_at < limit:
+            return False
+        gate = getattr(self.gateway, "gate", None) if self.gateway is not None else None
+        if gate is None:
+            return False
+        role_id = str(getattr(self._scope, "role_id", "") or "")
+        try:
+            verdict = gate.check(PURPOSE, role_id=role_id, ignore_interval=True)
+        except Exception:  # noqa: BLE001 - 闸门自己出错时按「不让」处理，别把日程卡死
+            return False
+        if getattr(verdict, "allowed", False) or str(getattr(verdict, "reason", "")) != "idle":
+            return False
+        # 「还没人跟她说过话」不算：全新部署里一次都别调（老契约：闲置不花钱）。
+        # 判断依据是「她有没有过真事」——今天或昨天收尾里出现过非 status/sleep 的干净段，
+        # 就说明这是个在用的角色，只是这会儿安静太久，给这一小时一次接班机会。
+        try:
+            return self._has_real_activity() or gate.interaction_at(role_id) is not None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _has_real_activity(self) -> bool:
+        """她今天（或昨天收尾）有没有过一段真事：有，就说明这不是全新部署。"""
+        slots = list(self.segments()) + list(self._prev_day_slots())
+        for slot in slots:
+            if not isinstance(slot, dict) or slot.get("status") or slot.get("sleep"):
+                continue
+            if _content_ok(str(slot.get("event") or "")):
+                return True
+        return False
 
     def _roll_peek(self) -> bool:
         """本窗已经掷出的骰子；本窗还没掷过就是 False（只读路径不替它掷）。"""
@@ -3403,9 +3765,7 @@ class ScheduleService:
         返回是否成功排入后台任务：已经有一轮生成在跑时返回 False（不排队重复）。
         没有正在进行的段时也能用——那就直接决定下一段。
         """
-        if self._task and not self._task.done():
-            return False
-        if self._generating:
+        if self._busy():
             return False
         coro = self.ensure_fresh(force=True, ignore_cooldown=True, force_switch=True)
         name = f"humanoid-schedule-interrupt-{self._scope.role_id}"
@@ -3422,17 +3782,304 @@ class ScheduleService:
                 coro.close()
             return False
         self._task = task
+        self._task_since = float(self._monotonic())
         return True
 
     # ------------------------------------------------------------------
     # 生成
     # ------------------------------------------------------------------
 
+    def _restore_heal_marks(self) -> None:
+        """把落盘的「上一次接班」换算回内存里的单调钟。
+
+        落盘用墙钟（`_clock.timestamp()`）：单调钟每次进程重启都从零开始，存下来
+        没法跨重载比较。这里换算成「单调钟 - 已经过去多久」，让
+        `now - self._heal_gen_at` 的老写法继续成立。
+        """
+        try:
+            wall = float(self._clock.timestamp())
+            stored = float(self._scope.get_self(HEAL_GEN_KEY, 0.0) or 0.0)
+        except Exception:  # noqa: BLE001 - 读不到就当没记过，别让服务起不来
+            return
+        if stored <= 0:
+            return
+        delta = wall - stored
+        if 0 <= delta <= HEAL_IDLE_CATCHUP_SECONDS:
+            self._heal_gen_at = float(self._monotonic()) - delta
+
+    def _purge_dirty_history(self) -> int:
+        """把旧版本写进 state 的设备词/含糊词条目真删掉（只删不改写）。
+
+        v3.1.13 起设备词禁入日程，但 3.1.18 之前它们已经落过盘：读的时候过滤
+        只能保证不再展示，state 里那堆脏文本还会被 `_stored_slots` 之类重新喂回
+        提示词。这里做一次性迁移——含 `设备:`/`含糊:` 的条目整条删除（改写会造
+        出病句，删掉就等于那段没发生过），跑过记 `PURGE_VERSION`。
+        """
+        try:
+            done = int(self._scope.get_self(PURGE_KEY, 0) or 0)
+        except (TypeError, ValueError):
+            done = 0
+        if done >= PURGE_VERSION:
+            return 0
+
+        def dirty(text: object) -> bool:
+            codes = content_issues(str(text or ""))
+            if any(code.startswith(("设备:", "含糊:")) for code in codes):
+                return True
+            # 物种（v3.1.33）：旧存档里「把门口的鞋摆整齐」这种段落，对一匹小马
+            # 来说和「用蹄子夹着手机」是同一类错，不能只在读取时挡，得真删。
+            return bool(species_issues(str(text or ""), self._species_kind()))
+
+        def scrub_dreams(slot: object) -> int:
+            """睡段的 dreams 里有旧设备词：只删那一条梦，别删整段觉。"""
+            if not isinstance(slot, dict):
+                return 0
+            dreams = slot.get("dreams")
+            if not isinstance(dreams, list):
+                return 0
+            kept = [item for item in dreams if not dirty(item)]
+            if len(kept) == len(dreams):
+                return 0
+            slot["dreams"] = kept
+            return len(dreams) - len(kept)
+
+        def dirty_slot(slot: object) -> bool:
+            """整段该不该删：设备/含糊/物种不对一律删；睡段留着（觉不能被删）。
+
+            低信息量的空话也删，**包括带 `status: true` 的**「忙手里的活」——
+            v3.1.26 之前它被当成「真状态」留了下来，读者照样不知道她在做什么。
+            短于 `MIN_TRUNCATED_STUB_MINUTES` 的碎段也删：那是拼接留下的渣（v3.1.29）。
+            物种不对的段（v3.1.33）也删：「把门口的鞋摆整齐」是素材池照着人写的，
+            对非人形角色来说这件事根本做不了。
+            """
+            if not isinstance(slot, dict):
+                return False
+            text = str(slot.get("event") or "")
+            if dirty(text):
+                return True
+            if slot.get("sleep"):
+                return False
+            if low_info_issues(text):
+                return True
+            lo = parse_time(slot.get("start"))
+            hi = parse_time(slot.get("end"))
+            if lo is not None and hi is not None and 0 <= hi - lo < MIN_TRUNCATED_STUB_MINUTES:
+                return True
+            return False
+
+        removed = 0
+        daily = self._scope.get_self("daily_schedule")
+        if isinstance(daily, list):
+            kept = [slot for slot in daily if not dirty_slot(slot)]
+            removed += len(daily) - len(kept)
+            dream_hits = sum(scrub_dreams(slot) for slot in kept)
+            removed += dream_hits
+            if len(kept) != len(daily) or dream_hits:
+                self._scope.set_self("daily_schedule", kept)
+
+        prev_day = self._scope.get_self("prev_day_schedule")
+        if isinstance(prev_day, list):
+            kept = [slot for slot in prev_day if not dirty_slot(slot)]
+            removed += len(prev_day) - len(kept)
+            dream_hits = sum(scrub_dreams(slot) for slot in kept)
+            removed += dream_hits
+            if len(kept) != len(prev_day) or dream_hits:
+                self._scope.set_self("prev_day_schedule", kept)
+
+        history = self._scope.get_self("schedule_history")
+        if isinstance(history, dict):
+            changed = False
+            cleaned: dict[str, object] = {}
+            for day, entries in history.items():
+                if not isinstance(entries, list):
+                    cleaned[day] = entries
+                    continue
+                kept = []
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        if scrub_dreams(entry):
+                            removed += 1
+                            changed = True
+                        drop = dirty_slot(entry)
+                    else:
+                        if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+                            drop = dirty(entry[2])
+                        else:
+                            drop = dirty(entry)
+                    if drop:
+                        removed += 1
+                        changed = True
+                        continue
+                    kept.append(entry)
+                cleaned[day] = kept
+            if changed:
+                self._scope.set_self("schedule_history", cleaned)
+
+        for key in ("process_history",):
+            entries = self._scope.get_self(key)
+            if not isinstance(entries, list):
+                continue
+            kept = []
+            for entry in entries:
+                if isinstance(entry, dict):
+                    text = entry.get("text") or entry.get("event") or ""
+                else:
+                    text = entry
+                if dirty(text):
+                    removed += 1
+                    continue
+                kept.append(entry)
+            if len(kept) != len(entries):
+                self._scope.set_self(key, kept)
+
+        # 「她手上还开着的事」（v3.1.30）：这本账会被渲染进提示词，点名设备的条目
+        # 同样会把「手机」这类东西教回模型。不换词——换词就是造含糊，直接删条目。
+        # 判据用窄口径 `object_issues`：只认设备物件，「等 TA 回消息」这种讲人的事留着。
+        life_entries = self._scope.get_self("life_log")
+        if isinstance(life_entries, list) and life_entries:
+            kept = []
+            for entry in life_entries:
+                text = entry.get("text") if isinstance(entry, dict) else entry
+                if _life_object_issues(str(text or "")):
+                    removed += 1
+                    continue
+                kept.append(entry)
+            if len(kept) != len(life_entries):
+                self._scope.set_self("life_log", kept)
+
+        frame = self._scope.get_self("day_frame")
+        if isinstance(frame, str) and frame and dirty(frame):
+            self._scope.set_self("day_frame", "")
+            removed += 1
+
+        suspended = self._scope.get_self("schedule_suspended")
+        if dirty_slot(suspended):
+            self._clear_suspended()
+            removed += 1
+
+        self._scope.set_self(PURGE_KEY, PURGE_VERSION)
+        if removed and self._log:
+            self._log.info(f"[humanoid_core] 旧日程清理（{self._scope.role_id}）：删掉 {removed} 条设备/含糊条目")
+        return removed
+
+    def heal_gap(self) -> bool:
+        """时间线断了就本地补一段：不调模型、不过闸门、不改来源以外的东西。
+
+        为什么需要这条独立路径（v3.1.19）：`ensure_fresh` 里那条「模型被闸门挡回后
+        用模板补位」只有在**真的走了一次生成**时才会执行；一旦某个角色的后台循环
+        因为旧进程、卡住的刷新任务或闸门长期关闭而没有走到那一步，`daily_schedule`
+        就会停在上一段结束处，之后 `current_slot()` 只能给中性「自由活动」，一停
+        就是几个小时。补位不该依赖一次模型调用的成败。
+
+        只处理「确实断了」：没有任何一段罩住此刻，且最后一段的结束时间不晚于此刻
+        （乱序/未来段不碰）。补的是一件按钟点筛过的具体事，实在没得挑才用
+        `dynamic_segment` 的处境词（v3.1.23），下一次真正的生成会照常覆盖它。
+        """
+        try:
+            self._purge_dirty_history()
+            self._ensure_quality_stats()
+            cfg = self.config
+            now = self._clock.now()
+            minutes = now.hour * 60 + now.minute
+            today = self._clock.today_str()
+            segs = self.segments()
+            if not segs:
+                return False
+            if self._covering(segs, minutes) is not None:
+                return False
+            ends = [parse_time(seg.get("end")) for seg in segs if isinstance(seg, dict)]
+            ends = [value for value in ends if value is not None]
+            if ends and max(ends) > minutes:
+                return False
+            _active, prev = self._active_and_prev(minutes)
+            # 补位优先给一件筛过的具体事，而不是「忙自己的事」这类处境词：处境词
+            # 干净但空洞，一整天全是它就等于把「含糊」换个说法。素材池本身按钟点
+            # 筛过，夜里不会冒出白天的事；真该睡了 `_degrade_to_neutral` 会保住觉。
+            recent_events = [
+                str(seg.get("event") or "") for seg in segs if isinstance(seg, dict)
+            ]
+            kind = self._species_kind()
+            slate_items = build_slate(
+                [
+                    {
+                        "event": item.get("event"),
+                        "location": item.get("location"),
+                        "minutes": material_minutes(item, self._seed()),
+                    }
+                    for item in materials_for(
+                        self._seed(), "", minutes, recent_events, species=kind
+                    )
+                ],
+                examples_for(self._seed(), ""),
+                recent_events=recent_events,
+                rejected=self._rejected_events(),
+                kind=kind,
+            )
+            slot = self._degrade_to_neutral(cfg, minutes, prev, slate_items)
+            if not slot:
+                return False
+            self._append_segment(slot, today)
+            self._set_source(SOURCE_TEMPLATE)
+            # 记下「这段是补出来的」：`_gap_catch_up()` 靠它判断要不要越过空闲静默，
+            # 让模型接手把处境词换成一件真事（v3.1.21）。
+            self._healed_at = float(self._monotonic())
+            if self._log:
+                self._log.info(
+                    f"[humanoid_core] 日程空档自愈（{self._scope.role_id}）："
+                    f"{slot.get('start')}–{slot.get('end')} {slot.get('event')}"
+                )
+            return True
+        except Exception as exc:
+            if self._log:
+                self._log.warning(f"[humanoid_core] 日程空档自愈失败: {exc}")
+            return False
+
+    def _busy(self) -> bool:
+        """有一轮生成在跑就不排新的；卡过阈值就强制复位，别让一次挂住锁死时间线。
+
+        两道闸（后台任务 `_task`、单飞闸 `_generating`）都只在协程正常结束时才复位。
+        模型/网关挂住时协程不结束，`request_refresh` 每 30 秒都在这两道闸前返回 False，
+        空档自愈也就永远轮不到——线上表现就是「角色在跑，日程停在几小时前」。
+        """
+        now = float(self._monotonic())
+        if self._task is not None and not self._task.done():
+            if self._task_since and now - self._task_since > GENERATION_STALL_SECONDS:
+                if self._log:
+                    self._log.warning(
+                        f"[humanoid_core] 日程后台任务卡了 {now - self._task_since:.0f} 秒，"
+                        f"取消重来（{self._scope.role_id}）"
+                    )
+                try:
+                    self._task.cancel()
+                except Exception:
+                    pass
+                self._task = None
+                self._task_since = 0.0
+            else:
+                return True
+        if self._generating:
+            if (
+                self._generating_since
+                and now - self._generating_since > GENERATION_STALL_SECONDS
+            ):
+                if self._log:
+                    self._log.warning(
+                        f"[humanoid_core] 日程生成卡了 {now - self._generating_since:.0f} 秒，"
+                        f"复位单飞闸（{self._scope.role_id}）"
+                    )
+                self._bump_quality("stall")
+                self._generating = False
+                self._generating_since = 0.0
+            else:
+                return True
+        return False
+
     def request_refresh(self, force: bool = False, ignore_cooldown: bool = False) -> bool:
         """投递一次后台决定。到点（到期/越线/掷中）才真的投。"""
-        if self._task and not self._task.done():
-            return False
-        if self._generating:
+        # 先自愈空档：它不花模型调用、不受闸门影响，也不该被「有一轮在跑」挡住——
+        # 那一轮可能正卡着，等它等不到（v3.1.20 把这一步提到所有判断之前）。
+        self.heal_gap()
+        if self._busy():
             return False
         if not force and not self.refresh_due():
             return False
@@ -3452,6 +4099,7 @@ class ScheduleService:
                 coro.close()
             return False
         self._task = task
+        self._task_since = float(self._monotonic())
         return True
 
     async def ensure_fresh(
@@ -3486,6 +4134,16 @@ class ScheduleService:
             # 拿锁期间可能已被别的路径决定过：再确认一次。
             if not force and not self.refresh_due():
                 return False
+            catch_up = False
+            if self._catch_up_armed:
+                # 真走到这一步才算「接班过」：一小时最多一次，被挡回的尝试也不会每 30 秒重来。
+                self._catch_up_armed = False
+                catch_up = True
+                self._heal_gen_at = float(self._monotonic())
+                try:
+                    self._scope.set_self(HEAL_GEN_KEY, float(self._clock.timestamp()))
+                except Exception:  # noqa: BLE001 - 落盘失败只影响限频，别打断生成
+                    pass
             # 「现在这一段」和「它前面那段」与写路径同一份口径：存档乱序时盲取
             # `segs[-1]` 会把更早的一段当成她正在做的事递给 prompt（时间跨度、
             # 「上一段是不是睡眠」、continue 判定全跟着错）。
@@ -3517,10 +4175,11 @@ class ScheduleService:
         slot: Slot | None = None
         if attempt_llm:
             self._generating = True
+            self._generating_since = float(self._monotonic())
         try:
             if attempt_llm:
                 slot = await self._generate_segment(
-                    cfg, now, minutes, prev, elapsed, ignore_cooldown,
+                    cfg, now, minutes, prev, elapsed, ignore_cooldown or catch_up,
                     interrupted_ts=interrupted_ts, event_phrase=event_phrase,
                     event_ts=event_ts, force_switch=force_switch,
                     ignore_interval=gap,
@@ -3565,6 +4224,7 @@ class ScheduleService:
         finally:
             if attempt_llm:
                 self._generating = False
+                self._generating_since = 0.0
 
     def _fail_backoff(self, cfg: HumanoidConfig) -> None:
         backoff = max(MIN_RETRY_BACKOFF_SECONDS, float(cfg.schedule_provider_cooldown_minutes) * 60)
@@ -3711,6 +4371,12 @@ class ScheduleService:
             return None
 
         persona = await self._resolve_persona()
+        # 她的身体形态与基础信息（v3.1.33）：物种档案早就认出来了，日程这边一直
+        # 没读过；年龄则从来没有过——现在第一次生成时从人设里认一次，之后按生日现算。
+        kind = self._species_kind()
+        species_text = self._species_text()
+        self._ensure_basics(persona)
+        basics_text = self._basics_text()
         frame = await self._ensure_day_frame()
         history, history_note = self._history_for_prompt()
         world = self._world_snapshot()
@@ -3734,20 +4400,45 @@ class ScheduleService:
         # 她自己的素材（v3.0.10）：按人设生成过一批就用那批，没有就只剩内置池。
         # 生成在后台（ensure_role_materials），这里只读缓存——换段仍然只调一次模型。
         role_items = _role_load(self._scope)
-        materials = render_materials(
-            materials_for(
-                self._seed(),
-                _example_evidence(persona, cfg),
-                minutes,
-                recent_events,
-                extra=role_items,
-            ),
+        material_items = materials_for(
             self._seed(),
+            _example_evidence(persona, cfg),
+            minutes,
+            recent_events,
+            extra=role_items,
+            species=kind,
         )
+        materials = render_materials(material_items, self._seed())
+        # 候选清单（v3.1.16）：把已经过筛的具体事摆到模型面前，让它「选着写」而不是
+        # 从空白里自由写。素材池给的是分钟区间，这里先换成统一的 event/location/minutes。
+        slate_items = build_slate(
+            [
+                {
+                    "event": item.get("event"),
+                    "location": item.get("location"),
+                    "minutes": material_minutes(item, self._seed()),
+                }
+                for item in material_items
+            ],
+            examples_for(self._seed(), _example_evidence(persona, cfg)),
+            recent_events=recent_events,
+            suspended=suspended or None,
+            # 被质量闸拒过的写法（v3.1.17）不再摆到模型面前：否则它照着再写一遍，
+            # 又被拒一次，同一句话在「写—拒—再写」之间打转。
+            rejected=self._rejected_events(),
+            kind=kind,
+        )
+        slate_text = _slate_block(slate_items)
         day_sleep = self._sleep_today(minutes)
         # 她自己长出来的习惯：过去几周这个钟点常做的事 + 作息。样本不够时是空串，
         # prompt 里连标题都不会出现。
         habits = render_habits(habit_lines(history_of(self._scope), minutes))
+        # 整体心境（v3.1.18，A）：只从她自己的身体推一个标签，不看任何人的好感；
+        # 没到阈值时是空串，prompt 里连标题都不出现。
+        mood_label, mood_reason = overall_mood(body)
+        mood_text = f"{mood_label}（{mood_reason}）" if mood_label else ""
+        # 身上的状态（v3.1.18，B 的读侧）：最近三小时有过私事才给一句，否则空串。
+        intimate_text = self._intimate_rest_line(now)
         prompt = segment_prompt(
             cfg,
             now_text=now.strftime("%H:%M"),
@@ -3774,6 +4465,11 @@ class ScheduleService:
             # 睡着期间听到的话（#66）：醒来这一段递给她，装上新段后清空。
             heard_asleep=self.heard_while_asleep(),
             materials=materials,
+            slate=slate_text,
+            mood=mood_text,
+            intimate=intimate_text,
+            species=species_text,
+            basics=basics_text,
             day_sleep_minutes=day_sleep,
             habits=habits,
             plans=self._today_plans(),
@@ -3785,6 +4481,7 @@ class ScheduleService:
             )
 
         self._generating = True
+        self._generating_since = float(self._monotonic())
         try:
             result: LLMResult = await self.gateway.generate(
                 prompt=prompt,
@@ -3805,6 +4502,7 @@ class ScheduleService:
             return None
         finally:
             self._generating = False
+            self._generating_since = 0.0
 
         # 结果对象可能来自替身/旧适配层，没有 outcome 字段时别炸掉整段换段流程（#75）：
         # 少了这个字段只影响「失败原因」这一句诊断，不该让日程停摆。
@@ -3866,6 +4564,7 @@ class ScheduleService:
             step=cfg.granularity_minutes,
             prev=prev,
             suspended=suspended or None,
+            slate=slate_items,
         )
         if slot is None:
             # 解析失败同样进退避：不挡的话每个后台周期都会再砸一次模型。
@@ -3894,120 +4593,120 @@ class ScheduleService:
         # 判中了先带提示重写一次；仍然编造就降级成中性段——宁可只给处境词，
         # 也不让「下午去接孩子放学」这种凭空事实进她的日程。
         degraded = False
-        if getattr(cfg, "schedule_quality_gate", False):
-            evidence = self._fact_evidence(persona, cfg)
-            issues, invented = self._quality_issues(slot, evidence, prev)
-            # 「睡够了还睡」也算一条：它不是重复、也不是编造，但同样是「这一段
-            # 本不该这样」。三条一起进重写，重写不动时只有编造会降级。
-            if self._needless_sleep(slot, minutes):
-                issues = list(issues) + ["needless_sleep"]
-            if self._overlong_nap(slot):
-                issues = list(issues) + ["overlong_nap"]
-            if issues:
-                self._bump_quality("rewrite")
-                retried = await self._rewrite_once(
-                    cfg,
-                    prompt,
-                    issues,
-                    invented,
-                    ignore_cooldown,
-                    now_minute=minutes,
-                    prev=prev,
-                    suspended=suspended or None,
-                )
-                if retried is not None:
-                    raw, slot = retried
-                    issues, invented = self._quality_issues(slot, evidence, prev)
-                    # 重写之后要重新判一遍「睡够了还睡」：只重算 repeat/invented
-                    # 的话，重写版照样排睡会被静默放行（闸门等于没装）。
-                    if self._needless_sleep(slot, minutes):
-                        issues = list(issues) + ["needless_sleep"]
-                    if self._overlong_nap(slot):
-                        issues = list(issues) + ["overlong_nap"]
-                if "invented" in issues:
-                    slot = self._degrade_to_neutral(cfg, minutes, prev)
-                    raw = {}
-                    degraded = True
-                    self._bump_quality("invented")
-                    self._bump_quality("fallback")
-                    if self._log:
-                        self._log.info(
-                            "[humanoid_core] 日程质量闸：人设里找不到依据的"
-                            f"「{'/'.join(invented)}」，已降级为中性段"
-                            f"（{self._scope.role_id}）"
-                        )
-                elif "overlong_nap" in issues:
-                    self._bump_quality("overlong_nap")
-                    if self._log:
-                        self._log.info(
-                            "[humanoid_core] 日程质量闸：白天这一觉太长，"
-                            f"重写后仍是「{slot.get('event')}」，放行"
-                            f"（{self._scope.role_id}）"
-                        )
-                elif "needless_sleep" in issues:
-                    self._bump_quality("needless_sleep")
-                    if self._log:
-                        self._log.info(
-                            "[humanoid_core] 日程质量闸：今天已经睡够，"
-                            f"重写后仍在排睡「{slot.get('event')}」，放行"
-                            f"（{self._scope.role_id}）"
-                        )
-                elif "repeat" in issues:
-                    self._bump_quality("repeat")
-                    if self._log and cfg.debug_mode:
-                        self._log.info(
-                            "[humanoid_core] 日程质量闸：今天已经排过"
-                            f"「{slot.get('event')}」，重写后仍重复，放行"
-                        )
-
-        # ---- 模型审查（v3.0.11）：写完之后回头看一眼「接不接得上」 ----
-        # 上面那道闸只判得了能客观计数的事（今天重复、人设里没有依据）。而
-        # 「上一段 09:05 在卧室结束，这一段 09:06 在超市」「倒杯水占了半小时」
-        # 这类问题要两段摆在一起才看得见，只有模型判得了。判不通过不降级成
-        # 中性段（那会把一天磨平成处境词），而是把原因交给它自己改一版再用。
-        # 只审「换了一件事」的段：continue/resume 是接着做同一件事，没有转场可审。
-        if getattr(cfg, "schedule_quality_gate", False) and not degraded:
-            # 「接着做同一件事」有两种写法：模型自己说 continue/resume，或者它给的
-            # 事件名与上一段一样（`_append_segment` 会把同名段并进上一段，不构成新
-            # 段，也就没有转场可审）。两种都跳过审查；真换了一件事才审。
-            raw_map = raw if isinstance(raw, Mapping) else {}
-            continuing = (
-                _truthy_flag(raw_map.get("continue"))
-                or _truthy_flag(raw_map.get("resume"))
-                or (
-                    bool(prev)
-                    and str(slot.get("event") or "") == str(prev.get("event") or "")
-                )
+        evidence = self._fact_evidence(persona, cfg)
+        issues, invented = self._quality_issues(slot, evidence, prev, kind)
+        # 「睡够了还睡」也算一条：它不是重复、也不是编造，但同样是「这一段
+        # 本不该这样」。三条一起进重写，重写不动时只有编造会降级。
+        if self._needless_sleep(slot, minutes):
+            issues = list(issues) + ["needless_sleep"]
+        if self._overlong_nap(slot):
+            issues = list(issues) + ["overlong_nap"]
+        if issues:
+            self._bump_quality("rewrite")
+            retried = await self._rewrite_once(
+                cfg,
+                prompt,
+                issues,
+                invented,
+                ignore_cooldown,
+                now_minute=minutes,
+                prev=prev,
+                suspended=suspended or None,
+                slate=slate_items,
             )
-            if not continuing:
-                verdict, payload = await self._review_segment(
-                    cfg, slot, prev, self._fact_evidence(persona, cfg), minutes
+            if retried is not None:
+                raw, slot = retried
+                issues, invented = self._quality_issues(slot, evidence, prev, kind)
+                # 重写之后要重新判一遍「睡够了还睡」：只重算 repeat/invented
+                # 的话，重写版照样排睡会被静默放行（闸门等于没装）。
+                if self._needless_sleep(slot, minutes):
+                    issues = list(issues) + ["needless_sleep"]
+                if self._overlong_nap(slot):
+                    issues = list(issues) + ["overlong_nap"]
+            content = _content_codes(issues)
+            if "invented" in issues or content:
+                # 编造与设备/含糊词都是**硬**问题：重写一次还这样就不让它进日程，
+                # 降级成处境词（dynamic_segment 那批词是干净的、通顺的）。
+                # 拒之前先记下来（v3.1.17）：这句写法下次不再进候选清单。
+                if low_info_issues(str(slot.get("event") or "")):
+                    self._bump_quality("low_info")
+                self._remember_reject(
+                    str(slot.get("event") or ""),
+                    "invented" if "invented" in issues else "/".join(content),
                 )
-                if verdict == "fixed":
-                    slot = payload
-                    raw = {}
-                    self._bump_quality("review_fixed")
-                    if self._log:
-                        self._log.info(
-                            "[humanoid_core] 日程审查：这一段接不上，已按模型自己"
-                            f"给的理由改成「{slot.get('event')}」"
-                            f"（{self._scope.role_id}）"
+                slot = self._degrade_to_neutral(cfg, minutes, prev, slate_items)
+                raw = {}
+                degraded = True
+                if "invented" in issues:
+                    self._bump_quality("invented")
+                if content:
+                    self._bump_quality("content")
+                self._bump_quality("fallback")
+                if self._log:
+                    reasons: list[str] = []
+                    if invented:
+                        reasons.append(
+                            "人设里找不到依据的「" + "/".join(invented) + "」"
                         )
-                elif verdict == "reason":
-                    retried = await self._rewrite_once(
-                        cfg, prompt, ["review"], [], ignore_cooldown,
-                        now_minute=minutes, prev=prev,
-                        suspended=suspended or None, reason=payload,
+                    if content:
+                        reasons.append("设备/含糊词 " + "/".join(content))
+                    self._log.info(
+                        "[humanoid_core] 日程质量闸："
+                        + "；".join(reasons)
+                        + "，已降级为中性段"
+                        f"（{self._scope.role_id}）"
                     )
-                    if retried is not None:
-                        raw, slot = retried
-                        self._bump_quality("review_rewritten")
-                        if self._log:
-                            self._log.info(
-                                "[humanoid_core] 日程审查：接不上（"
-                                f"{payload or '模型未说明'}），已按原因重写"
-                                f"（{self._scope.role_id}）"
-                            )
+            elif "overlong_nap" in issues:
+                self._bump_quality("overlong_nap")
+                if self._log:
+                    self._log.info(
+                        "[humanoid_core] 日程质量闸：白天这一觉太长，"
+                        f"重写后仍是「{slot.get('event')}」，放行"
+                        f"（{self._scope.role_id}）"
+                    )
+            elif "needless_sleep" in issues:
+                self._bump_quality("needless_sleep")
+                if self._log:
+                    self._log.info(
+                        "[humanoid_core] 日程质量闸：今天已经睡够，"
+                        f"重写后仍在排睡「{slot.get('event')}」，放行"
+                        f"（{self._scope.role_id}）"
+                    )
+            elif "repeat" in issues:
+                self._bump_quality("repeat")
+                if self._log and cfg.debug_mode:
+                    self._log.info(
+                        "[humanoid_core] 日程质量闸：今天已经排过"
+                        f"「{slot.get('event')}」，重写后仍重复，放行"
+                    )
+
+        # ---- 模型自审层（v3.0.11）已在 v3.1.28 删除 ----
+        # 原来每生成一段就再问一次模型「接不接得上」，判不通过就让它重写。
+        # 线上实测：它误判成「编造」而把整天日程磨成模板段的次数，比它拦下的
+        # 真问题多（_conf_schema.json 里那句说明就是这段的墓志铭），而且每段多
+        # 一次模型调用。现在改成：确定性检查常开 + 最后硬闸，不再问模型自审。
+        # ---- 最后一道硬闸（v3.1.16）----
+        # 重写版、审查改好的版本、甚至降级后的处境词，写进状态前都再验一次事件文本。
+        # 这一道不看质量闸开关：设备词进日程是产品约束，不是可选项。
+        # v3.1.17 起连「低信息量」一起验；v3.1.25 起不再放过 status 段——模型会
+        # 直接回一个 status:true 的「手头有东西要处理」，那和处境词一样是空话。
+        final_text = str(slot.get("event") or "")
+        final_issues = content_issues(final_text) + species_issues(final_text, kind)
+        if not final_issues and not slot.get("sleep"):
+            final_issues = low_info_issues(final_text)
+        if final_issues:
+            self._remember_reject(final_text, "/".join(final_issues))
+            slot = self._degrade_to_neutral(cfg, minutes, prev, slate_items)
+            degraded = True
+            self._bump_quality("content_final")
+            self._bump_quality("fallback")
+            if self._log:
+                self._log.info(
+                    "[humanoid_core] 日程最终校验：事件里仍有 "
+                    + "/".join(final_issues)
+                    + "，已降级为中性段"
+                    f"（{self._scope.role_id}）"
+                )
 
         if suspended and str(slot.get("event") or "") == str(suspended.get("event") or ""):
             # resume 成功（或模型自己又排了同一件事）：挂起结束。
@@ -4019,6 +4718,8 @@ class ScheduleService:
         self._last_outcome = OUTCOME_OK
         if not degraded:
             self._set_source(SOURCE_LLM)
+            # 模型真的接上了一次：之前那段自愈补位不用再当「欠一次接班」了（v3.1.21）。
+            self._healed_at = 0.0
         if self._log:
             # 带上是哪个 bot：多开时日志里分不清谁生成了谁没生成。
             self._log.info(
@@ -4036,9 +4737,160 @@ class ScheduleService:
     # 质量闸（v3.0.6）：生成之后、装进日程之前的独立判定
     # ------------------------------------------------------------------
 
+    def _ensure_quality_stats(self) -> None:
+        """把计数项补齐成 0（v3.1.30）：从没命中过闸的角色也该有一张全 0 的表。
+
+        只补缺的键，不覆盖已有计数；已经有全部键时一次都不写盘（这个方法每 30 秒
+        会跟着 `heal_gap()` 走一遍，不能每次都重写 state）。
+        """
+        try:
+            stats = self._scope.get_self(QUALITY_STATS_KEY)
+            if not isinstance(stats, dict) or not stats:
+                self._scope.set_self(
+                    QUALITY_STATS_KEY, {key: 0 for key in QUALITY_KEYS}
+                )
+                return
+            missing = {key: 0 for key in QUALITY_KEYS if key not in stats}
+            if missing:
+                self._scope.set_self(QUALITY_STATS_KEY, {**stats, **missing})
+        except Exception:  # noqa: BLE001 - 计数补齐失败不该影响日程
+            pass
+
     def _bump_quality(self, name: str) -> None:
-        """记一次质量闸命中。只计数，不打分——没有标注就没有分母。"""
+        """记一次质量闸命中：会话内计数 + 落盘累计（v3.1.17）。
+
+        落盘是为了让「这类事发生过多少次」跨重启还在——之前只在内存里，
+        重启一次计数归零，看日志也看不出是偶发还是天天发生。
+        """
         self._quality[name] = int(self._quality.get(name, 0)) + 1
+        try:
+            stats = dict(self._scope.get_self(QUALITY_STATS_KEY, {}) or {})
+            stats[name] = int(stats.get(name, 0)) + 1
+            self._scope.set_self(QUALITY_STATS_KEY, stats)
+        except Exception:  # noqa: BLE001 - 计数失败不该影响生成
+            pass
+
+    def _remember_reject(self, text: str, reason: str) -> None:
+        """记住被拒的写法（v3.1.17）：下次摆候选时不再递给模型。
+
+        这是「黑名单」的最小可用版：只记事件文本本身（截 60 字）和拒它的原因，
+        不做语义泛化。有它，同一句「忙自己的事」不会每轮都被重新发明一次。
+        """
+        body = str(text or "").strip()
+        if not body:
+            return
+        entry = {"event": body[:60], "reason": str(reason or "")[:24]}
+        try:
+            items = list(self._scope.get_self(REJECTS_KEY, []) or [])
+        except Exception:  # noqa: BLE001
+            items = []
+        kept = [
+            item
+            for item in items
+            if not (isinstance(item, Mapping) and str(item.get("event") or "") == entry["event"])
+        ]
+        kept.append(entry)
+        try:
+            self._scope.set_self(REJECTS_KEY, kept[-REJECTS_MAX:])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _rejected_events(self) -> list[str]:
+        """被拒过的写法（给 `build_slate` 过滤用）。"""
+        try:
+            items = self._scope.get_self(REJECTS_KEY, []) or []
+        except Exception:  # noqa: BLE001
+            return []
+        return [str(item.get("event") or "") for item in items if isinstance(item, Mapping)]
+
+    # ------------------------------------------------------------------
+    # 她自己的私事（v3.1.18）：只记事实，不排程、不生成
+    # ------------------------------------------------------------------
+
+    def _day_of(self, ts: float) -> str:
+        """时间戳落在哪一天。替身钟没有 `day_key` 时退回 `today_str()`。"""
+        try:
+            return str(self._clock.day_key(ts) or "")
+        except (AttributeError, TypeError, ValueError):
+            try:
+                return str(self._clock.today_str() or "")
+            except Exception:  # noqa: BLE001
+                return ""
+
+    def note_intimate(self, moment: float, minutes: float = 0.0) -> bool:
+        """记一条「今天确实发生过」的私事（v3.1.18）。
+
+        只在 `ccb.note_occurrence*` 真的记下账之后调用：日程这边不排这种事，也不
+        生成它，只记事实。同一天最多记 `INTIMATE_MAX_PER_DAY` 条——这不是计数任务，
+        是「今天有没有过」这一层记性；超过就不再记，免得它变成一件待办。
+        """
+        try:
+            at = float(moment)
+        except (TypeError, ValueError):
+            return False
+        # NaN/Inf 也会通过 `<= 0` 的比较（NaN 跟谁比都是 False），到这里才拦得住。
+        if not math.isfinite(at) or at <= 0:
+            return False
+        day = self._day_of(at)
+        try:
+            items = [
+                item
+                for item in (self._scope.get_self(INTIMATE_KEY, []) or [])
+                if isinstance(item, Mapping) and str(item.get("day") or "") == day
+            ]
+        except Exception:  # noqa: BLE001 - 记性坏了不该影响对话
+            items = []
+        if len(items) >= INTIMATE_MAX_PER_DAY:
+            return False
+        try:
+            span = max(0.0, float(minutes or 0.0))
+        except (TypeError, ValueError):
+            span = 0.0
+        items.append({"day": day, "at": at, "minutes": int(round(span))})
+        try:
+            self._scope.set_self(INTIMATE_KEY, items[-INTIMATE_MAX_PER_DAY:])
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
+    def intimate_today(self) -> int:
+        """今天记过几条私事（只给状态页看，不进 prompt）。"""
+        try:
+            day = self._clock.today_str()
+            items = self._scope.get_self(INTIMATE_KEY, []) or []
+        except Exception:  # noqa: BLE001
+            return 0
+        return sum(
+            1
+            for item in items
+            if isinstance(item, Mapping) and str(item.get("day") or "") == day
+        )
+
+    def _intimate_rest_line(self, now: Any) -> str:
+        """最近 `INTIMATE_REST_MINUTES` 里有过私事时，给一句身体状态。
+
+        给的是「身体还在缓」，不是「刚才做了什么」——日程里不写细节，也不把这件
+        事当素材喂回生成。没有就是空串，prompt 里连标题都不出现。
+        """
+        try:
+            items = self._scope.get_self(INTIMATE_KEY, []) or []
+            now_ts = float(now.timestamp())
+        except Exception:  # noqa: BLE001
+            return ""
+        day = self._day_of(now_ts)
+        latest = 0.0
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("day") or "") != day:
+                continue
+            try:
+                latest = max(latest, float(item.get("at") or 0.0))
+            except (TypeError, ValueError):
+                continue
+        if latest <= 0 or now_ts - latest >= INTIMATE_REST_MINUTES * 60:
+            return ""
+        return "身子还软着，做什么都慢半拍，也不太想动"
 
     def _fact_evidence(self, persona: Persona | None, cfg: HumanoidConfig) -> str:
         """判「有没有依据」的原文：人设正文 + 用户补充偏好。"""
@@ -4103,13 +4955,26 @@ class ScheduleService:
         slot: Slot,
         evidence: str,
         prev: Mapping[str, Any] | None = None,
+        kind: str = "",
     ) -> tuple[list[str], list[str]]:
-        """这一段客观上的两个问题：今天重复 / 事实没有依据。"""
+        """这一段客观上的问题：设备/含糊词、物种不对、今天重复、事实没有依据。
+
+        设备词与含糊词（v3.1.16）在这里**只判定、不替换**：替换会把句子改成病句
+        （「给姐姐发消息」→「给姐姐发话」），而且换出来的含糊词又被注入回提示词，
+        模型再补回设备，循环往复。判定后交给重写，重写不动就降级。
+        """
         if slot.get("status") or slot.get("sleep"):
             # 兜底的处境词不是「一件事」；睡段不涉及身份。
             return [], []
         issues: list[str] = []
         event = str(slot.get("event") or "")
+        issues.extend(content_issues(event))
+        # 物种（v3.1.33）：小马没有手、没有鞋。模型写「把鞋摆整齐」不是用词问题，
+        # 是这具身体做不到——和编造同级，重写不动就降级。
+        issues.extend(species_issues(event, kind))
+        # 低信息量（v3.1.17）：「忙自己的事」这种句子语法没问题、也不碰设备，
+        # 但它没写她在做什么，排进日程等于没排。
+        issues.extend(low_info_issues(event))
         if self._is_repeat_today(event, prev):
             issues.append("repeat")
         invented = invented_facts(event, evidence)
@@ -4135,6 +5000,8 @@ class ScheduleService:
                 continue
             if seg.get("sleep") or seg.get("status"):
                 continue
+            if not _content_ok(str(seg.get("event") or "")):
+                continue  # 旧存档里的脏段不算「排过」
             if _event_key(str(seg.get("event") or "")) == key:
                 matched.append(seg)
         if not matched:
@@ -4158,6 +5025,7 @@ class ScheduleService:
         prev: Mapping[str, Any] | None,
         suspended: Mapping[str, Any] | None,
         reason: str = "",
+        slate: Sequence[Mapping[str, Any]] | None = None,
     ) -> tuple[Any, Slot] | None:
         """带着「哪里不对」再问一次模型；失败返回 None（由调用方决定放行还是降级）。
 
@@ -4197,88 +5065,75 @@ class ScheduleService:
             step=cfg.granularity_minutes,
             prev=prev,
             suspended=suspended,
+            slate=slate,
         )
         if slot is None:
             return None
         return raw, slot
 
-    async def _review_segment(
+    # 模型自审层已在 v3.1.28 删除：见 _generate_segment 里的说明。
+    def _slot_from_slate(
         self,
         cfg: HumanoidConfig,
-        slot: Slot,
-        prev: Mapping[str, Any] | None,
-        persona_text: str,
         now_minute: int,
-    ) -> tuple[str, Any]:
-        """让模型审一遍这一段（v3.0.11）：返回 (结果, 载荷)。
+        prev: Mapping[str, Any] | None,
+        slate: Sequence[Mapping[str, Any]],
+    ) -> Slot | None:
+        """从过筛的候选里挑一件顶上（降级时优先用它，而不是「安静待着」）。
 
-        结果四种：
-        * "ok"     —— 判它接得上，原样用；
-        * "fixed"  —— 判它接不上，模型在同一份回答里给了改好的版本，载荷是新 slot；
-        * "reason" —— 判它接不上，但没给改好的版本，载荷是原因原话（交给 _rewrite_once）；
-        * "skip"   —— 调不通、超时、返回不是 JSON：保持原样，不让审查本身拖垮日程。
-
-        审查调用同样绕开最小间隔：它属于同一次决定，生成那一下已经把闸门间隔
-        刷新成 30~60 分钟，按间隔判会当场 GATED——这条路径就永远跑不到。
+        处境词干净但空洞：一整天全是「歇着」「安静待着」，读者仍然不知道她在做什么，
+        等于把「含糊」换个说法。候选本来就是素材池里过筛的具体事，用它兜底既具体、
+        又不会撞今天的重复，还带地点和时长。
         """
-        if self.gateway is None:
-            return "skip", None
-        prompt = _review_prompt(
-            now_text=format_time(now_minute),
-            prev=prev,
-            slot=slot,
-            persona_text=persona_text,
-        )
-        try:
-            result: LLMResult = await self.gateway.generate(
-                prompt=prompt,
-                chain=cfg.schedule_provider_ids,
-                allow_global=cfg.schedule_allow_global_fallback,
-                timeout=float(cfg.schedule_llm_timeout_seconds),
-                # 审查只问一次：它每段都跑，放大尝试次数等于放大额度消耗。
-                attempts_per_provider=1,
-                retry_interval=float(cfg.schedule_retry_interval_seconds),
-                purpose=PURPOSE,
-                ignore_interval=True,
-                role_label=str(self._scope.role_id or ""),
-            )
-        except Exception:
-            return "skip", None
-        if not result.ok:
-            return "skip", None
-        raw = extract_json_object(result.text)
-        if not isinstance(raw, Mapping):
-            return "skip", None
-        if "ok" not in raw:
-            # 没给结论（模型答了别的东西、或旧版本提示词）——当成没审，不改原样。
-            # 不能把「没回答」判成「不合格」：那会让每次生成都多一次重写。
-            return "skip", None
-        ok = raw.get("ok")
-        if isinstance(ok, str):
-            ok = ok.strip().lower() in ("true", "1", "yes", "是")
-        if bool(ok):
-            return "ok", None
-        reason = str(raw.get("reason") or "").strip()
-        fixed = raw.get("fixed")
-        if isinstance(fixed, Mapping):
-            new_slot = parse_segment(
-                dict(fixed),
-                now_minute=now_minute,
-                step=cfg.granularity_minutes,
-                prev=prev,
-            )
-            if new_slot is not None:
-                return "fixed", new_slot
-        return "reason", reason
+        if not slate:
+            return None
+        step = max(1, int(getattr(cfg, "granularity_minutes", 1) or 1))
+        prev_event = str((prev or {}).get("event") or "").strip()
+        usable: list[Mapping[str, Any]] = []
+        for item in slate:
+            event = str(item.get("event") or "").strip()
+            if not event or not _content_ok(event):
+                continue
+            if prev_event and event == prev_event:
+                continue
+            if self._is_repeat_today(event, prev):
+                continue
+            usable.append(item)
+        if not usable:
+            return None
+        # 按钟点稳定挑一条：同一处境反复降级也不该来回跳。
+        item = usable[(now_minute // step) % len(usable)]
+        event = str(item.get("event") or "").strip()
+        minutes = int(item.get("minutes") or 0) or SEGMENT_DEFAULT_MINUTES
+        minutes = max(SEGMENT_AWAKE_MIN_MINUTES, min(SEGMENT_MAX_MINUTES, minutes))
+        minutes = max(step, (minutes // step) * step)
+        start = segment_start(now_minute, step)
+        end = start + minutes
+        slot: Slot = {
+            "start": format_time(start),
+            "end": format_time(min(DAY_MINUTES, end)),
+            "event": event,
+            "location": str(item.get("location") or "家里"),
+            "emotion": "平静",
+            "energy_rate": clamp_rate(-0.02),
+        }
+        if end > DAY_MINUTES:
+            slot["carry_end"] = format_time(end - DAY_MINUTES)
+        return slot
 
     def _degrade_to_neutral(
         self,
         cfg: HumanoidConfig,
         now_minute: int,
         prev: Mapping[str, Any] | None,
+        slate: Sequence[Mapping[str, Any]] = (),
     ) -> Slot:
-        """降级：给中性处境词（与模型不可用时同一条兜底路径）。"""
-        slot = dynamic_segment(
+        """降级：先拿一件筛过的具体事顶上，实在没有才给中性处境词。
+
+        两条兜底都是本地的、都不带设备词：候选是素材池过筛的（书、本子、杯子这类），
+        处境词是「歇着」「吃饭」这类状态。前者更像她的生活，后者留给真的没得挑的时候。
+        """
+        neutral = dynamic_segment(
             cfg,
             self._body_snapshot(),
             now_minute=now_minute,
@@ -4287,6 +5142,14 @@ class ScheduleService:
             seed=self._seed(),
             asleep_minutes=self.sleeping_minutes(now_minute),
         )
+        # 该睡了就别拿一件醒着的事把觉顶掉；候选本身是按这个钟点筛出来的
+        # （materials_for 按 band 过滤），夜里不会冒出白天的事。
+        if slot_sleeps(neutral):
+            self._set_source(SOURCE_TEMPLATE)
+            return neutral
+        slot = self._slot_from_slate(cfg, now_minute, prev, slate)
+        if slot is None:
+            slot = neutral
         self._set_source(SOURCE_TEMPLATE)
         return slot
 
@@ -4341,14 +5204,18 @@ class ScheduleService:
                 # 去「接着做」那件早就结束的事。
                 if hi > new_start and hi > minutes:
                     # 她提前结束去做别的：收到新段起点，不留重叠。
-                    if new_start > lo:
+                    stub = new_start - lo
+                    if new_start > lo and (
+                        stub >= MIN_TRUNCATED_STUB_MINUTES or slot_sleeps(last)
+                    ):
                         # 这一件事被从中间截断了：记下它（新段换了事才挂起，见下）。
                         truncated = last
                         truncated_remaining = max(0, hi - new_start)
                         last["end"] = format_time(new_start)
                         segs[target] = last
                     else:
-                        # 上一段刚开始就被换掉：它没有存在过，丢掉比留一条零长度记录干净。
+                        # 上一段刚开始（或剩下的那一截短于 MIN_TRUNCATED_STUB_MINUTES）
+                        # 就被换掉：它没有存在过，丢掉比留一条「3 分钟的窗户」干净（v3.1.29）。
                         segs.pop(target)
 
 
@@ -4543,6 +5410,10 @@ class ScheduleService:
             "source": self.source,
             "source_text": self.source_text,
             "persona": str(self._scope.get_self("schedule_persona", "") or "") or self.last_persona,
+            # 基础信息（v3.1.33）：名字/年龄/生日。年龄每次读都按生日现算，
+            # 所以这里看到的数字会随年份自己变。
+            "basics": self.basics_info(),
+            "species": self._species_profile(),
             "generated_at": self._scope.get_self("schedule_generated_at", ""),
             "last_error": self.last_error,
             "generating": self.generating,
@@ -4555,6 +5426,12 @@ class ScheduleService:
             "interrupt": self._interrupt_status(),
             # 质量闸计数（v3.0.6）：repeat/invented/rewrite/fallback。
             "quality": dict(self._quality),
+            # 落盘累计（v3.1.17）：跨重启还在的「这类问题发生过几次」。
+            "quality_total": dict(self._scope.get_self(QUALITY_STATS_KEY, {}) or {}),
+            # 被拒过的写法（v3.1.17）：下次不再进候选清单的那几句。
+            "rejects": list(self._rejected_events()),
+            # 今天记过几条私事（v3.1.18）：只给状态页看，不进 prompt、不进日程。
+            "intimate_today": self.intimate_today(),
         }
 
     async def aclose(self):

@@ -273,7 +273,9 @@ class InterruptWindowConfigTest(unittest.TestCase):
 
 class InterruptNowTest(unittest.IsolatedAsyncioTestCase):
     async def test_interrupt_switches_to_another_thing_even_if_model_says_continue(self):
-        service, store, clock, provider, _ = build_service(reply=seg_reply("改海报", 90))
+        service, store, clock, provider, _ = build_service(
+            config=cfg(schedule_time_granularity="15min"), reply=seg_reply("改海报", 90)
+        )
         await service.ensure_fresh()
         self.assertEqual(service.current_activity()["name"], "改海报")
         clock.advance(minutes=20)  # 09:20，这一段还没做完
@@ -295,7 +297,9 @@ class InterruptNowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(suspended["remaining_minutes"], 75)
 
     async def test_interrupt_accepts_the_model_s_new_event(self):
-        service, _, clock, provider, _ = build_service(reply=seg_reply("改海报", 90))
+        service, _, clock, provider, _ = build_service(
+            config=cfg(schedule_time_granularity="15min"), reply=seg_reply("改海报", 90)
+        )
         await service.ensure_fresh()
         clock.advance(minutes=20)
         provider.reply = seg_reply("下楼取快递", 25)
@@ -629,7 +633,9 @@ class ResumeParseTest(unittest.TestCase):
 class ResumeFlowTest(unittest.IsolatedAsyncioTestCase):
     async def test_generation_resumes_and_clears_the_suspended_item(self):
         service, store, clock, provider, _ = build_service(
-            reply=resume_reply(), moment=datetime(2026, 8, 22, 9, 20, tzinfo=TZ)
+            config=cfg(schedule_time_granularity="15min"),
+            reply=resume_reply(),
+            moment=datetime(2026, 8, 22, 9, 20, tzinfo=TZ),
         )
         seed_day(store, [{
             "start": "09:00", "end": "10:30", "event": "改海报",

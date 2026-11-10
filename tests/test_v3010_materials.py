@@ -330,7 +330,6 @@ class NeedLessSleepGateTest(unittest.IsolatedAsyncioTestCase):
     def _build(self, reply, moment=MOMENT, sleep_pressure=40.0):
         conf = cfg(
             schedule_provider_name="p",
-            schedule_quality_gate=True,
             schedule_change_chance=0,
         )
         tmp = Path(tempfile.mkdtemp()) / "state.json"

@@ -282,19 +282,10 @@ class HumanoidConfig:
     schedule_persona_max_chars: int = 3000
     # 自由文本配置项，必须卡长度：它逐字进入日程生成 prompt，有人能往里面粘一整篇设定。
     SCHEDULE_PROMPT_EXTRA_MAX = 300
-    schedule_time_granularity: str = "15min"
+    schedule_time_granularity: str = "flexible"
     # 日程直接按 AstrBot 当前生效的人格设定生成（v2.15 起）。关掉后 prompt 里不带入设，
     # 回到中性身份；schedule_prompt_extra 两种情况下都照带。
     schedule_use_persona: bool = True
-    # 生成后的质量闸（v3.0.6）：这一段排进来之前，独立判一次「今天是不是已经排过
-    # 同一件事」和「事件里的身份/家人/宠物/约定，人设里有没有依据」。判中了先带着
-    # 提示重写一次，仍然编造就降级成中性处境词。
-    #
-    # 为什么改默认（3.1.0）：实测报告 P0-4 里，这道闸把**正常日程**判成「编造」
-    # 降级成中性模板的情况比拦下的真编造还多，用户看到的是一整天只有「睡一觉」。
-    # 判据来自模型自己的二次审查，误判成本是整天的日程，比放过一段轻微编造更贵，
-    # 所以默认关；想要严格口径的部署自己开。
-    schedule_quality_gate: bool = False
 
     admin_qq: tuple[str, ...] = ()
 
@@ -664,7 +655,6 @@ class HumanoidConfig:
             ),
             schedule_time_granularity=c("schedule_time_granularity", tuple(GRANULARITY_MINUTES)),
             schedule_use_persona=b("schedule_use_persona"),
-            schedule_quality_gate=b("schedule_quality_gate"),
             admin_qq=_as_str_tuple(pick("admin_qq")),
             weather_enabled=b("weather_enabled"),
             weather_api_key=s_opt("weather_api_key"),

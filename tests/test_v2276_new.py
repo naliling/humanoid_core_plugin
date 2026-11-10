@@ -284,7 +284,7 @@ class ConfigLayerGuardsTest(unittest.TestCase):
             })
         self.assertEqual(cfg.inject_activity_context, "medium")
         self.assertEqual(cfg.environment_mode, "both")
-        self.assertEqual(cfg.schedule_time_granularity, "15min")
+        self.assertEqual(cfg.schedule_time_granularity, "flexible")
         text = "\n".join(caught.output)
         for bad in ("low", "GROUP", "1min"):
             self.assertIn(bad, text)

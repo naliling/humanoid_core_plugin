@@ -140,6 +140,12 @@ def _system_prompt_support(provider: Any) -> str:
 # 额度用完之后她照样每 N 条私聊调一次模型，而 /拟人 诊断 里看不出任何痕迹。
 GATE_EXEMPT_PURPOSES = frozenset({PURPOSE_MOOD})
 
+# 日程生成要留一份自己的额度（v3.1.32）。线上实测：情绪分析把 200 次预算吃光之后，
+# 日程生成一次都排不上，六个角色一整天只剩「睡一觉」「把床单洗了」这类本地兜底段。
+# 保留额只在总预算用完那一刻才起作用，平时不设限；占比四分之一、下限 24 次。
+SCHEDULE_RESERVE_SHARE = 0.25
+SCHEDULE_RESERVE_MIN = 24
+
 _GATE_IDLE = "idle"
 _GATE_INTERVAL = "interval"
 _GATE_BUDGET = "budget"
@@ -756,6 +762,26 @@ class CallGate:
     def _daily_budget(self) -> int:
         return max(0, int(getattr(self._config(), "llm_daily_call_budget", 0) or 0))
 
+    def _schedule_reserve(self, budget: int) -> int:
+        """日程生成自己那份保留额；`budget<=0`（不限量）时没有保留额这回事。"""
+        if budget <= 0:
+            return 0
+        return min(budget, max(SCHEDULE_RESERVE_MIN, int(budget * SCHEDULE_RESERVE_SHARE)))
+
+    def _budget_verdict(self, purpose: str, budget: int) -> GateVerdict | None:
+        """预算闸：返回 None 表示放行，否则是拒绝结论。
+
+        总预算用完时，日程生成还能继续用自己那份保留额——否则情绪分析把额度吃光，
+        日程一整天退回本地兜底段（这是线上真实发生过的形态）。
+        """
+        if budget <= 0 or self._used_today < budget:
+            return None
+        if purpose == PURPOSE_SCHEDULE:
+            used = self._used_by_purpose.get(PURPOSE_SCHEDULE, 0)
+            if used < self._schedule_reserve(budget):
+                return None
+        return GateVerdict(False, _GATE_BUDGET, f"今日 {self._used_today}/{budget} 次已用完")
+
     def check(
         self,
         purpose: str,
@@ -777,7 +803,7 @@ class CallGate:
             self._roll_day()
             self._sync_from_disk()
             budget = self._daily_budget()
-            if budget > 0 and self._used_today >= budget:
+            if self._budget_verdict(purpose, budget) is not None:
                 return GateVerdict(
                     False,
                     _GATE_BUDGET,
@@ -790,9 +816,9 @@ class CallGate:
         wall = self._wall() if now is None else float(now)
 
         if budget_only:
-            budget = self._daily_budget()
-            if budget > 0 and self._used_today >= budget:
-                return GateVerdict(False, _GATE_BUDGET, f"今日 {self._used_today}/{budget} 次已用完")
+            denied = self._budget_verdict(purpose, self._daily_budget())
+            if denied is not None:
+                return denied
             return GateVerdict(True)
 
         idle_limit = self._idle_minutes()
@@ -827,9 +853,9 @@ class CallGate:
                     f"到这次抽到的间隔（{interval / 60:.0f} 分钟）",
                 )
 
-        budget = self._daily_budget()
-        if budget > 0 and self._used_today >= budget:
-            return GateVerdict(False, _GATE_BUDGET, f"今日 {self._used_today}/{budget} 次已用完")
+        denied = self._budget_verdict(purpose, self._daily_budget())
+        if denied is not None:
+            return denied
 
         return GateVerdict(True)
 
@@ -892,6 +918,7 @@ class CallGate:
             "interval_minutes": interval,
             "max_interval_minutes": max_interval,
             "budget": budget,
+            "schedule_reserve": self._schedule_reserve(budget),
             "used_today": self._used_today,
             "used_by_purpose": dict(self._used_by_purpose),
             "verdict": self.check(PURPOSE_SCHEDULE, role_id=role_id),

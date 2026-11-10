@@ -6,7 +6,7 @@ import asyncio
 import random
 import re
 import time
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .state import seed_cycle_day
 from . import __version__
@@ -746,6 +746,20 @@ class HumanoidCoreInstance:
             return None
         return await self.persona_source.persona(self.role_id)
 
+    def _note_intimate_in_schedule(self, moment: float) -> None:
+        """把「今天确实发生过」记到日程的私事账上（v3.1.18，B 的写侧）。
+
+        日程这边不排这种事、也不生成它，只记一条事实：下次她自己的日程里会多一句
+        「身子还软着」，但不会出现「做了什么」。记失败不影响结算。
+        """
+        try:
+            schedule = getattr(self, "schedule", None)
+            if schedule is None:
+                return
+            schedule.note_intimate(float(moment))
+        except Exception:  # noqa: BLE001 - 记性坏了不该影响对话
+            pass
+
     def _schedule_body(self) -> dict:
         """日程重排用的身体参考数值：每次重排现取的活值，不是静态设定。
 
@@ -759,6 +773,8 @@ class HumanoidCoreInstance:
         if self.config.soma_enabled:
             try:
                 snap = self.soma.snapshot()
+                # v3.1.17：9 个活值全给。之前只递 6 个，冷/亲近/想说话这几项
+                # 在排日程时根本看不见，等于让模型猜。
                 body.update(
                     {
                         "hunger": snap["hunger"],
@@ -766,6 +782,9 @@ class HumanoidCoreInstance:
                         "sleep_debt": snap["sleep_debt"],
                         "last_sleep_hours": snap["last_sleep_hours"],
                         "discomfort": snap["discomfort"],
+                        "chill": snap["chill"],
+                        "arousal": snap["arousal"],
+                        "social_desire": snap["social_desire"],
                         "asleep": snap["asleep"],
                     }
                 )
@@ -978,6 +997,7 @@ class HumanoidCoreInstance:
                     # 绕过 38/50 门槛、场景分与冷却；社交层又拿 ccb_done_count 判断
                     # 「是否发生过」。场景外直接返回 False，下面结算不会执行。
                     if _ccb.note_occurrence_in_scene(_us, now):
+                        self._note_intimate_in_schedule(now)
                         # 结算：明确拒绝 → 掉好感；到基线且不是第一次 → 多涨并降攻击。
                         # P1：拒绝有两个来源——**他**这条消息在拒绝（他不想），
                         # 或者**她**刚刚明确说过不要（她不想要）却仍然发生了。
@@ -1639,6 +1659,7 @@ class HumanoidCoreInstance:
                 return
             if not _ccb.note_occurrence(state, moment):
                 return
+            self._note_intimate_in_schedule(moment)
             prof = self.mood.profile(user_id) or {}
             eff = _ccb.occurrence_effects(state, prof, refused=False)
             if "affection" in eff:
@@ -1795,6 +1816,47 @@ class HumanoidCoreInstance:
             pass
         self._species_cache = (key, profile)
         return profile
+
+    def basics_profile(self) -> dict[str, Any]:
+        """她的基础信息（名字/年龄/生日，v3.1.33）：状态里那一份 + 现算的年龄。
+
+        为什么要有：用户原话「这个插件 没有给每个角色可以拥有一套基础信息 如年龄
+        且也是会变得」。以前年龄只活在人设正文里，日程和聊天都读不到；现在第一次
+        见到人设就从正文里认一次（只补空键，不覆盖用户改过的值），之后**年龄按生日
+        现算**——跨年、过生日它自己就变，不需要任何定时任务去改状态。
+        """
+        from . import role_basics
+
+        scope = getattr(self, "_scope", None)
+        stored: dict[str, Any] = {}
+        if scope is not None:
+            try:
+                raw = scope.get_self(role_basics.PROFILE_KEY)
+                stored = dict(raw) if isinstance(raw, Mapping) else {}
+            except Exception:
+                stored = {}
+        try:
+            prompt = self._ccb_persona_prompt() or self._persona_text()
+        except Exception:
+            prompt = ""
+        try:
+            today = self.clock.now().strftime("%Y-%m-%d")
+        except Exception:
+            today = ""
+        if prompt.strip():
+            parsed = role_basics.parse_basics(prompt, today=today)
+            merged = role_basics.merge_missing(stored, parsed)
+            if merged != stored:
+                stored = merged
+                # 只在真的认出东西时才写：认不出来就空着，别替她编一个年龄。
+                try:
+                    if scope is not None:
+                        scope.set_self(role_basics.PROFILE_KEY, stored)
+                except Exception:
+                    pass
+        info = dict(stored)
+        info["age"] = role_basics.age_at(stored, today)
+        return info
 
     def ccb_safety(self) -> str:
         """人设安全闸的判定结果（缓存按人设正文，避免每轮重跑正则）。
@@ -2322,12 +2384,39 @@ class HumanoidCoreInstance:
             if published is None:
                 return
             existing = self._scope.get_self(life_log.LIFE_KEY)
-            merged = life_log.merge_open(existing, published, self.now_epoch())
+            merged = life_log.merge_open(
+                self._clean_open_items(existing),
+                self._clean_open_items(published),
+                self.now_epoch(),
+            )
             if merged != existing:
                 self._scope.set_self(life_log.LIFE_KEY, merged)
         except Exception as exc:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 应用未完事项失败: {exc}")
+
+    @staticmethod
+    def _clean_open_items(items: Any) -> Any:
+        """点名设备的未完事项不进账本（v3.1.30）。
+
+        这本账会被渲染进提示词。社交层那份列表是「还开着」的定义，它会把
+        「你咋知道我那手机坏了？」这种带着设备的条目一起发过来，等于教她认识手机；
+        而日程那边早就把设备词挡在门外了。只认设备**物件**：「等 TA 回消息」这种
+        讲人的事照留（那是真事，删了就是丢信息）。
+        """
+        try:
+            from .services.schedule_content import object_issues
+        except Exception:  # noqa: BLE001 - 判据加载失败时宁可不动账本
+            return items
+        if not isinstance(items, list):
+            return items
+        kept = []
+        for item in items:
+            text = item.get("text") if isinstance(item, dict) else item
+            if isinstance(text, str) and object_issues(text):
+                continue
+            kept.append(item)
+        return kept
 
     def life_items(self) -> list[dict[str, Any]]:
         """她手上还开着的那几件事。已经到期的在这里就被丢掉，不再往外递。
@@ -2340,7 +2429,7 @@ class HumanoidCoreInstance:
             raw = self._scope.get_self(life_log.LIFE_KEY)
         except Exception:
             return []
-        return life_log.prune(raw, self.now_epoch())
+        return self._clean_open_items(life_log.prune(raw, self.now_epoch()))
 
     def _drop_life_items_of(self, removed: set[str]) -> int:
         """把已经删掉的人从「她手上还开着的事」里一并抹掉。
@@ -2623,7 +2712,7 @@ class HumanoidCoreInstance:
             out.append(row("天气", str(wx["weather"])))
         elif str(wx.get("env", "") or ""):
             out.append(row("天气", "未取到", str(wx["env"])))
-        segs = self.schedule.segments()
+        segs = self.schedule.display_segments()
         active = self.schedule.active_segment()
         out.append(row("日程", f"今天 {len(segs)} 段", self.schedule.source_text))
         if active:
@@ -2648,7 +2737,7 @@ class HumanoidCoreInstance:
     def schedule_text(self) -> str:
         """她今天过出来的日程：已过完的段 + 当前段，没有预排的未来。"""
         now = self.clock.now()
-        segs = self.schedule.segments()
+        segs = self.schedule.display_segments()
         who = self.persona_label()
         head = f"📅 {now.strftime('%Y-%m-%d')} 她今天过出来的日程（{self.schedule.source_text}"
         head += f"，人设：{who}）：" if who else "）："
@@ -2757,6 +2846,13 @@ class HumanoidCoreInstance:
                 if task is not None:  # 停止信号竞态窗口里会返回 None
                     spawned.append(task)
             self.schedule.current_slots()
+            # 基础信息（v3.1.33）：启动时先认一次名字/年龄/生日。不能只等她第一次
+            # 真去生成日程——全天靠兜底段的角色可能一天都不生成，那这份档案就永远
+            # 空着，提示词里也永远没有「她多大」。
+            try:
+                self.basics_profile()
+            except Exception:
+                pass
             self.schedule.seed_first_segment()
         except BaseException:
             self._started = False

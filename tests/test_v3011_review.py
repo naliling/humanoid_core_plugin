@@ -1,4 +1,4 @@
-"""日程接续与模型审查（v3.0.11）：空档不被节流挡住、生成后有模型复审。"""
+"""日程接续（v3.0.11）：空档不被节流挡住；模型自审层已在 v3.1.28 删除。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from humanoid.llm import CallGate, LLMGateway, ProviderResolver
 from humanoid.services.schedule import (
     SOURCE_LLM,
     ScheduleService,
-    _review_prompt,
     parse_segment,
 )
 from humanoid.state import StateStore
@@ -28,11 +27,10 @@ FIXED_MOMENT = datetime(2026, 8, 22, 9, 0, tzinfo=TZ)
 
 
 def cfg(**overrides) -> HumanoidConfig:
-    # 3.1.0 起 schedule_quality_gate 默认关；本文件测的就是「生成后复审」这条链路，
-    # 显式打开，否则审查根本不会被调用（要测「关掉」的用例自己再传 False）。
+    # v3.1.28 起模型自审层已删；本文件只留闸门间隔、空档接续与固定段解析。
     return HumanoidConfig.from_raw(
         {"timezone_city": "北京", "schedule_change_chance": 0,
-         "schedule_quality_gate": True, **overrides}
+         **overrides}
     )
 
 
@@ -99,120 +97,6 @@ class GateIntervalTest(unittest.TestCase):
         self.assertEqual(verdict.reason, "idle")
 
 
-class ReviewPromptTest(unittest.TestCase):
-    def test_prompt_carries_the_previous_segment(self):
-        text = _review_prompt(
-            now_text="09:00",
-            prev={"start": "08:30", "end": "08:55", "event": "洗杯子", "location": "厨房"},
-            slot={"start": "09:00", "end": "09:30", "event": "在沙发上喝东西", "location": "客厅"},
-            persona_text="她是个安静的人",
-        )
-        self.assertIn("【审查这一段】", text)
-        self.assertIn("洗杯子", text)
-        self.assertIn("在沙发上喝东西", text)
-        self.assertIn("30 分钟", text)
-
-    def test_prompt_asks_for_a_reason_and_a_fixed_version(self):
-        text = _review_prompt(
-            now_text="09:00",
-            prev=None,
-            slot={"start": "09:00", "end": "09:30", "event": "喝东西", "location": "客厅"},
-            persona_text="",
-        )
-        self.assertIn("ok", text)
-        self.assertIn("reason", text)
-        self.assertIn("fixed", text)
-        # 判据必须在提示词里，否则「准一点」无从谈起。
-        for word in ("时间", "地点", "时长", "重复"):
-            self.assertIn(word, text)
-
-
-class ReviewServiceTest(unittest.IsolatedAsyncioTestCase):
-    def build(self, config=None, providers=None, gate=None):
-        conf = config or cfg()
-        self.conf = conf
-        tmp = Path(tempfile.mkdtemp()) / "state.json"
-        store = ScopeStore(tmp)
-        store.load(FIXED_TODAY, conf.cycle_length)
-        log = RecordingLogger()
-        ctx = FakeContext(chat_providers=list(providers or []))
-        resolver = ProviderResolver(ctx, log)
-        gateway = LLMGateway(resolver, lambda: self.conf, log, time.monotonic, gate=gate)
-        clock = FrozenClock(FIXED_MOMENT)
-        service = ScheduleService(
-            store.scope,
-            lambda: self.conf,
-            clock,
-            logger=log,
-            monotonic=time.monotonic,
-        )
-        service.set_resolver_gateway(resolver, gateway)
-        return service, store, log
-
-    async def test_ok_verdict_keeps_the_segment(self):
-        provider = FakeProvider("p", reply=seg_reply(event="改海报", minutes=40))
-        service, _store, _log = self.build(cfg(schedule_provider_name="p"), [provider])
-        self.assertTrue(await service.ensure_fresh())
-        self.assertEqual(provider.calls, 1)
-        self.assertEqual(provider.review_calls, 1, "生成完必须审一遍")
-        segs = service.segments()
-        self.assertEqual(segs[0]["event"], "改海报")
-        self.assertEqual(segs[0]["end"], "09:40")
-
-    async def test_fixed_verdict_replaces_the_segment_without_rewriting(self):
-        provider = FakeProvider("p", reply=seg_reply(event="在沙发上喝东西", minutes=30))
-        provider.review_reply = review_reply(
-            ok=False,
-            reason="喝东西不该占 30 分钟",
-            fixed={"event": "把杯子洗了", "location": "厨房", "minutes": 6},
-        )
-        service, _store, _log = self.build(cfg(schedule_provider_name="p"), [provider])
-        await service.ensure_fresh()
-        segs = service.segments()
-        self.assertEqual(segs[0]["event"], "把杯子洗了", "用模型改好的那版")
-        self.assertEqual(segs[0]["end"], "09:30", "改法也要过清醒下限（#311）")
-        self.assertEqual(provider.calls, 1, "同一份回答里给了改法，不该再问一次")
-
-    async def test_reason_verdict_sends_the_reason_into_the_rewrite(self):
-        provider = FakeProvider("p", reply=seg_reply(event="在沙发上喝东西", minutes=30))
-        provider.review_reply = review_reply(
-            ok=False, reason="在沙发上喝东西不该占 30 分钟",
-        )
-        service, _store, _log = self.build(cfg(schedule_provider_name="p"), [provider])
-        await service.ensure_fresh()
-        self.assertEqual(provider.calls, 2, "生成一次 + 按原因重写一次")
-        prompt = provider.last_kwargs.get("prompt") or ""
-        self.assertIn("在沙发上喝东西不该占 30 分钟", prompt, "原因要原样带进重写提示词")
-
-    async def test_review_answer_without_ok_is_ignored(self):
-        """模型没给结论（或答了别的东西）时保持原样，别把它当不合格。"""
-        provider = FakeProvider("p", reply=seg_reply(event="改海报", minutes=40))
-        provider.review_reply = "这一段看起来还行。"
-        service, _store, _log = self.build(cfg(schedule_provider_name="p"), [provider])
-        await service.ensure_fresh()
-        self.assertEqual(provider.calls, 1, "没结论就不该触发重写")
-        self.assertEqual(provider.review_calls, 1)
-        self.assertEqual(service.segments()[0]["event"], "改海报")
-
-    async def test_review_is_skipped_when_she_keeps_doing_the_same_thing(self):
-        provider = FakeProvider("p", reply=seg_reply(event="改海报", minutes=60))
-        service, _store, _log = self.build(cfg(schedule_provider_name="p"), [provider])
-        await service.ensure_fresh()
-        self.assertEqual(provider.review_calls, 1)
-        service._clock.advance(minutes=30)
-        provider.reply = continue_reply(minutes=60)
-        self.assertTrue(await service.ensure_fresh(force=True))
-        self.assertEqual(provider.review_calls, 1, "接着做同一件事没有转场可审")
-
-    async def test_review_is_skipped_when_quality_gate_is_off(self):
-        provider = FakeProvider("p", reply=seg_reply(event="改海报", minutes=40))
-        service, _store, _log = self.build(
-            cfg(schedule_provider_name="p", schedule_quality_gate=False), [provider]
-        )
-        await service.ensure_fresh()
-        self.assertEqual(provider.review_calls, 0)
-
-
 class GapContinuityTest(unittest.IsolatedAsyncioTestCase):
     """空档接续：她手上那段过完之后，立刻排下一段，不被上一段留下的间隔挡住。"""
 
@@ -241,7 +125,7 @@ class GapContinuityTest(unittest.IsolatedAsyncioTestCase):
         return service, provider, gateway
 
     async def test_gap_is_filled_right_away_despite_the_interval(self):
-        service, provider, _gateway = self.build()
+        service, provider, _gateway = self.build(schedule_time_granularity="15min")
         await service.ensure_fresh()  # 09:00-09:30 倒杯水（清醒下限 30）
         self.assertEqual(provider.calls, 1)
         service._clock.advance(minutes=31)  # 09:31，手上没有任何一段
