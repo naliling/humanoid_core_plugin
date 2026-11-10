@@ -51,6 +51,25 @@ def _is_address(norm: str) -> bool:
     return bool(norm) and len(norm) <= ADDRESS_MAX_CHARS and not _CJK.search(norm)
 
 
+#: AstrBot 分段流式渲染时会先把响应对象填成占位文本，真文本要等渲染完才写回来。
+#: 这些占位符**不是她说的话**：一旦被当成原话记进 `spoke_log`，情绪分析、提示词、
+#: 巡检都会把它当真（线上实例：`(Model response will be rendered here)` 躺在账本里）。
+#: 只认死证据，不做模糊匹配——宁可漏一条，也不能把她的真话判成占位符扔了。
+PLACEHOLDER_MARKERS: Tuple[str, ...] = (
+    "model response will be rendered here",
+    "response will be rendered here",
+    "will be rendered here",
+)
+
+
+def is_placeholder(text: str) -> bool:
+    """这段文本是不是渲染占位符（不是她真正说出来的话）。"""
+    low = str(text or "").strip().lower()
+    if not low:
+        return False
+    return any(marker in low for marker in PLACEHOLDER_MARKERS)
+
+
 def _clauses(text: str) -> List[Tuple[str, str]]:
     """切成 [(小句, 分隔符), ...]；分隔符为空串表示最后一段。"""
     parts = _SPLIT.split(str(text or ""))

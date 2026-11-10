@@ -21,6 +21,7 @@ from ..data.mood_map import generate_mood_tag, get_mood_label
 from ..jsonx import extract_json_object
 from ..llm import PURPOSE_MOOD, LLMGateway
 from ..recall import MAX_SNIPPETS, note_said, recall_lines
+from ..reply_guard import is_placeholder as _is_placeholder
 from ..wording import pick
 from ..role_scope import RoleScope
 
@@ -1150,7 +1151,17 @@ class MoodService:
 
     def spoke(self, user_id: str) -> list:
         # 同 `said`：只读用 peek，别因为「看一眼她说过什么」就给对方建条目。
-        return self._scope.peek_user(user_id, "spoke_log") or []
+        rows = self._scope.peek_user(user_id, "spoke_log") or []
+        # 旧版本把渲染占位符当成她的原话记过账（v3.1.35）：读的时候一律滤掉，
+        # 情绪分析与提示词就不会再吃一遍。
+        return [
+            row
+            for row in rows
+            if not (
+                isinstance(row, dict)
+                and _is_placeholder(str(row.get("text") or ""))
+            )
+        ]
 
     def note_spoke(
         self, user_id: str, text: str, now: float | None = None, *, pending: bool = True
@@ -1158,6 +1169,10 @@ class MoodService:
         """记一句她自己的原话。`pending=True` = 发出去了，还没等到回应。"""
         body = str(text or "").strip()[:200]
         if not body:
+            return self.spoke(user_id)
+        # 渲染占位符不是她的话：记进去等于把「(Model response will be rendered here)」
+        # 当成她的原话喂给情绪分析（v3.1.35）。
+        if _is_placeholder(body):
             return self.spoke(user_id)
         stamp = self._time() if now is None else now
         # 先 append 再截。原来是 append 之前切，于是存进去的是上限 +1 条。

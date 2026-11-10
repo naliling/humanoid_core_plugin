@@ -573,7 +573,7 @@
     "description": "每日调用预算(次)",
     "hint": "每天模型调用上限（0=不限）",
     "type": "int",
-    "default": 200,
+    "default": 500,
     "minimum": 0,
     "maximum": 1000000,
     "slider": {

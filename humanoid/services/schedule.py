@@ -39,10 +39,12 @@ from ..slots import (
     slot_sleeps,
 )
 from ..traits import detect as detect_traits, trait_hints
+from ..reply_guard import is_placeholder as _is_placeholder
 from ..wording import pick
 from .habit import archive_day, habit_lines, history_of, render_habits
 from .life_material import (
     CAPABILITY_WORDS as _EXAMPLE_NEEDS,
+    MATERIALS_DONE_KEY as _MATERIALS_DONE_KEY,
     material_minutes,
     materials_for,
     render_materials,
@@ -102,8 +104,10 @@ HEAL_IDLE_CATCHUP_SECONDS = 4 * 3600.0
 HEAL_GEN_KEY = "schedule_heal_gen_wall"
 # 旧状态清理（v3.1.28）：设备词/含糊词曾经写进日程，读的时候过滤不够，
 # 得在 state 里真的删掉。跑过一次就记版本，别每次启动都扫。
+# v3.1.35 升到 8：再清两处漏网的——`materials_done` 里带设备/物种词的台账，
+# 以及被反复加前缀的「今天上午今天上午…」标题。
 PURGE_KEY = "schedule_purged_v"
-PURGE_VERSION = 7
+PURGE_VERSION = 8
 # 被下一段从中间截断时，剩下的那一小截值不值得留（v3.1.29）。
 # 3 分钟的「把窗户打开」不是一段生活，是拼接留下的碎渣；短于这个数就把整段
 # 撤掉（睡眠段例外：觉不能被删），免得日程里出现「太短」的段。
@@ -3947,6 +3951,50 @@ class ScheduleService:
             if len(kept) != len(life_entries):
                 self._scope.set_self("life_log", kept)
 
+        # 「今天已经做过的事」台账（v3.1.35）：`materials_done` 会被 `done_card`
+        # 渲染成「今天上午…」再递回提示词，设备词与物种词就是从这里进模型的。
+        # 只删条目，不改词。
+        done_rows = self._scope.get_self(_MATERIALS_DONE_KEY)
+        if isinstance(done_rows, list) and done_rows:
+            kept = []
+            for row in done_rows:
+                if not isinstance(row, dict):
+                    kept.append(row)
+                    continue
+                title = str(row.get("title") or "")
+                # 旧 `past_title()` 不幂等，攒出过「今天上午今天上午今天上午…」；
+                # 这种标题已经不成句，留着只会教模型复读前缀。
+                if dirty(title) or title.count("今天") > 1:
+                    removed += 1
+                    continue
+                kept.append(row)
+            if len(kept) != len(done_rows):
+                self._scope.set_self(_MATERIALS_DONE_KEY, kept)
+
+        # `spoke_log` 里的渲染占位符（v3.1.35）：AstrBot 分段流式会把
+        # `(Model response will be rendered here)` 顶在响应对象上，它曾被当成她的
+        # 原话记账、还进了情绪分析。这本账按人存，只能逐人翻；读路径
+        # `mood.spoke()` 也已过滤，这里把脏行真删掉。
+        try:
+            user_ids = list(self._scope.all_user_ids())
+        except Exception:
+            user_ids = []
+        for user_id in user_ids:
+            rows = self._scope.peek_user(user_id, "spoke_log")
+            if not isinstance(rows, list) or not rows:
+                continue
+            kept = [
+                row
+                for row in rows
+                if not (
+                    isinstance(row, dict)
+                    and _is_placeholder(str(row.get("text") or ""))
+                )
+            ]
+            if len(kept) != len(rows):
+                removed += len(rows) - len(kept)
+                self._scope.set_user(user_id, "spoke_log", kept)
+
         frame = self._scope.get_self("day_frame")
         if isinstance(frame, str) and frame and dirty(frame):
             self._scope.set_self("day_frame", "")
@@ -4685,6 +4733,10 @@ class ScheduleService:
         # 线上实测：它误判成「编造」而把整天日程磨成模板段的次数，比它拦下的
         # 真问题多（_conf_schema.json 里那句说明就是这段的墓志铭），而且每段多
         # 一次模型调用。现在改成：确定性检查常开 + 最后硬闸，不再问模型自审。
+        # 困意只当提示词里的一句建议，不在这里强制改写模型给的段（v3.1.36 起）：
+        # 她困了还醒着是模型和身体数值自己的事，硬把段换成睡会把她整天排醒着
+        # 的事全作废，也不是用户要的「按困意生成」。
+
         # ---- 最后一道硬闸（v3.1.16）----
         # 重写版、审查改好的版本、甚至降级后的处境词，写进状态前都再验一次事件文本。
         # 这一道不看质量闸开关：设备词进日程是产品约束，不是可选项。

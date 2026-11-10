@@ -829,6 +829,11 @@ def past_title(event: str, slot: str = "") -> str:
     if not text:
         return ""
     prefix = f"今天{slot}" if slot else "今天"
+    # 幂等：台账里的标题可能已经被加过一次前缀。旧写法不判断，`past_title` 每次
+    # 被调都再拼一个「今天上午」，线上攒出了
+    # 「今天上午今天上午今天上午凌晨在被小腹的坠痛弄醒…」（v3.1.35 修）。
+    if text.startswith("今天"):
+        return text
     if any(mark in text for mark in ("了", "过", "着", "完")):
         return prefix + text
     return prefix + text + "了"

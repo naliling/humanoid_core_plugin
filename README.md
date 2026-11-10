@@ -4,7 +4,7 @@
 > 不是一句人设，是一整天的生活。
 > 插件负责她的身体、日程、情绪和关系背景；怎么说话，仍然由大模型按人设自己决定。
 
-![version](https://img.shields.io/badge/version-v3.1.34-2563eb?style=flat-square)
+![version](https://img.shields.io/badge/version-v3.1.36-2563eb?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -174,7 +174,7 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 | `max_sleep_hours` | 0 | 一觉的硬上限，睡过就强制结算成醒着。0 = 自动（睡眠需求 + 3 小时，至少 10）；小于 4 按 4 算。日程断档后她一直「在睡」时靠它兜底 |
 | `weather_api_key` | 空 | OpenWeather 密钥（免费档就够） |
 | `llm_idle_silence_minutes` | 60 | 连续这么久没人说话就停掉后台调用，有人一说话立刻恢复 |
-| `llm_daily_call_budget` | 200 | 每日模型调用**次数**上限（不是 token），多 bot 共享一份 |
+| `llm_daily_call_budget` | 500 | 每日模型调用**次数**上限（不是 token），多 bot 共享一份 |
 | `opportunity_evidence_enabled` | 开 | 注入侧证据卡：每轮把「她此刻真能提的具体的事」（日程/未完事项/天气/生活素材）连同出处、采集时间与剩余有效期递进上下文；一条都没有时明确告诉她「少说，不要编」 |
 | `greeting_opportunity_enabled` | 开 | 问候时机卡：早 7-11 点、午间 12-14 点、晚 21-24 点落在窗口里时，把「现在适合开口」翻成一张可提的由头并进证据卡，出处写「问候时机」；只给时机，不代表对方刚醒，说什么由她自己定 |
 | `closing_guard_enabled` | 开 | 收尾沉默守卫：她已经用「晚安」这类话收过尾、对方也只回了句「晚安」时，不再补一条同义道别 |

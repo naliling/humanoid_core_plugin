@@ -1319,14 +1319,21 @@ def _response_text(response: Any) -> str:
         return ""
     for attr in ("completion_text", "text"):
         value = getattr(response, attr, None)
-        if isinstance(value, str) and value.strip():
+        # 分段流式时 `completion_text` 会被占位文本顶住（「(Model response will be
+        # rendered here)」）。那不是她说的话，以前它一路进了 `spoke_log`、情绪分析
+        # 和提示词（v3.1.35 修）。遇到占位符就当这一项没取到，继续往下找。
+        if isinstance(value, str) and value.strip() and not reply_guard.is_placeholder(value):
             return value
     chain = getattr(response, "result_chain", None)
     getter = getattr(chain, "get_plain_text", None)
     if callable(getter):
         try:
             plain = getter()
-            if isinstance(plain, str) and plain.strip():
+            if (
+                isinstance(plain, str)
+                and plain.strip()
+                and not reply_guard.is_placeholder(plain)
+            ):
                 return plain
         except Exception:
             pass
@@ -1471,6 +1478,9 @@ class HumanoidCore(Star):
         # 每日额度落盘。以前只在内存里，重启一次就归零——「一天 N 次」实际上
         # 是「每次重启再来 N 次」，而诊断页里看不出来。
         self.call_gate.bind_ledger(data_dir / "llm_usage.json")
+        # 「每个角色最后一次有人说话」也落盘（v3.1.35）。不落盘的话重启后所有角色都
+        # 变成「从没人跟她说过话」，日程生成会被空闲静默整段挡掉。
+        self.call_gate.bind_interactions(data_dir / "llm_interactions.json")
         self.gateway = LLMGateway(
             self.resolver, lambda: self._config, logger, gate=self.call_gate
         )

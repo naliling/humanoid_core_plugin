@@ -167,7 +167,7 @@ class DisplayAndPurgeTest(unittest.TestCase):
         left = [s["event"] for s in service._scope.get_self("daily_schedule")]
         self.assertEqual(left, ["把碗洗了"])
         self.assertEqual(service._scope.get_self(PURGE_KEY), PURGE_VERSION)
-        self.assertEqual(PURGE_VERSION, 7)
+        self.assertGreaterEqual(PURGE_VERSION, 7)
 
     def test_purge_keeps_everything_for_a_human(self):
         service = self.build(species=HUMAN)

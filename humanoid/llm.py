@@ -392,6 +392,8 @@ class CallGate:
         "_used_today",
         "_used_by_purpose",
         "_ledger_path",
+        "_interaction_path",
+        "_interaction_saved_at",
         "_synced_used",
         "_synced_by_purpose",
         "_next_gap",
@@ -434,6 +436,14 @@ class CallGate:
         # 每日额度必须落盘。以前只在内存里，AstrBot 重启一次就归零——200 次的预算
         # 重启一次又变 200 次，这个额度形同虚设，而且诊断里看不出任何痕迹。
         self._ledger_path = None
+        # 「每个角色最后一次有人跟她说话」也要落盘（v3.1.35）。原来只在内存里，
+        # 于是 AstrBot 一重启，所有角色都变成「从没人跟她说过话」——
+        # `idle_active` 判定把她们全当成「没人看着」，日程生成整天被判空闲静默、
+        # 一次都排不上。用户问的「重启能不能恢复」就是这条：以前不能。
+        self._interaction_path = None
+        # 上一次写盘的时刻（墙钟）。她每收到一条消息都会更新「隔了多久」，但没必要
+        # 每条消息都写一次盘：同一个群里几句话连着来，节流到几秒一次就够。
+        self._interaction_saved_at = 0.0
         # 账本里「已经算进磁盘」的那一份用量。落盘时只把自己新增的部分加进去，
         # 这样两个实例同时记账不会互相覆盖（见 _save_ledger）。
         self._synced_used = 0
@@ -445,6 +455,8 @@ class CallGate:
         self._last_interaction[str(role_id or "")] = (
             self._wall() if now is None else float(now)
         )
+        # 顺手落盘（v3.1.35）：量很小（每条角色一个时间戳），重启后还能算「隔了多久」。
+        self._save_interactions()
 
     def interaction_at(self, role_id: str = "") -> float | None:
         """这个角色最后一次「有人在跟她说话」的墙钟；从没说过返回 None。
@@ -489,6 +501,58 @@ class CallGate:
         # 于是重启后额度照旧归零，而这个洞在测试里长得和「代码写错了」一模一样。
         self._roll_day()
         self._load_ledger()
+
+    def bind_interactions(self, path) -> None:
+        """把「每个角色最后一次有人说话」的墙钟落盘（v3.1.35）。
+
+        不落盘的话，重启之后 `_last_interaction` 是空的，`interaction_at()` 返回
+        None → `never_interacted=True` → `idle_active=True`：闸门按「没人看着她」
+        把日程生成整段跳过。用户看到的「重启后日程不更新」就是这一条。
+        """
+        self._interaction_path = str(path)
+        self._load_interactions()
+
+    def _load_interactions(self) -> None:
+        path = self._interaction_path
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        wall = self._wall()
+        for key, value in data.items():
+            try:
+                at = float(value)
+            except (TypeError, ValueError):
+                continue
+            # 未来时间（时钟回拨/坏数据）不当真，否则「空闲多久」会算成负数。
+            if at <= 0 or at - wall > 86400.0:
+                continue
+            self._last_interaction[str(key)] = at
+
+    def _save_interactions(self, *, force: bool = False) -> None:
+        path = self._interaction_path
+        if not path:
+            return
+        # 节流：同一批消息连着进来时，只留最后那一次写盘。差值小于 0（时钟回拨）
+        # 也照写，宁可多写一次，也别让时间戳一直停在旧的。
+        now = self._wall()
+        if not force and 0.0 <= now - self._interaction_saved_at < 5.0:
+            return
+        try:
+            payload = json.dumps(self._last_interaction, ensure_ascii=False)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp, path)
+            self._interaction_saved_at = now
+        except OSError:
+            # 写不进去也不该影响发消息：这只是「重启后还记不记得」的加分项。
+            pass
 
     def _read_ledger(self) -> dict[str, Any] | None:
         """把账本文件读成 dict；读不出来（不存在 / 坏了 / 不是对象）返回 None。"""
