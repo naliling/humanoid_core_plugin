@@ -257,6 +257,30 @@ def _is_chat_provider(candidate: Any) -> bool:
     return candidate is not None and callable(getattr(candidate, "text_chat", None))
 
 
+def _split_id_parts(target: str) -> list[str]:
+    """把「供应商/模型名」拆成可能的候选 id。
+
+    面板里选模型时显示的是「娜莉灵/agnes-3.0-flash」这种写法，而 provider 的 id
+    可能只有后半截（或只有前半截）。两种都试一遍，免得明明有这个模型却报「不存在」。
+    """
+    if "/" not in target:
+        return []
+    head, _, tail = target.rpartition("/")
+    parts = [tail.strip(), head.strip()]
+    return [part for part in parts if part and part != target]
+
+
+# v3.1.39：模型 id 告警是**进程级限流**的。7 个角色各自生成一次日程，以前日志里
+# 会出现 14 条一模一样的「配置的 id 不存在」；同一条话半小时内只说一次。
+_MODEL_WARN_AT: dict[tuple[str, ...], float] = {}
+_MODEL_WARN_INTERVAL = 1800.0
+
+
+def reset_model_warnings() -> None:
+    """清空模型告警的限流记录（测试用）。"""
+    _MODEL_WARN_AT.clear()
+
+
 class ProviderResolver:
     __slots__ = ("_context", "_log")
 
@@ -323,6 +347,17 @@ class ProviderResolver:
             if _is_chat_provider(provider) and self.id_of(provider).strip().casefold() == folded:
                 self._debug(f"'{target}' 通过忽略大小写匹配到 {self.id_of(provider)}")
                 return provider
+        # v3.1.39：「供应商/模型」的写法拆开再试一遍（见 `_split_id_parts`）。
+        for part in _split_id_parts(target):
+            part_folded = part.casefold()
+            for provider in providers:
+                if not _is_chat_provider(provider):
+                    continue
+                if self.id_of(provider).strip().casefold() == part_folded:
+                    self._debug(
+                        f"'{target}' 按「供应商/模型」拆分后匹配到 {self.id_of(provider)}"
+                    )
+                    return provider
         return None
 
     def resolve_global(self, umo: str | None = None) -> Any | None:
@@ -1388,13 +1423,35 @@ class LLMGateway:
 
     def _warn_not_found(self, purpose: str, label: str, provider_id: str, is_global: bool) -> None:
         if is_global:
-            self._warn(f"{purpose} 无法获取全局默认对话模型，请检查 AstrBot 的「默认对话模型」设置")
+            self._warn_throttled(
+                ("global", purpose),
+                f"{purpose} 无法获取全局默认对话模型，请检查 AstrBot 的「默认对话模型」设置",
+            )
             return
         ids = self._resolver.available_ids()
-        self._warn(
+        if not ids:
+            # 一个可用 id 都没有 ≠ 配置写错：AstrBot 刚启动、或模型列表正在重载时很常见。
+            # 以前这里照样报「配置的 id 不存在」，用户看到的就是「明明有却说没有」。
+            self._warn_throttled(
+                ("not-ready", purpose, label, provider_id),
+                f"{purpose} {label} 暂时读不到可用模型列表（AstrBot 刚启动或正在重载时常见），"
+                "稍后会自动重试，不用改配置",
+            )
+            return
+        self._warn_throttled(
+            ("missing", purpose, label, provider_id),
             f"{purpose} {label} 配置的 id '{provider_id}' 不存在。"
-            f"当前可用 id: {ids or '（无）'}。请在插件配置里重新选择，或用 /拟人 诊断 查看详情"
+            f"当前可用 id: {ids}。请在插件配置里重新选择，或用 /拟人 诊断 查看详情",
         )
+
+    def _warn_throttled(self, key: tuple[str, ...], message: str) -> None:
+        """同一条告警半小时内只说一次（见 `_MODEL_WARN_AT`）。"""
+        now = time.monotonic()
+        last = _MODEL_WARN_AT.get(key, 0.0)
+        if last and now - last < _MODEL_WARN_INTERVAL:
+            return
+        _MODEL_WARN_AT[key] = now
+        self._warn(message)
 
     def _info(self, message: str) -> None:
         if self._log is not None:

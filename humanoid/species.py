@@ -29,6 +29,50 @@ KIND_MACHINE = "machine"
 #: 低于这个置信度就不注入（判不出当人类处理，宁缺勿错）。
 INJECT_MIN = 0.65
 
+#: 措辞用的身体类型（v3.1.37）。措辞池按「身上长什么样」分，不按物种名分：
+#: 四蹄没有手指、爪兽有爪没有蹄、鳞甲类盖着鳞片不是皮毛，而半兽人形（猫娘那类）
+#: 有手——对她说「手指」并不出戏。分四种：多一种就多维护一套句子，所以只分到
+#: 「毛」「鳞」「蹄」「手」这一步为止。
+BODY_HUMAN = "human"
+BODY_HOOF = "hoof"
+BODY_PAW = "paw"
+BODY_SCALE = "scale"
+
+
+def body_kind(kind: Any, traits: Any = ()) -> str:
+    """物种 → 措辞用的身体类型。判不出来一律按人形（宁可不出彩，不能出戏）。
+
+    顺序有讲究：四蹄优先于鳞片（龙马、麒麟既有鳞片又有蹄），鳞片优先于爪
+    （龙有爪但盖的是鳞片，不能说「皮毛底下」）。
+    """
+    name = str(kind or "")
+    try:
+        marks = tuple(str(t) for t in (traits or ()))
+    except TypeError:
+        marks = ()
+    if name == KIND_PONY or "四蹄" in marks or "蹄子" in marks:
+        return BODY_HOOF
+    if "鳞片" in marks or "鳞甲" in marks:
+        return BODY_SCALE
+    if name == KIND_BEAST:
+        return BODY_PAW
+    return BODY_HUMAN
+
+
+def profile_body(profile: Any) -> str:
+    """物种档案 → 身体类型。不是 dict、或档案里没判出物种，都按人形。
+
+    v3.1.38：档案里带 `body` 就**以它为准**——面板 `ccb_body` 手填的身体类型、
+    以及「半龙人 / 人鱼 / 兽人」这类靠词表猜不准的人形兽类，都由识别层直接写进
+    这一格。没有才退回按 kind + traits 推。
+    """
+    if not isinstance(profile, dict):
+        return BODY_HUMAN
+    explicit = str(profile.get("body") or "")
+    if explicit in (BODY_HUMAN, BODY_HOOF, BODY_PAW, BODY_SCALE):
+        return explicit
+    return body_kind(profile.get("kind"), profile.get("traits"))
+
 #: mask 表 = outfit 那份（**去掉「人马」**，否则「半人马」会被挖掉）+ 额外复合词。
 _EXTRA_MASK: Tuple[str, ...] = (
     "小马哥", "小马甲", "小马扎", "小马仔",
@@ -86,6 +130,8 @@ _TRAITS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 #: 明确物种（在身份区里出现就判，优先于粗分类）。
 _SPECIFIC: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("半人马", "半人马", ("四蹄",)),
+    # v3.1.38：半龙人排在「龙」前面——不然「你是半龙人」会被当成整条龙，按鳞甲兽形写。
+    ("半龙人", "半龙人", ("角", "鳞片")),
     ("人鱼", "人鱼", ("尾巴",)),
     ("鲛人", "鲛人", ("尾巴",)),
     ("魅魔", "魅魔", ("尾巴",)),
@@ -95,14 +141,33 @@ _SPECIFIC: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
     ("吸血鬼", "吸血鬼", ()),
     ("精灵", "精灵", ("兽耳",)),
     ("妖精", "妖精", ("翅膀",)),
+    ("凤凰", "凤凰", ("翅膀",)),
+    ("朱雀", "朱雀", ("翅膀",)),
+    ("海妖", "海妖", ("尾巴",)),
+    ("塞壬", "塞壬", ("翅膀",)),
+    ("僵尸", "僵尸", ()),
+    ("幽灵", "幽灵", ()),
+    ("亡灵", "亡灵", ()),
+    ("龙马", "龙马", ("角", "鳞片", "四蹄")),
     ("龙", "龙", ("角", "鳞片")),
-    ("麒麟", "麒麟", ("角", "鳞片")),
+    ("麒麟", "麒麟", ("角", "鳞片", "四蹄")),
+)
+
+#: 有手的非人（v3.1.38）。它们身体结构是人形——说「手指」「手腕」不出戏，但按
+#: kind=beast 一律当爪兽，就会写成「爪尖点着地面」「皮毛底下」。所以身体类型单独
+#: 钉成人形；kind 仍保留 beast/spirit（契约里「她不是人类」这件事还要说）。
+_HUMANOID_LABELS: Tuple[str, ...] = (
+    "半龙人", "人鱼", "鲛人", "魅魔", "梦魔", "天使", "恶魔", "吸血鬼",
+    "精灵", "妖精", "僵尸", "幽灵", "亡灵", "半兽人形",
 )
 
 #: 兽耳类（明确词，不用裸「尾巴」——否则魅魔/龙都会被抢先判成半兽）。
 _BEAST_EAR_WORDS = (
     "兽耳", "猫耳", "狐耳", "狼耳", "兔耳", "犬耳", "熊耳", "马耳",
     "猫娘", "狐娘", "狼女", "兽娘", "兽人娘", "兽尾", "毛茸茸",
+    # v3.1.38：这些以前落到 `outfit._IDENTITY_RE` 的 beast 分支，被当成兽形（说爪、
+    # 说皮毛）——它们是**人形**：有手、穿衣服。放进半兽人形这一档。
+    "兽人", "半兽人", "狼人", "虎人", "豹人", "鹰人", "蛇人",
 )
 
 #: 兽形动物词（身份区）。
@@ -372,7 +437,10 @@ def detect(persona: str, *, override: str = "") -> Dict[str, Any]:
         if item not in traits and item not in absent:
             traits.append(item)
 
-    if pony_conf >= 0.65:
+    # 明确物种优先于「小马系」的粗判定：龙马同时有四蹄和鳞片，只按 pony_conf
+    # 判就会被「四蹄 + 鬃毛」拖进小马分支、标签写成独角兽。麒麟本身是小马系
+    # 里的一个种族（有蹄有角有鳞），仍走小马分支。
+    if pony_conf >= 0.65 and (not spec_label or spec_label == "麒麟"):
         kind = KIND_PONY
         confidence = pony_conf
         terms = pony_terms
@@ -417,7 +485,8 @@ def detect(persona: str, *, override: str = "") -> Dict[str, Any]:
         label = _pony_label(traits, masked)
     elif spec_label:
         kind = KIND_SPIRIT if spec_label in (
-            "魅魔", "梦魔", "天使", "恶魔", "吸血鬼", "精灵", "妖精"
+            "魅魔", "梦魔", "天使", "恶魔", "吸血鬼", "精灵", "妖精",
+            "海妖", "塞壬", "僵尸", "幽灵", "亡灵",
         ) else KIND_BEAST
         confidence = 0.85
         terms = [spec_label]
@@ -450,10 +519,17 @@ def detect(persona: str, *, override: str = "") -> Dict[str, Any]:
         # 面板覆盖 = 用户明确指定，置信度拉满（但判不出仍然不注入）。
         confidence = 1.0
 
+    # v3.1.38：身体类型也随档案一起给。有手的非人钉成人形，其余按 kind + traits 推。
+    # 放这里而不是让调用方各推一次：四处（注入/素材/穿着/日程）必须读同一个结论。
+    body = body_kind(kind, traits)
+    if label in _HUMANOID_LABELS:
+        body = BODY_HUMAN
+
     return {
         "kind": kind,
         "label": label,
         "traits": traits,
+        "body": body,
         "confidence": round(confidence, 2),
         "terms": terms[:6],
         "source": source,

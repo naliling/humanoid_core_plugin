@@ -43,6 +43,25 @@ _LIST_BATCH_MIN = 8
 # 一次性告警阈值。
 _SLOW_SERIALIZE_SECONDS = 0.05
 _WRITE_VOLUME_WARN_BYTES_PER_DAY = 1024 ** 3  # 1 GiB/天
+
+# v3.1.39：体积/耗时告警改成**进程级、按档位**提示。
+# 以前 `_warned_once` 是每个 StateStore 一份，而每个角色各有一份 store：7 个角色
+# 就是 7 条一模一样的「状态文件已达 2014 KB」，日志里看着像出了故障。现在同一
+# 档位全进程只报一次，档位按体积翻倍划分（512 KB、1 MB、2 MB、4 MB……）：体积
+# 不涨就不会再出现，涨到 8 MB 也只会再多一条。
+_VOLUME_WARNED: dict[str, int] = {}
+
+
+def reset_volume_warnings() -> None:
+    """清空进程级体积告警记录（测试用：每个用例都要能独立看到第一次提示）。"""
+    _VOLUME_WARNED.clear()
+
+
+def _size_bucket(value: float, unit: float) -> int:
+    """体积落在第几档：unit 的 1 倍、2 倍、4 倍……（越往后提示越少）。"""
+    if unit <= 0 or value <= 0:
+        return 0
+    return max(1, int(math.log2(max(1.0, value / unit))) + 1)
 # 连续落盘失败时的退避上限（秒）。
 MAX_FAILURE_BACKOFF = 300.0
 
@@ -824,24 +843,32 @@ class StateStore:
         self._error(message)
 
     def _maybe_warn_volume(self) -> None:
-        """体积/耗时/写盘量的一次性告警（P1-4 可观测性）。"""
+        """体积/耗时/写盘量的告警（P1-4 可观测性）。
+
+        v3.1.39：改成**进程级、按档位**提示（见 `_VOLUME_WARNED`）。同一个档位全进程
+        只出现一次；体积翻倍才再提示一条。多角色共用一份日志时，不会再出现 7 条
+        一模一样的「状态文件已达 2014 KB」。
+        """
         size = self._last_payload_bytes
         if size >= _FLUSH_LARGE_BYTES:
-            self._warn_once(
+            self._warn_volume_once(
                 "volume_large",
+                _size_bucket(size, _FLUSH_LARGE_BYTES),
                 f"状态文件已达 {size / (1024 * 1024):.1f} MB（>2 MB）：落盘间隔自适应为"
                 f" {_FLUSH_LARGE_INTERVAL:.0f} 秒一次，避免频繁全量重写；体积主要来自"
                 "用户档案，可调小 stale_user_retention_days / mood_data_retention_days",
             )
         elif size >= _FLUSH_MEDIUM_BYTES:
-            self._warn_once(
+            self._warn_volume_once(
                 "volume_medium",
+                _size_bucket(size, _FLUSH_MEDIUM_BYTES),
                 f"状态文件已达 {size / 1024:.0f} KB（>512 KB）：落盘间隔自适应为"
                 f" {_FLUSH_MEDIUM_INTERVAL:.0f} 秒一次，减少全量重写开销",
             )
         if self._last_serialize_seconds >= _SLOW_SERIALIZE_SECONDS:
-            self._warn_once(
+            self._warn_volume_once(
                 "serialize_slow",
+                1,
                 f"状态序列化耗时 {self._last_serialize_seconds * 1000:.0f} ms"
                 f"（体积 {size / 1024:.0f} KB；已分块让出事件循环，主循环不会被整段卡住），"
                 "如持续偏高可清理不活跃用户",
@@ -850,12 +877,20 @@ class StateStore:
         if interval > 0:
             per_day = size / interval * 86400.0
             if per_day >= _WRITE_VOLUME_WARN_BYTES_PER_DAY:
-                self._warn_once(
+                self._warn_volume_once(
                     "write_volume",
+                    _size_bucket(per_day, _WRITE_VOLUME_WARN_BYTES_PER_DAY),
                     f"状态全量写盘约 {per_day / (1024 ** 3):.1f} GiB/天"
                     f"（{size / 1024:.0f} KB 每 {interval:.0f} 秒一次）：长期运行会持续写盘，"
                     "建议减小状态体积或调大 state_flush_interval_seconds",
                 )
+
+    def _warn_volume_once(self, key: str, bucket: int, message: str) -> None:
+        """同一档位全进程只提示一次（见 `_VOLUME_WARNED`）。"""
+        if bucket <= _VOLUME_WARNED.get(key, 0):
+            return
+        _VOLUME_WARNED[key] = bucket
+        self._warn(message)
 
     def _info(self, message: str) -> None:
         if self._log is not None:

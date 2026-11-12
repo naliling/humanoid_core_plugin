@@ -570,19 +570,28 @@ def _wake_block(core: Any, cfg: Any = None) -> dict[str, Any]:
 
 
 def _contract_weather(weather: Any) -> str:
-    """契约里的天气：拿到真天气才有值，说明书（未取到/过期/未配置）导出空串。
+    """契约里的天气：拿到真天气、而且**值得开口**时才导出，否则空串。
 
     以 `snapshot()` 打在 `notice` 字段上的标志为准，而不是猜字符串——说明书文案会
     增改，字符串黑名单（`is_notice`）会漏（曾漏过「天气数据过期了」「天气还没取到」，
     被当成真天气导出，社交层照着编）。`is_notice` 仍留作兜底。
+
+    v3.1.38 又加了一道 `notable_weather`：晴、多云、阴、20℃ 这类天气照样进
+    `snapshot()`（身体与穿着要用），但**不进契约**。原因见 `weather.notable_weather`
+    的注释——天气是唯一「永远有值」的素材，只要进了契约，社交层每轮都摆着它，
+    模型就顺手拿它凑开场白。要断就断在源头这一处：这里返回空串，
+    `social/core_bridge.py` 的 `if _env` 会把空串导成空 dict，天气由头与
+    humanoid 的证据卡同时消失。
     """
 
-    from .services.weather import is_notice
+    from .services.weather import is_notice, notable_weather
 
     if not isinstance(weather, dict) or weather.get("notice"):
         return ""
     env = str(weather.get("env", "") or "").strip()
-    return "" if not env or is_notice(env) else env
+    if not env or is_notice(env) or not notable_weather(env):
+        return ""
+    return env
 
 
 def _contract_holiday(core) -> str:

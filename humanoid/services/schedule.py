@@ -50,6 +50,8 @@ from .life_material import (
     render_materials,
 )
 from .plans import load_plans, note_plans, render_plans
+# v3.1.38：天气只有「变天」才进日程提示词，判据与契约/证据卡/聊天共用同一份。
+from .weather import notable_weather
 from .schedule_content import (
     build_slate,
     clean_slots as _clean_slots,
@@ -1394,7 +1396,9 @@ def segment_prompt(
     # 外界（天气/节日）：她身处的环境。只递事实，不说「所以该做什么」——
     # 下雨要不要改行程、过节要不要出门，由她按人设自己决定。
     world_lines = []
-    if weather:
+    # v3.1.38：只有变天才把天气递进日程。晴天/多云天天都一样，写进提示词只会让
+    # 每一段日程都先来一句「今天天不错」——她的安排该由人设和她想做的事决定。
+    if weather and notable_weather(weather):
         world_lines.append(f"- 外头：{weather}")
     if holiday:
         world_lines.append(f"- 今天：{holiday}")
@@ -2986,14 +2990,18 @@ class ScheduleService:
         return frame
 
     def _fallback_day_frame(self) -> str:
-        """模型不可用时的确定句：星期 + 节日 + 天气。"""
+        """模型不可用时的确定句：星期 + 节日 +（变天时的）天气。
+
+        v3.1.38：天气只在 `notable_weather` 为真时进来。日框会跟着每一段日程进
+        提示词，带上「晴，气温 22℃」等于每天给模型一句现成的天气话头。
+        """
         world = self._world_snapshot()
         bits = [f"周{self._clock.weekday()}"]
         holiday = str(world.get("holiday") or "").strip()
         weather = str(world.get("weather") or "").strip()
         if holiday:
             bits.append(f"是{holiday}")
-        if weather:
+        if weather and notable_weather(weather):
             bits.append(f"外头{weather}")
         return "，".join(bits) + "。"
 
@@ -4055,7 +4063,11 @@ class ScheduleService:
                         "minutes": material_minutes(item, self._seed()),
                     }
                     for item in materials_for(
-                        self._seed(), "", minutes, recent_events, species=kind
+                        self._seed(),
+                        "",
+                        minutes,
+                        recent_events,
+                        species=self._species_profile(),
                     )
                 ],
                 examples_for(self._seed(), ""),
@@ -4358,7 +4370,10 @@ class ScheduleService:
         persona_text = _example_evidence(persona, cfg)
         if not persona_text.strip():
             return cached
-        fingerprint = _role_fingerprint(persona_text)
+        # v3.1.38：身体类型进指纹与提示词。四蹄/爪兽/鳞甲拿到「整理衣柜」「下楼取
+        # 快递」不是词表漏词，是**素材本身不属于她**——所以在她生成素材时就说清楚。
+        species_profile = self._species_profile()
+        fingerprint = _role_fingerprint(persona_text, species_profile)
         now_ts = time.time()
         if not _role_needs_build(self._scope, fingerprint, now_ts, ROLE_MATERIALS_RETRY_SECONDS):
             return cached
@@ -4367,7 +4382,9 @@ class ScheduleService:
         _role_mark_try(self._scope, now_ts, fingerprint)
         try:
             result = await self.gateway.generate(
-                prompt=_role_build_prompt(persona_text, ROLE_MATERIALS_COUNT),
+                prompt=_role_build_prompt(
+                    persona_text, ROLE_MATERIALS_COUNT, species_profile
+                ),
                 chain=cfg.schedule_provider_ids,
                 allow_global=cfg.schedule_allow_global_fallback,
                 timeout=float(cfg.schedule_llm_timeout_seconds),
@@ -4454,7 +4471,7 @@ class ScheduleService:
             minutes,
             recent_events,
             extra=role_items,
-            species=kind,
+            species=self._species_profile(),
         )
         materials = render_materials(material_items, self._seed())
         # 候选清单（v3.1.16）：把已经过筛的具体事摆到模型面前，让它「选着写」而不是

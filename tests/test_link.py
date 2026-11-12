@@ -166,14 +166,25 @@ class ContractTest(unittest.TestCase):
         self.assertTrue(self.harness.store.dirty)
 
     def test_contract_weather_drops_notices(self):
-        """说明书（未取到/过期/未配置）不能当天气导出——社交层会照着编。"""
+        """说明书（未取到/过期/未配置）不能当天气导出——社交层会照着编。
+
+        v3.1.38：除了说明书，**平常天气也不导出**（晴/多云/阴、温度不极端）。契约里
+        只要挂着天气，社交层每轮都有「今天天气…」的由头，角色就反复念天气。
+        """
         from humanoid.link import _contract_weather
 
         self.assertEqual(
             _contract_weather(
+                {"weather": "小雨 🌧️ 12°C", "env": "天气：小雨，气温 12℃", "notice": False}
+            ),
+            "天气：小雨，气温 12℃",
+        )
+        # v3.1.38：多云不算变天，导出空串——不给社交层这个由头
+        self.assertEqual(
+            _contract_weather(
                 {"weather": "多云 🌡️ 12°C", "env": "天气：多云，气温 12℃", "notice": False}
             ),
-            "天气：多云，气温 12℃",
+            "",
         )
         # notice 标志为真就导出空串，不管文案有没有被字符串黑名单覆盖
         for text in ("天气数据过期了", "天气还没取到", "当前城市 [X]（获取中）", "天气未开启"):

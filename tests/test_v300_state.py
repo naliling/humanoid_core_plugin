@@ -29,6 +29,7 @@ from humanoid.state import (
     _replace_with_retry,
     _serialize,
     _serialize_async,
+    reset_volume_warnings,
 )
 
 from .fakes import RecordingLogger
@@ -240,6 +241,8 @@ class EventLoopStallTest(unittest.IsolatedAsyncioTestCase):
     async def test_two_megabyte_state_stalls_loop_less_than_50ms(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = RecordingLogger()
+            # v3.1.39：体积告警是进程级去重的，前面用例可能已经报过同一档位。
+            reset_volume_warnings()
             store = _new_store(tmp, log)
             store.load("2026-01-01")
             big = _big_state()
@@ -351,6 +354,7 @@ class AdaptiveFlushIntervalTest(unittest.TestCase):
         self.assertEqual(big_config.effective_flush_interval, 300.0)
 
     def test_warnings_fire_only_once(self):
+        reset_volume_warnings()  # v3.1.39：进程级去重，先清掉前面用例留下的档位
         store = self.store
         store._last_payload_bytes = 4 * 1024 * 1024
         store._last_serialize_seconds = 0.5

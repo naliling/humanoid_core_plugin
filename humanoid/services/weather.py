@@ -45,12 +45,65 @@ def is_notice(text: str) -> bool:
     return any(word in text for word in NOTICE_WORDS)
 
 
+# 「值得开口」的天气：雨、雪、雷、雹、雾、霾、沙尘、台风、霜冻，或者真的冷/热。
+# 晴、多云、阴、20℃ 这类**不在这里**——它们是背景，不是话题。
+#
+# 为什么要有这道闸（v3.1.38）：线上真实发言里 `多云，hanhandouya那边呢？`、
+# `外头阴沉7度，有点冷呢` 反复出现。天气是唯一「永远有值、永远具体」的一条，
+# 只要每轮摆在注入里，模型就会顺手拿它凑开场白。插件自己的设计纪律是「不下禁令、
+# 只少喂」（见 prompt_builder 顶部注释），所以做法是**不给**，而不是写一句
+# 「不要聊天气」。
+NOTABLE_WEATHER_WORDS = (
+    "雨", "雪", "雷", "雹", "雾", "霾", "沙尘", "风", "霜", "冻", "冰",
+)
+# 温度阈值与 social 侧 `_notable_weather` 对齐：≤5℃ 或 ≥33℃ 才算「变了样」。
+NOTABLE_WEATHER_COLD = 5.0
+NOTABLE_WEATHER_HOT = 33.0
+
+_TEMP_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*(?:℃|°C|°|度)")
+
+
+def notable_weather(text: str) -> bool:
+    """这条天气值不值得让模型看见（`True` = 雨雪风雾或真的冷热）。
+
+    这是**唯一的判据**：契约导出（`link._contract_weather`）、证据卡
+    （`anchors.cards_from_contract`）、聊天背景句（`prompt_builder._background_lines`）
+    与日程提示词（`schedule` 的【今天的外界】）都问它，四处必须同一个答案——
+    否则会出现「卡片说天气变了、提示词里却没有」这种互相打脸。
+    """
+    body = str(text or "").strip()
+    if not body:
+        return False
+    if any(word in body for word in NOTABLE_WEATHER_WORDS):
+        return True
+    for match in _TEMP_RE.finditer(body):
+        try:
+            temp = float(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if temp <= NOTABLE_WEATHER_COLD or temp >= NOTABLE_WEATHER_HOT:
+            return True
+    return False
+
+
+def _weather_fingerprint(body: str) -> str:
+    """天气指纹：**不含温度数字**。
+
+    温度每变一度指纹就变，于是「小雨 9℃」→「小雨 10℃」被当成变天，一天能说
+    七八次——用户原话「角色会很喜欢说天气」。天气本身（晴/多云/小雨/大风）才是
+    「变了」的意思，温度只影响冷热，不该单独触发一次开口。
+    """
+    return _TEMP_RE.sub("", str(body or "")).strip()
+
+
 # 「天气这一句这一轮该不该再说一遍」的判定状态。**按会话/用户分桶**，不是角色级单值：
 # 旧写法是 PromptBuilder 上的一个 (文本, 时刻)，整个角色共用一份——一个会话把
 # 「阴，气温 8℃」讲过后，另一个会话在 4 小时内再也拿不到天气句（跨用户互相压制，
 # 审核 P-08 #41）。每桶存的是**天气指纹**（城市 + 描述 + 温度），不是「已说过」这个
 # 布尔：指纹变了就说明天气变了，该说；指纹没变才看时间间隔。
-WEATHER_REPEAT_SECONDS = 4 * 3600.0
+# 天气本身没变时，隔多久才允许再提一次（v3.1.38：4 小时 → 8 小时）。
+# 4 小时太密：一个下午能听见两三次「外头…」。真人隔半天才会再感慨一次天气。
+WEATHER_REPEAT_SECONDS = 8 * 3600.0
 # 桶上限：只放内存、不落盘。满了淘汰最久没被问到的那一桶（LRU），
 # 而不是整表 clear()——整表清空会让所有会话立刻再看到同一句天气。
 WEATHER_SEEN_LIMIT = 64
@@ -85,7 +138,8 @@ class WeatherSayGate:
         if not body:
             return False
         extra_text = str(extra or "").strip()
-        fingerprint = f"{extra_text}\x1f{body}"
+        # 指纹里去掉温度数字：见 `_weather_fingerprint` 的注释（温度漂移不算变天）。
+        fingerprint = f"{extra_text}\x1f{_weather_fingerprint(body)}"
         bucket = str(key or "")
         try:
             now_v = float(now)

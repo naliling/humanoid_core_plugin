@@ -25,6 +25,7 @@ import hashlib
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..opportunity import MATERIAL_TTL_SECONDS, anchor_key_for, make_card
+from ..species import BODY_HUMAN, body_kind, profile_body
 from ..wording import pick
 from .schedule_content import species_issues
 
@@ -469,7 +470,7 @@ def materials_for(
     used: Iterable[str] = (),
     segment: str = "",
     asleep: bool = False,
-    species: str = "",
+    species: Any = "",
 ) -> list[dict[str, Any]]:
     """抽一批「这个时候她可能做的事」：同一天同一时段稳定，换一天换一批。
 
@@ -504,7 +505,10 @@ def materials_for(
             and not _topic_used(str(item.get("topic") or ""), recent)
             and _segment_allows(item, kind)
             and not _used_item(item, used_set)
-            and not species_issues(str(item.get("event") or ""), species)
+            and not species_issues(str(item.get("event") or ""), _species_name(species))
+            # v3.1.37：细节也过一遍物种——但只在「没有对照句可换」时整条不发：
+            # 有对照句的（鞋底 → 蹄子）留着，句子在 sensory_line 里换掉。
+            and not _sensory_blocked(item, species)
         )
 
     role_pool = _ordered(
@@ -567,7 +571,25 @@ def materials_for(
             segment="",
             asleep=False,
         )
-    return picked[: max(1, int(count))]
+    def delivered(item: Mapping[str, Any]) -> dict[str, Any]:
+        """交给调用方的副本：非人形把「她没有的部位」的细节清空。
+
+        卡片上的画面由 `sensory_line(item, seed, species)` 按物种重挑，清空不影响
+        它；但返回的这一份必须干净——验收口径就是「materials_for 返回的 event /
+        sensory 都过 species_issues」。
+        """
+        data = dict(item)
+        own = str(data.get("sensory") or "").strip()
+        if own and _species_name(species):
+            # 有对照句的（鞋底→蹄子）就地换掉：日程这条链路只读 event，但测试与
+            # 调试都看这份输出，交出去的原句也不该带着「她没有的部位」。
+            swapped = body_sensory(data, species)
+            data["sensory"] = (
+                "" if species_issues(swapped, _species_name(species)) else swapped
+            )
+        return data
+
+    return [delivered(item) for item in picked[: max(1, int(count))]]
 
 
 def material_minutes(item: dict[str, Any], seed: list[Any] | None = None) -> int:
@@ -632,14 +654,157 @@ SENSORY_TEMPLATES: dict[str, tuple[str, ...]] = {
     "interest": ("手上还留着刚才的劲", "眼睛有点发酸", "肩颈僵着没松开"),
 }
 
+#: 非人形的档位模板（v3.1.37）。只写「提到了身上某个部位」的档，其余档沿用上面
+#: 那份——按物种一刀切把整份换掉，半兽人形（有手）和人类角色都会被伤到。
+def _species_name(species: Any) -> str:
+    """物种参数可以是 kind 字符串，也可以是一整份物种档案。
 
-def sensory_line(item: Mapping[str, Any], seed: Sequence[Any] | None = None) -> str:
-    """这一条的感官细节：条目自带的优先，否则按档位模板池抽一句（同日稳定）。"""
+    v3.1.37 起调用方可以传 `core.species_profile()`（dict）：光有 kind 分不出
+    「龙」和「狼」——两者都是 beast，但一个盖鳞片、一个盖皮毛。
+    """
+    if isinstance(species, Mapping):
+        return str(species.get("kind") or "")
+    return str(species or "")
+
+
+def _species_body(species: Any) -> str:
+    """物种参数 → 措辞用的身体类型（dict 会连 traits 一起看）。
+
+    v3.1.38：dict 走 `profile_body`——面板手填的 `ccb_body`、识别层给半龙人/人鱼/
+    兽人这类人形兽类钉的 `body` 都在档案里，直接看 kind+traits 会漏掉它们。
+    """
+    if isinstance(species, Mapping):
+        return profile_body(species)
+    return body_kind(species)
+
+
+_SENSORY_TEMPLATES_BY_BODY: dict[str, dict[str, tuple[str, ...]]] = {
+    "hoof": {
+        "life": ("皮毛上还有点湿", "身上出了点薄汗", "桌上的杯子挪了个位置", "鬃毛上沾了点灰"),
+        "duty": ("肩胛有点发紧", "眼睛盯得有点发干", "桌上堆着几张纸"),
+        "rare": ("蹄子上还沾着点灰", "心里还惦记着刚才那下", "屋里比平时乱一点"),
+        "interest": ("后腿还留着刚才的劲", "眼睛有点发酸", "颈根僵着没松开"),
+    },
+    "paw": {
+        "life": ("皮毛上还有点湿", "身上出了点薄汗", "桌上的杯子挪了个位置", "毛上沾了点灰"),
+        "duty": ("肩胛有点发紧", "眼睛盯得有点发干", "桌上堆着几张纸"),
+        "rare": ("爪子上还沾着点灰", "心里还惦记着刚才那下", "屋里比平时乱一点"),
+        "interest": ("后腿还留着刚才的劲", "眼睛有点发酸", "颈根僵着没松开"),
+    },
+}
+
+#: 鳞甲类（龙/龙马/麒麟/人鱼）：动作和爪兽一样，盖的不是毛而是鳞片。
+#: 按词替换从爪兽那套派生——两处各写一遍迟早走偏（「皮毛」漏改就是出戏）。
+_SCALE_SWAPS: tuple[tuple[str, str], ...] = (
+    ("皮毛", "鳞片"),
+    ("鬃毛", "鳞片"),
+    ("换季的毛", "换季脱的鳞"),
+    ("毛上", "鳞片上"),
+    ("毛湿了", "鳞片湿了"),
+    ("毛蹭得", "鳞片蹭得"),
+    ("毛底下", "鳞片底下"),
+)
+
+
+def _scale_line(text: str) -> str:
+    """把一句「皮毛」措辞换成「鳞片」措辞。"""
+    out = str(text or "")
+    for old, new in _SCALE_SWAPS:
+        out = out.replace(old, new)
+    return out
+
+
+_SENSORY_TEMPLATES_BY_BODY["scale"] = {
+    band: tuple(_scale_line(line) for line in lines)
+    for band, lines in _SENSORY_TEMPLATES_BY_BODY["paw"].items()
+}
+
+#: 人形句子 → 非人形的等价句（v3.1.37）。按**原句**查表，条目本身不用动：
+#: 「手上」「袖口」「扎手」这类词进不了 `species_issues` 的黑名单（四足也有手
+#: 这个字，误拦会伤到「手腕」以外的正常句子），所以只能在这里逐句给对照。
+_SENSORY_BODY_VARIANTS: dict[str, dict[str, str]] = {
+    "手上有股洗衣液味": {"hoof": "皮毛上有股皂角味", "paw": "毛上有股皂角味"},
+    "袋子提手勒得手疼": {"hoof": "袋子在嘴上勒出印子", "paw": "袋子在嘴上勒得生疼"},
+    "围裙上溅了点油": {"hoof": "皮毛上溅了点油", "paw": "毛上溅了点油"},
+    "手冻得有点发麻": {"hoof": "蹄尖冻得有点发麻", "paw": "爪尖冻得有点发麻"},
+    "衣服上有股樟脑味": {"hoof": "皮毛上有股樟脑味", "paw": "毛上有股樟脑味"},
+    "纸箱边角扎手": {"hoof": "纸箱边角蹭得嘴疼", "paw": "纸箱边角扎得爪疼"},
+    "纸边有点划手": {"hoof": "纸边有点划嘴", "paw": "纸边有点划爪"},
+    "手上有股泥土味": {"hoof": "蹄子上有股泥土味", "paw": "爪子上有股泥土味"},
+    "袖口蹭到胳膊，有点痒": {"hoof": "换季的毛蹭得身上发痒", "paw": "换季的毛蹭得身上发痒"},
+    "手上还留着螺丝刀的凉": {"hoof": "蹄尖还留着铁器的凉", "paw": "爪尖还留着铁器的凉"},
+    "鞋底沾了点泥": {"hoof": "蹄子上沾了点泥", "paw": "爪子上沾了点泥"},
+    "脚边的拖鞋歪着": {"hoof": "脚边的垫子歪着", "paw": "脚边的垫子歪着"},
+    "玻璃上有一点手印": {"hoof": "玻璃上有一点鼻印", "paw": "玻璃上有一点爪印"},
+    "杯壁烫得换了个手": {"hoof": "杯壁烫得换了个蹄", "paw": "杯壁烫得换了个爪"},
+    "鞋跟敲在地上的声音": {"hoof": "蹄子敲在地上的声音", "paw": "爪子敲在地上的声音"},
+    "手上沾了点机油": {"hoof": "蹄子上沾了点机油", "paw": "爪子上沾了点机油"},
+    "袖口湿了半截": {"hoof": "鬃毛湿了半截", "paw": "毛湿了半截"},
+    "翻得满手是灰": {"hoof": "翻得满身是灰", "paw": "翻得满身是灰"},
+    "手背被蹭了一下": {"hoof": "鼻梁被蹭了一下", "paw": "鼻梁被蹭了一下"},
+    "水桶提着勒手": {"hoof": "水桶在嘴上勒得生疼", "paw": "水桶在嘴上勒得生疼"},
+    "手上还留着塑料袋的滑": {"hoof": "嘴上还留着塑料袋的滑", "paw": "嘴上还留着塑料袋的滑"},
+    "衣服上还有太阳味": {"hoof": "皮毛上还有太阳味", "paw": "毛上还有太阳味"},
+    "手指上沾了点汁": {"hoof": "鼻尖上沾了点汁", "paw": "鼻尖上沾了点汁"},
+    "杯壁烫得手心发红": {"hoof": "杯壁烫得蹄心发红", "paw": "杯壁烫得爪心发红"},
+    "纸边划得手指发紧": {"hoof": "纸边划得嘴皮发紧", "paw": "纸边划得爪皮发紧"},
+    "手腕有点发酸": {"hoof": "前蹄撑得发酸", "paw": "前爪撑得发酸"},
+    "胳膊举过头顶有点酸": {"hoof": "前蹄举过头顶有点酸", "paw": "前爪举过头顶有点酸"},
+}
+
+# 鳞甲类的对照句 = 爪兽那句换掉「毛」（龙有爪，只是盖鳞片）。
+for _own, _pair in _SENSORY_BODY_VARIANTS.items():
+    _pair.setdefault("scale", _scale_line(_pair.get("paw") or _pair.get("hoof") or _own))
+
+
+def body_sensory(item: Mapping[str, Any], species: Any = "") -> str:
+    """这一条在这一身体类型下的画面细节（没给对照就用原句）。"""
     own = str(item.get("sensory") or "").strip()
-    if own:
+    body = _species_body(species)
+    if not own or body == BODY_HUMAN:
+        return own
+    pair = _SENSORY_BODY_VARIANTS.get(own) or {}
+    if body in pair:
+        return pair[body]
+    if body == "scale":
+        # 鳞甲类没有一张固定的对照表（素材池里「皮毛」的说法会随版本变），
+        # 按词替换兜底：鳞片类说「皮毛」在任何一句里都是错的。
+        return _scale_line(own)
+    return own
+
+
+def _sensory_blocked(item: Mapping[str, Any], species: Any) -> bool:
+    """这条素材的细节是不是「她没有的部位」，且没有对照句可换。
+
+    有对照句就留着换一句（例：鞋底沾了点泥 → 蹄子上沾了点泥），没对照才整条不发。
+    """
+    own = str(item.get("sensory") or "").strip()
+    if not own or not species_issues(own, _species_name(species)):
+        return False
+    return body_sensory(item, species) == own
+
+
+def sensory_line(
+    item: Mapping[str, Any],
+    seed: Sequence[Any] | None = None,
+    species: Any = "",
+) -> str:
+    """这一条的感官细节：条目自带的优先，否则按档位模板池抽一句（同日稳定）。
+
+    v3.1.37：带 species 时按身体类型取——四蹄 / 爪兽没有人形那些部位，条目自带的
+    人形句子换成对照句（见 `_SENSORY_BODY_VARIANTS`）；换不了又确实是她没有的
+    部位，就退回这一档的身体模板，绝不把「手」递出去。
+    """
+    body = _species_body(species)
+    own = body_sensory(item, species)
+    if own and not species_issues(own, _species_name(species)):
         return own
     band = str(item.get("band") or "").strip()
-    options = SENSORY_TEMPLATES.get(band) or SENSORY_TEMPLATES["life"]
+    options = (
+        (_SENSORY_TEMPLATES_BY_BODY.get(body) or {}).get(band)
+        or SENSORY_TEMPLATES.get(band)
+        or SENSORY_TEMPLATES["life"]
+    )
     return pick(
         "material_sensory_" + (band or "life"),
         [*(seed or []), str(item.get("event") or "")],
@@ -653,6 +818,7 @@ def material_card(
     captured_at: Any,
     seed: Sequence[Any] | None = None,
     ttl: Any = None,
+    species: Any = "",
 ) -> dict[str, Any]:
     """把一条素材翻成证据卡（形状见 humanoid.opportunity）。
 
@@ -664,7 +830,7 @@ def material_card(
     # v3.1.9：detail 从「地点，大概 N 分钟」改成一句感官细节。为什么不留时长：
     # 模型会把「大概 55 分钟」当成一句可以直接念的进度汇报。时长仍然由
     # `material_minutes` 给日程生成用，只是不再进模型上下文。
-    detail = sensory_line(item, seed)
+    detail = sensory_line(item, seed, species)
     topic = str(item.get("topic") or "").strip() or event
     return make_card(
         kind="life",
@@ -683,11 +849,15 @@ def materials_as_cards(
     captured_at: Any,
     seed: Sequence[Any] | None = None,
     skip: Iterable[str] = (),
+    species: Any = "",
 ) -> list[dict[str, Any]]:
     """一批素材 → 一批卡。坏条目单条丢弃，不因为一条坏的让整批作废。
 
     skip 是近 7 天已经用过的键（card_id / anchor_key），命中就丢：只按题眼过滤不
     够——旧记录里可能只有 card_id，所以这里拿卡自己的 id 再兜一次。
+
+    species 是她的物种（v3.1.37）：卡片上的 detail 按身体类型挑句子，四蹄 / 爪兽
+    不会拿到「手」「袖口」这类她身上没有的部位。
     """
     skip_set = {str(key).strip() for key in (skip or ()) if str(key or "").strip()}
     cards: list[dict[str, Any]] = []
@@ -695,7 +865,7 @@ def materials_as_cards(
         if not isinstance(item, Mapping):
             continue
         try:
-            card = material_card(item, captured_at=captured_at, seed=seed)
+            card = material_card(item, captured_at=captured_at, seed=seed, species=species)
         except (TypeError, ValueError):
             continue
         if skip_set and (

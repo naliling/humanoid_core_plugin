@@ -27,6 +27,7 @@ import json
 from typing import Any, Mapping, Sequence
 
 from .life_material import capabilities, interests_in
+from ..species import BODY_HOOF, BODY_PAW, BODY_SCALE, profile_body
 
 # state 键：条目、人设指纹、上次尝试时间（失败退避用）
 ROLE_MATERIALS_KEY = "role_materials"
@@ -60,23 +61,72 @@ def _clean(text: Any) -> str:
     return " ".join(str(text or "").split())
 
 
-def persona_fingerprint(text: str) -> str:
-    """人设指纹：人设正文变了才重写素材（换了措辞也算变，宁可多问一次）。"""
+#: 身体做不到的事（v3.1.38）。内置池和「按人设生成」的池都默认她是人：四蹄角色
+#: 于是会拿到「整理衣柜，把不穿的收起来」「下楼把快递取上来」。这些不是人形部位，
+#: 词表挡不住——只能在她**生成素材之前**就把身体条件写进去。
+_BODY_LIMITS = {
+    BODY_HOOF: (
+        "她是四蹄动物：没有手，不穿衣服，做事靠嘴、蹄子和身体。"
+        "不能写打字、写字、洗碗、系鞋带、化妆、梳头、穿脱衣服、拿筷子这类需要手指的事；"
+        "也不能写熨衣服、缝扣子这种只有人才能做的居家活。"
+    ),
+    BODY_PAW: (
+        "她是兽形：有爪没有手，不穿衣服。不能写需要手指的精细动作"
+        "（打字、写字、系鞋带、化妆、穿脱衣服、拿筷子），也不写熨衣服、缝扣子这类居家活。"
+    ),
+    BODY_SCALE: (
+        "她是鳞甲兽形：有爪、可能还有翼，不穿衣服，身上是鳞片不是皮毛。"
+        "不能写需要手指的精细动作与穿衣打扮，也不要写「皮毛」「绒毛」「毛发」这类说法。"
+    ),
+}
+
+
+def _body_of(species: Any) -> str:
+    """物种参数（kind 字符串或整份物种档案）→ 身体类型；认不出按人形。"""
+    if isinstance(species, Mapping):
+        return profile_body(dict(species))
+    return profile_body({"kind": str(species or "")})
+
+
+def body_limits(species: Any) -> str:
+    """她这个身体做不到什么；人形返回空串（人形不需要额外约束）。"""
+    return _BODY_LIMITS.get(_body_of(species), "")
+
+
+def persona_fingerprint(text: str, species: Any = None) -> str:
+    """人设指纹：人设正文变了才重写素材（换了措辞也算变，宁可多问一次）。
+
+    v3.1.38：身体类型也进指纹。面板把 `ccb_body` 从人形改成四蹄、或识别层把人鱼
+    从爪改成手，旧素材整批作废重问——否则「整理衣柜」会一直留在她柜子里。
+    """
     body = _clean(text)
     if not body:
         return ""
+    body = f"{body}\x1f{_body_of(species)}"
     return hashlib.sha1(body.encode("utf-8")).hexdigest()[:16]
 
 
-def build_prompt(persona_text: str, count: int = ROLE_MATERIALS_COUNT) -> str:
+def build_prompt(
+    persona_text: str, count: int = ROLE_MATERIALS_COUNT, species: Any = None
+) -> str:
     """问模型要一张「她这样的人可能做的事」的表。"""
     body = str(persona_text or "").strip()
+    limits = body_limits(species)
     rows = [
         "你在为一个角色写「她这样的人，一天里可能做的事」的素材表。",
         "",
         "【她是谁】",
         body,
         "",
+    ]
+    if limits:
+        rows += [
+            "【她的身体】",
+            limits,
+            "她做这件事的方式必须符合上面这段；做不到的事不要写。",
+            "",
+        ]
+    rows += [
         "要求：",
         "1. 写 " + str(int(count)) + " 条，每条是她这个人在某个时段真可能做的一件事。",
         "2. 只写人设里确实有依据的事。人设里没有工作、没有宠物、没有家人、没有朋友，",

@@ -371,6 +371,10 @@ class HumanoidConfig:
     # 面板手动指定物种/身体结构（如「小马宝莉」「半人马+触手」）。
     # 空 = 自动按人设识别；人设没写清楚时才需要填。
     ccb_species: str = ""
+    # 面板手动指定**身体类型**（v3.1.38）：human / hoof / paw / scale。
+    # 空 = 由物种自动推断。填了就压过自动判定——「她是兽人，但有手」这种靠词表
+    # 猜不准的，用户自己一句话就定了，比继续扩词表可靠。
+    ccb_body: str = ""
     # 这一场她想不想主导：auto（按人设+动作比例）/ her（强制主动措辞）/ him（被动）。
     # 只改注入措辞，不强制模型行为——写清楚，免得用户以为拨了就一定主动。
     ccb_lead: str = "auto"
@@ -701,6 +705,7 @@ class HumanoidConfig:
             ccb_scene_detail=b("ccb_scene_detail"),
             ccb_presence=b("ccb_presence"),
             ccb_species=s_opt("ccb_species"),
+            ccb_body=s_opt("ccb_body"),
             ccb_lead=c("ccb_lead", CCB_LEAD_MODES),
             ccb_aftercare_minutes=i("ccb_aftercare_minutes", 0, 720),
             ccb_scene_log_debug=b("ccb_scene_log_debug"),

@@ -1830,6 +1830,16 @@
     },
     "collapsed": true
   },
+  "ccb_body": {
+    "type": "string",
+    "description": "她的身体类型（留空按物种自动推断）",
+    "hint": "human = 人形（有手）；hoof = 四蹄；paw = 爪兽；scale = 鳞甲。留空 = 按物种自动判。物种判得不准时用它兜底，例如「兽人，但有手」填 human。",
+    "default": "",
+    "condition": {
+      "ccb": true
+    },
+    "collapsed": true
+  },
   "ccb_aftercare_minutes": {
     "type": "int",
     "default": 120,

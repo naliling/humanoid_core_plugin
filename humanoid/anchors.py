@@ -22,6 +22,7 @@ from typing import Any, Mapping
 from . import clock as _clock
 from . import opportunity
 from .services import life_material
+from .services.weather import notable_weather
 
 #: 卡片出处（中文标签）。社交层可以直接把它念出来，也方便排查一张卡从哪来。
 SOURCE_DAY = "日程"
@@ -110,8 +111,11 @@ def cards_from_contract(contract: Any, *, now: Any) -> list[dict[str, Any]]:
     if holiday:
         cards.append(_card("holiday", holiday, SOURCE_HOLIDAY, ts))
 
+    # 天气：只有「变天」才成卡（v3.1.38）。契约侧 `link._contract_weather` 已经
+    # 过了一道 `notable_weather`，这里再判一次是因为 `cards_from_contract` 也会被
+    # 直接喂一份手搓契约（测试、诊断、别的插件），不能指望上游一定洗过。
     weather = " ".join(str(contract.get("weather") or "").split())
-    if weather:
+    if weather and notable_weather(weather):
         cards.append(_card("weather", weather, SOURCE_WEATHER, ts))
 
     return [card for card in cards if card]
@@ -141,6 +145,23 @@ def _role_materials(core: Any) -> list[dict[str, Any]]:
     if not isinstance(stored, list):
         return []
     return [dict(item) for item in stored if isinstance(item, Mapping)]
+
+
+def _species_profile(core: Any) -> dict[str, Any]:
+    """她的物种档案（`{"kind": "beast", "traits": ["鳞片"], …}`）；读不到就是空表。
+
+    v3.1.37 补的漏点：这条链路（社交层证据卡）原来调 `materials_for` 时根本没传
+    species，日程那条筛了、证据卡这条没筛，同一批「把门口的鞋摆整齐」照样能递到
+    小马面前。传整份档案而不只是 kind，是因为「龙」和「狼」都是 beast：只有 traits
+    里那个「鳞片」能告诉素材该说鳞片而不是皮毛。
+    """
+    try:
+        profile = core.species_profile()
+    except Exception:
+        return {}
+    if not isinstance(profile, Mapping):
+        return {}
+    return dict(profile)
 
 
 def _used_materials(core: Any, now_ts: float) -> set[str]:
@@ -212,6 +233,7 @@ def material_cards(
         recent += _texts(contract.get("ongoing"), 3)
     seed = [str(getattr(core, "role_id", "") or ""), moment.strftime("%Y-%m-%d")]
     used = _used_materials(core, ts)
+    species = _species_profile(core)
     try:
         items = life_material.materials_for(
             seed,
@@ -223,9 +245,10 @@ def material_cards(
             used=used,
             segment=_segment_text(contract),
             asleep=_asleep(contract),
+            species=species,
         )
         return life_material.materials_as_cards(
-            items, captured_at=ts, seed=seed, skip=used
+            items, captured_at=ts, seed=seed, skip=used, species=species
         )
     except Exception:
         return []

@@ -112,7 +112,12 @@ class ShortNameTest(unittest.TestCase):
 
 
 class WeatherRepeatTest(unittest.TestCase):
-    """天气是「永远有值、永远具体」的那一条，每轮都写就会被念成开场白。"""
+    """天气是「永远有值、永远具体」的那一条，每轮都写就会被念成开场白。
+
+    v3.1.38：判据从「变了 + 4 小时」收紧成「**变天**（雨雪风雾或真的冷热）+ 8 小时」，
+    温度漂移不再算变天。所以这里的样例天气用「小雨」而不是「阴」——阴/多云现在
+    连背景句都不进（见 `WeatherRepeatTest` 之外的 `test_notable_weather`）。
+    """
 
     def _builder(self, now):
         b = PromptBuilder.__new__(PromptBuilder)
@@ -121,25 +126,40 @@ class WeatherRepeatTest(unittest.TestCase):
         return b
 
     def test_first_time_is_written(self) -> None:
-        self.assertTrue(self._builder(1000.0)._weather_worth_saying("阴，气温 8℃"))
+        self.assertTrue(self._builder(1000.0)._weather_worth_saying("小雨，气温 8℃"))
 
-    def test_unchanged_weather_is_skipped_within_four_hours(self) -> None:
+    def test_unchanged_weather_is_skipped_within_the_window(self) -> None:
+        from humanoid.services.weather import WEATHER_REPEAT_SECONDS
+
         b = self._builder(1000.0)
-        self.assertTrue(b._weather_worth_saying("阴，气温 8℃"))
-        b._core = SimpleNamespace(now_epoch=lambda: 1000.0 + 3600)
-        self.assertFalse(b._weather_worth_saying("阴，气温 8℃"))
+        self.assertTrue(b._weather_worth_saying("小雨，气温 8℃"))
+        b._core = SimpleNamespace(now_epoch=lambda: 1000.0 + WEATHER_REPEAT_SECONDS - 60)
+        self.assertFalse(b._weather_worth_saying("小雨，气温 8℃"))
 
     def test_changed_weather_is_always_written(self) -> None:
         b = self._builder(1000.0)
-        b._weather_worth_saying("阴，气温 8℃")
+        b._weather_worth_saying("小雨，气温 8℃")
         b._core = SimpleNamespace(now_epoch=lambda: 1000.0 + 60)
-        self.assertTrue(b._weather_worth_saying("小雨，气温 6℃"))
+        self.assertTrue(b._weather_worth_saying("中雨，气温 6℃"))
 
-    def test_unchanged_weather_comes_back_after_four_hours(self) -> None:
+    def test_unchanged_weather_comes_back_after_the_window(self) -> None:
+        from humanoid.services.weather import WEATHER_REPEAT_SECONDS
+
         b = self._builder(1000.0)
-        b._weather_worth_saying("阴，气温 8℃")
-        b._core = SimpleNamespace(now_epoch=lambda: 1000.0 + 4 * 3600 + 1)
-        self.assertTrue(b._weather_worth_saying("阴，气温 8℃"))
+        b._weather_worth_saying("小雨，气温 8℃")
+        b._core = SimpleNamespace(now_epoch=lambda: 1000.0 + WEATHER_REPEAT_SECONDS + 1)
+        self.assertTrue(b._weather_worth_saying("小雨，气温 8℃"))
+
+    def test_temperature_drift_is_not_a_change(self) -> None:
+        """v3.1.38：9℃ → 10℃ 不算变天。
+
+        温度每变一度指纹就变，于是「小雨 9℃」→「小雨 10℃」被当成变天，一天能说
+        七八次——用户原话「角色会很喜欢说天气」。
+        """
+        b = self._builder(1000.0)
+        self.assertTrue(b._weather_worth_saying("小雨，气温 9℃"))
+        b._core = SimpleNamespace(now_epoch=lambda: 1000.0 + 60)
+        self.assertFalse(b._weather_worth_saying("小雨，气温 10℃"))
 
     def test_another_session_still_gets_the_weather(self) -> None:
         """审核 P-08 #41：去重状态不能是角色级单值。
@@ -149,21 +169,21 @@ class WeatherRepeatTest(unittest.TestCase):
         天气对谁都是同一句，但「刚说过」是对**每个会话**分别成立的）。
         """
         b = self._builder(1000.0)
-        self.assertTrue(b._weather_worth_saying("阴，气温 8℃", key="umo:a"))
-        self.assertFalse(b._weather_worth_saying("阴，气温 8℃", key="umo:a"))
-        self.assertTrue(b._weather_worth_saying("阴，气温 8℃", key="umo:b"))
+        self.assertTrue(b._weather_worth_saying("小雨，气温 8℃", key="umo:a"))
+        self.assertFalse(b._weather_worth_saying("小雨，气温 8℃", key="umo:a"))
+        self.assertTrue(b._weather_worth_saying("小雨，气温 8℃", key="umo:b"))
 
     def test_empty_key_keeps_the_old_single_bucket(self) -> None:
         """key 为空时退化成旧行为：没接线也不炸、也不会突然每轮复读。"""
         b = self._builder(1000.0)
-        self.assertTrue(b._weather_worth_saying("阴，气温 8℃"))
-        self.assertFalse(b._weather_worth_saying("阴，气温 8℃"))
+        self.assertTrue(b._weather_worth_saying("小雨，气温 8℃"))
+        self.assertFalse(b._weather_worth_saying("小雨，气温 8℃"))
 
     def test_city_is_part_of_the_fingerprint(self) -> None:
         """换了城市就是天气变了，该说——指纹里带城市。"""
         b = self._builder(1000.0)
-        self.assertTrue(b._weather_worth_saying("阴，气温 8℃", key="umo:a", city="河源"))
-        self.assertTrue(b._weather_worth_saying("阴，气温 8℃", key="umo:a", city="北京"))
+        self.assertTrue(b._weather_worth_saying("小雨，气温 8℃", key="umo:a", city="河源"))
+        self.assertTrue(b._weather_worth_saying("小雨，气温 8℃", key="umo:a", city="北京"))
 
     def test_gate_buckets_are_bounded(self) -> None:
         """桶上限 64、淘汰最旧：只放内存，但不能无界增长。"""
@@ -171,10 +191,10 @@ class WeatherRepeatTest(unittest.TestCase):
 
         gate = WeatherSayGate()
         for i in range(WEATHER_SEEN_LIMIT + 10):
-            gate.worth_saying("阴，气温 8℃", key="umo:%d" % i, now=1000.0 + i)
+            gate.worth_saying("小雨，气温 8℃", key="umo:%d" % i, now=1000.0 + i)
         self.assertEqual(len(gate._seen), WEATHER_SEEN_LIMIT)
         # 最旧的桶被淘汰了：它再问一次算「第一次」，该说。
-        self.assertTrue(gate.worth_saying("阴，气温 8℃", key="umo:0", now=2000.0))
+        self.assertTrue(gate.worth_saying("小雨，气温 8℃", key="umo:0", now=2000.0))
 
     def _full_builder(self, now):
         import datetime
@@ -193,7 +213,7 @@ class WeatherRepeatTest(unittest.TestCase):
             snapshot=lambda refresh=False: {
                 "today": "3月1日",
                 "city": "河源",
-                "weather": {"env": "天气：阴，气温 8℃"},
+                "weather": {"env": "天气：小雨，气温 8℃"},
             },
         )
         b._weather_gate = None
@@ -202,9 +222,50 @@ class WeatherRepeatTest(unittest.TestCase):
     def test_background_note_is_per_session(self) -> None:
         """整条链路：A 会话讲过天气，B 会话的【此刻的她】里照样有（#41）。"""
         b = self._full_builder(1000.0)
-        self.assertIn("外头阴，气温 8℃", b.background_note(key="umo:a"))
-        self.assertNotIn("外头阴，气温 8℃", b.background_note(key="umo:a"))
-        self.assertIn("外头阴，气温 8℃", b.background_note(key="umo:b"))
+        self.assertIn("外头小雨，气温 8℃", b.background_note(key="umo:a"))
+        self.assertNotIn("外头小雨，气温 8℃", b.background_note(key="umo:a"))
+        self.assertIn("外头小雨，气温 8℃", b.background_note(key="umo:b"))
+
+    def test_plain_weather_never_reaches_the_background(self) -> None:
+        """v3.1.38：多云/晴这类天气不进她的背景，无论隔多久。
+
+        这是用户原话「角色会很喜欢说天气」的直接治法：不是让模型别说，而是不给它。
+        """
+        b = self._full_builder(1000.0)
+        b._core = SimpleNamespace(
+            config=SimpleNamespace(show_city_time_in_low_intrusion=True),
+            clock=b._core.clock,
+            now_epoch=lambda: 1000.0 + 48 * 3600,
+            snapshot=lambda refresh=False: {
+                "today": "3月1日",
+                "city": "河源",
+                "weather": {"env": "天气：多云，气温 22℃"},
+            },
+        )
+        self.assertNotIn("外头", b.background_note(key="umo:c"))
+
+
+class NotableWeatherTest(unittest.TestCase):
+    """「值得开口的天气」判据：雨雪风雾、或真的冷热。"""
+
+    def test_rain_and_snow_and_wind_are_notable(self) -> None:
+        from humanoid.services.weather import notable_weather
+
+        for text in ("小雨，气温 9℃", "大雪，气温 -2℃", "雷阵雨", "大风", "雾", "霾", "沙尘"):
+            self.assertTrue(notable_weather(text), text)
+
+    def test_plain_weather_is_not_notable(self) -> None:
+        from humanoid.services.weather import notable_weather
+
+        for text in ("多云，气温 22℃", "晴，气温 25℃", "阴，气温 18℃", ""):
+            self.assertFalse(notable_weather(text), text)
+
+    def test_extreme_temperature_is_notable(self) -> None:
+        from humanoid.services.weather import notable_weather
+
+        self.assertTrue(notable_weather("晴，气温 3℃"))
+        self.assertTrue(notable_weather("晴，气温 36℃"))
+        self.assertFalse(notable_weather("晴，气温 12℃"))
 
 
 if __name__ == "__main__":

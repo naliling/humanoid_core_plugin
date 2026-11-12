@@ -478,7 +478,25 @@ class HumanoidCoreInstance:
             return None
 
     def outfit_text(self) -> str:
-        """此刻穿着（未格式化）。关掉 / 判不出来 → 空串。"""
+        """此刻穿着（未格式化）。关掉 / 判不出来 → 空串。
+
+        四蹄的身体不穿衣服（v3.1.37）：物种档案判成四蹄（小马 / 半人马 / 带四蹄的兽形）
+        时直接返回空串，后面的感官细节也就不会再说「腿上有点凉」「领口有点闷」。
+        兽形（爪兽 / 鳞甲）同理：它们也不穿衣服，这里给「没穿衣服」，别让穿搭层把它判成
+        「日常便服」——狼穿便服是最直白的一种出戏。人形兽类（半龙人 / 人鱼这类有手的）
+        反过来：穿搭层可能把它们判成兽形而给「没穿衣服」，那不是她们的样子，这里退回
+        不注入。判不出来照旧按人写，别在信息不足时把穿搭整条砍掉。
+        """
+        body = species.BODY_HUMAN
+        try:
+            sp = self.species_profile()
+            body = species.profile_body(sp)
+            if body == species.BODY_HOOF:
+                return ""
+            if body in (species.BODY_PAW, species.BODY_SCALE):
+                return "没穿衣服"
+        except Exception:
+            body = species.BODY_HUMAN
         cfg = self.config
         if not cfg.outfit_enabled:
             return ""
@@ -494,11 +512,15 @@ class HumanoidCoreInstance:
             )
             try:
                 # 把气温当**数值**传下去，别让 outfit 自己再从格式化串里抠正则。
-                return outfit.resolve(temp_c=temp_c, **kwargs)
+                text = outfit.resolve(temp_c=temp_c, **kwargs)
             except TypeError:
                 # `outfit.resolve` 还没接受 temp_c（另一条改动线）：退回旧签名，
                 # 别让一个多出来的关键字把整条穿搭弄没。
-                return outfit.resolve(**kwargs)
+                text = outfit.resolve(**kwargs)
+            if body == species.BODY_HUMAN and text == "没穿衣服":
+                # 人形身体 + 穿搭层判成兽形：她其实穿得了衣服，只是没写穿什么。
+                return ""
+            return text
         except Exception:
             return ""
 
@@ -1779,6 +1801,19 @@ class HumanoidCoreInstance:
             override = str(getattr(self.config, "ccb_species", "") or "")
         except Exception:
             override = ""
+        # v3.1.38：面板可以直接钉身体类型（human/hoof/paw/scale）。它比物种覆盖更
+        # 细——「她是兽人但有手」这种靠词表永远猜不准，用户填一格就定了。
+        try:
+            body_override = str(getattr(self.config, "ccb_body", "") or "").strip()
+        except Exception:
+            body_override = ""
+        if body_override not in (
+            species.BODY_HUMAN,
+            species.BODY_HOOF,
+            species.BODY_PAW,
+            species.BODY_SCALE,
+        ):
+            body_override = ""
         scope = getattr(self, "_scope", None)
         # **识别一次就固定**：认准了就写进角色状态，之后不再随人设文本抖动。
         # 只有面板覆盖值变了才重算（那是用户明确改的）；人设改了想重认，
@@ -1792,11 +1827,12 @@ class HumanoidCoreInstance:
         if (
             isinstance(stored, dict)
             and str(stored.get("_override") or "") == override
+            and str(stored.get("_body_override") or "") == body_override
             and str(stored.get("label") or "").strip()
         ):
             return stored
 
-        key = (prompt, override)
+        key = (prompt, override, body_override)
         cached = getattr(self, "_species_cache", None)
         if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == key:
             return cached[1]
@@ -1806,10 +1842,16 @@ class HumanoidCoreInstance:
             profile = {"kind": "human", "label": "", "traits": [],
                        "confidence": 0.0, "terms": [], "source": ""}
         profile["_override"] = override
+        profile["_body_override"] = body_override
+        if body_override:
+            # 手填优先：识别层给的 body 只在没有覆盖时才有意义。
+            profile["body"] = body_override
         # 只在「真的认出来了」或「用户手填了」时才固化；人设还没加载时不写死成人类。
         try:
             if scope is not None and (
-                override or float(profile.get("confidence") or 0.0) >= species.INJECT_MIN
+                override
+                or body_override
+                or float(profile.get("confidence") or 0.0) >= species.INJECT_MIN
             ):
                 scope.set_self("species", profile)
         except Exception:

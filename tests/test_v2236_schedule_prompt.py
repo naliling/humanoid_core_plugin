@@ -174,11 +174,20 @@ class ScheduleWorldContext(unittest.TestCase):
     """S3：天气与节日要进日程 prompt，让她的这一天能跟着外头变。"""
 
     def test_weather_and_holiday_reach_the_prompt(self):
+        """v3.1.38：只有值得说的天气才进日程提示词，多云这种常态不再塞。"""
+        p = segment_prompt(
+            cfg(), now_text="16:10", weekday="二",
+            weather="小雨，气温 12℃", holiday="中秋节")
+        self.assertIn("今天的外界", p)
+        self.assertIn("小雨，气温 12℃", p)
+        self.assertIn("中秋节", p)
+
+    def test_plain_weather_is_left_out_of_the_prompt(self):
+        """平平无奇的天气不该占日程提示词的位置。"""
         p = segment_prompt(
             cfg(), now_text="16:10", weekday="二",
             weather="多云，气温 12℃", holiday="中秋节")
-        self.assertIn("今天的外界", p)
-        self.assertIn("多云，气温 12℃", p)
+        self.assertNotIn("多云", p)
         self.assertIn("中秋节", p)
 
     def test_block_is_absent_when_nothing_known(self):

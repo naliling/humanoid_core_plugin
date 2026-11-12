@@ -36,7 +36,7 @@ import math
 import re
 import time
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from astrbot.api import logger
 
@@ -47,6 +47,10 @@ from .config import HumanoidConfig
 from .data.mood_map import get_mood_label
 from .emotion import EmotionLayer, bracket
 from .services.soma import WAKE_DISTURBED_WINDOW_SECONDS
+from .services.schedule_content import species_issues as _species_issues
+# v3.1.38：「天气值不值得说」的唯一判据，契约 / 证据卡 / 日程 / 聊天四处共用。
+from .services.weather import WEATHER_REPEAT_SECONDS as _WEATHER_REPEAT_SECONDS
+from .services.weather import notable_weather as _notable_weather
 from .wording import (
     AGENCY_CONTINUATION,
     CARE_WORDS,
@@ -438,7 +442,9 @@ def _strip_heading_spans(text: str) -> str:
 
 class PromptBuilder:
     # 天气重复注入的最短间隔（秒）。见 `_weather_worth_saying`。
-    WEATHER_REPEAT_SECONDS = 4 * 3600.0
+    # v3.1.38：不再自己写一份 4 小时——直接引 `services.weather` 的模块常量，
+    # 否则改了一处、另一处还是旧值，天气抑制看起来生效其实没有（本轮真踩过）。
+    WEATHER_REPEAT_SECONDS = _WEATHER_REPEAT_SECONDS
     # 同一句内心话的最短重复间隔（秒）。见 `_emotion_repeated`。
     EMOTION_REPEAT_SECONDS = 10 * 60.0
     # 内存里最多记多少人的「上次注入的内心话」——只用于去重，不落盘。
@@ -757,18 +763,40 @@ class PromptBuilder:
             return ""
         slot = _sensory_slot(hour)
         weather_key = _sensory_weather_key(self._weather_snapshot())
-        options: List[str] = list(_SENSORY_SLOT_LINES.get(slot, ()))
-        options.extend(_SENSORY_WEATHER_LINES.get(weather_key, ()))
-        options.extend(_sensory_body_lines(body))
-        options.extend(_sensory_style_lines(style))
+        # v3.1.37：措辞按**身体类型**挑（四蹄 / 爪兽 / 鳞甲 / 人形），不按物种名一刀切。
+        # v3.1.38：走 `profile_body`——档案里带 `body`（面板手填、或识别层给半龙人/
+        # 人鱼/兽人这类人形兽类钉的）就以它为准，猜不出来才退回人形那套原句。
+        kind = ""
+        body_kind = _species.BODY_HUMAN
+        try:
+            profile = self._core.species_profile()
+            kind = str(profile.get("kind") or "")
+            body_kind = _species.profile_body(profile)
+        except Exception:
+            kind, body_kind = "", _species.BODY_HUMAN
+        table = _SENSORY_BY_BODY.get(body_kind) or {}
+        slot_table = table.get("slot") or {}
+        weather_table = table.get("weather") or {}
+        options: List[str] = list(slot_table.get(slot) or _SENSORY_SLOT_LINES.get(slot, ()))
+        options.extend(weather_table.get(weather_key) or _SENSORY_WEATHER_LINES.get(weather_key, ()))
+        options.extend(_sensory_body_lines(body, body_kind))
+        options.extend(_sensory_style_lines(style, body_kind))
         if not options:
             return ""
-        line = pick(
-            "sensory_line",
-            [*(seed or []), slot, weather_key],
-            options,
+        line = str(
+            pick(
+                "sensory_line",
+                [*(seed or []), slot, weather_key],
+                options,
+            )
+            or ""
         )
-        return str(line or "")
+        # 兜底：池子已按身体挑过，但角色素材等别处进来的句子可能还是人形措辞。
+        # 命中「她没有的部位」就换一条干净的；一条都不干净就不给（宁可少一句）。
+        if line and kind and _species_issues(line, kind):
+            clean = [item for item in options if not _species_issues(str(item), kind)]
+            return str(clean[0]) if clean else ""
+        return line
 
     def _ongoing_hint_line(self, busy: bool = False) -> str:
         """她手上有没有一件事还没放下——只说**有没有**，不说是什么。
@@ -1748,7 +1776,11 @@ class PromptBuilder:
         except Exception:
             weather = {}
         temp = _short_weather(weather)
-        if temp and self._weather_worth_saying(temp, key=key, city=city):
+        # v3.1.38：只有「变天」才把天气写进她的背景。晴/多云/20℃ 不进——
+        # 天气是唯一永远有值、永远具体的一条，摆在背景里就会被念成开场白
+        # （线上原话 `多云，hanhandouya那边呢？`、`外头阴沉7度，有点冷呢`）。
+        # 判据与契约、证据卡、日程提示词共用 `weather.notable_weather`。
+        if temp and _notable_weather(temp) and self._weather_worth_saying(temp, key=key, city=city):
             lines.append(f"外头{temp}")
         return lines
 
@@ -1767,7 +1799,13 @@ class PromptBuilder:
         一个 (文本, 时刻) 单值，**整个角色共用一份**——一个会话把「阴，气温 8℃」讲过
         后，另一个会话 4 小时内再也拿不到天气句。`key` 为空时退化成同一个桶（= 旧
         行为），调用方把 key 接上就自动按会话分开。`city` 进指纹：换城市等于天气变了。
+
+        v3.1.38：**平常天气永远不值得说**（`notable_weather`）。晴、多云、阴、20℃
+        这类天气照样在 `snapshot()` 里给身体和穿着用，但一句都不进上下文——只要
+        它每轮都有值，模型就会拿它凑开场白。这道判据放在最前面，去重门只管「变没变」。
         """
+        if not _notable_weather(text):
+            return False
         now = 0.0
         try:
             now = float(self._core.now_epoch())
@@ -2528,6 +2566,54 @@ _SENSORY_BODY_LOW: Tuple[str, ...] = ("后背有点僵", "眼皮发沉")
 _SENSORY_BODY_MID: Tuple[str, ...] = ("肩膀有点紧", "坐久了腰有点酸")
 _SENSORY_BODY_HIGH: Tuple[str, ...] = ("身上有点热", "手指敲着桌沿")
 
+#: 非人形只换「提到了她身上某个部位」的那几句（v3.1.37）。人形用上面那三组原句，
+#: 一个字都不动——按物种一刀切换掉，半兽人形（有手）和人类角色都会被伤到。
+#: 键是身体类型（见 species.body_kind）；这里没列到的时段/天气/档位沿用上面那几组。
+_SENSORY_BY_BODY: Dict[str, Dict[str, Any]] = {
+    "hoof": {
+        # 四蹄：没有手指，「洗手」也轮不到她。
+        "slot": {
+            "早上": ("窗台凉得不敢碰",),
+            "下午": ("刚擦过的桌面还凉",),
+            "夜里": ("地上凉得贴蹄",),
+        },
+        "weather": {"cold": ("鼻尖冻得发麻",)},
+        "body": {"mid": ("肩胛有点发紧",), "high": ("蹄尖点着地面",)},
+        # 四蹄不穿衣（outfit_text() 已返回空串），这里再兜一层：给空组而不是给人形句。
+        "style": {"thick": (), "thin": ()},
+    },
+    "paw": {
+        # 爪兽：有爪没有蹄，也不穿衣服。
+        "slot": {
+            "早上": ("窗台凉得不敢碰",),
+            "下午": ("刚擦过的桌面还凉",),
+            "夜里": ("地上凉得不敢踩",),
+        },
+        "weather": {"cold": ("鼻头冻得发麻",)},
+        "body": {"mid": ("肩胛有点发紧",), "high": ("爪尖点着地面",)},
+        "style": {
+            "thick": ("皮毛底下有点闷", "后腿内侧蹭得发痒"),
+            "thin": ("后腿有点凉", "皮毛底下起了层鸡皮"),
+        },
+    },
+    "scale": {
+        # 鳞甲（龙/龙马/麒麟/人鱼）：爪子有，皮毛没有——盖着的是鳞片。
+        "slot": {
+            "早上": ("窗台凉得隔着鳞片透过来",),
+            "下午": ("刚擦过的桌面还凉",),
+            "夜里": ("地气凉得贴着鳞片往上走",),
+        },
+        "weather": {"cold": ("鼻头冻得发麻",)},
+        "body": {"mid": ("肩胛有点发紧",), "high": ("爪尖点着地面",)},
+        # 也不穿衣（兽形走「没穿衣服」那条，走不到风格句），给空组兜底。
+        "style": {"thick": (), "thin": ()},
+    },
+}
+
+#: 人形的穿搭句（原样保留）。非人形用 _SENSORY_BY_BODY[...]["style"] 里那两组。
+_SENSORY_STYLE_THICK: Tuple[str, ...] = ("领口有点闷", "袖子挽到了小臂")
+_SENSORY_STYLE_THIN: Tuple[str, ...] = ("腿上有点凉", "胳膊上起了层小疙瘩")
+
 
 def _sensory_slot(hour: int) -> str:
     """钟点 → 时段名（与 life_material.SLOT_NAMES 同一套边界）。"""
@@ -2572,7 +2658,7 @@ def _sensory_weather_key(weather: Dict[str, Any]) -> str:
     return ""
 
 
-def _sensory_body_lines(body: Dict[str, Any]) -> Tuple[str, ...]:
+def _sensory_body_lines(body: Dict[str, Any], kind: str = "human") -> Tuple[str, ...]:
     """按精力档位给一条身体细节。取不到精力就不给（宁可少一句，不编一句）。"""
     if not isinstance(body, dict):
         return ()
@@ -2585,18 +2671,26 @@ def _sensory_body_lines(body: Dict[str, Any]) -> Tuple[str, ...]:
         return ()
     if value < 35.0:
         return _SENSORY_BODY_LOW
+    table = (_SENSORY_BY_BODY.get(kind) or {}).get("body") or {}
     if value > 78.0:
-        return _SENSORY_BODY_HIGH
-    return _SENSORY_BODY_MID
+        return tuple(table.get("high") or _SENSORY_BODY_HIGH)
+    return tuple(table.get("mid") or _SENSORY_BODY_MID)
 
 
-def _sensory_style_lines(style: str) -> Tuple[str, ...]:
-    """按穿搭给一条细节。只认得出厚/薄两类，认不出就不给。"""
+def _sensory_style_lines(style: str, body: str = "human") -> Tuple[str, ...]:
+    """按穿搭给一条细节。只认得出厚/薄两类，认不出就不给。
+
+    v3.1.37：非人形不再套「领口 / 袖子 / 胳膊」——四蹄不穿衣（`outfit_text()` 对
+    她返回空串，走不到这里，这里再兜一层），爪兽换成皮毛 / 后腿。
+    """
     text = str(style or "")
     if not text:
         return ()
+    table = (_SENSORY_BY_BODY.get(body) or {}).get("style") or {}
     if any(word in text for word in ("外套", "大衣", "毛衣", "羽绒", "厚")):
-        return ("领口有点闷", "袖子挽到了小臂")
+        picked = table.get("thick")
+        return tuple(picked) if picked is not None else _SENSORY_STYLE_THICK
     if any(word in text for word in ("裙", "短袖", "背心", "薄")):
-        return ("腿上有点凉", "胳膊上起了层小疙瘩")
+        picked = table.get("thin")
+        return tuple(picked) if picked is not None else _SENSORY_STYLE_THIN
     return ()
