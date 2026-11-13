@@ -355,3 +355,47 @@ class ServiceBuildTest(unittest.IsolatedAsyncioTestCase):
     async def test_no_gateway_does_nothing(self):
         service, _conf, _holder = _service()
         self.assertFalse(service.ensure_role_materials())
+
+
+class DirtyGeneratedMaterialTest(unittest.TestCase):
+    """v3.1.40：模型生成的角色素材不走日程词表，线上真写过「低头舔舐肩胛翅根」。"""
+
+    def test_a_dirty_item_is_dropped_on_accept(self):
+        items = [
+            {
+                "event": "低头舔舐肩胛翅根",
+                "location": "窗边",
+                "minutes": [20, 40],
+                "slots": ["上午"],
+            },
+            {
+                "event": "把晒干的草药收进罐子",
+                "location": "厨房",
+                "minutes": [20, 40],
+                "slots": ["上午"],
+            },
+        ]
+        kept = role_materials.accepted(items, PERSONA)
+        self.assertEqual([item["event"] for item in kept], ["把晒干的草药收进罐子"])
+
+    def test_a_dirty_item_is_hidden_on_load(self):
+        scope = _scope()
+        scope.set_self(
+            role_materials.ROLE_MATERIALS_KEY,
+            [
+                {
+                    "event": "用嘴舔舐背脊白毛",
+                    "location": "窝里",
+                    "minutes": [20, 40],
+                    "slots": ["上午"],
+                },
+                {
+                    "event": "把晒干的草药收进罐子",
+                    "location": "厨房",
+                    "minutes": [20, 40],
+                    "slots": ["上午"],
+                },
+            ],
+        )
+        kept = role_materials.load(scope)
+        self.assertEqual([item["event"] for item in kept], ["把晒干的草药收进罐子"])

@@ -17,7 +17,7 @@ desc: |
   群里同样生效：群消息也会进情绪分析，只跟已经有情绪档案的人，间隔比私聊宽；另含默认关闭的亲密场景模拟等进阶项，详见 README。
 
   配置不复杂，真正要改的就那几项，额外的都标着【进阶】。
-version: 3.1.39
+version: 3.1.40
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.24.0"

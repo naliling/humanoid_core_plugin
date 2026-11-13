@@ -133,3 +133,70 @@ class GuardWiringTest(unittest.IsolatedAsyncioTestCase):
         response = _Response("窗外的雪下大了，我把炉子添了块柴。")
         await star.note_her_reply(FakeEvent("在吗", sender=HUMAN), response)
         self.assertEqual(response.completion_text, "窗外的雪下大了，我把炉子添了块柴。")
+
+
+class RefusalTest(unittest.TestCase):
+    """v3.1.36：模型拒绝/整句英文不是她的话。"""
+
+    def test_a_provider_refusal_is_recognised(self):
+        text = (
+            "Your request involves sexually suggestive roleplay within a "
+            "sexualized context. I am refusing to continue."
+        )
+        self.assertTrue(reply_guard.looks_like_refusal(text))
+
+    def test_a_whole_english_sentence_is_a_refusal(self):
+        self.assertTrue(
+            reply_guard.looks_like_refusal("The kettle is on the stove, come sit.")
+        )
+
+    def test_a_short_english_word_is_not(self):
+        self.assertFalse(reply_guard.looks_like_refusal("Wind"))
+
+    def test_a_chinese_reply_is_not_a_refusal(self):
+        self.assertFalse(
+            reply_guard.looks_like_refusal("窗外的雪下大了，我把炉子添了块柴。")
+        )
+
+    def test_empty_text_is_not_a_refusal(self):
+        self.assertFalse(reply_guard.looks_like_refusal(""))
+
+
+class RefusalWiringTest(unittest.IsolatedAsyncioTestCase):
+    """线上实例：一条英文拒绝被当成她的话记进 `spoke_log` 还发了出去。"""
+
+    async def _star(self, **raw):
+        self.tmp = Path(tempfile.mkdtemp())
+        provider = FakeProvider("p1", reply=GOOD_SCHEDULE)
+        ctx = FakeContext(chat_providers=[provider])
+        base = {
+            "timezone_city": "北京",
+            "schedule_provider_name": "p1",
+            "admin_qq": [HUMAN],
+            "state_flush_interval_seconds": 1,
+        }
+        base.update(raw)
+        main_module.get_astrbot_data_path = lambda: str(self.tmp)
+        star = main_module.HumanoidCore(ctx, base)
+        await star.initialize()
+        self.addAsyncCleanup(star.terminate)
+        return star
+
+    async def test_a_refusal_is_neither_sent_nor_recorded(self):
+        star = await self._star()
+        core = star._core(FakeEvent("/你的状态"))
+        response = _Response(
+            "Your request involves sexually suggestive roleplay within a "
+            "sexualized context. I am refusing to continue."
+        )
+        await star.note_her_reply(FakeEvent("在吗", sender=HUMAN), response)
+        self.assertEqual(response.completion_text, "")
+        self.assertEqual(core.mood.spoke(HUMAN), [])
+
+    async def test_a_chinese_reply_is_still_sent(self):
+        star = await self._star()
+        core = star._core(FakeEvent("/你的状态"))
+        response = _Response("窗外的雪下大了，我把炉子添了块柴。")
+        await star.note_her_reply(FakeEvent("在吗", sender=HUMAN), response)
+        self.assertEqual(response.completion_text, "窗外的雪下大了，我把炉子添了块柴。")
+        self.assertTrue(core.mood.spoke(HUMAN))

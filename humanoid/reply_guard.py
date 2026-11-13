@@ -70,6 +70,43 @@ def is_placeholder(text: str) -> bool:
     return any(marker in low for marker in PLACEHOLDER_MARKERS)
 
 
+#: 模型安全策略拒绝时吐出来的英文样板。这类文本**不是她的话**，是生成失败：
+#: 线上实例（2026-11-14 扫 `spoke_log` 384 条时发现）：一条
+#: `Your request involves sexually suggestive roleplay ... I am refusing`
+#: 被当成她的发言记进账本，还发出去了。用户的原话是「发言看起来很傻」。
+REFUSAL_MARKERS: Tuple[str, ...] = (
+    "i'm sorry",
+    "i am sorry",
+    "i cannot",
+    "i can't",
+    "i won't",
+    "i will not",
+    "as an ai",
+    "your request",
+    "i must decline",
+    "i'm unable",
+    "i am unable",
+    "i'm not able",
+    "i am not able",
+    "sorry, but",
+)
+
+#: 一句中文都没有、又不算短语气词时，按「模型在用英文说话」处理——她的角色都说中文，
+#: 整句英文不是她。短词（比如 `Wind`）不判，免得把正常的英文昵称/词当拒绝。
+NON_CJK_MIN_CHARS = 12
+
+
+def looks_like_refusal(text: str) -> bool:
+    """这句是不是模型的拒绝/英文样板（不是她该发出去的话）。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    low = raw.lower()
+    if any(marker in low for marker in REFUSAL_MARKERS):
+        return True
+    return not _CJK.search(raw) and len(raw) >= NON_CJK_MIN_CHARS
+
+
 def _clauses(text: str) -> List[Tuple[str, str]]:
     """切成 [(小句, 分隔符), ...]；分隔符为空串表示最后一段。"""
     parts = _SPLIT.split(str(text or ""))

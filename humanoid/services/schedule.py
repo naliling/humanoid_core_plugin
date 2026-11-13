@@ -69,6 +69,7 @@ from .schedule_content import (
 )
 from .role_materials import (
     ROLE_MATERIALS_COUNT,
+    ROLE_MATERIALS_KEY,
     ROLE_MATERIALS_MIN,
     ROLE_MATERIALS_RETRY_SECONDS,
     accepted as _role_accepted,
@@ -109,7 +110,7 @@ HEAL_GEN_KEY = "schedule_heal_gen_wall"
 # v3.1.35 升到 8：再清两处漏网的——`materials_done` 里带设备/物种词的台账，
 # 以及被反复加前缀的「今天上午今天上午…」标题。
 PURGE_KEY = "schedule_purged_v"
-PURGE_VERSION = 8
+PURGE_VERSION = 10
 # 被下一段从中间截断时，剩下的那一小截值不值得留（v3.1.29）。
 # 3 分钟的「把窗户打开」不是一段生活，是拼接留下的碎渣；短于这个数就把整段
 # 撤掉（睡眠段例外：觉不能被删），免得日程里出现「太短」的段。
@@ -3836,7 +3837,7 @@ class ScheduleService:
 
         def dirty(text: object) -> bool:
             codes = content_issues(str(text or ""))
-            if any(code.startswith(("设备:", "含糊:")) for code in codes):
+            if any(code.startswith(("设备:", "含糊:", "私事:")) for code in codes):
                 return True
             # 物种（v3.1.33）：旧存档里「把门口的鞋摆整齐」这种段落，对一匹小马
             # 来说和「用蹄子夹着手机」是同一类错，不能只在读取时挡，得真删。
@@ -3880,6 +3881,20 @@ class ScheduleService:
             return False
 
         removed = 0
+        # 角色专属素材池（v3.1.40）：模型生成时没走词表，线上真写过
+        # 「低头舔舐肩胛翅根」这种句子。整条删掉，指纹重建时再补新的。
+        stored_mats = self._scope.get_self(ROLE_MATERIALS_KEY, [])
+        if isinstance(stored_mats, list):
+            kept = []
+            for item in stored_mats:
+                event = str(item.get("event") or "") if isinstance(item, dict) else ""
+                if event and dirty(event):
+                    removed += 1
+                    continue
+                kept.append(item)
+            if len(kept) != len(stored_mats):
+                self._scope.set_self(ROLE_MATERIALS_KEY, kept)
+
         daily = self._scope.get_self("daily_schedule")
         if isinstance(daily, list):
             kept = [slot for slot in daily if not dirty_slot(slot)]

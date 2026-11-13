@@ -2933,6 +2933,22 @@ class HumanoidCore(Star):
         `response` 可写时把 `completion_text` 一起改掉，宿主发出去的就是删过的版本。
         """
         try:
+            # 出站拦截（v3.1.36）：模型安全策略拒绝时的英文样板不是她的话。
+            # 线上真的有一条被记成她的发言发了出去（2026-11-14 查 `spoke_log`）：
+            # `Your request involves sexually suggestive roleplay ... I am refusing`。
+            # 整句英文、一句中文都没有的也按同一个理由拦——她的角色都说中文。
+            if reply_guard.looks_like_refusal(text):
+                logger.warning(
+                    f"{LOG_PREFIX} 出站拦截：模型给的是拒绝/英文样板，这条不发（"
+                    + str(text or "")[:40]
+                    + "）"
+                )
+                if isinstance(getattr(response, "completion_text", None), str):
+                    try:
+                        response.completion_text = ""
+                    except Exception:
+                        pass
+                return ""
             try:
                 recent = [
                     str(row.get("text", ""))
@@ -2993,6 +3009,10 @@ class HumanoidCore(Star):
             # 出站复读拦截（v3.1.31）：她自己最近说过的话（同一个地点、同一句），
             # 这一条里不再原样念一遍。放在兄弟 bot 判据之后——别人的话不归我们改。
             text = self._guard_reply(core, user_id, response, text)
+            # 被出站拦截的那条（模型拒绝/整句英文）既不发也不记账——账本里记一句
+            # 英文拒绝，会让她后面的情绪分析把「她说的话」判错。
+            if not text:
+                return
             # 收尾守卫：记下她这句，下一轮判断「她是不是已经收过尾了」。
             self._closing_record_out(event, text)
             # P1：她**自己说出口**的话也进 ccb 的账。原来只有用户那一路

@@ -27,6 +27,7 @@ import json
 from typing import Any, Mapping, Sequence
 
 from .life_material import capabilities, interests_in
+from .schedule_content import content_issues
 from ..species import BODY_HOOF, BODY_PAW, BODY_SCALE, profile_body
 
 # state 键：条目、人设指纹、上次尝试时间（失败退避用）
@@ -266,6 +267,9 @@ def accepted(items: Sequence[Mapping[str, Any]], persona_text: str) -> list[dict
     for item in items:
         if not isinstance(item, Mapping):
             continue
+        # 模型生成时不走日程那套词表：线上真写过「低头舔舐肩胛翅根」（v3.1.40）。
+        if content_issues(str(item.get("event") or "")):
+            continue
         needs = item.get("needs") or ()
         if isinstance(needs, str):
             needs = (needs,)
@@ -289,8 +293,12 @@ def load(scope: Any) -> list[dict[str, Any]]:
     out = []
     for entry in stored:
         item = _item(entry)
-        if item is not None:
-            out.append(item)
+        if item is None:
+            continue
+        # 旧存档里的脏条目读取时就挡掉（state 清理走 `_purge_dirty_history`）。
+        if content_issues(str(item.get("event") or "")):
+            continue
+        out.append(item)
     return out
 
 
