@@ -208,6 +208,10 @@ def quote_line(raw: object, limit: int) -> str:
     return " ".join(text.split())[:limit]
 
 
+#: 引号里是别人（多半是用户）的原话：里面的「她」指的是别人的她，不替换。
+_QUOTED_SPAN = re.compile(r"「[^」]*」|『[^』]*』|“[^”]*”|\"[^\"]*\"")
+
+
 def to_first_person(text: str) -> str:
     """把注入正文里的「她」全部换成「我」（v13 归属改造的出口）。
 
@@ -217,10 +221,24 @@ def to_first_person(text: str) -> str:
 
     安全性：注入正文里没有第二个人用「她」——玩家一律写「TA」，别人一律写名字或不
     出现。所以正文里的「她」100% 指角色自己，整字替换不会改错人。
+
+    例外（v3.1.42）：引号里是**用户原话**（recall 的「TA之前说过『…』」、
+    `_behavior_lines` 里的引文），里面的「她」指的是别人的她，替换等于篡改原话。
+    所以按引号切段，只替换引号外的部分。
     """
     if not text:
         return text
-    return str(text).replace("她", "我")
+    raw = str(text)
+    if "她" not in raw:
+        return raw
+    out: List[str] = []
+    last = 0
+    for match in _QUOTED_SPAN.finditer(raw):
+        out.append(raw[last:match.start()].replace("她", "我"))
+        out.append(match.group(0))
+        last = match.end()
+    out.append(raw[last:].replace("她", "我"))
+    return "".join(out)
 
 
 def build_framing(char_name: str = "", user_name: str = "") -> str:
@@ -402,6 +420,8 @@ def _flatten_memory(text: str, limit: int = MEMORY_TEXT_MAX_CHARS) -> str:
     body = _MEMORY_RUN.sub("，", body).strip("，。；、 ")
     cap = max(0, int(limit))
     if len(body) > cap:
+        # 静默截断等于丢信息（被截掉的正好可能是关键那半句）：留一条日志好排查。
+        logger.info("记忆正文超过 %d 字，已截断（原长 %d 字）", cap, len(body))
         body = body[:cap].rstrip("，。；、 ") + "…"
     return body
 

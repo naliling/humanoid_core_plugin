@@ -276,6 +276,10 @@ def _mask_id(value: Any) -> str:
 #:
 #: 截断的代价是少看几行，不截断的代价是整条回复消失。所以宁可截断并明说「还有多少」。
 COMMAND_OUTPUT_CHARS = 1500
+#: 诊断报告单独放宽：它是最长的指令输出（十几节），1500 字符只够前两三节，
+#: 用户看到的就是「还有 69 行没显示」。真正会炸 NapCat 的是昵称列表那种 5 万字符，
+#: 6000 字符离那条线还远。
+DIAGNOSTICS_OUTPUT_CHARS = 6000
 #: 昵称列表最多显示多少行。
 NICKNAME_ROWS = 30
 
@@ -300,25 +304,35 @@ def _clip_text(text: Any, limit: int = COMMAND_OUTPUT_CHARS,
 
     先按行保留（尽量不切断句子），行本身超长时再硬截——昵称那种「QQ → 名字」一行
     就可能上百字符，光按行数限不住。
+
+    v3.1.41：中间某一行特别长时，截断这一行再收尾，而不是直接停下。以前「第一行
+    之后的某一行超长」会把后面全部吞掉：诊断页的模型 id 列表拼成一行就是这个症状
+    （用户只看到「还有 69 行没显示」）。
     """
     body = str(text or "")
     limit = max(1, int(limit))
     if len(body) <= limit:
         return body
     lines = body.splitlines()
+    budget = limit - 40
     kept: list[str] = []
     used = 0
-    for line in lines:
-        if used + len(line) + 1 > limit - 40:
-            break
-        kept.append(line)
-        used += len(line) + 1
-    rest = max(0, len(lines) - len(kept))
+    index = 0
+    while index < len(lines) and used + len(lines[index]) + 1 <= budget:
+        kept.append(lines[index])
+        used += len(lines[index]) + 1
+        index += 1
     if not kept:
         # 第一行自己就超了预算（昵称列表一行可能几百字符）：硬截第一行，
         # 不能返回一句「还有 N 行没显示」把正文整段吞掉。
         head = lines[0] if lines else ""
         return head[: max(1, limit - 1)] + "…"
+    if index < len(lines):
+        room = budget - used
+        if room >= 8:
+            kept.append(lines[index][:room] + "…")
+            index += 1
+    rest = max(0, len(lines) - index)
     tail = (more_note or "……还有 {rest} 行没显示").format(rest=rest)
     out = "\n".join(kept + [tail])
     if len(out) > limit:
@@ -1219,10 +1233,18 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
                 event = str(slot.get("event", "") or "").strip()
                 loc = str(slot.get("location", "") or "").strip()
                 if event:
-                    head = _NOUN_EVENTS.get(event) or (
-                        event if event.startswith(_ACT_HEADS) else "在" + event
-                    )
-                    day = f"她这会儿{head}" + (f"（{loc}）" if loc else "")
+                    if slot.get("status"):
+                        # 兜底段的 `status` 标记（见 schedule.dynamic_segment）：event
+                        # 是处境词，不是真发生的动作。补「在」会拼出「她这会儿在有点
+                        # 饿了」；原样接又会把「把桌子擦了」说成完成态。只有不像动作
+                        # 的处境词才当状态说出来，动作式的一律不提。
+                        if not event.startswith(_ACT_HEADS):
+                            day = f"她这会儿{event}" + (f"（{loc}）" if loc else "")
+                    else:
+                        head = _NOUN_EVENTS.get(event) or (
+                            event if event.startswith(_ACT_HEADS) else "在" + event
+                        )
+                        day = f"她这会儿{head}" + (f"（{loc}）" if loc else "")
             except Exception:
                 day = ""
         # 她自己的情况（v3.1.18）：只在对方问到她本人时给；问「在做什么」时不重复给
@@ -1912,7 +1934,8 @@ class HumanoidCore(Star):
         if banner:
             text = "\n".join(banner) + "\n" + text
         # 诊断项会越加越多（每加一个子系统就多几行），同样要压到一条消息能发出去。
-        yield event.plain_result(_clip_text(text))
+        # v3.1.41：它自己的预算比别的指令宽（见 DIAGNOSTICS_OUTPUT_CHARS）。
+        yield event.plain_result(_clip_text(text, DIAGNOSTICS_OUTPUT_CHARS))
 
     # 面板上 89 项、AstrBot 又不支持分组，改一个城市要翻半天。这一条命令只管常用那几项，
     # 进阶项仍然去面板改——两边改的是同一份配置文件。
@@ -2534,7 +2557,7 @@ class HumanoidCore(Star):
                 user_id,
                 # 不写「刚刚」：过程是 Core 按自己的节拍推进的，这边只在她下一条消息
                 # 到达时才发现它结束了，中间可能隔了几个小时。写死时间就是写错。
-                f"她做完了{name}",
+                f"她手头那件「{name}」告一段落",
                 umo=umo,
                 # 幂等键要能区分「同一件事的不同次」：以前只用内容（proc:名字），同一个
                 # 名字的过程第二次结束就被记忆插件当成重放丢掉，永远写不进去。现在带上
@@ -2936,7 +2959,8 @@ class HumanoidCore(Star):
             # 出站拦截（v3.1.36）：模型安全策略拒绝时的英文样板不是她的话。
             # 线上真的有一条被记成她的发言发了出去（2026-11-14 查 `spoke_log`）：
             # `Your request involves sexually suggestive roleplay ... I am refusing`。
-            # 整句英文、一句中文都没有的也按同一个理由拦——她的角色都说中文。
+            # v3.1.42：整句英文不再一律拦（那会把英文人设永久静音），只有命中
+            # 拒绝语义特征（cannot / sorry / refuse…）才拦。
             if reply_guard.looks_like_refusal(text):
                 logger.warning(
                     f"{LOG_PREFIX} 出站拦截：模型给的是拒绝/英文样板，这条不发（"
@@ -3083,6 +3107,12 @@ class HumanoidCore(Star):
             user_id = self._sender(event)
             # 与 on_llm_response 同一道出站判据：兄弟 bot 的回复不进情绪/好感账。
             if self._is_sibling_peer(event):
+                return
+            # 出站守卫（v3.1.42 / P0）：第三方 runner 和流式收尾不走
+            # `on_llm_response`，拒绝样板和复读原来就从这里原样发出去。这里补
+            # 同一道判据；删空（整条都是拒绝样板）就整条不发。
+            text = self._guard_reply(core, user_id, result, text)
+            if not text:
                 return
             # 收尾守卫：同一条口径——她真正发出去的话都记，下一轮判定才准。
             self._closing_record_out(event, text)

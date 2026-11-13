@@ -32,7 +32,8 @@ import re
 from typing import Any, Iterable, Mapping
 
 #: 卡片恰好这九个键。社交层按结构读，少一个、多一个都当坏卡丢掉——
-#: 形状漂了却没人报错，是这个项目历史上最常见的一类故障。
+#: 形状漂了却没人报错，是这个项目历史上最常见的一类故障。（投影层可能额外
+#: 打 `generated` 标记，见 `OPTIONAL_CARD_KEYS`；那不算契约键。）
 CARD_KEYS: tuple[str, ...] = (
     "id",
     "kind",
@@ -44,6 +45,11 @@ CARD_KEYS: tuple[str, ...] = (
     "expires_at",
     "anchor_key",
 )
+
+#: 可选的附加键：投影层打的标记，不属于九键契约本身。
+#: `generated`（v3.1.42）：这张卡是插件按日程 / 素材排出来的，不是她真经历过的
+#: 事实。社交层旧版本不认识它就当没有；结构校验也不该因为它判坏卡。
+OPTIONAL_CARD_KEYS: tuple[str, ...] = ("generated",)
 
 #: 卡片种类。前几种是 Core 现在产得出来的（日程 / 未完成 / 想做的 / 天气 / 节日 /
 #: 梦 / 刚发生），后面几种留给以后接进来的源（屏幕 / 新闻 / 成长 / 共同记忆 /
@@ -63,11 +69,17 @@ KINDS: tuple[str, ...] = (
     "greeting",
 )
 
+#: 由插件「生成」的出处（不是真实发生的事实）：日程 / 想做的事 / 未完事项都是 Core
+#: 按计划推出来的，问候时机只是窗口。社交层要能区分「她真经历过」和「插件排出来
+#: 的事」——v3.1.42 起投影（`fresh_cards`）给这些卡打 `generated` 标记。
+#: 标签与 `anchors.SOURCE_*` 一致；这里不 import anchors，避免循环依赖。
+GENERATED_SOURCES: frozenset[str] = frozenset({"日程", "想做的事", "未完事项", "问候时机"})
+
 #: 有效期（秒）：按「这条由头多久之后说出来就已经不像话了」分档。
-#: 日程里做过的事能撑到半天（今天下午的手冲，晚上说还成立）；「正在做」的事只在
-#: 这一段里成立；天气三小时就换；节日一整天；梦到中午就该停了。
+#: 日程里做过的事按半天撑不住（下午的手冲，晚上再说就已经像编的）：只给两小时，
+#: 跟「正在做」的事同档；天气三小时就换；节日一整天；梦到中午就该停了。
 OPP_TTL_SECONDS: dict[str, float] = {
-    "life": 6 * 3600.0,
+    "life": 2 * 3600.0,
     "activity": 2 * 3600.0,
     "weather": 3 * 3600.0,
     "holiday": 24 * 3600.0,
@@ -208,7 +220,10 @@ def validate_card(card: Any) -> list[str]:
     missing = [key for key in CARD_KEYS if key not in card]
     if missing:
         problems.append("缺键: " + ",".join(missing))
-    extra = [str(key) for key in card if key not in CARD_KEYS]
+    extra = [
+        str(key) for key in card
+        if key not in CARD_KEYS and key not in OPTIONAL_CARD_KEYS
+    ]
     if extra:
         problems.append("多键: " + ",".join(extra))
     kind = _clean(card.get("kind"))
@@ -274,9 +289,20 @@ def dedupe(cards: Iterable[Any]) -> list[dict[str, Any]]:
     return list(kept.values())
 
 
-def fresh_cards(cards: Any, now: Any, limit: int = OPP_LIMIT) -> list[dict[str, Any]]:
+def fresh_cards(
+    cards: Any,
+    now: Any,
+    limit: int = OPP_LIMIT,
+    *,
+    generated: bool | None = None,
+) -> list[dict[str, Any]]:
     """过滤出「现在还能说」的卡：结构合格、没过期、同 anchor_key 去重、
-    按采集时间倒序、截到 limit 条。"""
+    按采集时间倒序、截到 limit 条。
+
+    `generated=True` 时给每张卡打 `generated` 标记（素材整块都是插件排的）；
+    不传时按 `source` 判：`GENERATED_SOURCES` 里的出处算生成来源，其余（刚发生 /
+    天气 / 节日 / 梦境这些真实事实）不加标记。
+    """
     stamp = to_epoch(now)
     alive: list[dict[str, Any]] = []
     for card in cards or ():
@@ -284,7 +310,12 @@ def fresh_cards(cards: Any, now: Any, limit: int = OPP_LIMIT) -> list[dict[str, 
             continue
         if is_expired(card, stamp):
             continue
-        alive.append(dict(card))
+        item = dict(card)
+        if generated is True or (
+            generated is None and _clean(item.get("source")) in GENERATED_SOURCES
+        ):
+            item["generated"] = True
+        alive.append(item)
     picked = dedupe(alive)
     picked.sort(
         key=lambda card: (
@@ -303,13 +334,16 @@ def fresh_cards(cards: Any, now: Any, limit: int = OPP_LIMIT) -> list[dict[str, 
 def contract_blocks(opportunities: Any, materials: Any, now: Any) -> dict[str, list[dict[str, Any]]]:
     """把卡片投影成契约里的两个只读键。
 
-    * `opportunities`：既成事实的由头，最多 `OPP_LIMIT` 条；
-    * `materials`：她这样的人还可能做的事，最多 `MATERIAL_LIMIT` 条。
+    * `opportunities`：可以拿来开口的由头，最多 `OPP_LIMIT` 条。**不都是既成
+      事实**：日程 / 素材这类是插件按计划排出来的（卡上带 `generated` 标记），
+      社交层别当实况转述；
+    * `materials`：她这样的人还可能做的事，最多 `MATERIAL_LIMIT` 条（全部带
+      `generated`）。
 
     两个键**永远都在**（没有卡就是空列表）：社交层按「键在不在」判新旧版本，
     缺键与空列表在它眼里是两件事。
     """
     return {
         "opportunities": fresh_cards(opportunities, now, limit=OPP_LIMIT),
-        "materials": fresh_cards(materials, now, limit=MATERIAL_LIMIT),
+        "materials": fresh_cards(materials, now, limit=MATERIAL_LIMIT, generated=True),
     }

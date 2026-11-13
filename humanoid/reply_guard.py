@@ -23,6 +23,8 @@ from __future__ import annotations
 import re
 from typing import Iterable, List, Sequence, Tuple
 
+from astrbot.api import logger
+
 #: 家里会被她当成「我在哪儿」说出口的地点。只认这些，避免把「厨房纸巾」这类
 #: 名词误判成地点复读。
 PLACES: Tuple[str, ...] = (
@@ -95,6 +97,13 @@ REFUSAL_MARKERS: Tuple[str, ...] = (
 #: 整句英文不是她。短词（比如 `Wind`）不判，免得把正常的英文昵称/词当拒绝。
 NON_CJK_MIN_CHARS = 12
 
+#: 一句中文都没有的长句，只有命中这些拒绝语义特征才当拒绝拦掉（v3.1.42）。
+#: 以前「非中文 + 够长」就直接判拒绝，英文/非中文人设的正常句子会被永久静音。
+NON_CJK_REFUSAL_HINTS: Tuple[str, ...] = (
+    "cannot", "can not", "can't", "unable", "not able", "refuse",
+    "won't", "will not", "must decline", "as an ai", "sorry",
+)
+
 
 def looks_like_refusal(text: str) -> bool:
     """这句是不是模型的拒绝/英文样板（不是她该发出去的话）。"""
@@ -104,7 +113,12 @@ def looks_like_refusal(text: str) -> bool:
     low = raw.lower()
     if any(marker in low for marker in REFUSAL_MARKERS):
         return True
-    return not _CJK.search(raw) and len(raw) >= NON_CJK_MIN_CHARS
+    if not _CJK.search(raw) and len(raw) >= NON_CJK_MIN_CHARS:
+        # 英文/非中文人设的正常句子不是拒绝：只有命中拒绝语义特征才拦。
+        if any(hint in low for hint in NON_CJK_REFUSAL_HINTS):
+            return True
+        logger.warning("非中文回复未命中拒绝特征，放行（前 40 字）：" + raw[:40])
+    return False
 
 
 def _clauses(text: str) -> List[Tuple[str, str]]:
@@ -189,8 +203,10 @@ def trim_repeats(
         # 整条都是复读：宁可原样发，也不发空。
         return body, dropped
     rebuilt = "".join(c + d for c, d in kept).strip()
-    # 只清掉行首残留的分隔符（删掉第一句时会留下「，」）；句尾标点保留。
-    rebuilt = rebuilt.lstrip("，,。！？!?；;…、~～ ")
+    # 行首和句尾的分隔符都要清：删掉第一句会留下行首「，」，删掉**末尾**那句会让
+    # 前一句的分隔符挂在句尾（「刚把碗洗完，」再接原句末标点就成了「刚把碗洗完，。」）。
+    # 句尾标点（。！？）不动——下面还要按原句末标点补一次。
+    rebuilt = rebuilt.lstrip("，,。！？!?；;…、~～ ").rstrip("，,、；;：:…~～ ")
     if rebuilt and body[-1] in "。！？!?…" and rebuilt[-1] not in "。！？!?…":
         rebuilt += body[-1]
     if len(_norm(rebuilt)) < 2:

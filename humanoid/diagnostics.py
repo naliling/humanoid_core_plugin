@@ -25,6 +25,9 @@ OK_MARK = "✓"
 BAD_MARK = "✗"
 WARN_MARK = "⚠"
 
+#: 诊断报告里最多列多少个模型 id。装了几十个模型时，这一段会长到把别的检查项挤掉。
+MODEL_ID_ROWS = 40
+
 
 def config_error_banner(load_error: str) -> list[str]:
     """配置整体退回默认值时，报告最顶上那几行。空串=正常，返回空列表。
@@ -612,8 +615,14 @@ def _build_report_body(
     lines = [f"〖拟人诊断〗v{version}", ""]
     lines += config_error_banner(config_load_error)
     lines += _loop_failure_lines(failed_loops)
-    lines.append("【AstrBot 可用对话模型 id】")
-    lines.append(f"  {available}" if available else "  （空 —— AstrBot 还没有配置任何对话模型）")
+    # v3.1.41：报告开头先说清「怎么读」。以前一上来就是模型 id 列表，而且整份列表
+    # 挤成一行——用户配了六十来个模型时，那一行就超过整条消息的长度预算，后面所有
+    # 检查项被截掉，只剩一句「还有 69 行没显示」（issue #10）。
+    lines.append(
+        f"（下面每一段是一项检查：{OK_MARK} 正常、{BAD_MARK} 有问题、{WARN_MARK} 注意；"
+        "带「-」的行是这一项的具体数值）"
+    )
+    lines.append("")
 
     lines += ["", "【日程模型链】"]
     lines.append(_resolve_line(resolver, "首选模型", cfg.schedule_provider_name, available))
@@ -900,6 +909,22 @@ def _build_report_body(
         lines += ["", "→ 请先在 AstrBot 的「服务提供商」里配置至少一个对话模型。"]
     elif cfg.schedule_provider_name and cfg.schedule_provider_name not in available:
         lines += ["", "→ 首选模型 id 不在可用列表里：请在插件配置里用下拉框重新选择。"]
+
+    # v3.1.41：模型 id 列表挪到最末尾、一行一个。它是最长的一段（几十个 id），
+    # 放在开头会把整份报告挤没；一行一个也才看得清该抄哪个。太多时只列前
+    # MODEL_ID_ROWS 个，剩下的指路到面板——不然一装几十个模型，报告光这一段就上千字。
+    lines += ["", "【AstrBot 可用对话模型 id】"]
+    if available:
+        lines.append("  填面板上的「日程模型」「情绪模型」时，照抄下面任意一行的 id：")
+        for name in available[:MODEL_ID_ROWS]:
+            lines.append(f"  - {name}")
+        if len(available) > MODEL_ID_ROWS:
+            lines.append(
+                f"  ……还有 {len(available) - MODEL_ID_ROWS} 个没列"
+                "（去 AstrBot 的「服务提供商」页面看完整列表）"
+            )
+    else:
+        lines.append("  （空 —— AstrBot 还没有配置任何对话模型，先去「服务提供商」加一个）")
 
     return "\n".join(lines)
 

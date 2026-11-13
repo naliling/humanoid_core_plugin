@@ -37,6 +37,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from astrbot.api import logger
+
 __all__ = [
     "Fact",
     "select",
@@ -186,6 +188,10 @@ def _fit(
         for i in sorted(range(len(kept)), key=lambda j: -kept[j].priority):
             cost = estimate(kept[i].text) + 1
             if used + cost > budget_tokens:
+                logger.debug(
+                    "注入 token 预算不足，丢掉一条：%s（%d tokens，已用 %d/%d）",
+                    kept[i].key, cost, used, budget_tokens,
+                )
                 continue
             keep_idx.append(i)
             used += cost
@@ -195,6 +201,10 @@ def _fit(
         # 字数可以精确算：正文 = 各句用「。」连接。
         while kept and len(render(kept)) > max_chars:
             lowest = min(range(len(kept)), key=lambda i: (kept[i].priority, -i))
+            logger.debug(
+                "注入字数超线，丢掉一条：%s（%d/%d 字）",
+                kept[lowest].key, len(render(kept)), max_chars,
+            )
             del kept[lowest]
     return kept
 

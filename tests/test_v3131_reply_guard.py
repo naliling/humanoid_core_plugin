@@ -145,8 +145,10 @@ class RefusalTest(unittest.TestCase):
         )
         self.assertTrue(reply_guard.looks_like_refusal(text))
 
-    def test_a_whole_english_sentence_is_a_refusal(self):
-        self.assertTrue(
+    def test_a_whole_english_sentence_is_not_a_refusal(self):
+        # v3.1.42：整句英文不再一律当拒绝——那会把英文 / 非中文人设永久静音。
+        # 只有带拒绝语义特征的样板才拦（见 test_v3142_guard）。
+        self.assertFalse(
             reply_guard.looks_like_refusal("The kettle is on the stove, come sit.")
         )
 

@@ -9,6 +9,8 @@ from datetime import datetime, tzinfo
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from astrbot.api import logger
+
 from .config import HumanoidConfig
 from .data.cities import (
     CITY_TO_TIMEZONE,
@@ -60,14 +62,22 @@ def _resolve_zone_uncached(city: str) -> tuple[tzinfo | None, str, bool]:
     if not name:
         raw = (city or "").strip()
         if raw and raw != DEFAULT_CITY_PLACEHOLDER and raw != SYSTEM_TIMEZONE_LABEL:
-            return None, f"认不出城市「{raw}」，她现在按这台机器的时间过日子（可填表内城市，或直接填 Asia/Shanghai 这类时区名）", False
+            note = f"认不出城市「{raw}」，她现在按这台机器的时间过日子（可填表内城市，或直接填 Asia/Shanghai 这类时区名）"
+            logger.warning("时区退回宿主机（认不出城市）：%s", note)
+            return None, note, False
+        # 没配城市 / 配的是占位符：这是正常配置，不是退化，只留 debug。
+        logger.debug("未配置城市（或占位符），按宿主机时钟：%r", raw)
         return None, "", False
     try:
         return ZoneInfo(name), "", False
     except (ZoneInfoNotFoundError, ValueError, OSError):
         if _tzdata_usable():
-            return None, f"「{name}」这个时区名用不了（可能拼错了），她现在按这台机器的时间过日子", False
-        return None, f"这台机器缺时区数据库（tzdata），{name} 用不了，她现在按这台机器的时间过日子", True
+            note = f"「{name}」这个时区名用不了（可能拼错了），她现在按这台机器的时间过日子"
+            logger.warning("时区退回宿主机（时区名不可用）：%s", note)
+            return None, note, False
+        note = f"这台机器缺时区数据库（tzdata），{name} 用不了，她现在按这台机器的时间过日子"
+        logger.warning("时区退回宿主机（缺 tzdata）：%s", note)
+        return None, note, True
 
 
 _tzdata_state: tuple[bool, float] | None = None
