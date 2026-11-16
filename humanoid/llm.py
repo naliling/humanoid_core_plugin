@@ -1140,7 +1140,13 @@ class LLMGateway:
         **call_kwargs: Any,
     ) -> LLMResult:
         candidates: list[tuple[str, str]] = [(label, pid) for label, pid in chain if pid]
-        if allow_global:
+        # 留空 = 跟随官方（issue #11）：链上一个专用模型都没有时，即使配置里写着
+        # 「禁止回退全局默认模型」，也要用 AstrBot 自己的默认对话模型——否则面板留空
+        # 就等于「永远只按身体与钟点现算」，用户以为插件坏了。
+        if allow_global or (
+            not candidates
+            and (self._resolver.available_ids() or self._resolver.resolve_global(umo) is not None)
+        ):
             candidates.append((GLOBAL_LABEL, ""))
 
         attempts: list[Attempt] = []

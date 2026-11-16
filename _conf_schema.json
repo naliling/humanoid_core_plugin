@@ -28,6 +28,13 @@
       "group"
     ]
   },
+  "preset_role_ids": {
+    "description": "【进阶】预置角色QQ",
+    "hint": "留空 = 只认「谁发消息就按谁的号建角色」。填了（逗号或换行分隔，如 10001,10002）就给她额外开几份身份档案：这些号没发过消息也会有自己的日程、身体、情绪，可用 /拟人 角色 查看。注意：这只多给一份档案，不能让本插件去驱动另一台机器上的 bot。",
+    "type": "string",
+    "default": "",
+    "collapsed": true
+  },
   "admin_qq": {
     "description": "管理员QQ",
     "hint": "能发管理指令的 QQ 名单",
@@ -551,6 +558,16 @@
       "max": 1440,
       "step": 20
     },
+    "condition": {
+      "weather_enabled": true
+    },
+    "collapsed": true
+  },
+  "weather_proxy": {
+    "description": "【进阶】天气出网代理",
+    "hint": "留空=直连。国内直连 api.openweathermap.org 经常 getaddrinfo failed 或超时，填代理即可（如 http://127.0.0.1:7890、socks5://127.0.0.1:7890）。AstrBot 不读系统代理，只有这里填了才走代理。",
+    "type": "string",
+    "default": "",
     "condition": {
       "weather_enabled": true
     },
@@ -1503,7 +1520,7 @@
   },
   "mood_enabled_in_group": {
     "description": "【进阶】群聊也算情绪",
-    "hint": "关：群里只跟已经有情绪档案的熟人（陌生人在群里说一句不建档）；开：群里所有人各自积累好感。私聊始终生效",
+    "hint": "这个开关只管群聊，不是「读取所有人好感」那种总闸（那个不存在）。关：群里不建档——陌生人在群里说一句什么都不记，只读「熟人」已有的档案；开：群里所有人各自积累好感。熟人 = 私聊过、已被写入情绪档案的人（建档只发生在私聊，或这里开了之后在群聊）。私聊始终生效。",
     "type": "bool",
     "default": false,
     "condition": {

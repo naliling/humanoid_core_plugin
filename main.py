@@ -86,6 +86,7 @@ HELP_TEXT = f"""📖 人形化核心伴侣 指令列表 (v{__version__})
 /拟人 重置情绪 —— 把你自己的情绪重置到初始值
 /拟人 设置好感度 88 —— 设你自己的好感度（0-100）
 /拟人 批量好感度 111:30,222:40 —— 批量导入（逗号分隔）
+/拟人 角色 —— 列出所有身份档案；/拟人 角色 10001 只看那一个
 /拟人 查看昵称 —— 所有用户设的称呼（人多只显示前 30 个）"""
 
 NO_PERMISSION = "❌ 权限不足，该指令仅管理员可用。"
@@ -280,6 +281,12 @@ COMMAND_OUTPUT_CHARS = 1500
 #: 用户看到的就是「还有 69 行没显示」。真正会炸 NapCat 的是昵称列表那种 5 万字符，
 #: 6000 字符离那条线还远。
 DIAGNOSTICS_OUTPUT_CHARS = 6000
+# 诊断报告超过这个字数就转成图片发（issue #11 第 2 条）。700 字以下是「一条消息
+# 翻两屏」，转图反而多一次渲染失败风险；再长就纯文本已经没人愿意读了。
+DIAGNOSTICS_T2I_THRESHOLD = 700
+# 一页图能看清的字数上限（按【小节】边界切，切不开才硬切），以及最多发几张。
+DIAGNOSTICS_T2I_PAGE_CHARS = 1400
+DIAGNOSTICS_T2I_MAX_PAGES = 3
 #: 昵称列表最多显示多少行。
 NICKNAME_ROWS = 30
 
@@ -296,6 +303,53 @@ def _clip_lines(lines: Any, limit: int, more_note: str | None = None) -> str:
     rest = len(items) - limit
     tail = (more_note or "……还有 {rest} 行没显示").format(rest=rest)
     return "\n".join(items[:limit] + [tail])
+
+
+def _diagnostics_pages(
+    text: str,
+    per_page: int = DIAGNOSTICS_T2I_PAGE_CHARS,
+    max_pages: int = DIAGNOSTICS_T2I_MAX_PAGES,
+) -> list[str]:
+    """把诊断报告切成几页，供文转图逐页渲染。
+
+    一张图塞进整份报告会小到看不清，所以按「【小节】」边界切：每页尽量整段、
+    不超过 per_page 字；某一节自己就超长时硬切。超过 max_pages 的尾巴直接丢
+    （尾部是 debug 才有的模型 id 列表）。
+    """
+    newline = chr(10)
+    if len(text) <= per_page:
+        return [text]
+    sections: list[str] = []
+    current = ""
+    for line in text.split(newline):
+        if current and line.startswith("【") and len(current) + len(line) + 1 > per_page:
+            sections.append(current)
+            current = line
+        else:
+            current = f"{current}{newline}{line}" if current else line
+    if current:
+        sections.append(current)
+    chunks: list[str] = []
+    for section in sections:
+        if len(section) <= per_page:
+            chunks.append(section)
+            continue
+        # 单节自己就超过一页（典型是几十个模型 id 那种长列表）时硬切：
+        # 不切的话这张图会小到看不清，等于白转。
+        for start in range(0, len(section), per_page):
+            chunks.append(section[start:start + per_page])
+    sections = chunks
+    pages: list[str] = []
+    buf = ""
+    for section in sections:
+        if buf and len(buf) + len(section) + 1 > per_page:
+            pages.append(buf)
+            buf = section
+        else:
+            buf = f"{buf}{newline}{section}" if buf else section
+    if buf:
+        pages.append(buf)
+    return pages[:max_pages]
 
 
 def _clip_text(text: Any, limit: int = COMMAND_OUTPUT_CHARS,
@@ -1654,10 +1708,27 @@ class HumanoidCore(Star):
                     self._session = aiohttp.ClientSession()
         return self._session
 
+    def _weather_proxy(self) -> str | None:
+        """天气出网代理：留空返回 None = 直连（issue #11 新增 weather_proxy）。
+
+        AstrBot 的 aiohttp 不读系统代理，国内直连 api.openweathermap.org 常年
+        `getaddrinfo failed` / `TimeoutError`（2026-11-13 与 11-15 的日志各有实例），
+        缓存于是停在最后一次成功那天，注入里只剩一句「天气数据过期了」。
+        """
+        try:
+            proxy = str(getattr(self._config, "weather_proxy", "") or "").strip()
+        except Exception:
+            return None
+        return proxy or None
+
     async def _fetch_json(self, url: str, timeout: float) -> dict[str, Any]:
         session = await self._ensure_session()
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                proxy=self._weather_proxy(),
+            ) as response:
                 response.raise_for_status()
                 return await response.json()
         except Exception as exc:
@@ -1738,6 +1809,7 @@ class HumanoidCore(Star):
         """人形化核心伴侣 · 管理员指令（都要 /拟人 前缀）
 
         改配置：时间 / 参照名称 / 诊断 / 设置 / 重载
+        看角色：角色（列出所有身份档案，含面板「预置角色QQ」里预置的异机号）
         动数据：重置日程 / 日程打断 / 日程继续 / 重置状态 / 重置情绪 / 设置好感度 / 批量好感度 / 查看昵称
         查状态不用前缀：/你的状态 /亲密状态 /好感度 /情绪详情 /情绪日志 /查看日程 /时间 /叫我 /拟人帮助
         """
@@ -1914,6 +1986,53 @@ class HumanoidCore(Star):
 
     # -------------------- 管理员指令 --------------------
 
+    @humanoid_group.command("角色")
+    async def cmd_roles(self, event: AstrMessageEvent, argument: str = ""):
+        """用法：/角色（列出所有角色档案，含面板预置但还没说过话的号）"""
+        if not self._is_admin(event):
+            yield event.plain_result(NO_PERMISSION)
+            return
+        argument = _arg_after(event.message_str, "角色").strip()
+        instances = {str(core.role_id): core for core in self.role_manager.get_all()}
+        preset_getter = getattr(self._config, "preset_role_id_list", None)
+        presets = list(preset_getter() if callable(preset_getter) else ())
+        failed_getter = getattr(self.role_manager, "failed_roles", None)
+        try:
+            failed = set(failed_getter() or ()) if callable(failed_getter) else set()
+        except Exception:  # noqa: BLE001 - 只是诊断性输出
+            failed = set()
+        ordered: list[str] = []
+        for rid in [*presets, *instances.keys()]:
+            rid = str(rid or "").strip()
+            if rid and rid not in ordered:
+                ordered.append(rid)
+        if argument:
+            if argument not in ordered:
+                yield event.plain_result(
+                    f"没有这个角色：{argument}（/角色 看全部，面板「预置角色QQ」里加）"
+                )
+                return
+            ordered = [argument]
+        if not ordered:
+            yield event.plain_result(
+                "还没有任何角色档案。"
+                "她只要在私聊里说过一句话就会自动建档；"
+                "异机 bot 的号可以填在面板「预置角色QQ」里，插件加载时同样建档案。"
+            )
+            return
+        lines = ["【角色档案】"]
+        for rid in ordered:
+            core = instances.get(rid)
+            if core is None:
+                lines.append(f"- {rid}：已预置，等她第一次说话（或重载插件）才建实例")
+                continue
+            state = "启动失败，稍后重试" if rid in failed else "运行中"
+            lines.append(f"- {rid}：{state}")
+        lines.append(
+            "预置号只多给一份身份档案，本插件不会去驱动另一台机器上的 bot。"
+        )
+        yield event.plain_result(_clip_text(chr(10).join(lines)))
+
     @humanoid_group.command("诊断")
     async def cmd_diagnose(self, event: AstrMessageEvent):
         """用法：/拟人 诊断（模型链、时区、上下文大小、状态文件、冷却状态）"""
@@ -1935,7 +2054,31 @@ class HumanoidCore(Star):
             text = "\n".join(banner) + "\n" + text
         # 诊断项会越加越多（每加一个子系统就多几行），同样要压到一条消息能发出去。
         # v3.1.41：它自己的预算比别的指令宽（见 DIAGNOSTICS_OUTPUT_CHARS）。
-        yield event.plain_result(_clip_text(text, DIAGNOSTICS_OUTPUT_CHARS))
+        clipped = _clip_text(text, DIAGNOSTICS_OUTPUT_CHARS)
+        # 长报告走 AstrBot 官方的文转图（issue #11 第 2 条）：上千字的纯文本在 QQ 上
+        # 要翻好几屏，还容易被 `_clip_text` 截掉尾巴。渲染服务没配/挂了就回落纯文本
+        # ——诊断是唯一的排查入口，绝不能因为它自己打不开。
+        if len(clipped) >= DIAGNOSTICS_T2I_THRESHOLD:
+            images: list[str] = []
+            rendered = True
+            for page in _diagnostics_pages(clipped):
+                try:
+                    url = await self.text_to_image(
+                        page, return_url=True, umo=event.unified_msg_origin
+                    )
+                except Exception as exc:  # noqa: BLE001 - 渲染失败必须回落
+                    logger.warning(f"{LOG_PREFIX} 诊断转图失败，回落纯文本: {exc}")
+                    rendered = False
+                    break
+                if not url:
+                    rendered = False
+                    break
+                images.append(url)
+            if rendered and images:
+                for url in images:
+                    yield event.image_result(url)
+                return
+        yield event.plain_result(clipped)
 
     # 面板上 89 项、AstrBot 又不支持分组，改一个城市要翻半天。这一条命令只管常用那几项，
     # 进阶项仍然去面板改——两边改的是同一份配置文件。

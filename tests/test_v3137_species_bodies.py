@@ -80,6 +80,11 @@ def _core(persona: str, moment: datetime = BASE + timedelta(hours=13)) -> Humano
     )
     asyncio.run(source.persona("bot1"))
     core.clock = FrozenClock(moment)
+    # 周期日是在**构造时按真实日期**播种的（core_instance.seed_cycle_day(today)），
+    # 所以这几条用例原来会随「今天是不是生理期」变红：人类人设被判成「不适」，
+    # 穿搭层就多一句「（换成了宽松的家居服）」。这些用例只关心衣服有没有被保留，
+    # 把周期日钉在排卵期，别让运行日期决定结果。
+    core.scope.set_self("current_cycle_day", 14)
     for name in ("schedule", "soma", "energy", "social", "process", "mood"):
         service = getattr(core, name, None)
         if service is not None and hasattr(service, "_clock"):

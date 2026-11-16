@@ -290,6 +290,9 @@ class HumanoidConfig:
     schedule_use_persona: bool = True
 
     admin_qq: tuple[str, ...] = ()
+    # 预置角色 QQ（issue #11 第 4 条）：这些号没发过消息也给她开一份身份档案，
+    # 逗号/空白分隔。**只多一份档案**，不代表本插件能驱动另一台机器上的 bot。
+    preset_role_ids: str = ""
 
     weather_enabled: bool = True
     weather_api_key: str = ""
@@ -297,6 +300,9 @@ class HumanoidConfig:
     # v2.13.2 默认写死 Heyuan,CN，于是「她在北京」但「她那边天气是河源」，两个城市对不上。
     weather_location: str = ""
     weather_refresh_minutes: int = 60
+    # 出网代理（issue #11）。AstrBot 自己不吃系统代理，api.openweathermap.org 在国内
+    # 直连常年 getaddrinfo failed / TimeoutError；这里填了就由 `_fetch_json` 带上 proxy。
+    weather_proxy: str = ""
 
     # 输入状态（正在输入）。
     #
@@ -662,10 +668,12 @@ class HumanoidConfig:
             schedule_time_granularity=c("schedule_time_granularity", tuple(GRANULARITY_MINUTES)),
             schedule_use_persona=b("schedule_use_persona"),
             admin_qq=_as_str_tuple(pick("admin_qq")),
+            preset_role_ids=s_opt("preset_role_ids"),
             weather_enabled=b("weather_enabled"),
             weather_api_key=s_opt("weather_api_key"),
             weather_location=s_opt("weather_location"),
             weather_refresh_minutes=i("weather_refresh_minutes", 1, 1440),
+            weather_proxy=s_opt("weather_proxy"),
             input_state_enabled=b("input_state_enabled"),
             input_state_interval_seconds=f("input_state_interval_seconds", 0.1, 10.0),
             input_state_timeout_seconds=f("input_state_timeout_seconds", 10.0, 600.0),
@@ -882,6 +890,28 @@ class HumanoidConfig:
         if self.mood_provider_name:
             return (("情绪模型", self.mood_provider_name),)
         return self.schedule_provider_ids
+
+    def preset_role_id_list(self) -> tuple[str, ...]:
+        """预置角色 QQ（去重、去空）。
+
+        面板上是字符串，逗号/分号/空白/换行都认；旧存档里如果是列表也吃。
+        解析出问题就当没配——一个配置项写错不该让所有角色都起不来。
+        """
+        raw = self.preset_role_ids
+        chunks: list[str] = []
+        if isinstance(raw, str):
+            chunks = re.split(r"[,，;；\s]+", raw)
+        elif isinstance(raw, Iterable):
+            chunks = [str(item) for item in raw]
+        out: list[str] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            pid = str(chunk).strip()
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            out.append(pid)
+        return tuple(out)
 
     def is_night_hour(self, hour: int) -> bool:
         start, end = self.night_start_hour, self.night_end_hour

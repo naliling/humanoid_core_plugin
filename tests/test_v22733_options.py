@@ -61,6 +61,7 @@ DYNAMIC_KEYS = {
 DERIVED_KEYS = {
     "mood_affection_override": ("affection_override_for", "humanoid/services/mood.py"),
     "energy_recovery_phase_multipliers": ("phase_recovery_multiplier", "humanoid/services/energy.py"),
+    "preset_role_ids": ("preset_role_id_list", "humanoid/role_manager.py"),
 }
 
 

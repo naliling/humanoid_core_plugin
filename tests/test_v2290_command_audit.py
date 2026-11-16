@@ -53,6 +53,8 @@ TOP_LEVEL = (
 ADMIN_GROUP = (
     ("cmd_set_city", "拟人 时间 大阪"),
     ("cmd_set_char_name", "拟人 参照名称 小雨"),
+    # v3.1.43：`/拟人 角色` 看各身份档案（issue #11 第 4 条），同样只给管理员。
+    ("cmd_roles", "拟人 角色"),
     ("cmd_diagnose", "拟人 诊断"),
     ("cmd_settings", "拟人 设置"),
     ("cmd_reload", "拟人 重载"),
@@ -83,7 +85,8 @@ class CommandRegistrationTest(unittest.TestCase):
         # v3.1.10：10 → 9，`/查看昵称` 的顶层别名去掉，只留在「拟人」组里。
         self.assertEqual(len(top), 9, f"顶层指令数变了：{sorted(top)}")
         # v2.28.11 多了 `/拟人 时间 城市`（设置她的城市），12 → 13。
-        self.assertEqual(len(grouped), 13, f"管理指令数变了：{sorted(grouped)}")
+        # v3.1.43 多了 `/拟人 角色`（看各身份档案，issue #11 第 4 条），13 → 14。
+        self.assertEqual(len(grouped), 14, f"管理指令数变了：{sorted(grouped)}")
 
     def test_command_names_cover_every_registered_command(self):
         """`COMMAND_NAMES` 是「这条消息是不是指令」的唯一判据，漏一条就少一条。

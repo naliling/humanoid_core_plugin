@@ -299,7 +299,16 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         out = await collect(self.star.cmd_diagnose(event))
         self.assertIn("拟人诊断", out[0])
 
+    async def test_diagnose_hides_the_model_id_list_unless_debug(self):
+        """issue #11 第 1 条：默认只给主模型 + 回退模型，id 长列表要开 debug 才看。"""
+        out = await collect(self.star.cmd_diagnose(FakeEvent("拟人 诊断")))
+        self.assertNotIn("可用对话模型 id", out[0])
+        self.assertIn("本次实际将使用", out[0])
+
     async def test_diagnose_report_content(self):
+        # `_config` 是只读 property（engine 与插件共用同一个 config box），改配置只能走 box。
+
+        self.star._config_box.reload({**self.raw, "debug_mode": True})
         out = await collect(self.star.cmd_diagnose(FakeEvent("拟人 诊断")))
         report = out[0]
         self.assertIn("可用对话模型 id", report)

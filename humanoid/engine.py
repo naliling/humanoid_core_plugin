@@ -112,6 +112,16 @@ class HumanoidEngine:
                 },
             }
 
+        # 天气到底怎么了（issue #11）：新鲜度、失败次数、最近一次错误原文。
+        # 取不到就当没这节——诊断自己不能因为天气炸掉。
+        weather_status = None
+        status_getter = getattr(getattr(core, "weather", None), "status", None)
+        if callable(status_getter):
+            try:
+                weather_status = status_getter()
+            except Exception:  # noqa: BLE001
+                weather_status = None
+
         return build_report(
             cfg=self.config,
             resolver=resolver,
@@ -127,6 +137,7 @@ class HumanoidEngine:
             # 后台循环启动失败的角色（role_manager 的退避重试记录）：失败实例仍能读状态，
             # 但日程/情绪/天气/社交都不再自己跑——不写进面板，用户只能去翻日志。
             failed_loops=self._failed_loops(),
+            weather_status=weather_status,
         )
 
     def _failed_loops(self) -> dict[str, float]:

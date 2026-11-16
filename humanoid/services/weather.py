@@ -339,6 +339,11 @@ class WeatherService:
         self._next_attempt_at: float | None = None
         # 时钟回拨只告警一次：每次读取都刷一条 warning 会把日志淹掉。
         self._warned_clock_skew = False
+        # 最近一次失败的原因（已脱敏）与发生时刻（单调钟秒）。只给诊断看，不进注入：
+        # 以前刷新失败只写一行日志，`/拟人 诊断` 完全看不出「三天没取到天气」，
+        # 用户只能翻 astrbot.log（issue #11）。
+        self._last_error = ""
+        self._last_error_at: float | None = None
 
     @property
     def config(self) -> HumanoidConfig:
@@ -351,6 +356,43 @@ class WeatherService:
         判定逻辑**只有一份**，诊断页调的是同一个模块级函数。
         """
         return effective_location(self._clock, self.config)
+
+    def status(self) -> dict[str, Any]:
+        """诊断用快照：天气新不新鲜、失败了几次、上次错在哪。
+
+        `snapshot()` 是给注入用的（过期就只回一句「天气数据过期了」），它不告诉
+        任何人**为什么**过期。这里把「最后一次成功是几点、数据放了多少秒、宽限
+        多少秒、连续失败几次、下次什么时候重试、最近一次错误原文」全摊开，
+        `/拟人 诊断` 直接照抄——issue #11 里用户能看到的只有缓存三天没动。
+        """
+        cfg = self.config
+        location = self.effective_location()
+        fetched = self._fetched_at()
+        now = _now_epoch(self._clock)
+        age = None if fetched is None else max(0.0, now - fetched)
+        grace = max(1, int(cfg.weather_refresh_minutes)) * 60 * 3
+        next_retry: float | None = None
+        if self._next_attempt_at is not None:
+            next_retry = max(0.0, self._next_attempt_at - time.monotonic())
+        return {
+            "enabled": bool(cfg.weather_enabled),
+            "has_key": len(cfg.weather_api_key) >= MIN_KEY_LENGTH,
+            "location": location,
+            "proxy": str(getattr(cfg, "weather_proxy", "") or ""),
+            "fetched_at": fetched,
+            "age_seconds": age,
+            "grace_seconds": grace,
+            "stale": fetched is None or age is None or age > grace,
+            "fail_streak": self._fail_streak,
+            "next_retry_seconds": next_retry,
+            "inflight": self._inflight,
+            "last_error": self._last_error,
+            "last_error_ago": (
+                None
+                if self._last_error_at is None
+                else max(0.0, time.monotonic() - self._last_error_at)
+            ),
+        }
 
     def _fetched_at(self) -> float | None:
         """缓存写入时刻（epoch 秒）；旧存档的墙钟字符串在这里迁移一次。"""
@@ -505,11 +547,15 @@ class WeatherService:
             )
             self._fail_streak = 0
             self._next_attempt_at = None
+            self._last_error = ""
+            self._last_error_at = None
             if cfg.debug_mode and self._log:
                 self._log.info(f"[humanoid_core] 天气刷新成功: {parsed}")
             return True
         except Exception as e:
             self._note_failure()
+            self._last_error = redact_secrets(str(e))
+            self._last_error_at = time.monotonic()
             if self._log:
                 # 异常文本可能带完整 URL（aiohttp 的 real_url 含 appid=）——日志是长期
                 # 留存物，必须在这里脱敏（审核 P1-2）。不只 debug：warning 才是默认会写盘的。

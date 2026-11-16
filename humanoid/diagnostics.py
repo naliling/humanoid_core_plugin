@@ -220,7 +220,12 @@ def _routine_lines(
     return lines
 
 
-def _timezone_lines(cfg: HumanoidConfig, zone: Any, moment: Any) -> list[str]:
+def _timezone_lines(
+    cfg: HumanoidConfig,
+    zone: Any,
+    moment: Any,
+    weather_status: dict[str, Any] | None = None,
+) -> list[str]:
     """时间与时区：她按哪个钟过日子，以及时在哪一步退化了。
 
     这一节存在的原因：以前时区只能从注入里那句「你在东京」间接推，而插件在缺 tzdata
@@ -281,12 +286,78 @@ def _timezone_lines(cfg: HumanoidConfig, zone: Any, moment: Any) -> list[str]:
     else:
         same = "与时间城市同一处" if not (cfg.weather_location or "").strip() else "单独指定"
         lines.append(f"- 天气城市：{weather_city}（{same}）")
+        lines += _weather_status_lines(weather_status)
     lines.append(
         "- 日程、夜间窗口、睡眠债记账都按她那个城市的钟点算，不按机器时间"
         if not degraded
         else "- 现在日程、夜间窗口、睡眠债记账全部按这台机器的时间排（她拿不到自己城市的钟）"
     )
     return lines
+
+
+def _age_text(seconds: Any) -> str:
+    """秒数说成人话（诊断里到处要用，别再各写一份 f"{x/60:.0f} 分钟"）。"""
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "未知"
+    if value != value or value < 0:  # NaN / 负数
+        return "未知"
+    if value < 90:
+        return f"{value:.0f} 秒"
+    if value < 5400:
+        return f"{value / 60:.0f} 分钟"
+    if value < 172800:
+        return f"{value / 3600:.1f} 小时"
+    return f"{value / 86400:.1f} 天"
+
+
+def _weather_status_lines(status: dict[str, Any] | None) -> list[str]:
+    """天气新鲜度、失败次数与最近一次错误（issue #11）。
+
+    以前这一节只报「天气城市：X」，「三天没取到天气」在诊断里完全不可见：
+    `snapshot()` 过期只回一句「天气数据过期了」，用户得自己翻 astrbot.log 才看得到
+    `天气刷新失败: ClientConnectorDNSError ... getaddrinfo failed`。
+    """
+    if not status:
+        return []
+    out: list[str] = []
+    if not status.get("has_key"):
+        out.append(f"  {BAD_MARK} 天气 API Key 没填或不足位数：根本不会去拉天气")
+        return out
+    fetched = status.get("fetched_at")
+    grace = status.get("grace_seconds")
+    if fetched is None:
+        out.append(f"  {WARN_MARK} 从来没成功取到过天气（缓存是空的）")
+    else:
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(fetched)))
+        out.append(f"- 最后一次取到：{stamp}（{_age_text(status.get('age_seconds'))}前，本机时区）")
+        if status.get("stale"):
+            out.append(
+                f"  {BAD_MARK} 已过期：超过 {_age_text(grace)} 的宽限，"
+                "注入里只会说「天气数据过期了」，她不知道外头什么天气"
+            )
+        else:
+            out.append(f"  {OK_MARK} 还新鲜（宽限 {_age_text(grace)}）")
+    streak = int(status.get("fail_streak") or 0)
+    if streak:
+        out.append(f"- 连续失败 {streak} 次")
+    retry = status.get("next_retry_seconds")
+    if retry is not None:
+        out.append(f"- 下次重试：约 {_age_text(retry)}后")
+    err = str(status.get("last_error") or "")
+    if err:
+        ago = status.get("last_error_ago")
+        tail = f"（{_age_text(ago)}前）" if ago is not None else ""
+        out.append(f"  {WARN_MARK} 最近一次失败{tail}：{err}")
+        out.append(
+            "  → 直连不通就在面板填「天气出网代理」（如 http://127.0.0.1:7890）；"
+            "AstrBot 不读系统代理，留空就是直连"
+        )
+    proxy = str(status.get("proxy") or "")
+    if proxy:
+        out.append(f"- 出网代理：{proxy}")
+    return out
 
 
 def _resolve_line(
@@ -328,6 +399,13 @@ def _chain_pick(
         provider = resolver.resolve_global(None)
         if provider is not None:
             return f"{GLOBAL_LABEL}({resolver.id_of(provider)})"
+    # 留空 = 跟随 AstrBot 官方设置（issue #11）：一个专用模型都没配时，
+    # 「禁止回退全局」不该把她判成「没有模型」——官方主模型本来就摆在那儿。
+    if not chain:
+        provider = resolver.resolve_global(None)
+        if provider is not None:
+            return f"{GLOBAL_LABEL}({resolver.id_of(provider)})（面板留空 → 跟随官方默认模型）"
+        return "未配置专用模型，AstrBot 也没设默认对话模型 → 按身体与钟点现算一段（不调模型）"
     return "无可用模型 → 按身体与钟点现算一段（不调模型）"
 
 
@@ -563,6 +641,7 @@ def build_report(
     config_load_error: str = "",
     role_id: str = "",
     failed_loops: dict[str, float] | None = None,
+    weather_status: dict[str, Any] | None = None,
 ) -> str:
     """诊断报告。**任何一处取值/格式化炸了都不能让这条命令整体报错**。
 
@@ -585,6 +664,7 @@ def build_report(
             config_load_error=config_load_error,
             role_id=role_id,
             failed_loops=failed_loops,
+            weather_status=weather_status,
         )
     except Exception as exc:  # noqa: BLE001 - 兜底就是为了诊断页还能打开
         logger.exception("诊断报告生成失败")
@@ -610,6 +690,7 @@ def _build_report_body(
     config_load_error: str = "",
     role_id: str = "",
     failed_loops: dict[str, float] | None = None,
+    weather_status: dict[str, Any] | None = None,
 ) -> str:
     available = resolver.available_ids()
     lines = [f"〖拟人诊断〗v{version}", ""]
@@ -695,7 +776,16 @@ def _build_report_body(
     if schedule_status.get("last_error"):
         lines.append(f"- 上次失败原因: {schedule_status['last_error']}")
 
-    lines += ["", "【时间与时区】", *_timezone_lines(cfg, (zone_status or {}).get("zone"), (zone_status or {}).get("moment"))]
+    lines += [
+        "",
+        "【时间与时区】",
+        *_timezone_lines(
+            cfg,
+            (zone_status or {}).get("zone"),
+            (zone_status or {}).get("moment"),
+            weather_status,
+        ),
+    ]
 
     lines += ["", "【作息】", *_routine_lines(cfg, schedule_status, body_status)]
 
@@ -733,7 +823,7 @@ def _build_report_body(
             f"- 每个用户各自每 {cfg.mood_llm_interval_messages} 条消息分析一次（不是全局每 N 条："
             f"10 个人各自满 {cfg.mood_llm_interval_messages} 条就是 10 次）"
             f"，失败冷却 {cfg.mood_provider_cooldown_minutes} 分钟"
-            f"，群聊{'启用' if cfg.mood_enabled_in_group else '不启用'}"
+            f"，群聊{'启用（群里的人也各自建档）' if cfg.mood_enabled_in_group else '不启用（群里不建档：只读私聊过、已有档案的熟人）'}"
         )
 
     lines += ["", "【身体与联动】"]
@@ -913,6 +1003,11 @@ def _build_report_body(
     # v3.1.41：模型 id 列表挪到最末尾、一行一个。它是最长的一段（几十个 id），
     # 放在开头会把整份报告挤没；一行一个也才看得清该抄哪个。太多时只列前
     # MODEL_ID_ROWS 个，剩下的指路到面板——不然一装几十个模型，报告光这一段就上千字。
+    if not cfg.debug_mode:
+        # 模型 id 长列表只在 debug 时输出（issue #11 第 1 条）：几十行 id 会把
+        # 「主模型 / 回退模型」这两行要说的东西淹掉，而用户要看的正是那两行。
+        # 面板上本来就有下拉框，「抄 id」这个需求已经不存在了。
+        return chr(10).join(lines)
     lines += ["", "【AstrBot 可用对话模型 id】"]
     if available:
         lines.append("  填面板上的「日程模型」「情绪模型」时，照抄下面任意一行的 id：")

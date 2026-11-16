@@ -83,6 +83,28 @@ class RoleManager:
                 ids.append(rid)
         return ids
 
+    def _preset_role_ids(self) -> list[str]:
+        """面板里预置的角色 id（issue #11 第 4 条）。
+
+        别的机器上的 bot 号不会往我们这里发消息，`_known_role_ids()` 永远扫不到它；
+        面板填了预置号就在这里补上，插件加载时照样给她建实例、起后台循环。
+        语义只到「多一份身份档案」——本插件管不到那台机器。
+        """
+        try:
+            cfg = self._config_provider()
+        except Exception:  # noqa: BLE001 - 读配置失败不该拖垮预热
+            return []
+        try:
+            raw = cfg.preset_role_id_list()
+        except Exception:  # noqa: BLE001 - 旧配置里没有这个访问器就当没配
+            return []
+        ids: list[str] = []
+        for rid in raw:
+            rid = str(rid or "").strip()
+            if rid and rid not in ids:
+                ids.append(rid)
+        return ids
+
     def get_or_create(self, role_id: str) -> HumanoidCoreInstance:
         if role_id not in self._instances:
             self._new_instance(role_id)
@@ -213,7 +235,13 @@ class RoleManager:
         # `schedule_source` 永远是 template。实测线上一个角色就这样静了 4 天，
         # 还被误判成「一直在睡」。状态里出现过的角色都是真实在用的角色，加载时
         # 就该把循环起起来，而不是等人来敲一下。
-        for role_id in self._known_role_ids():
+        # 面板预置号排在前面（issue #11 第 4 条）：别的机器上的 bot 不会往这里发
+        # 消息，只靠 state 里出现过的角色，永远等不到她。
+        warmup_ids: list[str] = []
+        for role_id in [*self._preset_role_ids(), *self._known_role_ids()]:
+            if role_id and role_id not in warmup_ids:
+                warmup_ids.append(role_id)
+        for role_id in warmup_ids:
             if role_id not in self._instances:
                 self._new_instance(role_id)
         for inst in list(self._instances.values()):

@@ -61,7 +61,7 @@ class _Gateway:
 
 def _report(ids: list[str]) -> str:
     return build_report(
-        cfg=HumanoidConfig(),
+        cfg=HumanoidConfig.from_raw({"debug_mode": True}),
         resolver=_Resolver(ids),
         gateway=_Gateway(),
         schedule_status={},
@@ -101,6 +101,21 @@ class ReadableReportTest(unittest.TestCase):
     def test_the_note_says_where_the_rest_is(self):
         text = _report([f"p{index}" for index in range(MODEL_ID_ROWS + 5)])
         self.assertIn("「服务提供商」", text)
+
+
+class ModelIdsAreDebugOnlyTest(unittest.TestCase):
+    def test_model_ids_are_debug_only(self):
+        """issue #11 第 1 条：默认诊断只给主模型 + 回退模型，id 长列表要开 debug 才看。"""
+        text = build_report(
+            cfg=HumanoidConfig(),
+            resolver=_Resolver(["p1"]),
+            gateway=_Gateway(),
+            schedule_status={},
+            activity_status={},
+            version="3.1.43",
+        )
+        self.assertNotIn(IDS_SECTION, text, "默认不该再输出可用模型 id 长列表")
+        self.assertIn("【今日日程】", text)
 
 
 class ClipKeepsWhatComesAfterALongLineTest(unittest.TestCase):

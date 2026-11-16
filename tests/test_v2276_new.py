@@ -475,7 +475,7 @@ class DiagnosticsFallbackTest(unittest.TestCase):
         self.assertIn("配置解析失败，已整体退回默认值：ValueError: boom", text)
         self.assertLess(
             text.index("配置解析失败"),
-            text.index("【AstrBot 可用对话模型 id】"),
+            text.index("【今日日程】"),
             "配置兜底提示必须在报告最顶部，否则用户会把它当成正常的默认配置",
         )
 
