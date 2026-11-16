@@ -1,4 +1,4 @@
-"""v3.1.43：issue #11 的四处改动各钉一条断言。
+"""v3.1.44：issue #11 的四处改动各钉一条断言。
 
 issue #11（KiWinger）提了五条，这一版做了四条，第五条（接 livingmemory）没做，
 理由写在 issue #11 的回复里：`memory_link.py` 只对接 `astrbot_plugin_memory_companion`，
@@ -203,7 +203,7 @@ class DiagnosticsPaginationTest(unittest.TestCase):
         return main_module._diagnostics_pages(text, **kwargs)
 
     def test_short_report_stays_one_page(self):
-        text = "〖拟人诊断〗v3.1.43" + NEWLINE + "【身体】好"
+        text = "〖拟人诊断〗v3.1.44" + NEWLINE + "【身体】好"
         self.assertEqual(self._pages(text), [text])
 
     def test_every_page_fits_the_budget(self):

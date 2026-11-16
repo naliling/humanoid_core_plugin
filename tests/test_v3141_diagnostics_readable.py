@@ -112,7 +112,7 @@ class ModelIdsAreDebugOnlyTest(unittest.TestCase):
             gateway=_Gateway(),
             schedule_status={},
             activity_status={},
-            version="3.1.43",
+            version="3.1.44",
         )
         self.assertNotIn(IDS_SECTION, text, "默认不该再输出可用模型 id 长列表")
         self.assertIn("【今日日程】", text)
