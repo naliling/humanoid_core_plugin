@@ -10,12 +10,15 @@
   `place_hits` 次，这一条里又带着它 → 含这个地点的那一小句整句去掉。
 * **小句复读**：这一句（去掉标点后）与最近某条里的某一句相同或互相包含
   （都不短于 `min_chars`）→ 这一句去掉。
+* **注入照抄**（v3.1.45，`trim_injection_echo`）：本轮刚递给她的背景原文
+  （身体/日程/天气/证据卡）被逐字念进回复 → 那一小句去掉。注入侧再干净，
+  也挡不住弱模型把原文当台词照抄，只能在**出站**比对原文。
 
-两道都只**删句**，不换词、不生成新内容：删完还剩东西就发删过的版本；一句都
+三道都只**删句**，不换词、不生成新内容：删完还剩东西就发删过的版本；一句都
 不剩就原样发出去（宁可复读，也不许发空消息）。
 
-这里只处理「她自己重复自己」，不碰内容判据（设备/含糊/私事在 schedule_content
-那一侧，日程侧还有硬闸）。整段是纯函数，方便单测。
+这里处理「她自己重复自己」与「她照抄本轮背景」，不碰内容判据（设备/含糊/私事
+在 schedule_content 那一侧，日程侧还有硬闸）。整段是纯函数，方便单测。
 """
 
 from __future__ import annotations
@@ -206,6 +209,103 @@ def trim_repeats(
     # 行首和句尾的分隔符都要清：删掉第一句会留下行首「，」，删掉**末尾**那句会让
     # 前一句的分隔符挂在句尾（「刚把碗洗完，」再接原句末标点就成了「刚把碗洗完，。」）。
     # 句尾标点（。！？）不动——下面还要按原句末标点补一次。
+    rebuilt = rebuilt.lstrip("，,。！？!?；;…、~～ ").rstrip("，,、；;：:…~～ ")
+    if rebuilt and body[-1] in "。！？!?…" and rebuilt[-1] not in "。！？!?…":
+        rebuilt += body[-1]
+    if len(_norm(rebuilt)) < 2:
+        return body, dropped
+    return rebuilt, dropped
+
+
+# ── v3.1.45：注入原文照抄闸 ──────────────────────────────────────────────
+#
+# 注入侧（prompt_builder / injection / body_voice）已经做了很多防复读：第一人称归属、
+# 频率闸门、key 去重、近似文本去重、字数预算、数值不进上下文。但那些都在**注入时**，
+# 看不到模型最终会怎么用。弱模型拿到「我这两天小腹坠着，腰也酸」这样的原文，最省力
+# 的续写就是整句照抄进回复；强模型偶尔也会。注入侧再干净也挡不住，只能在出站比对
+# 「这条回复是不是把刚才注入的原文念出来了」，把照抄的小句删掉。
+#
+# 与 trim_repeats 的分工：那是「她重复她自己」（对比 spoke_log），这是「她照抄刚才
+# 递给她的背景」（对比本轮注入块）。两道串联，互不替代。
+
+#: 注入原文里的句子至少这么长才参与「照抄」判定。短句（「我有点困」「腰也酸」）
+#: 逐字说出口是正常的，不是卡带；阈值压低只会误伤。6 字与 MIN_DUP_CHARS 同口径——
+#: 典型照抄句「我这两天小腹坠着」8 字、「今天外面下着雪」7 字都要抓得到。
+ECHO_MIN_CHARS = 6
+
+#: 注入块的结构抬头（〔我现在的身体 v13〕/【我现在的情况】）——不是她说的话，
+#: 比对前先从每一行里剥掉，否则抬头会和正文首句黏成一句（换行不是小句分隔符）。
+_HEADER_RE = re.compile(r"[〔【][^〕】]*[〕】]")
+
+
+def _injection_norms(blocks: Sequence[str]) -> List[str]:
+    """把本轮注入的原文切成可比对的小句（norm 后、够长、非结构抬头）。
+
+    `blocks` 是本轮真正注入的那几块原文（state_note / injection / closing / evidence）。
+    单独传 str 也收（str 本身就是字符序列，这里特判成单块），方便单测直接喂一句话。
+    """
+    if isinstance(blocks, str):
+        texts: Sequence[str] = [blocks]
+    else:
+        texts = [str(block or "") for block in (blocks or [])]
+    out: List[str] = []
+    for raw in texts:
+        if not raw:
+            continue
+        # 先剥掉结构抬头再切句：抬头里的「我现在的身体 v13」不是她的话。
+        raw = _HEADER_RE.sub("", raw)
+        for clause, _ in _clauses(raw):
+            norm = _norm(clause)
+            if len(norm) >= ECHO_MIN_CHARS:
+                out.append(norm)
+    return out
+
+
+def trim_injection_echo(
+    text: str,
+    blocks: Sequence[str],
+    *,
+    min_chars: int = ECHO_MIN_CHARS,
+) -> Tuple[str, List[str]]:
+    """把回复里逐字照抄「本轮注入背景」的小句删掉。返回 (新文本, 被删的小句)。
+
+    只删不写：不换词、不生成新内容。删空了原样返回——宁可复读，也不发空消息。
+    短句与纯称呼不动；只有两边都够长的「相等或互相包含」才算照抄，避免把
+    「我在睡」这种正常短句当成对注入「我在睡懒觉」的复读而误删。
+    """
+    body = str(text or "").strip()
+    if not body:
+        return body, []
+    injected = _injection_norms(blocks)
+    if not injected:
+        return body, []
+    floor = max(2, int(min_chars))
+    kept: List[Tuple[str, str]] = []
+    dropped: List[str] = []
+    for clause, delim in _clauses(body):
+        norm = _norm(clause)
+        hit = False
+        if len(norm) >= floor and not _is_address(norm):
+            for old in injected:
+                if norm == old:
+                    hit = True
+                    break
+                # 互相包含要两边都够长：一边短会把长句里任意一小段都判成复读。
+                if len(norm) >= floor and len(old) >= floor:
+                    if norm in old or old in norm:
+                        hit = True
+                        break
+        if hit:
+            dropped.append(clause)
+            continue
+        kept.append((clause, delim))
+
+    if not dropped:
+        return body, []
+    if not kept:
+        # 整条都在照抄：宁可原样发，也不发空。
+        return body, dropped
+    rebuilt = "".join(c + d for c, d in kept).strip()
     rebuilt = rebuilt.lstrip("，,。！？!?；;…、~～ ").rstrip("，,、；;：:…~～ ")
     if rebuilt and body[-1] in "。！？!?…" and rebuilt[-1] not in "。！？!?…":
         rebuilt += body[-1]

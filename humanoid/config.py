@@ -320,6 +320,10 @@ class HumanoidConfig:
     input_state_max_frames: int = 60
 
     inject_activity_context: str = "medium"
+    # 出站照抄闸（v3.1.45）：把回复里逐字照抄「本轮注入背景」的小句删掉。
+    # 注入侧再干净也挡不住弱模型把原文当台词念，只能在出站比对本轮注入原文。
+    # 只删不写、删空则原样发，默认开；关掉则退回没有这道闸的行为。
+    injection_echo_guard_enabled: bool = True
     # 注入的 Token 硬预算：超了按显著度从低到高丢句，必需品（时间/称呼/场景）永不丢。
     inject_token_budget: int = 3500
     environment_mode: str = "both"
@@ -680,6 +684,7 @@ class HumanoidConfig:
             input_state_min_interval_seconds=f("input_state_min_interval_seconds", 0.1, 10.0),
             input_state_max_frames=i("input_state_max_frames", 5, 500),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
+            injection_echo_guard_enabled=b("injection_echo_guard_enabled"),
             # 这一项曾经是 113 个字段里唯一不走 i()/f() 的（直接 int(src.get(...))），
             # 面板里填个 'abc' 或 '3000.0' 就会抛 ValueError 一路冒到 initialize()，
             # 插件加载失败，而坏值还躺在配置文件里 —— 每次重启再崩一次。

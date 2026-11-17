@@ -3070,6 +3070,10 @@ class HumanoidCore(Star):
                     # 只有真的塞进去了才记「这个请求已经注入过」：没塞进去的话
                     # 下一次重放还该再试一次。
                     _set_event_extra(event, mark, blocks)
+                    # v3.1.45：出站照抄闸要拿「本轮真正注入的原文」比对。mark 绑的是
+                    # id(req)，出站钩子拿不到 req，所以另存一个固定键；每轮覆盖，
+                    # 只留本轮的，不滚雪球。
+                    _set_event_extra(event, "_hcore_injected_blocks", blocks)
                 if channel and channel != "temp_parts" and not self._inject_fallback_warned:
                     # 只提示一次：每轮回执会刷屏，但这说明宿主的 AstrBot 版本偏低。
                     self._inject_fallback_warned = True
@@ -3088,15 +3092,19 @@ class HumanoidCore(Star):
 
     # -------------------- 出站复读拦截 --------------------
 
-    def _guard_reply(self, core: Any, user_id: str, response: Any, text: str) -> str:
-        """把她自己刚说过的地点/句子从这一条回复里删掉（v3.1.31）。
+    def _guard_reply(self, core: Any, user_id: str, response: Any, text: str,
+                     event: Any = None) -> str:
+        """把复读句从这一条回复里删掉。
 
-        线上实例：同一个「我在厨房呢」连着三轮、「刚在沙发养神呢」连着四轮。
-        模型不会变通，那就别让它念——按「这一句在最近三条里已经出现过」删句，
-        删完不空才生效，一句不剩就原样发（宁可复读，不发空消息）。
+        三道确定性闸，按顺序、都只删句不换词：
 
-        只删不写：不换词、不生成新内容，所以不会造出「手边的东西」那种含糊话。
-        `response` 可写时把 `completion_text` 一起改掉，宿主发出去的就是删过的版本。
+        * v3.1.36：模型的拒绝/英文样板不是她的话，整条不发；
+        * v3.1.45：**照抄本轮注入背景**——弱模型把刚递给它的身体/日程/天气原文
+          逐字念进回复，拿本轮注入原文比对后删掉那一句（对比 event 上存的原文）；
+        * v3.1.31：她自己重复自己——同地点/同句在最近三条里出现过就删。
+
+        删完不空才生效，一句不剩就原样发（宁可复读，不发空消息）。`response`
+        可写时把 `completion_text` 一起改掉，宿主发出去的就是删过的版本。
         """
         try:
             # 出站拦截（v3.1.36）：模型安全策略拒绝时的英文样板不是她的话。
@@ -3116,6 +3124,34 @@ class HumanoidCore(Star):
                     except Exception:
                         pass
                 return ""
+
+            # v3.1.45 出站照抄闸：注入侧做得再干净，也挡不住弱模型把原文当台词
+            # 照抄。这里拿本轮真正注入的那几块原文比对，逐字照抄的小句删掉。
+            # 放在「她重复她自己」之前：先去掉照抄，再去重自己，两道互不替代。
+            cfg = getattr(self, "_config", None)
+            if bool(getattr(cfg, "injection_echo_guard_enabled", True)):
+                try:
+                    blocks = _event_extra(event, "_hcore_injected_blocks", []) or []
+                    if isinstance(blocks, (list, tuple)) and blocks:
+                        echo_text, echo_dropped = reply_guard.trim_injection_echo(
+                            text, blocks
+                        )
+                        if echo_dropped and echo_text and echo_text != text:
+                            if isinstance(getattr(response, "completion_text", None), str):
+                                try:
+                                    response.completion_text = echo_text
+                                except Exception:
+                                    pass
+                            text = echo_text
+                            logger.info(
+                                f"{LOG_PREFIX} 出站照抄拦截：删掉 {len(echo_dropped)} 句（"
+                                + "、".join(echo_dropped)[:60]
+                                + "）"
+                            )
+                except Exception:
+                    # 照抄闸是纯函数、本就不该炸；万一炸了也 fail-open 原文放行。
+                    pass
+
             try:
                 recent = [
                     str(row.get("text", ""))
@@ -3175,7 +3211,7 @@ class HumanoidCore(Star):
                 return
             # 出站复读拦截（v3.1.31）：她自己最近说过的话（同一个地点、同一句），
             # 这一条里不再原样念一遍。放在兄弟 bot 判据之后——别人的话不归我们改。
-            text = self._guard_reply(core, user_id, response, text)
+            text = self._guard_reply(core, user_id, response, text, event=event)
             # 被出站拦截的那条（模型拒绝/整句英文）既不发也不记账——账本里记一句
             # 英文拒绝，会让她后面的情绪分析把「她说的话」判错。
             if not text:
@@ -3254,7 +3290,7 @@ class HumanoidCore(Star):
             # 出站守卫（v3.1.42 / P0）：第三方 runner 和流式收尾不走
             # `on_llm_response`，拒绝样板和复读原来就从这里原样发出去。这里补
             # 同一道判据；删空（整条都是拒绝样板）就整条不发。
-            text = self._guard_reply(core, user_id, result, text)
+            text = self._guard_reply(core, user_id, result, text, event=event)
             if not text:
                 return
             # 收尾守卫：同一条口径——她真正发出去的话都记，下一轮判定才准。

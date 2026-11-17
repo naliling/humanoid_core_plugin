@@ -915,6 +915,12 @@
       "mood_only"
     ]
   },
+  "injection_echo_guard_enabled": {
+    "description": "出站照抄闸",
+    "hint": "回复逐字照抄本轮注入的身体/日程/天气原文时删掉那一句；只删不写，默认开",
+    "type": "bool",
+    "default": true
+  },
   "inject_token_budget": {
     "description": "【进阶】注入Token预算",
     "hint": "事实块超预算时按显著度从低到高丢句，时间/称呼/场景这些必需品永不丢",
