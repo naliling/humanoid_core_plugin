@@ -330,7 +330,7 @@ class ContractCapabilityTest(unittest.TestCase):
         facade_caps = set(CAPABILITIES)
         self.assertEqual(facade_caps, {
             "brief", "clock", "events", "fingerprint", "dreams", "wake",
-            "intimacy", "identity", "user",
+            "intimacy", "identity", "user", "psyche",
         })
 
 

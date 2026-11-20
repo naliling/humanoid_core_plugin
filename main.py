@@ -3062,9 +3062,18 @@ class HumanoidCore(Star):
             except Exception as exc:
                 logger.debug(f"{LOG_PREFIX} 心理注入失败，本轮跳过: {exc}")
                 psyche_note = ""
+            # v3.1.47：她自己憋着想说的那句。压强不够就是空串——安静是常态。
+            # 与背景句分开成块，出站照抄闸按心理抬头放行（见下方 _guard_reply）。
+            psyche_urge = ""
+            try:
+                psyche_urge = core.psyche_urge(user_id, text=said)
+            except Exception as exc:
+                logger.debug(f"{LOG_PREFIX} 主动动机注入失败，本轮跳过: {exc}")
+                psyche_urge = ""
             blocks = [
                 block
-                for block in (state_note, injection, closing_note, evidence_note, psyche_note)
+                for block in (state_note, injection, closing_note, evidence_note,
+                              psyche_note, psyche_urge)
                 if block
             ]
             if blocks:
@@ -3150,9 +3159,13 @@ class HumanoidCore(Star):
                     blocks = _event_extra(event, "_hcore_injected_blocks", []) or []
                     # v3.1.46：心理层写的是「她自己写下的话」，允许她直接说出口——
                     # 照抄闸只管插件生成的背景句（身体/日程/天气），不删她的自述。
+                    # v3.1.47：连同「憋着想跟你说」的主动动机一起放行。
                     from .humanoid.psyche import INJECTION_MARK as _PSYCHE_MARK
+                    from .humanoid.psyche import URGE_MARK as _PSYCHE_URGE_MARK
                     if isinstance(blocks, (list, tuple)):
-                        blocks = [b for b in blocks if _PSYCHE_MARK not in str(b)]
+                        blocks = [b for b in blocks
+                                  if _PSYCHE_MARK not in str(b)
+                                  and _PSYCHE_URGE_MARK not in str(b)]
                     if blocks:
                         echo_text, echo_dropped = reply_guard.trim_injection_echo(
                             text, blocks

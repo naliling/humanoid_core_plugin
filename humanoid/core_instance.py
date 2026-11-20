@@ -1428,6 +1428,29 @@ class HumanoidCoreInstance:
             self._log.debug(f"{LOG_PREFIX} 心理注入失败，本轮跳过: {exc}")
             return ""
 
+    def psyche_urge(self, user_id: str, *, text: str = "") -> str:
+        """v3.1.47：她自己憋着想说的那句（压强过阈值才给，原文来自她自己）。
+
+        与 `psyche_injection` 分开成块：相关系数是「她想主动开口的动机」，不该跟
+        身体/日程背景句一起被照抄闸当成念稿删掉；出站闸按 URGE_MARK 放行。
+        """
+        store = getattr(self, "psyche_store", None)
+        if store is None:
+            return ""
+        try:
+            now = self.now_epoch()
+            st = store.state(user_id)
+            st.decay(now)
+            hour = int(self.clock.now().hour)
+            urge = st.urge_to_speak(
+                local_hour=hour, text=text,
+                body_modulation=self._psyche_body_modulation(), now=now,
+            )
+            return "" if not urge else "\n\n" + _psyche.URGE_MARK + "\n" + urge + "。"
+        except Exception as exc:
+            self._log.debug(f"{LOG_PREFIX} 主动动机生成失败，本轮跳过: {exc}")
+            return ""
+
     def psyche_proactive_pressure(self, user_id: str) -> float:
         """给自主社交层读的主动压强（0..1）。拿不到就 0。"""
         store = getattr(self, "psyche_store", None)

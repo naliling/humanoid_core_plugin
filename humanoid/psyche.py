@@ -55,6 +55,8 @@ STATE_FILE = "psyche_state.json"
 
 #: 注入块抬头。出站照抄闸靠它识别「这是她自己写的心理话」，不把它当念稿删掉。
 INJECTION_MARK = "〔我和他之间〕"
+#: v3.1.47：她自己想开口的那句（与反刍注入分开的抬头，照抄闸同样放行）。
+URGE_MARK = "〔憋着想跟你说〕"
 
 # 四个需求。欠得越多（deficit 越大），越想被满足。
 NEEDS: Tuple[str, ...] = ("response", "understanding", "space", "novelty")
@@ -355,6 +357,33 @@ class PsycheState:
         return _clamp(pressure, 0.0, 1.0)
 
     # ---- 注入文本（只做「选中哪几句」的拼装，文字本身是生成的）----
+    def urge_to_speak(self, *, local_hour: int = 12, text: str = "",
+                       body_modulation: float = 0.0,
+                       now: float | None = None) -> str:
+        """此刻她「自己想说」的一句，来自反刍/需求/误判——不是插件排的由头。
+
+        与 `injection_lines` 的区别：injection 只拼「够格浮上来的心事」；urge 看的是
+        「她心里有没有憋着一句非说不可的话」——压强过了阈值才给，而且只取她自己
+        生成过的第一人称原文（concern.text / view.misread），不在这里造新句子。
+
+        「发言像被插件引起」的根子是：社交层只拿日程/天气这类排出来的由头开口。
+        有了 urge，模型手里就有一句「她惦记着、压了一阵子」的话，开口动机来自她
+        自己心里的账，而不是插件今天替她安排了什么。安静仍是常态——压强不够就
+        返回空串。
+        """
+        now = now if now is not None else _now()
+        pressure = self.proactive_pressure(local_hour=local_hour, now=now)
+        if pressure < 0.55:
+            return ""
+        lines = self.injection_lines(
+            local_hour=local_hour, text=text,
+            body_modulation=body_modulation, now=now,
+        )
+        if not lines:
+            return ""
+        # 只递第一句最要紧的：一次憋一句才像人，倒豆子不像。
+        return lines[0]
+
     def injection_lines(self, *, local_hour: int = 12, text: str = "",
                         body_modulation: float = 0.0,
                         now: float | None = None) -> List[str]:

@@ -171,6 +171,20 @@ class PsycheLogicTest(unittest.TestCase):
         self.assertEqual(st.journal[0].now_view, "他后来真的来了，说话算数")
         self.assertEqual(st.concerns["k"].text, "他后来真的来了，说话算数")
 
+    def test_urge_to_speak_needs_pressure_and_uses_own_words(self):
+        """v3.1.47：压强不够憋着不说；够了也只取她自己生成过的原句。"""
+        now = 1_000_000.0
+        st = PsycheState("u1")
+        st.add_concern(Concern(key="k", text="他那句随便到底什么意思",
+                               ts=now - 20 * 3600, significance=0.9))
+        # 只有心事、需求都低：压强 = 0.55*0.25 + 0.35*0.5 ≈ 0.32 < 0.55 → 不说
+        self.assertEqual(st.urge_to_speak(local_hour=23, body_modulation=1.0, now=now), "")
+        # 需求欠到顶 + 心事发酵：0.55*1 + 0.35*0.5 ≈ 0.72 ≥ 0.55 → 憋不住
+        st.frustrate_need("response", 1.0)
+        urge = st.urge_to_speak(local_hour=23, body_modulation=1.0, now=now)
+        self.assertEqual(urge, "他那句随便到底什么意思")
+        self.assertNotIn("〔", urge)  # 抬头由 core 加，psyche 只给原句
+
     def test_proactive_pressure_range(self):
         st = PsycheState("u1")
         self.assertGreaterEqual(st.proactive_pressure(), 0.0)

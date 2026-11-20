@@ -95,6 +95,15 @@ class BriefShapeTest(unittest.TestCase):
         self.assertNotIn("events", chat or {}, "chat 任务不该多带事件，省预算")
         self.assertIn("events", proactive or {})
 
+    def test_psyche_capability_does_not_crash(self):
+        """v3.1.47：门面心理账只读、不抛；没有档案时也有确定的空形状。"""
+        self.assertIn("psyche", self.facade.capabilities())
+        out = self.facade.psyche("bot1", "10001")
+        self.assertIsInstance(out, dict)
+        # 没启用/没内容时至少给出 pressure，且是数字
+        if out:
+            self.assertIsInstance(out.get("pressure"), (int, float))
+
     def test_ongoing_items_carry_ids(self):
         self.h.publish("他上次说的那个面试")
         brief = self.facade.brief("bot1", "10001", task="proactive")

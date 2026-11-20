@@ -67,7 +67,7 @@ API_VERSION = 3
 #: 三态是读法而不是接口。判「对面懂不懂三态」请看 `API_VERSION >= 3`。
 CAPABILITIES = (
     "brief", "clock", "events", "fingerprint", "dreams", "wake", "intimacy",
-    "identity", "user",
+    "identity", "user", "psyche",
 )
 
 
@@ -421,6 +421,61 @@ class CoreFacade:
         except Exception as exc:
             self._debug(f"brief 失败: {exc}")
             return None
+
+    # ─── 叙事心理层（v3.1.47，只加不改）──────────────────
+
+    def psyche(self, role_id: str, user_id: str = "") -> Dict[str, Any]:
+        """她此刻的心理账，供社交层决定「是不是她自己想开口」。
+
+        * `pressure`（0..1）：主动压强——需求欠着 + 心事发酵 + 误判积累算出来的，
+          越高越说明她心里憋着话；这是「她自己想说」的动机，与日程/天气那种插件
+          排出来的由头不是一回事。
+        * `concerns`：她惦记的事（第一人称原文，最多 3 条）；`rumination` 是此刻
+          够格浮上来的那些 key。
+        * `top_need` / `need_deficit`：最缺的那个需求与欠了多少。
+        * `misread`：她眼里对方可能看错的地方（心智理论会推错）。
+
+        只读、不抛异常、不猜。拿不到（角色不存在 / 没启用心理层）返回 `{}`，社交层
+        按「不知道」处理，退回原来的由头规则。与 intimacy 同理，这里不放进契约：
+        per-user 的心理账会把 state.json 撑大，门面按需现算才是它该待的地方。
+        """
+        core = self._core(role_id)
+        if core is None:
+            return {}
+        uid = _s(user_id)
+        try:
+            store = getattr(core, "psyche_store", None)
+            if store is None:
+                return {}
+            st = store.state(uid) if uid else None
+            now = float(core.now_epoch())
+            pressure_fn = getattr(core, "psyche_proactive_pressure", None)
+            pressure = float(pressure_fn(uid)) if callable(pressure_fn) and uid else 0.0
+            if st is None:
+                return {"pressure": round(pressure, 3), "available": False}
+            st.decay(now)
+            hour = int(core.clock.now().hour)
+            rum = st.ruminating(local_hour=hour, now=now)
+            rum_keys = {c.key for c in rum}
+            need, deficit = st.top_need()
+            from .psyche import NEED_LABELS as _NEED_LABELS
+            return {
+                "available": True,
+                "pressure": round(pressure, 3),
+                "concerns": [
+                    {"key": c.key, "text": _s(c.text),
+                     "ruminating": c.key in rum_keys}
+                    for c in st.active_concerns()[:3]
+                ],
+                "rumination": [c.key for c in rum],
+                "top_need": _s(need),
+                "need_label": _s(_NEED_LABELS.get(need, need)),
+                "need_deficit": round(_num(deficit), 3),
+                "misread": _s(st.view.misread),
+            }
+        except Exception as exc:
+            self._debug(f"psyche 失败: {exc}")
+            return {}
 
     def events(self, role_id: str, user_id: str = "", *, limit: int = 5,
                since: float = 0.0) -> List[Dict[str, Any]]:
