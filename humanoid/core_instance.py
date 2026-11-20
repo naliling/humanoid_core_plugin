@@ -9,6 +9,7 @@ import time
 from typing import Any, Mapping, Optional
 
 from .state import seed_cycle_day
+from . import psyche as _psyche
 from . import __version__
 from . import body_voice as _body_voice
 from . import life_log
@@ -308,6 +309,33 @@ class HumanoidCoreInstance:
 
         self.prompt_builder = PromptBuilder(self)
         self.engine_compat = _EngineCompat(self)
+
+        # 叙事心理层（psyche）：增强，不替换。写在 state.json 旁边，
+        # 各角色各一份心理库；生成器复用日程的模型链/保留额度。
+        # 整块 fail-open：心理层坏了不影响身体、日程、情绪与回复。
+        try:
+            psy_dir = self._state_store.path.parent
+            self.psyche_store = _psyche.PsycheStore(psy_dir, self.role_id)
+            def _psyche_persona_sync():
+                # 用缓存快照，不能在后台生成里 await；persona_source 还没起来就空串。
+                src = getattr(self, "persona_source", None)
+                if src is None:
+                    return ""
+                snap = src.cached_persona(self.role_id)
+                return str(getattr(snap, "prompt", "") or "")
+
+            self.psyche_writer = _psyche.PsycheWriter(
+                self.psyche_store,
+                self.gateway,
+                config_provider,
+                persona_provider=_psyche_persona_sync,
+                logger=logger,
+                time_source=self.now_epoch,
+            )
+        except Exception as exc:
+            self.psyche_store = None
+            self.psyche_writer = None
+            logger.warning(f"{LOG_PREFIX} 心理层初始化失败，本角色不带叙事心理: {exc}")
 
         self._rebase_after_move()
 
@@ -1344,6 +1372,142 @@ class HumanoidCoreInstance:
             user_name=user_name,
             memory_text=memory_text,
         )
+
+    # -------------------- 叙事心理层（psyche）--------------------
+
+    def _psyche_body_modulation(self) -> float:
+        """把身体状态折成一个 -1..1 的调制数：清醒有精力=正，困/累=负。
+
+        这是「身体—心理缝合」的接缝：psyche 本体不读 body 数值，只认这个数。
+        """
+        try:
+            snap = self.soma.snapshot() or {}
+            asleep = float(snap.get("asleep", 0.0) or 0.0) >= 1.0
+            if asleep:
+                return -1.0
+            sleep_pressure = float(snap.get("sleep_pressure", 0.0) or 0.0)
+            energy = float(getattr(self.energy, "energy", 50.0) or 50.0)
+            # 困意越高越不想纠结，精力越低越懒得想；刚睡醒（低困意）为正。
+            val = (energy - 50.0) / 50.0 - sleep_pressure / 100.0
+            return max(-1.0, min(1.0, val))
+        except Exception:
+            return 0.0
+
+    def psyche_injection(self, user_id: str, *, text: str = "") -> str:
+        """本轮该递给模型的心理轻提示（她惦记的事 / 看错的人）。
+
+        文字全是她自己之前生成的，这里只做「哪件够格浮上来」的确定性筛选。
+        没有够格的事就返回空串——安静是常态。
+        """
+        store = getattr(self, "psyche_store", None)
+        if store is None:
+            return ""
+        try:
+            now = self.now_epoch()
+            st = store.state(user_id)
+            st.decay(now)
+            lines = st.injection_lines(
+                local_hour=int(self.clock.now().hour),
+                text=text,
+                body_modulation=self._psyche_body_modulation(),
+                now=now,
+            )
+            if not lines:
+                return ""
+            # 记下这轮反刍到的心事（抑制连着念叨 + 回涨显著性）
+            for c in st.ruminating(
+                local_hour=int(self.clock.now().hour), text=text,
+                body_modulation=self._psyche_body_modulation(), now=now,
+            ):
+                st.note_echo(c.key, now=now)
+            store.save_state()
+            # 心理文字本就是模型生成的第一人称，不再做人称转换（转了反而会改坏引号里的话）
+            body = "；".join(dict.fromkeys(lines))  # 保序去重
+            return "\n\n" + _psyche.INJECTION_MARK + "\n" + body + "。"
+        except Exception as exc:
+            self._log.debug(f"{LOG_PREFIX} 心理注入失败，本轮跳过: {exc}")
+            return ""
+
+    def psyche_proactive_pressure(self, user_id: str) -> float:
+        """给自主社交层读的主动压强（0..1）。拿不到就 0。"""
+        store = getattr(self, "psyche_store", None)
+        if store is None:
+            return 0.0
+        try:
+            return store.state(user_id).proactive_pressure(
+                local_hour=int(self.clock.now().hour), now=self.now_epoch()
+            )
+        except Exception:
+            return 0.0
+
+    def psyche_panel(self, user_id: str) -> str:
+        """给她看的可观测面板：惦记什么、缺什么、怎么看他、反刍到哪一步。"""
+        store = getattr(self, "psyche_store", None)
+        if store is None:
+            return "心理层未启用。"
+        try:
+            st = store.state(user_id)
+            st.decay(self.now_epoch())
+            lines = [f"〔她心里的账 · {self.char_name() or self.role_id}视角〕"]
+            concerns = st.active_concerns()
+            if concerns:
+                lines.append("惦记的事：")
+                rum_keys = {c.key for c in st.ruminating(
+                    local_hour=int(self.clock.now().hour), now=self.now_epoch())}
+                for c in concerns[:5]:
+                    tag = "（此刻正想起）" if c.key in rum_keys else ""
+                    lines.append(f"- {c.text}（显著性 {c.significance:.2f}）{tag}")
+            else:
+                lines.append("惦记的事：暂时没有——她现在心里是安静的。")
+            need, val = st.top_need()
+            from .psyche import NEED_LABELS
+            lines.append(f"最缺的：{NEED_LABELS.get(need, need)}（欠 {val:.2f}）")
+            if st.view.traits:
+                lines.append("我眼里的你：" + "、".join(st.view.traits))
+            if st.view.misread:
+                lines.append("可能在看错：" + st.view.misread)
+            recent = [e for e in store.journal if e.kind == "self"][-3:]
+            if recent:
+                lines.append("最近写下的：")
+                for e in recent:
+                    lines.append(f"- {e.text}")
+            pressure = st.proactive_pressure(
+                local_hour=int(self.clock.now().hour), now=self.now_epoch())
+            lines.append(f"主动压强：{pressure:.2f}")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"心理面板读取失败：{exc}"
+
+    def psyche_note_turn(self, user_id: str, *, user_text: str, her_reply: str) -> None:
+        """一轮对话结束后，后台低频生成一条心理记录（不阻塞回复）。
+
+        事件驱动 + 节流在 writer 里判；这里只负责把它丢进后台任务表。
+        身体感觉标签从当前 soma 取，用于「身体—心理缝合」的生成提示。
+        """
+        writer = getattr(self, "psyche_writer", None)
+        if writer is None:
+            return
+        try:
+            body_tag = ""
+            snap = self.soma.snapshot() or {}
+            if float(snap.get("asleep", 0.0) or 0.0) >= 1.0:
+                body_tag = "困，迷迷糊糊"
+            elif float(snap.get("sleep_pressure", 0.0) or 0.0) > 70:
+                body_tag = "有点困"
+            elif float(getattr(self.energy, "energy", 50.0) or 50.0) < 30:
+                body_tag = "没什么力气"
+            self._spawn_background(
+                writer.write_once(
+                    user_id,
+                    user_text=user_text,
+                    her_reply=her_reply,
+                    body_tag=body_tag,
+                    local_hour=int(self.clock.now().hour),
+                ),
+                "psyche-write",
+            )
+        except Exception as exc:
+            self._log.debug(f"{LOG_PREFIX} 心理生成派发失败，本轮跳过: {exc}")
 
     #: 契约的兜底重建间隔（秒）：即使输入摘要没变，也至少每分钟刷一次 time/day 这类
     #: 随时间走、但摘要里看不出来的字段（P2-06）。

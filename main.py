@@ -68,6 +68,7 @@ HELP_TEXT = f"""📖 人形化核心伴侣 指令列表 (v{__version__})
 /情绪详情 —— 含基线值与交互轮次
 /情绪日志 —— 最近的情绪波动记录
 /查看日程 —— 她今天已经过出来的日程
+/心事 —— 她惦记什么、缺什么、此刻在想什么
 /时间 大阪 —— 查那个城市现在几点；不带城市就用她所在的城市
 /叫我 小灵 —— 设她对你的称呼（最多 32 字）
 /拟人帮助 —— 显示这份帮助
@@ -248,7 +249,7 @@ def _sender_name(event: AstrMessageEvent) -> str:
 # （涨好感、算进「TA 说过的话」、扣精力与社交能量、还可能触发情绪分析调用）。
 # `tests/test_v2290_command_audit.py` 直接从 main.py 的装饰器解析注册名来钉住它。
 COMMAND_NAMES = (
-    "你的状态", "亲密状态", "好感度", "情绪详情", "情绪日志", "查看日程", "时间", "叫我",
+    "你的状态", "亲密状态", "好感度", "情绪详情", "情绪日志", "查看日程", "心事", "时间", "叫我",
     "拟人帮助", "拟人",
 )
 
@@ -1811,7 +1812,7 @@ class HumanoidCore(Star):
         改配置：时间 / 参照名称 / 诊断 / 设置 / 重载
         看角色：角色（列出所有身份档案，含面板「预置角色QQ」里预置的异机号）
         动数据：重置日程 / 日程打断 / 日程继续 / 重置状态 / 重置情绪 / 设置好感度 / 批量好感度 / 查看昵称
-        查状态不用前缀：/你的状态 /亲密状态 /好感度 /情绪详情 /情绪日志 /查看日程 /时间 /叫我 /拟人帮助
+        查状态不用前缀：/你的状态 /亲密状态 /好感度 /情绪详情 /情绪日志 /查看日程 /心事 /时间 /叫我 /拟人帮助
         """
 
     # 每条指令的参数都从 event.message_str 自己解析（支持中文空格与多词值）；签名里
@@ -1879,6 +1880,12 @@ class HumanoidCore(Star):
         """用法：/查看日程（她今天已经过出来的日程）"""
         core = self._core(event)
         yield event.plain_result(_clip_text(core.schedule_text()))
+
+    @filter.command("心事")
+    async def cmd_psyche(self, event: AstrMessageEvent):
+        """用法：/心事（她惦记什么、缺什么、此刻在想什么）"""
+        core = self._core(event)
+        yield event.plain_result(_clip_text(core.psyche_panel(self._sender(event))))
 
     @filter.command("时间")
     async def cmd_time(self, event: AstrMessageEvent, city: str = ""):
@@ -3046,9 +3053,18 @@ class HumanoidCore(Star):
             except Exception as exc:  # 证据卡坏了只是少一段由头，绝不能连累回复
                 logger.debug(f"{LOG_PREFIX} 证据卡生成失败，本轮不注入这一块: {exc}")
                 evidence_note = ""
+            # ─── 叙事心理层（psyche）：她惦记的事，走确定性筛选后按阈值放行 ───
+            # 没有够格浮上来的心事时是空串——安静是常态，不念叨才是活人。
+            # 整块 fail-open：心理层坏了不影响本轮其它注入与回复。
+            psyche_note = ""
+            try:
+                psyche_note = core.psyche_injection(user_id, text=said)
+            except Exception as exc:
+                logger.debug(f"{LOG_PREFIX} 心理注入失败，本轮跳过: {exc}")
+                psyche_note = ""
             blocks = [
                 block
-                for block in (state_note, injection, closing_note, evidence_note)
+                for block in (state_note, injection, closing_note, evidence_note, psyche_note)
                 if block
             ]
             if blocks:
@@ -3132,7 +3148,12 @@ class HumanoidCore(Star):
             if bool(getattr(cfg, "injection_echo_guard_enabled", True)):
                 try:
                     blocks = _event_extra(event, "_hcore_injected_blocks", []) or []
-                    if isinstance(blocks, (list, tuple)) and blocks:
+                    # v3.1.46：心理层写的是「她自己写下的话」，允许她直接说出口——
+                    # 照抄闸只管插件生成的背景句（身体/日程/天气），不删她的自述。
+                    from .humanoid.psyche import INJECTION_MARK as _PSYCHE_MARK
+                    if isinstance(blocks, (list, tuple)):
+                        blocks = [b for b in blocks if _PSYCHE_MARK not in str(b)]
+                    if blocks:
                         echo_text, echo_dropped = reply_guard.trim_injection_echo(
                             text, blocks
                         )
@@ -3240,6 +3261,16 @@ class HumanoidCore(Star):
                     setter("_hcore_reply_captured", True)
                 except Exception:
                     pass
+            # 叙事心理层：拿这一来一回，后台低频生成她心里留下的东西。
+            # 事件驱动 + 节流在 writer 里判，绝大多数轮次不会真的调模型。
+            try:
+                core.psyche_note_turn(
+                    user_id,
+                    user_text=str(getattr(event, "message_str", "") or ""),
+                    her_reply=text,
+                )
+            except Exception as exc:
+                logger.debug(f"{LOG_PREFIX} 心理生成派发失败: {exc}")
         except Exception as e:
             logger.debug(f"{LOG_PREFIX} 记录她的发言失败: {e}")
 
