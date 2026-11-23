@@ -42,13 +42,41 @@ _SPLIT = re.compile(r"([，,。！？!?；;…、~～]+)")
 MIN_CLAUSE_CHARS = 4
 
 #: 互相包含判定时，两边都要够长，否则「我在厨房」会把「厨房里」吃掉。
-MIN_DUP_CHARS = 6
+#: v3.1.51：从 6 提到 10——线上 6 字相互包含把「外头正落着四度寒雨 / 三度寒雨」
+#: 这种**逐日递进的天气句**当成复读删，天气本就该随日子变，不是卡带。
+MIN_DUP_CHARS = 10
+
+#: v3.1.51：互相包含还要求**两句长度接近**。原来「短句 in 长句」就算复读，
+#: 弱模型写出的角色习惯动作（「蹄子在软垫上无处安放地轻蹭着」）只要和最近某句
+#: 有 6 字交集就被删。近乎等长（差 ≤ 2 字）才可能是真的原样复读。
+DUP_MAX_LEN_DELTA = 2
+
+#: v3.1.51：地点复读也要求「整句几乎就是报地点」。原来地点词在最近窗口出现
+#: 2 次，这一句只要含该地点词就整句删，把「我在厨房，刚把碗洗完」连动作一起吞。
+#: 现在要求这一句去掉地点词后剩下的字很少（≤ 6），才是「纯报地点」的报备句。
+PLACE_ONLY_TAIL_CHARS = 6
 
 #: 纯称呼（拉丁字母/数字的用户名，比如「Regnator」）不参与小句复读：她每句都叫一声
 #: 对方的名字是称呼，不是卡带；删掉它句子就变成没头没尾的自言自语。
 ADDRESS_MAX_CHARS = 32
 
 _CJK = re.compile(r"[\u4e00-\u9fff]")
+
+
+#: 短句「状态词」：一句里带这些词的短小句（≤ dup_chars），即使和上一句一字不差
+#: 也保留——它们是她当下的身体/感官/情绪，真人本来就会反复说（真机三次被删的
+#: 「鼻尖冻得发麻」就是这种）。只用**明确的状态词组**，不用会撞实物的单字
+#: （「热红茶」的「热」「凉水」的「凉」不能触发），纯事务短句仍照删。
+STATE_WORDS: Tuple[str, ...] = (
+    "发麻", "发酸", "发胀", "发冷", "发烫", "发痒", "发懒", "发沉",
+    "冻得", "麻得", "酸得", "疼得", "困得", "累得", "热得", "冷得",
+    "难受", "舒服", "没劲", "没力气", "犯困", "犯懒", "精神",
+    "心里", "有点困", "有点累", "有点冷", "有点热",
+)
+
+
+def _is_state_clause(norm: str) -> bool:
+    return bool(norm) and any(w in norm for w in STATE_WORDS)
 
 
 def _is_address(norm: str) -> bool:
@@ -152,11 +180,17 @@ def trim_repeats(
     window: int = 3,
     place_hits: int = 2,
     min_chars: int = MIN_CLAUSE_CHARS,
+    dup_chars: int = MIN_DUP_CHARS,
+    dup_max_len_delta: int = DUP_MAX_LEN_DELTA,
+    place_only_tail_chars: int = PLACE_ONLY_TAIL_CHARS,
 ) -> Tuple[str, List[str]]:
     """删掉与最近几条重复的小句。返回 (新文本, 被删的小句)。
 
     `recent` 是她自己最近说过的话（越靠后越新）。删完一句不剩时原样返回——
     不许因为「怕复读」而发出空消息。
+
+    v3.1.51：收紧「复读」定义，只抓真正的原样卡带，不再误删角色的动作神态、
+    逐日递进的天气句。三道放宽都可从配置调（见 config）。
     """
     body = str(text or "").strip()
     if not body:
@@ -183,17 +217,33 @@ def trim_repeats(
     dropped: List[str] = []
     for clause, delim in _clauses(body):
         norm = _norm(clause)
-        place_hit = [p for p in sticky if p in clause]
+        # v3.1.51：地点复读只在「整句几乎就是报地点」时删。带动作/神态/天气的
+        # 句子（「我在厨房，刚把碗洗完」「窗边落着四度寒雨」）是角色在过日子，
+        # 不是报备，留下。
+        place_hit = False
+        for p in sticky:
+            if p in clause and len(_norm(clause.replace(p, ""))) <= max(0, int(place_only_tail_chars)):
+                place_hit = True
+                break
         dup = False
         if len(norm) >= min_chars and not _is_address(norm):
             for old in old_clauses:
                 if norm == old:
+                    # v3.1.51：短状态句（身体的冷麻酸困、感官的香暖）一字不差也留——
+                    # 那是她此刻的感受，不是卡带。长句或事务句照删。
+                    if (len(norm) <= max(2, int(dup_chars))
+                            and _is_state_clause(norm)):
+                        continue
                     dup = True
                     break
-                if len(norm) >= MIN_DUP_CHARS and len(old) >= MIN_DUP_CHARS:
-                    if norm in old or old in norm:
-                        dup = True
-                        break
+                # v3.1.51：互相包含要「两边都够长 + 长度接近」。原来 6 字交集
+                # 就把逐日天气（「四度寒雨/三度寒雨」）和习惯动作当复读，误伤严重。
+                if (len(norm) >= max(2, int(dup_chars))
+                        and len(old) >= max(2, int(dup_chars))
+                        and abs(len(norm) - len(old)) <= max(0, int(dup_max_len_delta))
+                        and (norm in old or old in norm)):
+                    dup = True
+                    break
         if place_hit or dup:
             dropped.append(clause)
             continue

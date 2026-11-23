@@ -87,13 +87,11 @@ class SchemaTest(unittest.TestCase):
             self.assertIn(key, self.schema)
 
     def test_field_count_is_pinned(self):
-        """字段数变化必须同步改这里（v3.1.38 = 144（加 ccb_body）；v3.1.28 = 143（删掉 schedule_quality_gate）：v3.1.4 加 3 项收尾沉默守卫，v3.1.5 加 1 项证据卡开关，v3.1.6 加 1 项问候机会开关，v3.1.15 加 1 项群聊情绪间隔；v3.1.44 = 146（加 preset_role_ids / weather_proxy）；v3.1.45 = 147（加 injection_echo_guard_enabled 出站照抄闸））。
-
-        面板项数在 README / main.py 的帮助文案里也被引用，字段增删时一并对齐，
-        否则用户看到的「共 N 项」与面板实际数量对不上。
+        """字段数变化必须同步改这里（v3.1.38 = 144（加 ccb_body）；v3.1.28 = 143（删掉 schedule_quality_gate）：v3.1.4 加 3 项收尾沉默守卫，v3.1.5 加 1 项证据卡开关，v3.1.6 加 1 项问候机会开关，v3.1.15 加 1 项群聊情绪间隔；v3.1.44 = 146（加 preset_role_ids / weather_proxy）；v3.1.51 = 150（加 repeat_dup_min_chars / repeat_dup_max_len_delta /
+        repeat_place_only_tail_chars 三个复读闸阈值）。
         """
-        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 147)
-        self.assertEqual(len(self.schema), 147)
+        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 150)
+        self.assertEqual(len(self.schema), 150)
 
     def test_input_state_throttle_keys_are_consistent(self):
         """v3.0.0 新增的两个「正在输入」节流项：类型/区间/默认值三处一致。"""

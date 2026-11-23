@@ -127,7 +127,8 @@ class InjectionEchoWiringTest(unittest.IsolatedAsyncioTestCase):
         return star
 
     async def test_echo_is_stripped_from_sent_text_when_event_has_blocks(self):
-        star = await self._star()
+        # v3.1.51：照抄闸默认关，要测它的行为得显式打开。
+        star = await self._star(injection_echo_guard_enabled=True)
         event = FakeEvent("在吗", sender=HUMAN)
         # 模拟本轮注入过的原文（真实路径由 inject_context 存进来）。
         setter = getattr(event, "set_extra", None)
@@ -147,6 +148,18 @@ class InjectionEchoWiringTest(unittest.IsolatedAsyncioTestCase):
         response = _Response("窗外的雪下大了，我把炉子添了块柴。")
         await star.note_her_reply(event, response)
         self.assertEqual(response.completion_text, "窗外的雪下大了，我把炉子添了块柴。")
+
+    async def test_guard_defaults_off(self):
+        """v3.1.51：照抄闸默认关——不再把她说出口的状态/感官句删掉。"""
+        star = await self._star()
+        event = FakeEvent("在吗", sender=HUMAN)
+        setter = getattr(event, "set_extra", None)
+        if callable(setter):
+            setter("_hcore_injected_blocks", ["我这两天小腹坠着，腰也酸，人有点发懒"])
+        original = "我这两天小腹坠着，腰也酸，你今天过得怎样？"
+        response = _Response(original)
+        await star.note_her_reply(event, response)
+        self.assertEqual(response.completion_text, original)
 
     async def test_guard_can_be_disabled(self):
         star = await self._star(injection_echo_guard_enabled=False)

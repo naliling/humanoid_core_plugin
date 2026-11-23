@@ -3154,7 +3154,7 @@ class HumanoidCore(Star):
             # 照抄。这里拿本轮真正注入的那几块原文比对，逐字照抄的小句删掉。
             # 放在「她重复她自己」之前：先去掉照抄，再去重自己，两道互不替代。
             cfg = getattr(self, "_config", None)
-            if bool(getattr(cfg, "injection_echo_guard_enabled", True)):
+            if bool(getattr(cfg, "injection_echo_guard_enabled", False)):
                 try:
                     blocks = _event_extra(event, "_hcore_injected_blocks", []) or []
                     # v3.1.46：心理层写的是「她自己写下的话」，允许她直接说出口——
@@ -3196,7 +3196,15 @@ class HumanoidCore(Star):
                 recent = []
             if not recent:
                 return text
-            new_text, dropped = reply_guard.trim_repeats(text, recent)
+            new_text, dropped = reply_guard.trim_repeats(
+                text,
+                recent,
+                dup_chars=int(getattr(cfg, "repeat_dup_min_chars", 10)),
+                dup_max_len_delta=int(getattr(cfg, "repeat_dup_max_len_delta", 2)),
+                place_only_tail_chars=int(
+                    getattr(cfg, "repeat_place_only_tail_chars", 6)
+                ),
+            )
             if not dropped or not new_text or new_text == text:
                 return text
             if isinstance(getattr(response, "completion_text", None), str):

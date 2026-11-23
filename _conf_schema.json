@@ -917,9 +917,51 @@
   },
   "injection_echo_guard_enabled": {
     "description": "出站照抄闸",
-    "hint": "回复逐字照抄本轮注入的身体/日程/天气原文时删掉那一句；只删不写，默认开",
+    "hint": "默认关：回复里逐字照抄本轮注入的身体/日程/天气原文时删掉那一句。关掉可保留角色的动作神态与感官句（推荐）；需要严格防念稿时再打开。只删不写",
     "type": "bool",
-    "default": true
+    "default": false
+  },
+  "repeat_dup_min_chars": {
+    "description": "【进阶】复读判定字数",
+    "hint": "复读闸判定「互相包含」的最小字数，默认 10。调低更容易判成复读（可能误删天气递进句），调高更宽松",
+    "type": "int",
+    "default": 10,
+    "minimum": 4,
+    "maximum": 40,
+    "slider": {
+      "min": 4,
+      "max": 40,
+      "step": 1
+    },
+    "collapsed": true
+  },
+  "repeat_dup_max_len_delta": {
+    "description": "【进阶】复读长度差",
+    "hint": "两句字数差不超过这个值才算复读，默认 2。调大更容易把长短不一的句子判成复读",
+    "type": "int",
+    "default": 2,
+    "minimum": 0,
+    "maximum": 20,
+    "slider": {
+      "min": 0,
+      "max": 20,
+      "step": 1
+    },
+    "collapsed": true
+  },
+  "repeat_place_only_tail_chars": {
+    "description": "【进阶】纯报地点字数",
+    "hint": "一句里去掉地点词后剩下的字不超过这个值，才算「纯报地点」的复读，默认 6。带动作神态的句子不会被误删",
+    "type": "int",
+    "default": 6,
+    "minimum": 0,
+    "maximum": 40,
+    "slider": {
+      "min": 0,
+      "max": 40,
+      "step": 1
+    },
+    "collapsed": true
   },
   "inject_token_budget": {
     "description": "【进阶】注入Token预算",

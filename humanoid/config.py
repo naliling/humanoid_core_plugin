@@ -322,8 +322,18 @@ class HumanoidConfig:
     inject_activity_context: str = "medium"
     # 出站照抄闸（v3.1.45）：把回复里逐字照抄「本轮注入背景」的小句删掉。
     # 注入侧再干净也挡不住弱模型把原文当台词念，只能在出站比对本轮注入原文。
-    # 只删不写、删空则原样发，默认开；关掉则退回没有这道闸的行为。
-    injection_echo_guard_enabled: bool = True
+    # v3.1.51：默认**关**。注入框架（prompt_builder.build_framing）用第一人称
+    # 「这些是你此刻的身体和处境，会影响你怎么说话」鼓励她把状态说出口，照抄闸
+    # 却把说出口的状态删掉——两处设计直接打架，真机 26 条出站拦截里删的全是角色感
+    # 最强的句子（动作神态/天气递进/口吻/感官）。默认关，需要时在面板手动开。
+    injection_echo_guard_enabled: bool = False
+    # 出站复读闸的三个阈值（v3.1.51）：默认收紧到只抓真正的原样卡带。
+    # dup_min_chars: 互相包含判定的最小字数（原 6 → 10）。
+    # dup_max_len_delta: 两句长度差上限，超过就不算复读（原无限制 → 2）。
+    # place_only_tail_chars: 去掉地点词后剩余字数不超过它才算「纯报地点」复读。
+    repeat_dup_min_chars: int = 10
+    repeat_dup_max_len_delta: int = 2
+    repeat_place_only_tail_chars: int = 6
     # 注入的 Token 硬预算：超了按显著度从低到高丢句，必需品（时间/称呼/场景）永不丢。
     inject_token_budget: int = 3500
     environment_mode: str = "both"
@@ -685,6 +695,9 @@ class HumanoidConfig:
             input_state_max_frames=i("input_state_max_frames", 5, 500),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
             injection_echo_guard_enabled=b("injection_echo_guard_enabled"),
+            repeat_dup_min_chars=i("repeat_dup_min_chars", 4, 40),
+            repeat_dup_max_len_delta=i("repeat_dup_max_len_delta", 0, 20),
+            repeat_place_only_tail_chars=i("repeat_place_only_tail_chars", 0, 40),
             # 这一项曾经是 113 个字段里唯一不走 i()/f() 的（直接 int(src.get(...))），
             # 面板里填个 'abc' 或 '3000.0' 就会抛 ValueError 一路冒到 initialize()，
             # 插件加载失败，而坏值还躺在配置文件里 —— 每次重启再崩一次。
