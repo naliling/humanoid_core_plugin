@@ -478,7 +478,7 @@ class InjectionLayerTest(unittest.TestCase):
         清理只删情绪与原话记忆（`mood_data_retention_days`）；`first_met` 会被搬到
         user 级，所以 `/你的状态` 仍然知道认识多久——只是那句话不进上下文了。
         """
-        core = self.core()
+        core = self.core(mood_data_retention_days=7)
         first_met = core.now_epoch() - 400 * 86400
         state = core.scope.user_state("42")
         state["mood"] = {

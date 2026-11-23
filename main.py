@@ -69,6 +69,7 @@ HELP_TEXT = f"""📖 人形化核心伴侣 指令列表 (v{__version__})
 /情绪日志 —— 最近的情绪波动记录
 /查看日程 —— 她今天已经过出来的日程
 /心事 —— 她惦记什么、缺什么、此刻在想什么
+/成长 —— 认识多久、关系阶段、聊过多少轮、好感、情绪事件、心事
 /时间 大阪 —— 查那个城市现在几点；不带城市就用她所在的城市
 /叫我 小灵 —— 设她对你的称呼（最多 32 字）
 /拟人帮助 —— 显示这份帮助
@@ -249,7 +250,7 @@ def _sender_name(event: AstrMessageEvent) -> str:
 # （涨好感、算进「TA 说过的话」、扣精力与社交能量、还可能触发情绪分析调用）。
 # `tests/test_v2290_command_audit.py` 直接从 main.py 的装饰器解析注册名来钉住它。
 COMMAND_NAMES = (
-    "你的状态", "亲密状态", "好感度", "情绪详情", "情绪日志", "查看日程", "心事", "时间", "叫我",
+    "你的状态", "亲密状态", "好感度", "情绪详情", "情绪日志", "查看日程", "心事", "成长", "时间", "叫我",
     "拟人帮助", "拟人",
 )
 
@@ -1880,6 +1881,12 @@ class HumanoidCore(Star):
         """用法：/查看日程（她今天已经过出来的日程）"""
         core = self._core(event)
         yield event.plain_result(_clip_text(core.schedule_text()))
+
+    @filter.command("成长")
+    async def cmd_growth(self, event: AstrMessageEvent):
+        """用法：/成长（认识多久、关系阶段、聊过多少轮、好感、情绪事件、心事）"""
+        core = self._core(event)
+        yield event.plain_result(_clip_text(core.growth_panel(self._sender(event))))
 
     @filter.command("心事")
     async def cmd_psyche(self, event: AstrMessageEvent):

@@ -2972,6 +2972,20 @@ class MoodService:
             _old_stage = int(record.get("_last_stage", _new_stage) or _new_stage)
             if _new_stage > _old_stage:
                 record["stage_rose_at"] = float(now)
+                # v3.1.53：把阶段跃迁轨迹写进 user 级档案（清理情绪档案也不会丢），
+                # 供 `/成长` 显示「走过的关系」，不主动播报（用户要被动可见、不乱发言）。
+                try:
+                    from ..relstage import BANDS as _BANDS
+                    label = str(_BANDS[min(_new_stage, len(_BANDS) - 1)][1])
+                    hist = [
+                        str(x) for x in (user_state.get("stage_history") or [])
+                        if str(x)
+                    ]
+                    if not hist or hist[-1] != label:
+                        hist.append(label)
+                        user_state["stage_history"] = hist[-12:]
+                except Exception:
+                    pass
             record["_last_stage"] = _new_stage
         except Exception:
             pass

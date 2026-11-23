@@ -4,7 +4,7 @@
 > 不是一句人设，是一整天的生活。
 > 插件负责她的身体、日程、情绪和关系背景；怎么说话，仍然由大模型按人设自己决定。
 
-![version](https://img.shields.io/badge/version-v3.1.52-2563eb?style=flat-square)
+![version](https://img.shields.io/badge/version-v3.1.53-2563eb?style=flat-square)
 ![platform](https://img.shields.io/badge/platform-QQ%20%7C%20AstrBot-2ea44f?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
 ![license](https://img.shields.io/badge/license-%E7%A7%81%E7%94%A8-blue?style=flat-square)
@@ -124,6 +124,7 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 | `/情绪日志` | 最近的情绪波动记录 |
 | `/查看日程` | 她今天已经过出来的日程 |
 | `/心事` | 她惦记什么、缺什么、此刻在想什么（叙事心理层） |
+| `/成长` | 认识多久、关系阶段、聊过多少轮、好感、情绪事件、心事——把后台记着的成长摆出来 |
 | `/时间 大阪` | 查那个城市现在几点；不带城市就用她所在的城市 |
 | `/叫我 小灵` | 设她对你的称呼（最多 32 字） |
 | `/拟人帮助` | 列出全部指令和用法 |
@@ -160,7 +161,7 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 
 ### 关键配置项
 
-面板上共 150 项（多数带【进阶】标记），这里列真正需要动的：
+面板上共 154 项（多数带【进阶】标记），这里列真正需要动的：
 
 | 项 | 默认 | 什么时候调 |
 | --- | --- | --- |
@@ -185,7 +186,7 @@ AstrBot 里的角色人设要先写好——日程语气与生活特质都从这
 | `closing_guard_prompt_enabled` | 开 | 每轮给模型一句短提示（「上一轮你已经道过晚安」）；关掉只保留静默判定 |
 | `closing_guard_window_seconds` | 1800 | 道别之后多久内的「晚安」还算同一场收尾（秒，60-7200） |
 | `input_state_enabled` | 开 | 私聊回复时显示「正在输入」（仅 NapCat） |
-| `mood_data_retention_days` | 7 | 超过这么多天没说话，情绪档案清回初始值（称呼保留） |
+| `mood_data_retention_days` | 30 | 超过这么多天没说话，情绪档案清回初始值（称呼保留） |
 | `contract_enabled` | 开 | 跨插件契约总开关；关掉后不再向「自主拟人社交」导出她的状态 |
 | `mood_use_llm_for_delta` | 开 | 关掉则情绪**完全本地**判断，零额外调用 |
 | `cooling_enabled` | 开 | 冷静期：好感跌破门槛后她冷着一段时间，且这段时间不主动找他 |

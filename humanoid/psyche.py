@@ -232,6 +232,10 @@ class PsycheState:
         self.last_entry_at: float = 0.0
         self.last_interaction_at: float = _now()
         self.last_proactive_at: float = 0.0
+        # 运行期剂量旋钮（v3.1.53）：默认值=模块常量；PsycheStore.state() 会把
+        # 面板配置覆盖上来。不参与 to_dict/from_dict，不落盘。
+        self.rumination_threshold: float = RUMINATION_THRESHOLD
+        self.inject_max_lines: int = INJECT_MAX_LINES
 
     # ---- 需求 ----
     def satisfy_need(self, name: str, amount: float) -> None:
@@ -301,10 +305,10 @@ class PsycheState:
             score = c.significance * mature + night * NIGHT_BOOST + topic
             score += body_modulation * 0.10
             score *= (0.5 + 0.5 * fresh)                 # 刚提过就压住，别连着念叨
-            if score >= RUMINATION_THRESHOLD:
+            if score >= getattr(self, "rumination_threshold", RUMINATION_THRESHOLD):
                 out.append((score, c))
         out.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in out[:INJECT_MAX_LINES]]
+        return [c for _, c in out[:getattr(self, "inject_max_lines", INJECT_MAX_LINES)]]
 
     def note_echo(self, key: str, now: float | None = None) -> None:
         now = now if now is not None else _now()
@@ -404,7 +408,7 @@ class PsycheState:
         if need_val > 0.7 and self.view.misread:
             # 需求欠着 + 有未澄清的误判 → 一句内部疑问，文字来自 view.misread
             lines.append(self.view.misread)
-        return lines[:INJECT_MAX_LINES]
+        return lines[:getattr(self, "inject_max_lines", INJECT_MAX_LINES)]
 
     # ---- 序列化 ----
     def to_dict(self) -> Dict[str, Any]:
@@ -452,12 +456,30 @@ class PsycheState:
 class PsycheStore:
     """一个角色的一份心理库：含所有对方的状态 + 自述本，负责原子读写。"""
 
-    def __init__(self, data_dir: Path | str, role_id: str) -> None:
+    def __init__(self, data_dir: Path | str, role_id: str,
+                 config_provider: Any = None) -> None:
         self.dir = Path(data_dir)
         self.role_id = str(role_id)
+        self.config_provider = config_provider
         self.states: Dict[str, PsycheState] = {}
         self.journal: List[Entry] = []
         self._load()
+
+    def _cfg(self, name: str, default: Any) -> Any:
+        provider = self.config_provider
+        if callable(provider):
+            return getattr(provider(), name, default)
+        if provider is not None:
+            return getattr(provider, name, default)
+        return default
+
+    def _apply_runtime_config(self, st: "PsycheState") -> "PsycheState":
+        """把面板上的剂量旋钮挂到 state（不序列化、不落盘），给纯方法读。"""
+        st.rumination_threshold = float(
+            self._cfg("psyche_rumination_threshold", RUMINATION_THRESHOLD))
+        st.inject_max_lines = int(
+            self._cfg("psyche_inject_max_lines", INJECT_MAX_LINES))
+        return st
 
     def _state_path(self) -> Path:
         return self.dir / STATE_FILE
@@ -498,7 +520,7 @@ class PsycheStore:
         if st is None:
             st = PsycheState(user_id)
             self.states[user_id] = st
-        return st
+        return self._apply_runtime_config(st)
 
     def _atomic_write(self, path: Path, data: str) -> bool:
         """临时文件 + replace，Windows 上被占用就放弃这次写（不阻塞主路径）。"""

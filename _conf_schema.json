@@ -963,6 +963,60 @@
     },
     "collapsed": true
   },
+  "psyche_rumination_threshold": {
+    "description": "心事浮出阈值",
+    "hint": "心事显著性超过这个值才会浮上来影响发言，默认 0.55。调低=她更爱惦记、更容易提起；调高=更安静克制",
+    "type": "float",
+    "default": 0.55,
+    "minimum": 0.0,
+    "maximum": 1.0,
+    "slider": {
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "psyche_inject_max_lines": {
+    "description": "心事注入句数",
+    "hint": "一次最多注入几句心理话，默认 2。调高=她一次说更多心里话；调低=更含蓄",
+    "type": "int",
+    "default": 2,
+    "minimum": 1,
+    "maximum": 10,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "psyche_min_interval_seconds": {
+    "description": "【进阶】心事写入节流(秒)",
+    "hint": "后台写一条心理记录至少要隔多久，默认 180 秒。调低=记得更勤；调高=更克制",
+    "type": "float",
+    "default": 180.0,
+    "minimum": 0.0,
+    "maximum": 86400.0,
+    "slider": {
+      "min": 0.0,
+      "max": 86400.0,
+      "step": 60.0
+    },
+    "collapsed": true
+  },
+  "psyche_daily_cap": {
+    "description": "【进阶】心事每日上限",
+    "hint": "一天最多写几条心理记录，默认 40。调低=她心里账长得慢；调高=长得快",
+    "type": "int",
+    "default": 40,
+    "minimum": 0,
+    "maximum": 1000,
+    "slider": {
+      "min": 0,
+      "max": 1000,
+      "step": 10
+    },
+    "collapsed": true
+  },
   "inject_token_budget": {
     "description": "【进阶】注入Token预算",
     "hint": "事实块超预算时按显著度从低到高丢句，时间/称呼/场景这些必需品永不丢",
@@ -1017,9 +1071,9 @@
   },
   "mood_data_retention_days": {
     "description": "【进阶】情绪数据保留(天)",
-    "hint": "超过这么多天没说话的人，情绪档案清回初始值（称呼与来源保留）。填 0 = 永不清理（不是「保留 0 天立刻清」），并会让下面的「久未联系归档」完全失效",
+    "hint": "超过这么多天没说话的人，情绪档案清回初始值（称呼与来源保留）。填 0 = 永不清理（不是「保留 0 天立刻清」），并会让下面的「久未联系归档」完全失效。默认 30 天：7 天太短，聊几天不来就被清零，用户会觉得「她记不住我」。",
     "type": "int",
-    "default": 7,
+    "default": 30,
     "minimum": 0,
     "maximum": 365,
     "slider": {

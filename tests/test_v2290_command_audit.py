@@ -45,6 +45,7 @@ TOP_LEVEL = (
     ("cmd_mood_detail", "/情绪详情"),
     ("cmd_mood_log", "/情绪日志"),
     ("cmd_view_schedule", "/查看日程"),
+    ("cmd_growth", "/成长"),
     ("cmd_time", "/时间 上海"),
     ("cmd_set_nickname", "/叫我 小灵"),
     ("cmd_help", "/拟人帮助"),
@@ -84,7 +85,8 @@ class CommandRegistrationTest(unittest.TestCase):
         top, grouped = _registered_from_source()
         # v3.1.10：10 → 9，`/查看昵称` 的顶层别名去掉，只留在「拟人」组里。
         # v3.1.46：新增 `/心事`（叙事心理层面板），9 → 10。
-        self.assertEqual(len(top), 10, f"顶层指令数变了：{sorted(top)}")
+        # v3.1.53：新增 `/成长`（成长档案面板），10 → 11。
+        self.assertEqual(len(top), 11, f"顶层指令数变了：{sorted(top)}")
         # v2.28.11 多了 `/拟人 时间 城市`（设置她的城市），12 → 13。
         # v3.1.44 多了 `/拟人 角色`（看各身份档案，issue #11 第 4 条），13 → 14。
         self.assertEqual(len(grouped), 14, f"管理指令数变了：{sorted(grouped)}")

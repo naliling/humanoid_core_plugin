@@ -334,6 +334,12 @@ class HumanoidConfig:
     repeat_dup_min_chars: int = 10
     repeat_dup_max_len_delta: int = 2
     repeat_place_only_tail_chars: int = 6
+    # 叙事心理层的四个剂量旋钮（v3.1.53）：以前硬编码在 psyche.py、不进配置，
+    # 用户想让「她多惦记、多开口」都改不了。现在面板可调，默认值保持原来的克制。
+    psyche_rumination_threshold: float = 0.55  # 心事浮上来的显著性门槛
+    psyche_inject_max_lines: int = 2           # 一次最多注入几句心理话
+    psyche_min_interval_seconds: float = 180.0  # 后台写心理记录的节流
+    psyche_daily_cap: int = 40                 # 每天最多写几条心理记录
     # 注入的 Token 硬预算：超了按显著度从低到高丢句，必需品（时间/称呼/场景）永不丢。
     inject_token_budget: int = 3500
     environment_mode: str = "both"
@@ -456,7 +462,7 @@ class HumanoidConfig:
     # 每条截多少字进分析（10 条加起来仍可控）
     mood_llm_message_chars: int = 300
     mood_enabled_in_group: bool = False
-    mood_data_retention_days: int = 7
+    mood_data_retention_days: int = 30
     # 整条用户记录的静默期（天）：只剩称呼/初遇时间这种「没有可清理内容」的条目，
     # 不活跃超过这么久就**整条删掉**。原来写死 90 天（`mood.STALE_USER_RETENTION_DAYS`，
     # 代码注释里就写着「配置项由主会话另行添加」）——一个 bot 攒到 7000+ 用户、
@@ -698,6 +704,10 @@ class HumanoidConfig:
             repeat_dup_min_chars=i("repeat_dup_min_chars", 4, 40),
             repeat_dup_max_len_delta=i("repeat_dup_max_len_delta", 0, 20),
             repeat_place_only_tail_chars=i("repeat_place_only_tail_chars", 0, 40),
+            psyche_rumination_threshold=f("psyche_rumination_threshold", 0.0, 1.0),
+            psyche_inject_max_lines=i("psyche_inject_max_lines", 1, 10),
+            psyche_min_interval_seconds=f("psyche_min_interval_seconds", 0.0, 86400.0),
+            psyche_daily_cap=i("psyche_daily_cap", 0, 1000),
             # 这一项曾经是 113 个字段里唯一不走 i()/f() 的（直接 int(src.get(...))），
             # 面板里填个 'abc' 或 '3000.0' 就会抛 ValueError 一路冒到 initialize()，
             # 插件加载失败，而坏值还躺在配置文件里 —— 每次重启再崩一次。

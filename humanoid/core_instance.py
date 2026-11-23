@@ -315,7 +315,8 @@ class HumanoidCoreInstance:
         # 整块 fail-open：心理层坏了不影响身体、日程、情绪与回复。
         try:
             psy_dir = self._state_store.path.parent
-            self.psyche_store = _psyche.PsycheStore(psy_dir, self.role_id)
+            self.psyche_store = _psyche.PsycheStore(psy_dir, self.role_id,
+                                                    config_provider=config_provider)
             def _psyche_persona_sync():
                 # 用缓存快照，不能在后台生成里 await；persona_source 还没起来就空串。
                 src = getattr(self, "persona_source", None)
@@ -1472,6 +1473,13 @@ class HumanoidCoreInstance:
             st = store.state(user_id)
             st.decay(self.now_epoch())
             lines = [f"〔她心里的账 · {self.char_name() or self.role_id}视角〕"]
+            _n = len(st.active_concerns())
+            _need, _val = st.top_need()
+            from .psyche import NEED_LABELS as _NL
+            lines.append("　" + (
+                f"她心里装着 {_n} 件事，最想要的是{_NL.get(_need, _need)}。"
+                if _n else "她这会儿心里挺安静，没惦记什么。"
+            ))
             concerns = st.active_concerns()
             if concerns:
                 lines.append("惦记的事：")
@@ -1500,6 +1508,91 @@ class HumanoidCoreInstance:
             return "\n".join(lines)
         except Exception as exc:
             return f"心理面板读取失败：{exc}"
+
+    @staticmethod
+    def _growth_hint(affection: float, energy: float = 50.0) -> str:
+        """把好感/精力翻成一句人话，给面板数值旁做解读（不进注入、不主动发）。"""
+        a = float(affection or 0.0)
+        e = float(energy or 50.0)
+        if a >= 80:
+            rel = "她几乎把你当自己人了"
+        elif a >= 60:
+            rel = "她挺在意你"
+        elif a >= 40:
+            rel = "她对你有点好感，还端着"
+        else:
+            rel = "她跟你还不熟"
+        if e < 35:
+            body = "不过最近有点累"
+        elif e > 75:
+            body = "精神头还不错"
+        else:
+            body = "状态平平"
+        return f"{rel}，{body}。"
+
+    def growth_panel(self, user_id: str) -> str:
+        """/成长：把后台已经记着的东西摆出来给人看（纯读，不建档、不注入、不主动发）。
+
+        真机里这些数据一直在跑，但用户看不见：认识天数、关系阶段、聊过多少轮、
+        好感、情绪事件、日程段数、心事数。这里只做汇总，不改任何状态。
+        没有档案的人给一句引导，不凭空建一条（读路径纪律）。
+        """
+        from . import state_snapshot as _snapshot
+        from .prompt_builder import PromptBuilder
+
+        lines = [f"〔成长档案 · {self.char_name() or self.role_id}〕"]
+        # 只读：没有 mood 条目就别 profile()（那会建档），直接引导。
+        mood_raw = None
+        try:
+            if user_id:
+                mood_raw = self.scope.peek_user(user_id, "mood", None)
+        except Exception:
+            mood_raw = None
+        if not isinstance(mood_raw, dict) or not mood_raw:
+            lines.append("还没有你们的档案——先聊起来，成长才会留下痕迹。")
+            return "\n".join(lines)
+
+        now = self.now_epoch()
+        # 关系阶段走唯一真源 state_snapshot（stage_of 只许它调用），天数也用它的
+        # 日历天口径——别自己拿秒差除，跨时区会差一天。
+        try:
+            _tz = self.clock.tz if getattr(self, "clock", None) else None
+        except Exception:
+            _tz = None
+        rel = _snapshot.relation_of(mood_raw, now, tz=_tz)
+        days = rel.days
+        from .prompt_builder import PromptBuilder
+        if rel.available and days > 0:
+            lines.append("认识：" + PromptBuilder._days_line(now - (mood_raw.get("first_met") or now)))
+        else:
+            lines.append("认识：刚认识")
+        lines.append(f"关系阶段：{rel.stage_name}")
+        lines.append(f"聊过：{rel.turns} 轮")
+        lines.append(f"好感度：{rel.affection:.1f}/100")
+        try:
+            logs = self.mood.logs(user_id, limit=0) or []
+            lines.append(f"情绪事件：记着 {len(logs)} 条")
+        except Exception:
+            pass
+        try:
+            segs = self.schedule.display_segments()
+            lines.append(f"日程：今天 {len(segs)} 段")
+        except Exception:
+            pass
+        try:
+            store = getattr(self, "psyche_store", None)
+            n = len(store.state(user_id).active_concerns()) if store else 0
+            lines.append(f"心事：惦记着 {n} 件")
+        except Exception:
+            pass
+        # 阶段跃迁轨迹：只在档案里记过才显示，没有就不编。
+        try:
+            hist = self.scope.peek_user(user_id, "stage_history", []) or []
+            if isinstance(hist, list) and hist:
+                lines.append("走过的关系：" + " → ".join(str(x) for x in hist[-6:]))
+        except Exception:
+            pass
+        return "\n".join(lines)
 
     def psyche_note_turn(self, user_id: str, *, user_text: str, her_reply: str) -> None:
         """一轮对话结束后，后台低频生成一条心理记录（不阻塞回复）。
@@ -2890,6 +2983,11 @@ class HumanoidCoreInstance:
             out.append("")
             out.append(f"关系 · {user_id}")
             out.append(row("好感度", f"{s['mood']['affection']:.1f}/100", str(s['mood']['label'])))
+            try:
+                _energy = float((s.get("energy") or {}).get("value", 50.0) or 50.0)
+                out.append("　" + self._growth_hint(float(s['mood']['affection']), _energy))
+            except Exception:
+                pass
             # 只读：`user_state()` 读就建条目，状态页是读路径（审核 F3）。
             mood_raw = self.scope.peek_user(user_id, "mood", None) or {}
             if mood_raw:

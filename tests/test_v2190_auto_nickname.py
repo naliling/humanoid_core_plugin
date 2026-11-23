@@ -21,7 +21,8 @@ from humanoid.services.mood import MoodService, validate_auto_nickname
 def make_service() -> tuple[MoodService, dict]:
     root: dict = {}
     scope = RoleScope(root, "default")
-    service = MoodService(scope, lambda: HumanoidConfig(), time_source=lambda: 1_000_000.0)
+    service = MoodService(scope, lambda: HumanoidConfig.from_raw(
+        {"mood_data_retention_days": 7}), time_source=lambda: 1_000_000.0)
     return service, root
 
 

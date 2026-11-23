@@ -145,7 +145,8 @@ def make_mood():
     marks: list[int] = []
     scope.set_mark_dirty(lambda: marks.append(1))
     clock = _MutableTime()
-    service = MoodService(scope, lambda: HumanoidConfig(), time_source=clock)
+    service = MoodService(scope, lambda: HumanoidConfig.from_raw(
+        {"mood_data_retention_days": 7}), time_source=clock)
     return service, root, scope, clock, marks
 
 

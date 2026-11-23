@@ -46,7 +46,8 @@ class _Clock:
 
 def _svc(start=datetime(2026, 8, 22, 9, 0, tzinfo=TZ), **over):
     conf = HumanoidConfig.from_raw(
-        {"timezone_city": "北京", "mood_use_llm_for_delta": False, **over}
+        {"timezone_city": "北京", "mood_use_llm_for_delta": False,
+         "mood_data_retention_days": 7, **over}
     )
     store = ScopeStore(Path(tempfile.mkdtemp()) / "s.json")
     store.load("2026-08-22", conf.cycle_length)
