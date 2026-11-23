@@ -333,6 +333,60 @@ def estimate_tokens(text: str) -> int:
 # 情绪标签逆映射已删（v2.16.7）：「态度亲昵」「带有敌意」这类括号注释是在教她用什么
 # 语气开口，属于限制发言。现在只给标签本身（如「亲密」），怎么说出来由她自己定。
 
+# ── v3.1.52：注入源去重——在「塞进提示词之前」识别她刚说过什么 ──────────────
+# 病根：以前只在出站拦复读（而且上一版刚把那道闸放松了），注入源却每轮把同一句
+# 天气/体感/感官再塞一遍——感官抽签种子含「今天+时段」，同一天同一时段每轮命中同一句
+# （真机「鼻尖冻得发麻」一天冒三次）。源头不治，模型被同一句喂三次，当然张口就是复读。
+# 统一口径：拿她最近说过的 spoken（core.mood.spoke）归一化后比对；够长的相等/包含
+# 就算「刚说过」，注入源据此换一句或整条不给。只读 spoke，不建档案、不写盘。
+_SPOKE_WINDOW = 5
+_ALREADY_SAID_MIN_CHARS = 5
+_SPOKE_NORM_RE = re.compile(r"[\s，,。！？!?；;…、~～\"'“”‘’（）()]+")
+
+
+def _norm_spoken(text: str) -> str:
+    s = str(text or "")
+    # ℃/°C/° 统一成「度」：「小雨 9℃」和她嘴里的「小雨9度」是同一句天气。
+    s = re.sub(r"℃|°C|°", "度", s)
+    s = _SPOKE_NORM_RE.sub("", s)
+    # 句首主语「她/我」是渲染时加的，不是内容差异：「她鼻尖冻得发麻」和
+    # 她真说出口的「鼻尖冻得发麻」应判成同一句，别被一个字骗过去。
+    if s[:1] in ("她", "我"):
+        s = s[1:]
+    return s
+
+
+def _recent_spoken(core: Any, user_id: str) -> List[str]:
+    """她最近说过的原话（归一化、够长）。取不到账本就当没说过（fail-open）。"""
+    try:
+        rows = core.mood.spoke(user_id) or []
+    except Exception:
+        return []
+    out: List[str] = []
+    for row in rows[-_SPOKE_WINDOW:]:
+        if isinstance(row, dict):
+            norm = _norm_spoken(row.get("text", ""))
+        else:
+            norm = _norm_spoken(row)
+        if len(norm) >= _ALREADY_SAID_MIN_CHARS:
+            out.append(norm)
+    return out
+
+
+def _already_said(candidate: str, spoken: Sequence[str]) -> bool:
+    """这句是不是她最近刚说过（相等或够长的互相包含）。"""
+    norm = _norm_spoken(candidate)
+    if len(norm) < _ALREADY_SAID_MIN_CHARS:
+        return False
+    for old in spoken:
+        if norm == old:
+            return True
+        # 互相包含要两边都够长，避免「我在睡」吃掉「我在睡懒觉」。
+        if len(old) >= _ALREADY_SAID_MIN_CHARS and (norm in old or old in norm):
+            return True
+    return False
+
+
 # 低注入档下最多给几条体感：真人多数时候不觉得自己在报备身体。
 MAX_FEELINGS_LOW = 2
 MAX_FEELINGS_FULL = 5
@@ -528,7 +582,8 @@ class PromptBuilder:
                 (self._ccb_presence_line(user_id, is_group), 9.5, _meta("ccb_presence")),
                 (
                     self._sentence(
-                        self._feelings_lines(max_items=1, threshold=0.7, text=text)
+                        self._feelings_lines(max_items=1, threshold=0.7, text=text,
+                                             user_id=user_id)
                     ),
                     7.0,
                     _meta("feelings"),
@@ -578,13 +633,14 @@ class PromptBuilder:
 
     def _feelings_lines(
         self, max_items: int, threshold: float, *, include_sleep: bool = True,
-        text: str = "",
+        text: str = "", user_id: str = "",
     ) -> List[str]:
         """按显著度挑体感。低于门槛的一律不注入。
 
         `include_sleep=False` 表示这段睡眠已经由 `_sleep_state_lines()` 更细的句子
         承载了，体感里那条「她这会儿在睡」不该再说一遍（P-15：判据是调用方给的
         结构化事实，不是正文里有没有那三个字）。
+        v3.1.52：`user_id` 给了就过滤掉她最近刚说过的体感——源头别再喂同一句。
         """
         core = self._core
         if not self.config.soma_enabled:
@@ -621,9 +677,14 @@ class PromptBuilder:
             )
         picked.sort(key=lambda item: item[0], reverse=True)
         # 体感句一律披上主语，但 soma 自己带主语的整句不能再披一遍。
-        return [
-            text if text.startswith("她") else f"她{text}" for _, text in picked[:max_items]
+        lines = [
+            body if body.startswith("她") else f"她{body}" for _, body in picked
         ]
+        # v3.1.52：源头去重——她最近说过的体感不再塞一遍（说过了就换下一条）。
+        if user_id:
+            spoken = _recent_spoken(core, user_id)
+            lines = [line for line in lines if not _already_said(line, spoken)]
+        return lines[:max_items]
 
     def _drop_sleep_feeling(
         self, picked: List[tuple[float, str]], *, hide_sleep_anyway: bool = False
@@ -760,6 +821,7 @@ class PromptBuilder:
         body: Dict[str, Any],
         style: str,
         seed: List[Any],
+        user_id: str = "",
     ) -> str:
         """一句**只能影响语气**的感官细节，每轮最多一条。
 
@@ -803,6 +865,18 @@ class PromptBuilder:
         options.extend(_sensory_style_lines(style, body_kind))
         if not options:
             return ""
+        # v3.1.52：源头去重——抽签种子含「今天+时段」，同一天同一时段本来每轮抽到同一句
+        # （真机「鼻尖冻得发麻」一天冒三次）。先把她最近说过的从候选里剔掉，再从剩下的
+        # 抽；全都说过就整条不给（安静好过复读）。
+        if user_id:
+            try:
+                spoken = _recent_spoken(self._core, user_id)
+                fresh = [opt for opt in options if not _already_said(str(opt), spoken)]
+                if fresh:
+                    options = fresh
+                # 全部说说过：保持原 options 但把抽签结果在下面挡掉（见 return 前）。
+            except Exception:
+                pass
         line = str(
             pick(
                 "sensory_line",
@@ -816,6 +890,13 @@ class PromptBuilder:
         if line and kind and _species_issues(line, kind):
             clean = [item for item in options if not _species_issues(str(item), kind)]
             return str(clean[0]) if clean else ""
+        # v3.1.52：候选全被「刚说过」占满时不给——宁可少一条感官句，不喂复读素材。
+        if user_id and line:
+            try:
+                if _already_said(line, _recent_spoken(self._core, user_id)):
+                    return ""
+            except Exception:
+                pass
         return line
 
     def _ongoing_hint_line(self, busy: bool = False) -> str:
@@ -1801,7 +1882,17 @@ class PromptBuilder:
         # （线上原话 `多云，hanhandouya那边呢？`、`外头阴沉7度，有点冷呢`）。
         # 判据与契约、证据卡、日程提示词共用 `weather.notable_weather`。
         if temp and _notable_weather(temp) and self._weather_worth_saying(temp, key=key, city=city):
-            lines.append(f"外头{temp}")
+            weather_line = f"外头{temp}"
+            # v3.1.52：源头去重——天气门只看「指纹变没变 + 隔了多久」、还是纯内存（重启
+            # 就忘），不管她刚没刚说过。她最近说过的天气不再塞一遍，别再喂复读素材。
+            # key 在 main._state_note 里就是 user_id；取不到 spoke 就 fail-open 照常给。
+            try:
+                if key and _already_said(weather_line, _recent_spoken(self._core, key)):
+                    weather_line = ""
+            except Exception:
+                pass
+            if weather_line:
+                lines.append(weather_line)
         return lines
 
     def _weather_worth_saying(self, text: str, key: str = "", city: str = "") -> bool:
@@ -2198,7 +2289,8 @@ class PromptBuilder:
             # 体感里那句「这会儿在睡」在取的时候就排除，不再事后按文案从正文里删。
             body = self._sentence(
                 self._feelings_lines(
-                    MAX_FEELINGS_LOW, 0.0, include_sleep=not sleep_state, text=text
+                    MAX_FEELINGS_LOW, 0.0, include_sleep=not sleep_state, text=text,
+                    user_id=user_id
                 )
             )
             if body:
@@ -2214,7 +2306,8 @@ class PromptBuilder:
         # 与原来 _sentence 拼出来的形状一致。睡眠相关两句带 when 标签，
         # 关掉睡眠时段开关时由 select 统一丢，不再各处写守卫（P-03）。
         feelings = self._sentence(
-            self._feelings_lines(MAX_FEELINGS_LOW, FEELING_THRESHOLD_LOW, text=text)
+            self._feelings_lines(MAX_FEELINGS_LOW, FEELING_THRESHOLD_LOW, text=text,
+                                 user_id=user_id)
         )
         if feelings:
             sents.append((feelings, 8.0, _meta("feelings")))
@@ -2231,6 +2324,7 @@ class PromptBuilder:
             (snap.get("soma") or {}),
             self._outfit_text(),
             self._seed(user_id),
+            user_id=user_id,
         )
         if sensory:
             sents.append((sensory, 5.5, _meta("sensory")))
@@ -2310,7 +2404,8 @@ class PromptBuilder:
             # 与 medium 档同一口径：睡眠状态句在时，体感里的睡眠条目不再重复。
             body = self._sentence(
                 self._feelings_lines(
-                    MAX_FEELINGS_FULL, 0.0, include_sleep=not sleep_state, text=text
+                    MAX_FEELINGS_FULL, 0.0, include_sleep=not sleep_state, text=text,
+                    user_id=user_id
                 )
             )
             if body:
@@ -2325,7 +2420,8 @@ class PromptBuilder:
         if state:
             sents.append((self._sentence(state), 4.0, _meta("state")))
         # 与 medium 档同一结构：身体一块同组、睡眠两句带 when 标签（P-03）。
-        feelings = self._sentence(self._feelings_lines(MAX_FEELINGS_FULL, 0.0, text=text))
+        feelings = self._sentence(self._feelings_lines(MAX_FEELINGS_FULL, 0.0, text=text,
+                                                      user_id=user_id))
         if feelings:
             sents.append((feelings, 8.0, _meta("feelings")))
         # 与 medium 档同一句（v3.1.9）：周期只给感觉，与一条倾向合成一句。
@@ -2338,6 +2434,7 @@ class PromptBuilder:
             (snap.get("soma") or {}),
             self._outfit_text(),
             self._seed(user_id),
+            user_id=user_id,
         )
         if sensory:
             sents.append((sensory, 5.5, _meta("sensory")))
