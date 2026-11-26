@@ -308,8 +308,8 @@ class InterruptNowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.source, SOURCE_LLM)
         self.assertEqual(service.current_activity()["name"], "下楼取快递")
         segs = service.segments()
-        self.assertEqual(segs[-1]["start"], "09:15", "新的一段从现在就接上")
-        self.assertEqual(segs[0]["end"], "09:15", "原来那件事被截断到新段起点")
+        self.assertEqual(segs[-1]["start"], "09:20", "活动段从实际中断时刻开始")
+        self.assertEqual(segs[0]["end"], "09:20", "原活动段截断到实际中断时刻")
         self.assertEqual(service.suspended_info()["event"], "改海报")
 
     async def test_interrupt_returns_false_when_a_generation_is_already_running(self):
@@ -651,8 +651,8 @@ class ResumeFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("被打断之前她在做", prompt, "下一次生成要把挂起的事递给模型")
         segs = service.segments()
         self.assertEqual(segs[-1]["event"], "整理个案笔记", "resume=true 用被挂起的事重建")
-        self.assertEqual(segs[-1]["start"], "09:15")
-        self.assertEqual(segs[-1]["end"], "10:15")
+        self.assertEqual(segs[-1]["start"], "09:20")
+        self.assertEqual(segs[-1]["end"], "10:20")
         self.assertEqual(segs[-1]["ongoing"], "还差 4 份")
         self.assertEqual(service.suspended_info(), {}, "resume 成功后挂起要清空")
         self.assertIsNone(store.get("schedule_suspended"))

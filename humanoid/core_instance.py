@@ -1073,6 +1073,7 @@ class HumanoidCoreInstance:
         # (B + D）：场景内的姿势/位置感知与强制收场。
         # 只在私聊——群里没有场景（`evaluate` 的 is_group 是硬闸）。
         if not is_command and not is_group and self._ccb_gate_ok(user_id):
+            self._ccb_consent_user_turn(user_id, text, now)
             self._ccb_end_if_stale(user_id, now)
             self._ccb_note_intimacy(user_id, text, now)
             self._ccb_note_scene_text(user_id, text, now, source="user")
@@ -1746,7 +1747,7 @@ class HumanoidCoreInstance:
         # 新算出来的 event 键**永远写不进去**（其它键都没变 → 直接 return previous）。
         # 社交层于是永远拿不到「她刚经历了什么」，而且不报错。
         keys = (
-            "body", "feelings", "form", "activity",
+            "body", "feelings", "activity",
             "ongoing", "wants", "day", "persona", "routine", "weather", "holiday",
             "event",
             # `wake` 与 `event` 同一个道理：醒来状态（睡着没有 / 惯性还剩几分钟）
@@ -1889,6 +1890,52 @@ class HumanoidCoreInstance:
             if self._log:
                 self._log.debug(f"{LOG_PREFIX} 记录她主动发的话失败: {exc}")
 
+    def _ccb_finish_consent(self, user_id: str, state: Dict[str, Any], now: float, *, refused: bool = False) -> None:
+        """End a consent proposal or active scene without touching ordinary reply text."""
+        if refused:
+            state["ccb_refused_at"] = float(now)
+            state["ccb_pout_until"] = max(float(state.get("ccb_pout_until", 0.0) or 0.0), float(now) + _ccb.CCB_POUT_SECONDS)
+        _ccb.reset_scene(state)
+        _ccb.clear_consent(state)
+        state["ccb_aftercare_until"] = max(float(state.get("ccb_aftercare_until", 0.0) or 0.0), float(now) + _ccb.CCB_CONTINUE_TIMEOUT_SECONDS)
+        self._scope.mark_dirty()
+
+    def _ccb_consent_user_turn(self, user_id: str, text: str, now: float) -> None:
+        """Consume only the current user's consent response for a private CCB flow."""
+        try:
+            state = self._scope.user_state(user_id)
+            current = _ccb.consent_state(state)
+            if current == _ccb.CONSENT_CANDIDATE:
+                _ccb.clear_consent(state)
+                self._scope.mark_dirty()
+                return
+            if current in (_ccb.CONSENT_PROPOSED, _ccb.CONSENT_CONTINUE_PENDING):
+                timeout = _ccb.CCB_CONTINUE_TIMEOUT_SECONDS if current == _ccb.CONSENT_CONTINUE_PENDING else _ccb.CCB_CONSENT_TIMEOUT_SECONDS
+                if not _ccb._recent_stamp(state.get("ccb_consent_at"), now, timeout):
+                    self._ccb_finish_consent(user_id, state, now)
+                elif _ccb.detect_refusal_hard(text):
+                    self._ccb_finish_consent(user_id, state, now, refused=True)
+                elif _ccb.detect_consent(text):
+                    if _ccb.accept_consent(state, now):
+                        self._scope.mark_dirty()
+                else:
+                    self._ccb_finish_consent(user_id, state, now)
+                return
+            stage = float(state.get("ccb_stage", 0.0) or 0.0)
+            if stage > 0.0 and current != _ccb.CONSENT_ACTIVE:
+                self._ccb_finish_consent(user_id, state, now)
+                return
+            if current == _ccb.CONSENT_ACTIVE:
+                if _ccb.detect_refusal_hard(text):
+                    self._ccb_finish_consent(user_id, state, now, refused=True)
+                elif _ccb.detect_intimacy(text) or _ccb.detect_consent(text):
+                    state["ccb_activity_at"] = float(now)
+                    self._scope.mark_dirty()
+                else:
+                    self._ccb_finish_consent(user_id, state, now)
+        except Exception:
+            return
+
     def note_her_words(
         self, user_id: str, text: str, *, is_group: bool = False,
         now: float | None = None,
@@ -1948,12 +1995,24 @@ class HumanoidCoreInstance:
             state = self._scope.user_state(user_id)
             # 
             # 放在拒绝判定之前：判姿势与拒绝互不影响，先记下来更省事。
-            self._ccb_note_intimacy(user_id, body, moment)
             self._ccb_note_scene_text(user_id, body, moment, source="her")
+            consent = _ccb.consent_state(state)
+            if float(state.get("ccb_stage", 0.0) or 0.0) > 0 and consent != _ccb.CONSENT_ACTIVE:
+                self._ccb_finish_consent(user_id, state, moment)
+                return
             if _ccb.detect_refusal_hard(body):
-                state["ccb_refused_at"] = moment
-                _ccb.reset_scene(state)
+                if consent in (_ccb.CONSENT_CANDIDATE, _ccb.CONSENT_PROPOSED, _ccb.CONSENT_ACTIVE, _ccb.CONSENT_CONTINUE_PENDING) or float(state.get("ccb_stage", 0.0) or 0.0) > 0:
+                    self._ccb_finish_consent(user_id, state, moment, refused=True)
+                return
+            if consent == _ccb.CONSENT_CANDIDATE and _ccb.detect_consent_proposal(body):
+                _ccb.mark_consent_proposal(state, moment)
                 self._scope.mark_dirty()
+                return
+            if (consent == _ccb.CONSENT_ACTIVE or float(state.get("ccb_stage", 0.0) or 0.0) > 0) and _ccb.detect_consent_proposal(body):
+                _ccb.request_continuation(state, moment)
+                self._scope.mark_dirty()
+                return
+            if consent in (_ccb.CONSENT_PROPOSED, _ccb.CONSENT_CONTINUE_PENDING):
                 return
             if float(state.get("ccb_stage", 0.0) or 0.0) <= 0:
                 return
@@ -2564,8 +2623,11 @@ class HumanoidCoreInstance:
                 return
             cfg = self.config
             state = self._scope.user_state(user_id)
-            if float(state.get("ccb_stage", 0.0) or 0.0) <= 0:
+            if float(state.get("ccb_stage", 0.0) or 0.0) <= 0 or _ccb.consent_state(state) != _ccb.CONSENT_ACTIVE:
                 return
+            if _ccb.detect_discomfort(text):
+                _ccb.mark_feedback_discomfort(state, now)
+                self._scope.mark_dirty()
             debug = bool(getattr(cfg, "ccb_scene_log_debug", False))
             pose, pose_word = _ccb.detect_pose_detail(text)
             site, site_word = _ccb.detect_site_detail(text)
@@ -2625,10 +2687,17 @@ class HumanoidCoreInstance:
         """
         try:
             state = self._scope.user_state(user_id)
+            consent = _ccb.consent_state(state)
+            if consent in (_ccb.CONSENT_PROPOSED, _ccb.CONSENT_CONTINUE_PENDING):
+                timeout = _ccb.CCB_CONTINUE_TIMEOUT_SECONDS if consent == _ccb.CONSENT_CONTINUE_PENDING else _ccb.CCB_CONSENT_TIMEOUT_SECONDS
+                if not _ccb._recent_stamp(state.get("ccb_consent_at"), now, timeout):
+                    _ccb.clear_consent(state)
+                    self._scope.mark_dirty()
+                return
             if float(state.get("ccb_stage", 0.0) or 0.0) <= 0:
                 return
-            idle = _ccb.scene_idle_expired(
-                last_at=float(state.get("ccb_last_at", 0.0) or 0.0), now=now
+            idle = _ccb.scene_gap_expired(
+                last_at=float(state.get("ccb_activity_at", 0.0) or 0.0) or float(state.get("ccb_last_at", 0.0) or 0.0), now=now
             )
             drained = False
             try:
@@ -2637,6 +2706,8 @@ class HumanoidCoreInstance:
                 drained = False
             if idle or drained:
                 _ccb.reset_scene(state)
+                _ccb.clear_consent(state)
+                state["ccb_aftercare_until"] = max(float(state.get("ccb_aftercare_until", 0.0) or 0.0), float(now) + _ccb.CCB_CONTINUE_TIMEOUT_SECONDS)
                 self._scope.mark_dirty()
         except Exception:
             pass
@@ -2817,9 +2888,6 @@ class HumanoidCoreInstance:
         }
         if self.config.soma_enabled:
             result["soma"] = self.soma.snapshot()
-            result["form_policy"] = self.soma.form_policy(
-                float(self.energy.energy), float(self.social.value)
-            )
         # 她手上这件事（过程服务的产物）：只读，没有过程时给空 dict，不凭空生成。
         try:
             process = self.process_state()

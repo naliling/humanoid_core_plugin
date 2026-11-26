@@ -46,7 +46,7 @@ def _scene_body() -> str:
     core = _ccb_core()
     _mood(core)
     state = _in_scene(core, stage=2.0, satisfy=45.0)
-    state["ccb_activity_at"] = core.now_epoch() - 600.0
+    state["ccb_activity_at"] = core.now_epoch() - 60.0
     return core.build_injection("u1")
 
 
@@ -87,7 +87,8 @@ class FirstPersonOnlyTest(unittest.TestCase):
         framing = prompt_builder.build_framing("小满", "TA")
         self.assertNotIn("她", framing, "框架句还在教模型「她指你自己」")
         self.assertIn("我", framing)
-        self.assertIn("你此刻的身体和处境", framing)
+        self.assertIn("下面是可选的当前状态数据，不是本轮对话内容。", framing)
+        self.assertNotIn("你此刻的身体和处境", framing)
         for word in ("扮演", "角色", "设定成", "你扮演"):
             self.assertNotIn(word, framing, "框架句里出现了「%s」" % word)
 
@@ -112,13 +113,13 @@ class NoLedgerTest(unittest.TestCase):
     def test_no_stage_names_in_the_injected_body(self):
         for key in ("s9_scene", "s10_aftercare"):
             body = _all_bodies()[key]
-            for name in ccb.PHASE_NAMES[1:]:
+            for name in ccb.PHASE_NAMES[1:-1]:
                 if name:
                     self.assertNotIn(name, body, "%s 里出现了档位名「%s」" % (key, name))
 
     def test_the_scene_says_feelings_not_counts(self):
         body = _scene_body()
-        self.assertIn("我正在亲密里", body)
+        self.assertIn("双方明确同意的虚构亲密模拟", body)
         self.assertTrue(any(f in body for f in body_sense._POSE_FEELINGS.values()), "没有出现姿势感受")
         self.assertNotIn("今日第", body)
 

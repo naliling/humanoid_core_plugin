@@ -36,14 +36,14 @@ from .services.schedule import (
 
 #: v3.0.3 起为 3：`body` 里的身体轴数值可以是 `null`（`available:false` 表示「这一项
 #: 没在跑/不知道」，而不是「不困、不饿、醒着」）。数值域新增 null 对按算术读的下游是
-#: **破坏性**变更，所以必须抬版本——社交层看到 v<3 就还按「数字都是真的」读。
-CONTRACT_VERSION = 3
-#: 结构标识。**现状要说实**：截至 autonomous_social v1.28.17，社交层并不校验它、也不读
-#: `fields_hash`（它的 core_bridge.py 自认没有校验方）——这三键目前是 Core 侧导出的死数据，
-#: 保留是为了「只加不改」：以后对方接上校验时不必再动 Core。
-CONTRACT_SCHEMA = "humanoid.contract/3"
+#: **破坏性**变更，所以当时抬到了 3；社交层看到 v<3 就还按「数字都是真的」读。v4 再移除发言约束块 form。
+CONTRACT_VERSION = 4
+#: 结构标识必须与 v 一致；ASO 的 core_bridge.py 会校验 schema / capabilities / fields_hash。
+#: v4 移除 form 表达约束块，避免 Core 向 ASO 传递长度、问句倾向和连发限制。
+#: 删除契约字段会破坏兼容性，所以 v 与 schema 均升到 4。
+CONTRACT_SCHEMA = "humanoid.contract/4"
 #: 这一版契约提供的能力。社交层按能力判断走哪条路，不靠版本号猜。
-#: 只加不改：`dreams`（她昨晚做的梦）与 `wake`（醒来状态/睡眠惯性）是 v2.28.0 新增的；
+#: 演进历史：`dreams`（她昨晚做的梦）与 `wake`（醒来状态/睡眠惯性）由 v2.28.0 新增；
 #: `event`（刚刚发生的事够重）**v2.28.5 起就有**（旧注释误写成 v2.29.0——那是个从未发布
 #: 过的版本号，联动 P2-28），3.0.0 起继续提供只读能力。API_VERSION 保持 2。
 #: v2.28.9 再补 `identity`（她是谁：参照名/人设标签）与 `outfit`（她此刻穿着）——
@@ -54,7 +54,7 @@ CONTRACT_SCHEMA = "humanoid.contract/3"
 #: 读法，没有自己的块。要判「对面懂不懂三态」，看 `v >= 3` 或 `schema` 结尾的版本号；
 #: 旧契约里数字恒为真值，不能把 null 当 0。
 CONTRACT_CAPABILITIES = (
-    "body", "feelings", "form", "activity", "day", "ongoing", "routine",
+    "body", "feelings", "activity", "day", "ongoing", "routine",
     "dreams", "wake", "event", "identity", "outfit",
 )
 
@@ -155,7 +155,6 @@ def build_contract(core: Any) -> dict[str, Any]:
     now = core.clock.now()
     snap = core.snapshot(refresh=False)
     soma = snap.get("soma") or {}
-    form = snap.get("form_policy") or {}
     slot = core.schedule.current_slot() or {}
     slots = core.schedule.current_slots()
     now_minutes = now.hour * 60 + now.minute
@@ -224,12 +223,6 @@ def build_contract(core: Any) -> dict[str, Any]:
         },
         "body": _body_block(core, cfg, snap, soma),
         "feelings": feelings,
-        "form": {
-            "max_chars": int(form.get("max_chars", 120)),
-            "question_bias": float(form.get("question_bias", 0.35)),
-            "long_reply_ok": bool(form.get("long_reply_ok", True)),
-            "burst_ok": bool(form.get("burst_ok", False)),
-        },
         "activity": {
             "name": str(slot.get("event", "")),
             "schedule_event": str(slot.get("event", "")),

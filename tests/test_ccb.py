@@ -203,9 +203,18 @@ class EndToEnd(unittest.TestCase):
         m = re.search(r"内心：([^，。\n]*)", core.build_injection("u1", is_group=is_group))
         return m.group(1) if m else ""
 
+    def _accept_candidate(self, core):
+        state = core._scope.user_state("u1")
+        now = core.now_epoch()
+        ccb.mark_consent_candidate(state, now, score=0.8, stage=2, line="想让你抱着我")
+        state["ccb_candidate_at"] = now
+        ccb.mark_consent_proposal(state, now)
+        self.assertTrue(ccb.accept_consent(state, now))
+
     def test_injection_carries_it_when_on(self):
         core = self._core(True)
         self._mood(core)
+        self._accept_candidate(core)
         self.assertIn("想让你抱着我", self._line(core))
 
     def test_injection_silent_when_off(self):
@@ -248,6 +257,7 @@ class EndToEnd(unittest.TestCase):
     def test_state_written_and_cleared(self):
         core = self._core(True)
         self._mood(core)
+        self._accept_candidate(core)
         self._line(core)
         us = core._scope.user_state("u1")
         self.assertEqual(us.get("ccb_stage"), 2.0)
@@ -265,8 +275,9 @@ class EndToEnd(unittest.TestCase):
         """
         core = self._core(True)
         self._mood(core)
+        self._accept_candidate(core)
         us = core._scope.user_state("u1")
-        # 第一次：条件全中 → 进场景。进场景只记「今天第 1 场」，不是「发生过」。
+        # 第一次：条件全中并已接受 → 进场景。进场景只记「今天第 1 场」，不是「发生过」。
         self._line(core)
         self.assertEqual(us.get("ccb_turns"), 1.0, "进一场 = 当日 1 次")
         self.assertEqual(us.get("ccb_done_count", 0.0), 0.0, "推进场景不是发生")
@@ -679,4 +690,104 @@ class RefusalIsNotSwallowedByAJoke(unittest.TestCase):
         # 对照：真的在开玩笑时仍按「没拒绝」结算（非第一次且已到基线 → +2+3）。
         joke = ccb.occurrence_effects(state, profile, refused=ccb.detect_refusal("不要，逗你玩的"))
         self.assertEqual(joke["affection"], 55.0)
+
+
+class ConsentLifecycleAndFeedbackTest(unittest.TestCase):
+    def test_only_unqualified_current_affirmatives_are_consent(self):
+        self.assertTrue(ccb.detect_consent("好。"))
+        self.assertTrue(ccb.detect_consent("我愿意！"))
+        self.assertFalse(ccb.detect_consent("好，但是等一下"))
+        self.assertFalse(ccb.detect_consent("不知道"))
+        self.assertFalse(ccb.detect_consent("不要"))
+        self.assertTrue(ccb.detect_consent_proposal("要不要继续"))
+        self.assertTrue(ccb.detect_consent_proposal("你愿意和我继续吗？"))
+        self.assertFalse(ccb.detect_consent_proposal("我愿意和你继续"))
+
+    def test_acceptance_activates_only_a_pending_recent_proposal(self):
+        state = {"ccb_consent_state": ccb.CONSENT_PROPOSED, "ccb_consent_at": 100.0}
+        self.assertTrue(ccb.accept_consent(state, 110.0))
+        self.assertEqual(ccb.consent_state(state), ccb.CONSENT_ACTIVE)
+        self.assertEqual(state.get("ccb_stage", 0.0), 0.0)
+        self.assertFalse(ccb.accept_consent({"ccb_consent_state": ccb.CONSENT_NONE}, 110.0))
+
+    def test_clear_consent_discards_cached_candidate(self):
+        state = {"ccb_consent_state": ccb.CONSENT_CANDIDATE, "ccb_candidate_at": 10.0,
+                 "ccb_consent_score": 0.9, "ccb_consent_stage": 2.0, "ccb_consent_line": "cached"}
+        ccb.clear_consent(state)
+        self.assertEqual(ccb.consent_state(state), ccb.CONSENT_NONE)
+        self.assertEqual(state["ccb_candidate_at"], 0.0)
+        self.assertEqual(state["ccb_consent_score"], 0.0)
+        self.assertNotIn("ccb_consent_line", state)
+
+    def test_feedback_is_internal_active_only_and_discomfort_is_bounded(self):
+        profile = {"libido": 40.0, "aggression": 10.0}
+        inactive = {"ccb_stage": 1.0, "ccb_satisfy": 40.0}
+        self.assertEqual(ccb.feedback_effects(inactive, profile, 1000.0), {})
+        active = {"ccb_consent_state": ccb.CONSENT_ACTIVE, "ccb_stage": 1.0,
+                  "ccb_satisfy": 40.0, "ccb_discomfort_at": 950.0}
+        effects = ccb.feedback_effects(active, profile, 1000.0)
+        self.assertEqual(effects["libido"], 39.25)
+        self.assertEqual(effects["aggression"], 11.0)
+        self.assertTrue(ccb.detect_discomfort("疼，轻一点"))
+        self.assertFalse(ccb.detect_discomfort("今天有点累"))
+
+
+class ConsentIntegrationIsolationTest(unittest.TestCase):
+    def setUp(self):
+        self.fixture = EndToEnd()
+
+    def test_numeric_candidate_never_enters_without_a_sent_proposal_and_yes(self):
+        core = self.fixture._core(True)
+        self.fixture._mood(core)
+        self.fixture._line(core)
+        state = core._scope.user_state("u1")
+        self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 0.0)
+        self.assertEqual(ccb.consent_state(state), ccb.CONSENT_CANDIDATE)
+
+    def test_explicit_yes_after_proposal_activates_cached_candidate(self):
+        core = self.fixture._core(True)
+        state = core._scope.user_state("u1")
+        now = core.now_epoch()
+        ccb.mark_consent_candidate(state, now, score=0.8, stage=2, line="想靠近")
+        state["ccb_candidate_at"] = now
+        ccb.mark_consent_proposal(state, now)
+        core._ccb_consent_user_turn("u1", "好。", now + 1)
+        self.assertEqual(ccb.consent_state(state), ccb.CONSENT_ACTIVE)
+        self.fixture._mood(core)
+        core.build_injection("u1")
+        self.assertGreater(float(state.get("ccb_stage", 0.0) or 0.0), 0.0)
+
+    def test_ambiguity_and_topic_change_end_without_pout_penalty(self):
+        for response in ("不知道", "你今天吃饭了吗"):
+            core = self.fixture._core(True)
+            state = core._scope.user_state("u1")
+            now = core.now_epoch()
+            ccb.mark_consent_candidate(state, now, score=0.8, stage=1, line="想靠近")
+            ccb.mark_consent_proposal(state, now)
+            core._ccb_consent_user_turn("u1", response, now + 1)
+            self.assertEqual(ccb.consent_state(state), ccb.CONSENT_NONE)
+            self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 0.0)
+            self.assertEqual(float(state.get("ccb_pout_until", 0.0) or 0.0), 0.0)
+
+    def test_continuation_requires_a_fresh_yes(self):
+        core = self.fixture._core(True)
+        state = core._scope.user_state("u1")
+        now = core.now_epoch()
+        state.update({"ccb_consent_state": ccb.CONSENT_ACTIVE, "ccb_stage": 2.0})
+        ccb.request_continuation(state, now)
+        self.assertEqual(ccb.consent_state(state), ccb.CONSENT_CONTINUE_PENDING)
+        core._ccb_consent_user_turn("u1", "嗯。", now + 1)
+        self.assertEqual(ccb.consent_state(state), ccb.CONSENT_ACTIVE)
+        self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 0.0)
+
+    def test_legacy_stage_is_cleared_and_bot_text_does_not_create_refusal(self):
+        core = self.fixture._core(True)
+        state = core._scope.user_state("u1")
+        state["ccb_stage"] = 2.0
+        core._ccb_consent_user_turn("u1", "继续", core.now_epoch())
+        self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 0.0)
+        self.assertEqual(ccb.consent_state(state), ccb.CONSENT_NONE)
+        self.fixture._mood(core)
+        core.note_her_words("u1", "不要", now=core.now_epoch())
+        self.assertEqual(float(state.get("ccb_refused_at", 0.0) or 0.0), 0.0)
 

@@ -55,7 +55,7 @@ from .humanoid.clock import Clock
 from .humanoid.input_state import InputStateNotifier
 from .humanoid.sibling_chat import SiblingChatGuard
 from .humanoid import memory_link
-from .humanoid import reply_guard
+from .humanoid.text_utils import is_placeholder
 
 DATA_SUBDIR = ("plugin_data", "humanoid_core")
 
@@ -1237,6 +1237,19 @@ def _self_state_line(core: Any) -> str:
     return "她自己的情况：" + "；".join(parts)
 
 
+def _relation_stage_guidance(stage_id: Any) -> str:
+    guidance = {
+        0: "若眼下有自然共同话题，可以从当下话题慢慢熟悉；不必追问或分享私事。",
+        1: "共同兴趣自然出现时，可以多分享一点真实偏好；不必刻意找话题。",
+        2: "可在合适时接续共同话题或更直接表达想法；是否主动由此刻心意决定。",
+        3: "可以坦率分享在意或真实想法；不要求固定问候，也不推定亲密同意。",
+    }
+    try:
+        return guidance.get(int(stage_id), "")
+    except (TypeError, ValueError):
+        return ""
+
+
 def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "",
                 is_group: bool = False, said: str = "") -> str:
     """I1/I2：算「此刻的她」那一段（关系阶段 + 心境 + 手头未完的事 + 外界 + 穿搭）。
@@ -1263,6 +1276,7 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
             )
         except Exception:
             readable = False
+        stage_id = None
         stage = tone = style = ""
         if readable:
             # 关系阶段走 state_snapshot 的唯一一份（好感 + 相处时长），门面 / 情绪 /
@@ -1274,9 +1288,16 @@ def _state_note(core: Any, user_id: str, char_name: str = "", user_name: str = "
                     core.now_epoch(),
                     tz=state_snapshot.tz_of(core),
                 )
-                stage = _relation.stage_phrase if _relation.available else ""
+                if _relation.available:
+                    stage = _relation.stage_phrase
+                    stage_id = int(_relation.stage_id)
             except Exception:
                 stage = ""
+                stage_id = None
+            if not is_group and stage:
+                growth = _relation_stage_guidance(stage_id)
+                if growth:
+                    stage = f"{stage.rstrip('。')}；关系互动参考（可选）：{growth.rstrip('。')}"
             tone = core.mood.current_tone(user_id)
             style = core.mood.style_tendency(user_id)
         # 「她此刻在做什么」只在对方问起时才给（理由见 _ASKS_ABOUT_NOW 上面那段）。
@@ -1400,7 +1421,7 @@ def _response_text(response: Any) -> str:
         # 分段流式时 `completion_text` 会被占位文本顶住（「(Model response will be
         # rendered here)」）。那不是她说的话，以前它一路进了 `spoke_log`、情绪分析
         # 和提示词（v3.1.35 修）。遇到占位符就当这一项没取到，继续往下找。
-        if isinstance(value, str) and value.strip() and not reply_guard.is_placeholder(value):
+        if isinstance(value, str) and value.strip() and not is_placeholder(value):
             return value
     chain = getattr(response, "result_chain", None)
     getter = getattr(chain, "get_plain_text", None)
@@ -1410,7 +1431,7 @@ def _response_text(response: Any) -> str:
             if (
                 isinstance(plain, str)
                 and plain.strip()
-                and not reply_guard.is_placeholder(plain)
+                and not is_placeholder(plain)
             ):
                 return plain
         except Exception:
@@ -2801,21 +2822,34 @@ class HumanoidCore(Star):
         except Exception as exc:
             logger.debug(f"{LOG_PREFIX} 记录她的收尾失败: {exc}")
 
-    # -------------------- LLM 请求注入钩子 --------------------
+    # -------------------- 兄弟 bot 配额（兼容逻辑，不注册） --------------------
 
-    @filter.on_llm_request()
+
+    async def guard_sibling_chat(self, event: AstrMessageEvent, req: ProviderRequest):
+        try:
+            is_group = not _is_private_chat(event)
+            if not self.engine.environment_allows(not is_group):
+                return
+            role_id = self._self_id(event)
+            user_id = self._sender(event)
+            if user_id and user_id in self._known_role_ids(exclude=role_id):
+                if not self._sibling_chat_allowed(role_id, user_id, event):
+                    stopper = getattr(event, "stop_event", None)
+                    if callable(stopper):
+                        stopper()
+                    logger.debug(
+                        f"{LOG_PREFIX} 兄弟 bot {_mask_id(user_id)} 互聊额度用完，挡下这一轮"
+                    )
+                else:
+                    logger.debug(f"{LOG_PREFIX} 兄弟 bot {_mask_id(user_id)} 互聊放行")
+        except Exception as exc:
+            logger.debug(f"{LOG_PREFIX} 兄弟 bot 配额判断失败，按放行处理: {exc}")
+
     async def inject_context(self, event: AstrMessageEvent, req: ProviderRequest):
-        """身体与生活进上下文：稳定的说明进 system_prompt，每轮变化的内容进临时内容块。
+        """Legacy request-context builder retained for explicit compatibility tests only.
 
-        为什么这么分：
-
-        1. 「这些事实是什么、按什么方式读」这段不随消息变，只进 system_prompt 一次——
-           它是参考，不该被当成用户刚说的一句话。初始 system 消息不入历史
-           （`agent_sub_stages/internal.py` 里 `skipped_initial_system` 就是干这个的）。
-        2. 「此刻的她」与身体事实每轮都在变，走 `extra_user_content_parts` 并
-           `mark_as_temp()`：临时块只发给模型、不落会话历史（`_save_to_history` 落盘时
-           会丢掉带 `_no_save` 的块），所以既不用回写清理旧块，也把变化的文本压在整个
-           提示词最末尾——前缀缓存不会被逐轮击穿。
+        This method is intentionally unregistered and has no runtime caller. Do not wire it
+        into ordinary requests; generated replies must pass through unchanged.
         """
         try:
             is_group = not _is_private_chat(event)
@@ -2825,15 +2859,8 @@ class HumanoidCore(Star):
             core = self._core(event)
             user_id = self._sender(event)
             text = (getattr(event, "message_str", "") or "").strip()
-            # 兄弟 bot 的发言：**可以聊，但防互刷**。
-            #
-            # 以前这里无条件 stop_event，同机另一台 bot 永远得不到回复（看起来像装死）；
-            # 完全放开又会两台机器你一句我一句刷到天亮。所以按
-            # `SiblingChatGuard` 的额度判：放行 → 不 stop，让主链路正常回它；
-            # 额度用完 → stop_event 挡下本轮 LLM（光 return 挡不住）。
-            #
-            # **只在真正会触发回复的这个钩子里判**（另一个 on_llm_request 是输入状态，
-            # 不碰它），并按 event 缓存结论，同一条消息被工具循环重放时不重复吃额度。
+            # Legacy helper is not registered. Runtime sibling quota is enforced by
+            # This compatibility method has no registered request hook.
             if user_id and user_id in self._known_role_ids(exclude=role_id):
                 if not self._sibling_chat_allowed(role_id, user_id, event):
                     stopper = getattr(event, "stop_event", None)
@@ -2865,7 +2892,7 @@ class HumanoidCore(Star):
             # 整段包起来：守卫坏了只是少挡一轮，绝不能让这一轮的注入也一起丢掉
             # （fail-open 的底线是「用户的话必须被看见」）。
             try:
-                decision = self._closing_decision(event, text)
+                decision = None  # Goodbye text never suppresses or steers a reply.
                 if decision is not None:
                     reason = str(decision.get("reason") or "")
                     prompt_on = bool(
@@ -3070,7 +3097,7 @@ class HumanoidCore(Star):
                 logger.debug(f"{LOG_PREFIX} 心理注入失败，本轮跳过: {exc}")
                 psyche_note = ""
             # v3.1.47：她自己憋着想说的那句。压强不够就是空串——安静是常态。
-            # 与背景句分开成块，出站照抄闸按心理抬头放行（见下方 _guard_reply）。
+            # 主动动机仅用于插件内部状态计算，不作为普通回复的提示或出站改写条件。
             psyche_urge = ""
             try:
                 psyche_urge = core.psyche_urge(user_id, text=said)
@@ -3102,10 +3129,7 @@ class HumanoidCore(Star):
                     # 只有真的塞进去了才记「这个请求已经注入过」：没塞进去的话
                     # 下一次重放还该再试一次。
                     _set_event_extra(event, mark, blocks)
-                    # v3.1.45：出站照抄闸要拿「本轮真正注入的原文」比对。mark 绑的是
-                    # id(req)，出站钩子拿不到 req，所以另存一个固定键；每轮覆盖，
-                    # 只留本轮的，不滚雪球。
-                    _set_event_extra(event, "_hcore_injected_blocks", blocks)
+
                 if channel and channel != "temp_parts" and not self._inject_fallback_warned:
                     # 只提示一次：每轮回执会刷屏，但这说明宿主的 AstrBot 版本偏低。
                     self._inject_fallback_warned = True
@@ -3122,111 +3146,7 @@ class HumanoidCore(Star):
         except Exception as e:
             logger.warning(f"{LOG_PREFIX} 注入失败: {e}")
 
-    # -------------------- 出站复读拦截 --------------------
 
-    def _guard_reply(self, core: Any, user_id: str, response: Any, text: str,
-                     event: Any = None) -> str:
-        """把复读句从这一条回复里删掉。
-
-        三道确定性闸，按顺序、都只删句不换词：
-
-        * v3.1.36：模型的拒绝/英文样板不是她的话，整条不发；
-        * v3.1.45：**照抄本轮注入背景**——弱模型把刚递给它的身体/日程/天气原文
-          逐字念进回复，拿本轮注入原文比对后删掉那一句（对比 event 上存的原文）；
-        * v3.1.31：她自己重复自己——同地点/同句在最近三条里出现过就删。
-
-        删完不空才生效，一句不剩就原样发（宁可复读，不发空消息）。`response`
-        可写时把 `completion_text` 一起改掉，宿主发出去的就是删过的版本。
-        """
-        try:
-            # 出站拦截（v3.1.36）：模型安全策略拒绝时的英文样板不是她的话。
-            # 线上真的有一条被记成她的发言发了出去（2026-11-14 查 `spoke_log`）：
-            # `Your request involves sexually suggestive roleplay ... I am refusing`。
-            # v3.1.42：整句英文不再一律拦（那会把英文人设永久静音），只有命中
-            # 拒绝语义特征（cannot / sorry / refuse…）才拦。
-            if reply_guard.looks_like_refusal(text):
-                logger.warning(
-                    f"{LOG_PREFIX} 出站拦截：模型给的是拒绝/英文样板，这条不发（"
-                    + str(text or "")[:40]
-                    + "）"
-                )
-                if isinstance(getattr(response, "completion_text", None), str):
-                    try:
-                        response.completion_text = ""
-                    except Exception:
-                        pass
-                return ""
-
-            # v3.1.45 出站照抄闸：注入侧做得再干净，也挡不住弱模型把原文当台词
-            # 照抄。这里拿本轮真正注入的那几块原文比对，逐字照抄的小句删掉。
-            # 放在「她重复她自己」之前：先去掉照抄，再去重自己，两道互不替代。
-            cfg = getattr(self, "_config", None)
-            if bool(getattr(cfg, "injection_echo_guard_enabled", False)):
-                try:
-                    blocks = _event_extra(event, "_hcore_injected_blocks", []) or []
-                    # v3.1.46：心理层写的是「她自己写下的话」，允许她直接说出口——
-                    # 照抄闸只管插件生成的背景句（身体/日程/天气），不删她的自述。
-                    # v3.1.47：连同「憋着想跟你说」的主动动机一起放行。
-                    from .humanoid.psyche import INJECTION_MARK as _PSYCHE_MARK
-                    from .humanoid.psyche import URGE_MARK as _PSYCHE_URGE_MARK
-                    if isinstance(blocks, (list, tuple)):
-                        blocks = [b for b in blocks
-                                  if _PSYCHE_MARK not in str(b)
-                                  and _PSYCHE_URGE_MARK not in str(b)]
-                    if blocks:
-                        echo_text, echo_dropped = reply_guard.trim_injection_echo(
-                            text, blocks
-                        )
-                        if echo_dropped and echo_text and echo_text != text:
-                            if isinstance(getattr(response, "completion_text", None), str):
-                                try:
-                                    response.completion_text = echo_text
-                                except Exception:
-                                    pass
-                            text = echo_text
-                            logger.info(
-                                f"{LOG_PREFIX} 出站照抄拦截：删掉 {len(echo_dropped)} 句（"
-                                + "、".join(echo_dropped)[:60]
-                                + "）"
-                            )
-                except Exception:
-                    # 照抄闸是纯函数、本就不该炸；万一炸了也 fail-open 原文放行。
-                    pass
-
-            try:
-                recent = [
-                    str(row.get("text", ""))
-                    for row in (core.mood.spoke(user_id) or [])
-                    if isinstance(row, dict)
-                ]
-            except Exception:
-                recent = []
-            if not recent:
-                return text
-            new_text, dropped = reply_guard.trim_repeats(
-                text,
-                recent,
-                dup_chars=int(getattr(cfg, "repeat_dup_min_chars", 10)),
-                dup_max_len_delta=int(getattr(cfg, "repeat_dup_max_len_delta", 2)),
-                place_only_tail_chars=int(
-                    getattr(cfg, "repeat_place_only_tail_chars", 6)
-                ),
-            )
-            if not dropped or not new_text or new_text == text:
-                return text
-            if isinstance(getattr(response, "completion_text", None), str):
-                try:
-                    response.completion_text = new_text
-                except Exception:
-                    return text
-            logger.info(
-                f"{LOG_PREFIX} 出站复读拦截：删掉 {len(dropped)} 句（"
-                + "、".join(dropped)[:60]
-                + "）"
-            )
-            return new_text
-        except Exception:
-            return text
 
     # -------------------- LLM 响应钩子 --------------------
 
@@ -3258,11 +3178,11 @@ class HumanoidCore(Star):
             # 否则跨 bot 互聊的每句话都在改她的关系数值（审核 跨插件契约 12）。
             if self._is_sibling_peer(event):
                 return
-            # 出站复读拦截（v3.1.31）：她自己最近说过的话（同一个地点、同一句），
-            # 这一条里不再原样念一遍。放在兄弟 bot 判据之后——别人的话不归我们改。
-            text = self._guard_reply(core, user_id, response, text, event=event)
-            # 被出站拦截的那条（模型拒绝/整句英文）既不发也不记账——账本里记一句
-            # 英文拒绝，会让她后面的情绪分析把「她说的话」判错。
+            # 记账只使用模型原文；Core 不修改生成文本。
+
+
+
+
             if not text:
                 return
             # 收尾守卫：记下她这句，下一轮判断「她是不是已经收过尾了」。
@@ -3346,10 +3266,10 @@ class HumanoidCore(Star):
             # 与 on_llm_response 同一道出站判据：兄弟 bot 的回复不进情绪/好感账。
             if self._is_sibling_peer(event):
                 return
-            # 出站守卫（v3.1.42 / P0）：第三方 runner 和流式收尾不走
-            # `on_llm_response`，拒绝样板和复读原来就从这里原样发出去。这里补
-            # 同一道判据；删空（整条都是拒绝样板）就整条不发。
-            text = self._guard_reply(core, user_id, result, text, event=event)
+            # 发送前兜底同样只读取宿主待发原文，不做复读或拒绝过滤。
+
+
+
             if not text:
                 return
             # 收尾守卫：同一条口径——她真正发出去的话都记，下一轮判定才准。
@@ -3491,8 +3411,8 @@ class HumanoidCore(Star):
             # 多台 bot 同进程部署时，另一台 bot 的群发言在事件层就是普通成员，
             # sender 不等于本台，前面那道「跳过自己」挡不住。只认状态里见过的角色 id。
             #
-            # 注意分工：**回复与否**由 `inject_context` 里的 `_sibling_chat_allowed`
-            # 决定（放行时主链路照常回它）；这里只做记账隔离，不让 bot 的发言进
+            # 注意分工：兄弟 bot 配额由独立的 `guard_sibling_chat` hook 处理；
+            # 这里只做记账隔离，不让 bot 的发言进
             # 情绪/身体账本——她会因为另一个 bot 的话改心情，那才是真串台。
             # 判据与出站记账共用 `_is_sibling_peer`，两边不再各判一次。
             if self._is_sibling_peer(event, exclude=role_id):

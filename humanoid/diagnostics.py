@@ -862,7 +862,7 @@ def _build_report_body(
         if isinstance(contract, dict) and contract:
             lines.append(
                 f"- 联动契约 v{contract.get('v')} 已导出（{len(contract.get('feelings') or [])} 条体感、"
-                f"max_chars {contract.get('form', {}).get('max_chars')}）；写在她自己的 state.json 里"
+                f"写在她自己的 state.json 里"
             )
         elif not cfg.contract_enabled:
             lines.append("- 联动契约：配置里关着（contract_enabled=false），不会导出")

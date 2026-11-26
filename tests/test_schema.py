@@ -87,12 +87,23 @@ class SchemaTest(unittest.TestCase):
             self.assertIn(key, self.schema)
 
     def test_field_count_is_pinned(self):
-        """字段数变化必须同步改这里（v3.1.38 = 144（加 ccb_body）；v3.1.28 = 143（删掉 schedule_quality_gate）：v3.1.4 加 3 项收尾沉默守卫，v3.1.5 加 1 项证据卡开关，v3.1.6 加 1 项问候机会开关，v3.1.15 加 1 项群聊情绪间隔；v3.1.44 = 146（加 preset_role_ids / weather_proxy）；v3.1.51 = 150（加 repeat_dup_min_chars / repeat_dup_max_len_delta /
-        repeat_place_only_tail_chars 三个复读闸阈值）；v3.1.53 = 154（加
-        psyche 的四个剂量旋钮）。
+        """字段数变化必须同步改这里（v3.1.38 = 144（加 ccb_body）；v3.1.28 = 143（删掉 schedule_quality_gate）：v3.1.4 加 3 项收尾沉默守卫，v3.1.5 加 1 项证据卡开关，v3.1.6 加 1 项问候机会开关，v3.1.15 加 1 项群聊情绪间隔；v3.1.44 = 146（加 preset_role_ids / weather_proxy）；v3.1.51 = 150（当时增加复读配置）；v3.1.53 = 154（当时增加心理剂量配置）；v3.1.54 = 150（移除四项无调用的出站过滤配置）。
         """
-        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 154)
-        self.assertEqual(len(self.schema), 154)
+        self.assertEqual(len(DEFAULTS.__dataclass_fields__), 150)
+        self.assertEqual(len(self.schema), 150)
+
+    def test_retired_output_guard_options_are_ignored(self):
+        legacy = {
+            "injection_echo_guard_enabled": True,
+            "repeat_dup_min_chars": 10,
+            "repeat_dup_max_len_delta": 2,
+            "repeat_place_only_tail_chars": 6,
+        }
+        built = HumanoidConfig.from_raw(legacy)
+        for key in legacy:
+            self.assertNotIn(key, self.schema)
+            self.assertNotIn(key, DEFAULTS.__dataclass_fields__)
+            self.assertFalse(hasattr(built, key))
 
     def test_input_state_throttle_keys_are_consistent(self):
         """v3.0.0 新增的两个「正在输入」节流项：类型/区间/默认值三处一致。"""

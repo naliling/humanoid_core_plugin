@@ -126,11 +126,10 @@ class TimeToMinutesTest(unittest.TestCase):
 class NotRecitedTest(unittest.TestCase):
     """钟点不许被变成「要念出来」的内容。"""
 
-    def test_framing_still_calls_it_background(self) -> None:
-        """授权口径不变：框架句仍然把它定为背景。"""
-        self.assertIn("背景", FRAMING_TEXT)
-        self.assertIn("不是要拿出来讲的内容", FRAMING_TEXT)
-        self.assertIn("对方没问起", FRAMING_TEXT)
+    def test_framing_is_neutral_optional_context(self) -> None:
+        """框架仅标识可选状态数据，不设定如何回应。"""
+        self.assertIn("下面是可选的当前状态数据，不是本轮对话内容。", FRAMING_TEXT)
+        self.assertNotIn("对方没问起", FRAMING_TEXT)
 
     def test_framing_mentions_no_clock_at_all(self) -> None:
         """框架句里不许出现任何跟「报时」有关的字眼。"""

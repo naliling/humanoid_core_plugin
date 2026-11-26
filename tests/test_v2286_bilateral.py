@@ -174,6 +174,7 @@ class KeySplit(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
         # 场景里渲染一轮：推进是「这一场还在」，不是「发生过」
         core.build_injection("u1")
         first = float(state.get("ccb_done_count", 0.0) or 0.0)
@@ -206,6 +207,7 @@ class GroupSilence(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
         state["ccb_last_at"] = core.now_epoch()
 
         async def _run():
@@ -254,6 +256,7 @@ class HerSide(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
         core.note_her_words("u1", "我们做过了")
         self.assertEqual(float(state.get("ccb_done_count", 0.0) or 0.0), 1.0)
 
@@ -273,6 +276,7 @@ class HerSide(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 3.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
         state["ccb_satisfy"] = 80.0
         core.note_her_words("u1", "住手，放开我")
         self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 0.0, "她拒绝之后场景该结束")
@@ -285,6 +289,7 @@ class HerSide(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 3.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
         core.note_her_words("u1", "讨厌啦，哼")
         self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 3.0)
         self.assertEqual(float(state.get("ccb_refused_at", 0.0) or 0.0), 0.0)

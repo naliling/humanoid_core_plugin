@@ -320,20 +320,7 @@ class HumanoidConfig:
     input_state_max_frames: int = 60
 
     inject_activity_context: str = "medium"
-    # 出站照抄闸（v3.1.45）：把回复里逐字照抄「本轮注入背景」的小句删掉。
-    # 注入侧再干净也挡不住弱模型把原文当台词念，只能在出站比对本轮注入原文。
-    # v3.1.51：默认**关**。注入框架（prompt_builder.build_framing）用第一人称
-    # 「这些是你此刻的身体和处境，会影响你怎么说话」鼓励她把状态说出口，照抄闸
-    # 却把说出口的状态删掉——两处设计直接打架，真机 26 条出站拦截里删的全是角色感
-    # 最强的句子（动作神态/天气递进/口吻/感官）。默认关，需要时在面板手动开。
-    injection_echo_guard_enabled: bool = False
-    # 出站复读闸的三个阈值（v3.1.51）：默认收紧到只抓真正的原样卡带。
-    # dup_min_chars: 互相包含判定的最小字数（原 6 → 10）。
-    # dup_max_len_delta: 两句长度差上限，超过就不算复读（原无限制 → 2）。
-    # place_only_tail_chars: 去掉地点词后剩余字数不超过它才算「纯报地点」复读。
-    repeat_dup_min_chars: int = 10
-    repeat_dup_max_len_delta: int = 2
-    repeat_place_only_tail_chars: int = 6
+
     # 叙事心理层的四个剂量旋钮（v3.1.53）：以前硬编码在 psyche.py、不进配置，
     # 用户想让「她多惦记、多开口」都改不了。现在面板可调，默认值保持原来的克制。
     psyche_rumination_threshold: float = 0.55  # 心事浮上来的显著性门槛
@@ -483,14 +470,13 @@ class HumanoidConfig:
     social_energy_enabled: bool = True
     # 社交能量：这两个数**必须和群里的实际消息量对得上**，否则整个机制等于不存在。
     #
-    # 原来 0.05/条 + 1.5/分钟（= 90/小时）。线上 4 个号一天上万条消息，也就是每分钟
-    # 好几条；每条扣 0.05、每分钟回 1.5——回血速度是消耗的几十倍，于是六个角色的
-    # `social_energy` 长期恒等于 100.0，`behavior.py` 里 <30 / <60 / >85 三档判定和
-    # `soma.form_policy` 永远走同一支。面板上 5 个开关，实际零影响。
+    # 当前默认 0.1/条 + 3.0/分钟（=180/小时）。按 4 个号每天共约 1 万条估算，
+    # 每号约 104 条/小时，消耗约 10.4/小时，远低于恢复；social_energy 会长期接近满值，
+    # behavior.py 的低精力分支因此很难触发，不能视作已验证有效的疲劳机制。
     #
     # 校准方法：把「每条扣多少 × 每小时消息数」和「每分钟回血 × 60」放一起看——
     # 只有消耗速率**大于**回血速率，她才会真的累下去。0.5/条 + 1.0/分钟下，
-    # 一小时 140 条 ≈ 扣 70、回 60，净掉 10；安静下来约 100 分钟回满。
+    # 一小时 140 条 ≈ 扣 70、回 60，净掉 10；安静下来约 100 分钟回满.
     social_energy_consumption_per_msg: float = 0.1
     social_energy_recovery_per_minute: float = 3.0
     social_energy_reset_hour: int = 0
@@ -516,7 +502,7 @@ class HumanoidConfig:
     debug_mode: bool = False
     holidays: tuple[dict[str, Any], ...] = ()
     state_flush_interval_seconds: int = 60
-    last_interaction_threshold_minutes: int = 5
+    last_interaction_threshold_minutes: int = 1
     last_interaction_mode: str = "with_last_msg"
     # 兄弟 bot 互聊护栏（humanoid/sibling_chat.py）：同一对角色在窗口内最多连续放行
     # N 次。以前这两个值是硬编码 600 秒 / 3 次，部署里改不了。
@@ -700,10 +686,7 @@ class HumanoidConfig:
             input_state_min_interval_seconds=f("input_state_min_interval_seconds", 0.1, 10.0),
             input_state_max_frames=i("input_state_max_frames", 5, 500),
             inject_activity_context=c("inject_activity_context", INJECT_MODES),
-            injection_echo_guard_enabled=b("injection_echo_guard_enabled"),
-            repeat_dup_min_chars=i("repeat_dup_min_chars", 4, 40),
-            repeat_dup_max_len_delta=i("repeat_dup_max_len_delta", 0, 20),
-            repeat_place_only_tail_chars=i("repeat_place_only_tail_chars", 0, 40),
+
             psyche_rumination_threshold=f("psyche_rumination_threshold", 0.0, 1.0),
             psyche_inject_max_lines=i("psyche_inject_max_lines", 1, 10),
             psyche_min_interval_seconds=f("psyche_min_interval_seconds", 0.0, 86400.0),

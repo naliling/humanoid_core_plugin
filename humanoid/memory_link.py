@@ -51,10 +51,8 @@ READ_CACHE_TTL_SECONDS = 60.0
 #: 缓存条目上限：超过就整体清空，比按 LRU 淘汰简单，且这里的数据全部可重建。
 READ_CACHE_MAX_ENTRIES = 256
 
-# 跨插件调用必须有上限（P1-6）：注入挂在 @filter.on_llm_request 上，对**每条消息**执行。
-# 对面检索一次卡住（死锁/在等网络），没有超时的 await 会把本插件所有回复一起挂住——
-# 表现是「装死」而不是报错，用户完全看不出方向。
-# 默认值取 0.5s：长期记忆是加分项，不值得为它让用户多等；写回复走 1.0s（更宽，但同样有界）。
+# Legacy optional reads stay time-bounded so a stalled cross-plugin bridge cannot stall its caller.
+# Long-term memory is supplemental; defaults remain short (read 0.5s, write 1.0s).
 READ_TIMEOUT_SECONDS = 0.5
 WRITE_TIMEOUT_SECONDS = 1.0
 #: 上限：调用方即使传了更大的值也夹到这里，防止「可配」变成「无限等」。
@@ -375,12 +373,9 @@ async def fetch_memory_text(
     top_k: int = READ_TOP_K,
     timeout: float = READ_TIMEOUT_SECONDS,
 ) -> str:
-    """拉这个人相关的长期记忆（拼好的注入文本）；拿不到返回空串。
+    """Build optional legacy context text; the live request pipeline does not attach it.
 
-    带 60 秒缓存：同一个会话连着几条消息只查一次记忆库。
-
-    **等待有上限**（P1-6）：调用点在 @filter.on_llm_request 里、对每条消息执行，对面
-    检索卡住时这里必须放弃而不是一直等。超时按「这一轮没有记忆」降级，下一轮重试。
+    The cache and timeout bound the cross-plugin read for any explicit caller.
     """
     if bridge is None or not str(uid or "").strip():
         return ""

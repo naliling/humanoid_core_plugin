@@ -291,7 +291,7 @@ class ContractCapabilityTest(unittest.TestCase):
     CAPABILITY_PATHS = {
         "body": ("body",),
         "feelings": ("feelings",),
-        "form": ("form",),
+
         "activity": ("activity",),
         "day": ("day",),
         "ongoing": ("ongoing",),

@@ -25,9 +25,13 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from humanoid.llm import CallGate, LLMGateway, ProviderResolver
+from humanoid.persona import Persona
+from humanoid.services.life_material import MATERIALS_USED_KEY, material_card
 from humanoid.services.schedule import (
     SOURCE_LLM,
     SOURCE_TEMPLATE,
+    dynamic_segment,
+    examples_for,
     ScheduleService,
     parse_segment,
 )
@@ -49,6 +53,11 @@ from .test_schedule import cfg, seg_reply
 TZ = ZoneInfo("Asia/Shanghai")
 FIXED_TODAY = "2026-08-22"
 FIXED_MOMENT = datetime(2026, 8, 22, 9, 0, tzinfo=TZ)
+
+
+async def _test_persona():
+    return Persona(name="她", prompt="她过着普通的日常生活。", source="test")
+
 
 DIRTY_EVENTS = (
     "窝在沙发上刷手机，什么正事也没做",
@@ -270,6 +279,7 @@ class SlatePromptTest(unittest.IsolatedAsyncioTestCase):
             lambda: conf,
             FrozenClock(FIXED_MOMENT),
             logger=log,
+            persona_provider=_test_persona,
             monotonic=time.monotonic,
         )
         service.set_resolver_gateway(resolver, gateway)
@@ -287,17 +297,89 @@ class SlatePromptTest(unittest.IsolatedAsyncioTestCase):
         for event in events:
             self.assertEqual(content_issues(event), [], f"候选里混进了脏东西：{event}")
         self.assertIn("手边的东西", prompt, "规则里要明说别用含糊词")
+        self.assertNotIn("【今天她可能做的事】", prompt)
+        self.assertEqual(prompt.count("【可以选的事】（"), 1)
 
-    async def test_pick_is_written_into_the_schedule(self):
-        provider = FakeProvider("p", reply=pick_reply(2))
+    async def test_pick_is_written_and_used_material_is_persisted(self):
+        provider = FakeProvider("p", reply=pick_reply(1))
         service, _conf = self.build(provider)
+
+        async def persona_provider():
+            return Persona(name="她", prompt="她是一名插画师。", source="test")
+
+        service._persona = persona_provider
         await service.ensure_fresh()
         prompt = str(provider.last_kwargs.get("prompt") or "")
         events = slate_events(prompt)
         self.assertGreaterEqual(len(events), 2)
         segs = service.segments()
-        self.assertEqual(segs[0]["event"], events[1], "选中的那条应该原样落库")
+        self.assertEqual(segs[0]["event"], events[0], "选中的那条应该原样落库")
+        self.assertNotIn("_material_card_id", segs[0])
+        self.assertNotIn("_material_anchor_key", segs[0])
+        records = service._scope.get_self(MATERIALS_USED_KEY, [])
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertTrue(record["card_id"])
+        self.assertTrue(record["anchor_key"])
         self.assertEqual(service.source, SOURCE_LLM)
+
+        identity_fields = {"card_id": "id", "anchor_key": "anchor_key"}
+        for key, card_field in identity_fields.items():
+            service._scope.set_self(
+                MATERIALS_USED_KEY,
+                [{key: record[key], "used_at": record["used_at"]}],
+            )
+            remaining = service._materials_for_schedule(
+                9 * 60, "她是一名插画师。", []
+            )
+            remaining_values = {
+                str(material_card(item, captured_at=record["used_at"]).get(card_field) or "")
+                for item in remaining
+            }
+            self.assertNotIn(
+                record[key],
+                remaining_values,
+                f"使用过的素材应按 {key} 过滤",
+            )
+
+    async def test_invalid_now_does_not_initialize_missing_ledger(self):
+        service, _conf = self.build(FakeProvider("p", reply=seg_reply(event="歇一会儿")))
+        missing = object()
+
+        self.assertEqual(service._material_usage(float("nan")), ([], set(), False))
+        self.assertIs(service._scope.get_self(MATERIALS_USED_KEY, missing), missing)
+
+    async def test_invalid_ledger_hides_materials_but_keeps_examples(self):
+        provider = FakeProvider("p", reply=seg_reply(event="歇一会儿"))
+        service, _conf = self.build(provider)
+        before = service._materials_for_schedule(9 * 60, "", [])
+        self.assertTrue(before, "固定时段应能拿到素材，便于验证 fail-closed")
+        service._scope.set_self(
+            MATERIALS_USED_KEY,
+            [{"card_id": "broken", "anchor_key": "broken", "used_at": "bad"}],
+        )
+        self.assertEqual(service._materials_for_schedule(9 * 60, "", []), [])
+
+        slate = build_slate([], examples_for(service._seed(), ""))
+        self.assertFalse(any(item.get("source") == "material" for item in slate))
+        self.assertTrue(any(item.get("source") == "example" for item in slate))
+
+        original_scope = service._scope
+
+        class UnreadableScope:
+            def __init__(self, scope):
+                self.scope = scope
+
+            def __getattr__(self, name):
+                return getattr(self.scope, name)
+
+            def get_self(self, key, default=None):
+                if key == MATERIALS_USED_KEY:
+                    raise OSError("unreadable ledger")
+                return self.scope.get_self(key, default)
+
+        service._scope = UnreadableScope(original_scope)
+        self.assertEqual(service._materials_for_schedule(9 * 60, "", []), [])
 
 
 class HardGateTest(unittest.IsolatedAsyncioTestCase):
@@ -322,6 +404,7 @@ class HardGateTest(unittest.IsolatedAsyncioTestCase):
             lambda: conf,
             FrozenClock(FIXED_MOMENT),
             logger=log,
+            persona_provider=_test_persona,
             monotonic=time.monotonic,
         )
         service.set_resolver_gateway(resolver, gateway)
@@ -341,6 +424,11 @@ class HardGateTest(unittest.IsolatedAsyncioTestCase):
     async def test_still_dirty_after_rewrite_degrades_to_a_candidate(self):
         provider = PromptRecordingProvider("p", [dirty_reply(DIRTY_EVENTS[1])])
         service, _conf = self.build(provider)
+
+        async def persona_provider():
+            return Persona(name="她", prompt="她是一名插画师。", source="test")
+
+        service._persona = persona_provider
         await service.ensure_fresh()
         self.assertEqual(provider.calls, 2, "只重写一次，不无限循环")
         segs = service.segments()
@@ -394,6 +482,7 @@ class LoopStressTest(unittest.IsolatedAsyncioTestCase):
             lambda: conf,
             FrozenClock(FIXED_MOMENT),
             logger=log,
+            persona_provider=_test_persona,
             monotonic=time.monotonic,
         )
         service.set_resolver_gateway(resolver, gateway)
@@ -418,7 +507,8 @@ class LoopStressTest(unittest.IsolatedAsyncioTestCase):
             resolver = ProviderResolver(FakeContext(chat_providers=[provider]), log)
             gateway = LLMGateway(resolver, lambda: conf, log, time.monotonic)
             service = ScheduleService(
-                store.scope, lambda: conf, FrozenClock(moment), logger=log, monotonic=time.monotonic
+                store.scope, lambda: conf, FrozenClock(moment), logger=log,
+                persona_provider=_test_persona, monotonic=time.monotonic
             )
             service.set_resolver_gateway(resolver, gateway)
             await service.ensure_fresh()
@@ -481,6 +571,7 @@ class ReadPathFilterTest(unittest.IsolatedAsyncioTestCase):
             lambda: conf,
             FrozenClock(FIXED_MOMENT),
             logger=log,
+            persona_provider=_test_persona,
             monotonic=time.monotonic,
         )
         service.set_resolver_gateway(resolver, gateway)
@@ -562,6 +653,7 @@ class OtherSinksTest(unittest.IsolatedAsyncioTestCase):
             lambda: conf,
             FrozenClock(FIXED_MOMENT),
             logger=log,
+            persona_provider=_test_persona,
             monotonic=time.monotonic,
         )
         service.set_resolver_gateway(resolver, gateway)
@@ -687,6 +779,7 @@ class DegradeToSlateTest(unittest.IsolatedAsyncioTestCase):
             lambda: conf,
             FrozenClock(moment),
             logger=log,
+            persona_provider=_test_persona,
             monotonic=time.monotonic,
         )
         service.set_resolver_gateway(resolver, gateway)
@@ -723,6 +816,47 @@ class DegradeToSlateTest(unittest.IsolatedAsyncioTestCase):
         slot = service._degrade_to_neutral(conf, 9 * 60, {"event": first}, candidates)
         self.assertNotEqual(slot["event"], first)
 
+
+    def test_short_slate_duration_and_start_alignment_are_preserved(self):
+        service, conf = self.build(PromptRecordingProvider("p", [dirty_reply()]))
+        slate = build_slate(
+            [], [{"event": "把桌上的小盒子拆了又装回去", "location": "书桌前", "minutes": 5}]
+        )
+        slot = service._slot_from_slate(
+            conf, 9 * 60 + 10, {"event": "翻了一会儿旧杂志", "end": "09:03"}, slate
+        )
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot["start"], "09:10")
+        self.assertEqual(slot["end"], "09:15")
+
+    def test_optional_nap_suppression_drops_sleep_slate_candidate(self):
+        service, conf = self.build(PromptRecordingProvider("p", [dirty_reply()]))
+        slot = service._degrade_to_neutral(
+            conf,
+            13 * 60,
+            None,
+            [{"event": "小睡一会儿", "location": "卧室", "minutes": 45}],
+            avoid_optional_nap=True,
+        )
+        self.assertNotIn("睡", slot["event"])
+
+    def test_suppressing_optional_naps_preserves_actual_asleep_and_night_sleep(self):
+        conf = cfg()
+        daytime = dynamic_segment(
+            conf, {"sleep_pressure": 95.0}, now_minute=13 * 60, step=15,
+            seed=["role", FIXED_TODAY], allow_optional_nap=False,
+        )
+        self.assertNotIn("睡", daytime["event"])
+        actually_asleep = dynamic_segment(
+            conf, {"asleep": True}, now_minute=13 * 60, step=15,
+            seed=["role", FIXED_TODAY], allow_optional_nap=False,
+        )
+        self.assertIn("睡", actually_asleep["event"])
+        night = dynamic_segment(
+            conf, {"sleep_pressure": 95.0}, now_minute=3 * 60, step=15,
+            seed=["role", FIXED_TODAY], allow_optional_nap=False,
+        )
+        self.assertIn("睡", night["event"])
 
     def test_night_slate_only_offers_night_things(self):
         """候选是按钟点筛的：凌晨的候选里不该出现白天的事，降级自然不会顶错。"""

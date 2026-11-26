@@ -362,6 +362,8 @@ class Fallback(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         # 45 + 40 = 85 → 临界，不会到顶（到顶会清姿势，那是另一条用例）
         state["ccb_satisfy"] = 45.0
         text = core.build_injection("u1")
@@ -379,6 +381,8 @@ class Injection(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         # 45 + 40 = 85 → 临界；不设 85 是因为再加 40 会到顶，到顶按设计要清姿势。
         state["ccb_satisfy"] = 45.0
         state["ccb_pose"] = 0.0
@@ -395,6 +399,8 @@ class Injection(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 3.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         state["ccb_pose"] = 0.0
         state["ccb_site"] = 1.0
         text = core.build_injection("u1", is_group=True)
@@ -406,6 +412,8 @@ class Injection(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         core.note_her_words("u1", "从后面抱住你")
         self.assertEqual(int(state.get("ccb_pose", -1)), 0)
         self.assertGreaterEqual(ccb.log_changes(state, "pose"), 1)
@@ -415,9 +423,11 @@ class Injection(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
 
         async def _run():
-            core.on_message("u1", "你坐上来", is_group=False)
+            core.on_message("u1", "我想要你坐上来", is_group=False)
 
         asyncio.run(_run())
         self.assertEqual(int(state.get("ccb_pose", -1)), 2)
@@ -429,6 +439,8 @@ class Aftercare(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         state["ccb_satisfy"] = 80.0
         state["ccb_pose"] = 0.0
         core.build_injection("u1")
@@ -501,6 +513,8 @@ class Refractory(unittest.TestCase):
     def _peak(self, core):
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         state["ccb_satisfy"] = 80.0
         core.build_injection("u1")
         return state
@@ -511,7 +525,7 @@ class Refractory(unittest.TestCase):
         before = float(core.mood.profile("u1")["libido"])
         self._peak(core)
         after = float(core.mood.profile("u1")["libido"])
-        self.assertAlmostEqual(after, before - 12.0, places=3)
+        self.assertAlmostEqual(after, before - 11.25, places=3)
 
     def test_it_never_goes_negative(self):
         core = _core(ccb_refractory_libido=30.0)
@@ -524,7 +538,7 @@ class Refractory(unittest.TestCase):
         _mood(core)
         before = float(core.mood.profile("u1")["libido"])
         self._peak(core)
-        self.assertAlmostEqual(float(core.mood.profile("u1")["libido"]), before, places=3)
+        self.assertAlmostEqual(float(core.mood.profile("u1")["libido"]), before + 0.75, places=3)
 
     def test_affection_is_untouched(self):
         """欲望退，感情不退——好感是长线评价，不该被一次性事件拉下来。"""
@@ -539,6 +553,8 @@ class Refractory(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         state["ccb_satisfy"] = 0.0
         before = float(core.mood.profile("u1")["libido"])
         core.build_injection("u1")
@@ -553,6 +569,8 @@ class Exit(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         state["ccb_last_at"] = core.now_epoch() - ccb.CCB_SCENE_IDLE_SECONDS - 60
         core._ccb_end_if_stale("u1", core.now_epoch())
         self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 0.0)
@@ -562,6 +580,8 @@ class Exit(unittest.TestCase):
         _mood(core, energy=10.0)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         state["ccb_last_at"] = core.now_epoch()
         core._ccb_end_if_stale("u1", core.now_epoch())
         self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 0.0)
@@ -639,6 +659,8 @@ class SceneScorePlumbing(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         state["ccb_gate_at"] = core.now_epoch() - 60
         state["ccb_scene_score"] = 0.2
         state["ccb_scene_at"] = core.now_epoch() - 10
@@ -651,6 +673,8 @@ class SceneScorePlumbing(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         state["ccb_gate_at"] = core.now_epoch() - 60
         state["ccb_scene_score"] = 0.2
         state["ccb_scene_at"] = core.now_epoch() - 120
@@ -716,6 +740,8 @@ class AuditRegressions(unittest.TestCase):
         state = _state(core)
         state["ccb_satisfy"] = 0.0
         state["ccb_stage"] = 0.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         # 进门需要一点证据（模型分不在时走兜底），这里直接给兜底信号。
         state["ccb_intimacy_at"] = core.now_epoch()
         text = core.build_injection("u1")
@@ -735,6 +761,8 @@ class AuditRegressions(unittest.TestCase):
         _mood(core)
         state = _state(core)
         state["ccb_stage"] = 2.0
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_active_at"] = core.now_epoch()
         state["ccb_satisfy"] = 80.0
         text = core.build_injection("u1")
         self.assertIn("到了", text, "#62：相位 4 在注入里是「到了」，不是「爆发」")

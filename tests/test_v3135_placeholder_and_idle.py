@@ -19,7 +19,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from humanoid.llm import CallGate
-from humanoid.reply_guard import is_placeholder
+from humanoid.text_utils import is_placeholder
 from humanoid.services.schedule import (
     PURGE_KEY,
     PURGE_VERSION,

@@ -21,7 +21,7 @@ from ..data.mood_map import generate_mood_tag, get_mood_label
 from ..jsonx import extract_json_object
 from ..llm import PURPOSE_MOOD, LLMGateway
 from ..recall import MAX_SNIPPETS, note_said, recall_lines
-from ..reply_guard import is_placeholder as _is_placeholder
+from ..text_utils import is_placeholder as _is_placeholder
 from ..wording import pick
 from ..role_scope import RoleScope
 

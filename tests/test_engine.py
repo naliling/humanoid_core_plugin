@@ -139,7 +139,7 @@ class EngineTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("schedule", snap)
             self.assertIn("soma", snap, "身体轴没进快照，主动社交层就读不到")
             self.assertIn("sleep_pressure", snap["soma"])
-            self.assertIn("max_chars", snap["form_policy"])
+            self.assertNotIn("form_policy", snap)
         finally:
             await engine.role_manager.stop()
 

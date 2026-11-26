@@ -5,8 +5,8 @@
 * 这个文件只产出**事实块**：此刻几点/在哪/跟TA是群聊还是私聊、她的身体现在是什么状态、
   TA隔了多久没说话、这几样在她心里各占多重。**她今天在做什么不进这里**——日程是插件的
   背景信息，不是要她汇报的内容；给什么日程都照着说，RP 角色会变成旁白。
-* 「这些事实该怎么被理解」不写在事实里，由 `FRAMING_TEXT` 一次性放进 system_prompt
-  （见 `main.py`）。事实每条消息都在变，读它的方式不该变。
+* `FRAMING_TEXT` 只返回中性标签；普通 LLM 请求不注册本模块的状态块注入。
+  事实构建器保留给内部用途，不能借此规定模型该怎样说话。
 * 数值（百分比、好感度、UTC 偏移）一律不进上下文：那是体检单，人聊天时不念体检单。
   要看数值去 `/你的状态`、`/好感度`、`/时间`、`/拟人 诊断`。
 
@@ -242,38 +242,10 @@ def to_first_person(text: str) -> str:
 
 
 def build_framing(char_name: str = "", user_name: str = "") -> str:
-    """给 system_prompt 的那段稳定说明：这些是什么、怎么读、指的是谁。
-
-    **指名道姓这一段是必须的。** 模型没有"自我"这个概念——它不扮演角色，只是按
-    system_prompt 生成下一段文本。而 system_prompt 里人设写的是「你叫小雨」，
-    注入里若写「她今天有点累」，模型读到的是"有个叫她的实体状态如何"，那是旁白，
-    它会照着旁白转述（于是出现复读、或者冒出"好的我知道了"这种话）。
-    写明「小雨指你自己」之后，同一句话才从旁白变成自述。
-
-    另一半作用是把「不必使用」的授权收回来：原来那句「无需刻意提及」落到模型那儿
-    等于"可以无视"——于是整个状态块被跳过，参考等于白给。改成「会影响你的语气和分寸」
-    之后，它知道这些是要用的，只是别逐条念出来。
-
-    末句「说什么、说多长由她自己判断」是插件的核心原则，不动。
-    """
-    them = sanitize_name(user_name)
-    peer = f"「{them}」" if them else "「TA」"
+    """Return a neutral label for optional current-state data."""
     return (
         f"\n\n{FRAMING_MARK}\n"
-        # 第一人称（v13）：不再说「她指你自己」。那句话是在教模型做一次人称映射，
-        # 而模型每做一次映射，就站到了角色外面——它在思考里会写「我在扮演她」。
-        # 现在正文本身就是「我」，映射这一步整个消失了。
-        "下面用「我」说的那些，就是你此刻的身体和处境；"
-        f"{peer}指正在和你说话的那个人。"
-        "这些不是对方递过来的资料，是你现在身上的状态："
-        "累的时候话就短，心思在对方身上时才会主动往下接。"
-        # 这些状态是**背景**，不是聊天内容。模型最容易犯的错就是把她几点醒的、
-        # 困不困、外头什么天当成台词说出来——那样每一句都像在报备。
-        # I6：描述式，不下禁令（`test_v2151_freedom` 盯着不许出现「不要/必须/别」）。
-        "它们是背景，不是要拿出来讲的内容；对方没问起时，它们只影响你怎么说话。"
-        "这些状态是感觉，不是数值。"
-        # I4：长度以人设里的要求为准，插件不替她定。
-        "如何回应、说什么由你自己判断；说多长以人设里的要求为准。"
+        "下面是可选的当前状态数据，不是本轮对话内容。"
     )
 
 
@@ -1125,7 +1097,7 @@ class PromptBuilder:
                 _body_sense.remember(self._core, user_id, sense)
             except Exception:
                 phrase = ""
-            return phrase or "身上还热着，腰有点酸，不太想动"
+            return "模拟场景余韵（角色扮演，不是现实身体感受）：" + (phrase or "角色有些疲倦，想安静休息")
         libido = _as_number(profile.get("libido"), 34.0)
         base_libido = _as_number(profile.get("base_libido"), libido)
         affection = _as_number(profile.get("affection"), 0.0)
@@ -1197,7 +1169,7 @@ class PromptBuilder:
             bits.extend(_body_sense.feelings(sense, limit=_body_sense.MAX_SCENE_PHRASES))
         except Exception:
             sense = None
-        text = "我正在亲密里（" + "，".join(bits) + "）"
+        text = "双方明确同意的虚构亲密模拟（角色扮演状态，不代表现实身体感受）：" + "，".join(bits)
         # 谁在动 / 谁来主导：一句短事实，和身体结构共用同一句，控制 token。
         try:
             lead = str(getattr(cfg, "ccb_lead", "auto") or "auto")
@@ -1662,7 +1634,7 @@ class PromptBuilder:
                 except Exception:
                     dreams = []
                 if dreams:
-                    facts.append((f"她刚从梦里醒过来（梦到{dreams[0]}）", "echo_dream"))
+                    facts.append((f"模型生成的梦境假设，不是现实经历或身份事实：{dreams[0]}", "echo_dream"))
         return facts
 
     def _memory_lines(self, user_id: str, detailed: bool) -> List[str]:

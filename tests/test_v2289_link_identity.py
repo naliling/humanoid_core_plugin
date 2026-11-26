@@ -356,19 +356,19 @@ class ContractIdentityOutfitTest(unittest.TestCase):
         for legacy in ("user_affection", "user_nickname",
                        "user_last_interaction", "user_said"):
             self.assertIn(legacy, paths, f"旧路径不能丢：{legacy}")
-        for old in ("body", "feelings", "form", "activity", "day", "ongoing", "routine",
+        for old in ("body", "feelings", "activity", "day", "ongoing", "routine",
                     "dreams", "wake", "event"):
             self.assertIn(old, CONTRACT_CAPABILITIES)
-        self.assertIn("identity", CONTRACT_CAPABILITIES)
-        self.assertIn("outfit", CONTRACT_CAPABILITIES)
+        self.assertTrue({"identity", "outfit"}.issubset(CONTRACT_CAPABILITIES))
+        self.assertNotIn("form", CONTRACT_CAPABILITIES)
         self.assertIn("identity", self.contract["capabilities"])
         self.assertIn("outfit", self.contract["capabilities"])
 
-    def test_schema_version_unchanged_but_fields_hash_moved(self):
+    def test_schema_version_bumped_for_removed_form_policy(self):
         # v3.0.3（契约 2）：身体轴可为 null，数值域变了 → 主版本 +1。
-        self.assertEqual(CONTRACT_VERSION, 3)
-        self.assertEqual(CONTRACT_SCHEMA, "humanoid.contract/3")
-        self.assertEqual(self.contract["v"], 3)
+        self.assertEqual(CONTRACT_VERSION, 4)
+        self.assertEqual(CONTRACT_SCHEMA, "humanoid.contract/4")
+        self.assertEqual(self.contract["v"], 4)
         self.assertEqual(self.contract["schema"], CONTRACT_SCHEMA)
         # 新块进了结构指纹：去掉 identity/outfit 后哈希必然不同（只加不改也得让
         # 对面的结构校验看得到变化）。
@@ -395,7 +395,7 @@ class ContractIdentityOutfitTest(unittest.TestCase):
                          {"char_name": "", "persona_label": "",
                           "species": "", "body_traits": []})
         self.assertEqual(contract["outfit"], {})
-        self.assertEqual(contract["v"], 3)
+        self.assertEqual(contract["v"], 4, "v4 is emitted when identity fields fail")
 
     def test_block_helpers_degrade(self):
         self.assertEqual(_identity_block(SimpleNamespace()),

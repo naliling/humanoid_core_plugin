@@ -36,30 +36,67 @@ class PsycheWriterTest(unittest.TestCase):
     def test_generated_text_becomes_injection(self):
         d = Path(tempfile.mkdtemp())
         store = PsycheStore(d, "bot1")
+        user_text = "我平时说话很直接，随便吧"
         raw = json.dumps({
             "entry": "他刚才那句随便，我有点在意",
             "concern": {"key": "casual", "text": "他那句随便到底什么意思",
                         "pull_toward": "他可能只是随口", "pull_away": "又怕我没接住",
                         "triggers": ["随便"], "significance": 0.8},
             "needs": {"understanding": 0.3},
-            "view": {"traits": ["说话短"], "misread": "我以为他不在意"},
+            "view": {
+                "traits": [
+                    {"text": "我平时说话很直接", "evidence": "我平时说话很直接"},
+                    {"text": "说话短", "evidence": "随便吧"},
+                ],
+                "expectation": {"text": "他会在意", "evidence": "随便吧"},
+                "misread": {"text": "我以为他不在意", "evidence": "随便吧"},
+            },
         }, ensure_ascii=False)
         gw = _FakeGateway("```json\n" + raw + "\n```")
         writer = PsycheWriter(store, gw, lambda: None, time_source=lambda: 1_000_000.0)
         wrote = asyncio.run(writer.write_once(
-            "u1", user_text="随便吧", her_reply="我有点在意你说的随便"))
+            "u1", user_text=user_text, her_reply="我有点在意你说的随便"))
         self.assertTrue(wrote)
         self.assertEqual(len(gw.calls), 1)
         st = store.state("u1")
         self.assertIn("casual", st.concerns)
         # delta 0.3 被钳到 0.2（防单次跳变）：0.25 + 0.2 = 0.45
         self.assertAlmostEqual(st.needs["understanding"], 0.45)
+        self.assertEqual(st.view.traits, ["我平时说话很直接"])
+        self.assertEqual(st.view.trait_evidence["我平时说话很直接"], "我平时说话很直接")
+        self.assertEqual(st.view.expectation_source, "user_text")
+        self.assertEqual(st.view.expectation_evidence, "随便吧")
         self.assertEqual(st.view.misread, "我以为他不在意")
-        self.assertTrue(any(e.text == "他刚才那句随便，我有点在意" for e in store.journal))
+        self.assertEqual(st.view.misread_evidence, "随便吧")
+        entry = next(e for e in store.journal if e.text == "他刚才那句随便，我有点在意")
+        self.assertEqual(entry.source_kind, "model_internal")
+        self.assertEqual(entry.source_text, user_text)
         # 生成后 10 小时、夜里、清醒：心事该浮上来成为注入
         lines = st.injection_lines(local_hour=23, text="", body_modulation=1.0,
                                    now=1_000_000.0 + 10 * 3600)
-        self.assertTrue(any("随便" in x for x in lines))
+        self.assertEqual(lines, [st.concerns["casual"].text], "注入只能回传已存心事原文")
+        self.assertNotIn(st.view.misread, lines)
+
+    def test_followup_writer_prompt_labels_view_hypotheses(self):
+        store = PsycheStore(Path(tempfile.mkdtemp()), "bot1")
+        st = store.state("u1")
+        source = "我喜欢慢慢熟，他说需要一点空间"
+        st.update_view(
+            traits=[{"text": "我喜欢慢慢熟", "evidence": "我喜欢慢慢熟"}],
+            expectation={"text": "他可能需要空间", "evidence": "他说需要一点空间"},
+            misread={"text": "我是不是误会了", "evidence": "他说需要一点空间"},
+            source_text=source,
+        )
+        gw = _FakeGateway('{"entry":"我还在想这件事"}')
+        writer = PsycheWriter(store, gw, lambda: None, time_source=lambda: 1_000_000.0)
+        self.assertTrue(asyncio.run(writer.write_once(
+            "u1", user_text="我今天发现，先处理手头的事让我安心一点", her_reply="我听见了")))
+        prompt = gw.calls[0]["prompt"]
+        self.assertIn("证据来自较早的用户原文，并非本轮内容", prompt)
+        self.assertNotIn("来源为本轮用户原文", prompt)
+        self.assertIn("他说需要一点空间", prompt)
+        self.assertIn("我今天发现，先处理手头的事让我安心一点", prompt)
+        self.assertIn("对方明确原文（逐字片段，非归纳）", prompt)
 
     def test_throttle_and_no_content_skip_call(self):
         d = Path(tempfile.mkdtemp())
@@ -146,20 +183,92 @@ class PsycheLogicTest(unittest.TestCase):
         lines = st.ruminating(local_hour=2, now=now, body_modulation=1.0)
         self.assertTrue(lines)
         inject = st.injection_lines(local_hour=2, now=now, body_modulation=1.0)
-        self.assertIn("想靠近又怕打扰", inject)
-        self.assertTrue(any("又想靠近" in x for x in inject))
+        self.assertEqual(inject, ["想靠近又怕打扰"], "只投递已存心事，不合成新的心理台词")
 
-    def test_view_update_and_misread(self):
+    def test_view_update_requires_verbatim_source_evidence(self):
         st = PsycheState("u1")
-        st.update_view(traits=["说话急"], expectation="他会在意", misread="我以为他在生气",
-                       evidence=2)
-        self.assertEqual(st.view.traits, ["说话急"])
-        self.assertEqual(st.view.evidence_count, 2)
-        # 新证据修正：重复 trait 不叠加，misread 被改写
-        st.update_view(traits=["说话急", "心细"], misread="其实他只是累了", evidence=1)
-        self.assertEqual(st.view.traits, ["说话急", "心细"])
-        self.assertEqual(st.view.misread, "其实他只是累了")
+        source = "我平时说话比较急，他会在意我；他刚才语气很短，其实他只是累了"
+        st.update_view(
+            traits=[{"text": "我平时说话比较急", "evidence": "我平时说话比较急"}],
+            expectation={"text": "他会在意我", "evidence": "他会在意我"},
+            misread={"text": "我以为他在生气", "evidence": "他刚才语气很短"},
+            source_text=source,
+        )
+        self.assertEqual(st.view.traits, ["我平时说话比较急"])
+        self.assertEqual(st.view.trait_evidence["我平时说话比较急"], "我平时说话比较急")
+        self.assertEqual(st.view.expectation_source, "user_text")
+        self.assertEqual(st.view.expectation_evidence, "他会在意我")
+        self.assertEqual(st.view.misread_evidence, "他刚才语气很短")
         self.assertEqual(st.view.evidence_count, 3)
+
+        st.update_view(
+            traits=[
+                {"text": "我平时说话比较急", "evidence": "我平时说话比较急"},
+                {"text": "我其实很心细", "evidence": "我其实很心细"},
+            ],
+            misread={"text": "我可能误会他了", "evidence": "其实他只是累了"},
+            source_text="我其实很心细；其实他只是累了",
+        )
+        self.assertEqual(st.view.traits, ["我平时说话比较急", "我其实很心细"])
+        self.assertEqual(st.view.misread, "我可能误会他了")
+        self.assertEqual(st.view.expectation, "他会在意我")
+        self.assertEqual(st.view.evidence_count, 4)
+
+        st.update_view(expectation=None, misread=None, source_text=source,
+                       clear_expectation=True, clear_misread=True)
+        self.assertEqual(st.view.expectation, "")
+        self.assertEqual(st.view.expectation_source, "")
+        self.assertEqual(st.view.expectation_evidence, "")
+        self.assertEqual(st.view.misread, "")
+        self.assertEqual(st.view.misread_source, "")
+        self.assertEqual(st.view.misread_evidence, "")
+        self.assertEqual(st.view.evidence_count, 2)
+
+    def test_unsupported_view_inferences_and_legacy_fields_are_dropped(self):
+        st = PsycheState("u1")
+        changed = st.update_view(
+            traits=[
+                {"text": "外向", "evidence": "我今天很开心"},
+                {"text": "外向", "evidence": "我不是很外向"},
+            ],
+            expectation={"text": "他会在意", "evidence": "不存在的引文"},
+            misread="我以为他在生气",
+            source_text="我今天很开心；我不是很外向",
+        )
+        self.assertFalse(changed)
+        self.assertEqual(st.view.traits, [])
+        self.assertEqual(st.view.expectation, "")
+        self.assertEqual(st.view.misread, "")
+
+        legacy = ViewOfPeer.from_dict({
+            "traits": ["外向"], "expectation": "他会在意",
+            "misread": "我以为他生气", "evidence_count": 9,
+        })
+        self.assertEqual(legacy.traits, [])
+        self.assertEqual(legacy.expectation, "")
+        self.assertEqual(legacy.misread, "")
+        self.assertEqual(legacy.evidence_count, 0)
+
+        old_entry = Entry.from_dict({"text": "我记下了"})
+        self.assertEqual(old_entry.source_kind, "legacy_unattributed")
+        self.assertEqual(old_entry.source_text, "")
+        forged_entry = Entry.from_dict({"text": "来源不明", "source_kind": "user_explicit"})
+        self.assertEqual(forged_entry.source_kind, "legacy_unattributed")
+
+    def test_reply_hints_do_not_project_peer_view_hypotheses(self):
+        st = PsycheState("u1")
+        source = "我平时喜欢慢慢熟，他刚才语气很短"
+        st.update_view(
+            traits=[{"text": "我平时喜欢慢慢熟", "evidence": "我平时喜欢慢慢熟"}],
+            expectation={"text": "他会在意", "evidence": "他刚才语气很短"},
+            misread={"text": "我以为他生气了", "evidence": "他刚才语气很短"},
+            source_text=source,
+        )
+        st.frustrate_need("response", 1.0)
+        lines = st.injection_lines(local_hour=23, body_modulation=1.0, now=1_000_000.0)
+        self.assertNotIn("我平时喜欢慢慢熟", lines)
+        self.assertNotIn(st.view.expectation, lines)
+        self.assertNotIn(st.view.misread, lines)
 
     def test_reframe_rewrites_old_interpretation(self):
         st = PsycheState("u1")
@@ -207,16 +316,25 @@ class PsycheStoreTest(unittest.TestCase):
         st = store.state("u1")
         st.frustrate_need("understanding", 0.6)
         st.add_concern(Concern(key="k", text="那件事", triggers=["那件事"]))
-        st.update_view(traits=["急"], misread="看错了")
+        st.update_view(
+            traits=[{"text": "我有点急", "evidence": "我有点急"}],
+            misread={"text": "我可能看错了", "evidence": "他今天说话很短"},
+            source_text="我有点急；他今天说话很短",
+        )
         self.assertTrue(store.save_state())
-        self.assertTrue(store.append_entry(Entry(text="我记下了", concern_key="k")))
+        self.assertTrue(store.append_entry(Entry(
+            text="我记下了", concern_key="k", source_kind="model_internal",
+            source_text="那件事",
+        )))
 
         reopened = PsycheStore(d, "bot1")
         self.assertAlmostEqual(reopened.state("u1").needs["understanding"], 0.85)
         self.assertIn("k", reopened.state("u1").concerns)
-        self.assertEqual(reopened.state("u1").view.misread, "看错了")
+        self.assertEqual(reopened.state("u1").view.misread, "我可能看错了")
         self.assertEqual(len(reopened.journal), 1)
         self.assertEqual(reopened.journal[0].text, "我记下了")
+        self.assertEqual(reopened.journal[0].source_kind, "model_internal")
+        self.assertEqual(reopened.journal[0].source_text, "那件事")
 
     def test_corrupt_files_do_not_crash(self):
         d = Path(tempfile.mkdtemp())

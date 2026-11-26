@@ -34,8 +34,9 @@ CARE_EMA_MIN_GAP_SECONDS = 600.0
 
 
 # (下界, 上界, 事件类型, 间隔档位, 基础重要性)
+MIN_RETURN_GAP_SECONDS = 60.0
 GAP_SEGMENTS = (
-    (300.0, 1800.0, "conversation_resumed", "short_return", 0.30),
+    (MIN_RETURN_GAP_SECONDS, 1800.0, "conversation_resumed", "short_return", 0.30),
     (1800.0, 7200.0, "user_returned", "medium_return", 0.55),
     (7200.0, 21600.0, "user_returned", "long_return", 0.72),
     (21600.0, float("inf"), "long_gap", "very_long_return", 0.86),
@@ -128,12 +129,12 @@ class BehaviorService:
         except (TypeError, ValueError):
             return self._make_event("conversation_started", now, 0.08, {})
 
-        threshold = max(0.0, float(self.config.last_interaction_threshold_minutes) * 60.0)
-        if elapsed < threshold or elapsed < 300.0:
+        threshold = max(MIN_RETURN_GAP_SECONDS, float(self.config.last_interaction_threshold_minutes) * 60.0)
+        if elapsed < threshold:
             return None
 
         for low, high, event_type, bucket, importance in GAP_SEGMENTS:
-            if low < elapsed <= high or (elapsed == low and low == 300.0):
+            if low < elapsed <= high or (elapsed == low and low == MIN_RETURN_GAP_SECONDS):
                 affection = 50.0
                 try:
                     affection = float(self._profile_readonly(user_id).get("affection", 50.0))

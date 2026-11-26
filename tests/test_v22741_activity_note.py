@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import inspect
 import unittest
+from types import SimpleNamespace
+
 
 from tests.test_main_integration import main_module
 
@@ -189,6 +191,47 @@ class StateNoteBudgetTest(unittest.TestCase):
         core.mood = _EmptyMood()
         core.schedule = _EmptySchedule()
         self.assertEqual(main_module._state_note(core, "u1", said="在吗"), "")
+
+
+
+
+class RelationStageGrowthNoteTest(unittest.TestCase):
+    def _note(self, stage_id, is_group):
+        affection = {0: 50.0, 1: 60.0, 2: 80.0, 3: 92.0}[stage_id]
+        config = SimpleNamespace(
+            mood_enabled=True,
+            mood_enabled_in_group=True,
+            inject_token_budget=3500,
+        )
+        mood = SimpleNamespace(
+            readable=lambda *_a, **_k: True,
+            profile=lambda _uid: {"affection": affection, "turn_count": 0, "first_met": 0.0},
+            current_tone=lambda _uid: "",
+            style_tendency=lambda _uid: "",
+            last_emotional_event=lambda _uid: None,
+        )
+        core = SimpleNamespace(
+            prompt_builder=SimpleNamespace(config=config, background_note=lambda key="": ""),
+            mood=mood,
+            schedule=SimpleNamespace(ongoing_tasks=lambda: []),
+            now_epoch=lambda: 1000.0,
+            outfit_line=lambda: "",
+        )
+        core.clock = None
+        return main_module._state_note(core, "u1", is_group=is_group, said="早安")
+
+    def test_each_stage_has_distinct_optional_guidance(self):
+        notes = [self._note(stage, False) for stage in range(4)]
+        self.assertEqual(len(set(notes)), 4)
+        self.assertTrue(all("关系互动参考（可选）" in note for note in notes))
+        self.assertIn("共同话题", notes[2])
+        self.assertIn("不推定亲密同意", notes[3])
+        self.assertNotIn("固定台词", "".join(notes))
+
+    def test_group_state_note_does_not_include_personal_growth_guidance(self):
+        note = self._note(2, True)
+        self.assertIn("不用绕弯子", note)
+        self.assertNotIn("关系互动参考（可选）", note)
 
 
 if __name__ == "__main__":

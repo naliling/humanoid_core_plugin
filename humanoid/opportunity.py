@@ -33,7 +33,7 @@ from typing import Any, Iterable, Mapping
 
 #: 卡片恰好这九个键。社交层按结构读，少一个、多一个都当坏卡丢掉——
 #: 形状漂了却没人报错，是这个项目历史上最常见的一类故障。（投影层可能额外
-#: 打 `generated` 标记，见 `OPTIONAL_CARD_KEYS`；那不算契约键。）
+#: 打 `generated` / `hypothesis` 标记，见 `OPTIONAL_CARD_KEYS`；那不算契约键。）
 CARD_KEYS: tuple[str, ...] = (
     "id",
     "kind",
@@ -47,9 +47,8 @@ CARD_KEYS: tuple[str, ...] = (
 )
 
 #: 可选的附加键：投影层打的标记，不属于九键契约本身。
-#: `generated`（v3.1.42）：这张卡是插件按日程 / 素材排出来的，不是她真经历过的
-#: 事实。社交层旧版本不认识它就当没有；结构校验也不该因为它判坏卡。
-OPTIONAL_CARD_KEYS: tuple[str, ...] = ("generated",)
+#: `generated` 表示卡片由插件生成；`hypothesis` 表示内容不能当作已发生的事实。
+OPTIONAL_CARD_KEYS: tuple[str, ...] = ("generated", "hypothesis")
 
 #: 卡片种类。前几种是 Core 现在产得出来的（日程 / 未完成 / 想做的 / 天气 / 节日 /
 #: 梦 / 刚发生），后面几种留给以后接进来的源（屏幕 / 新闻 / 成长 / 共同记忆 /
@@ -69,11 +68,14 @@ KINDS: tuple[str, ...] = (
     "greeting",
 )
 
-#: 由插件「生成」的出处（不是真实发生的事实）：日程 / 想做的事 / 未完事项都是 Core
-#: 按计划推出来的，问候时机只是窗口。社交层要能区分「她真经历过」和「插件排出来
-#: 的事」——v3.1.42 起投影（`fresh_cards`）给这些卡打 `generated` 标记。
-#: 标签与 `anchors.SOURCE_*` 一致；这里不 import anchors，避免循环依赖。
-GENERATED_SOURCES: frozenset[str] = frozenset({"日程", "想做的事", "未完事项", "问候时机"})
+#: 梦境内容属于生成的假设，不是真实经历；保留一个单独集合供投影标记。
+HYPOTHESIS_SOURCES: frozenset[str] = frozenset({"梦境"})
+
+#: 由插件生成、不能直接当成真实经历的出处。标签与 `anchors.SOURCE_*` 一致；这里
+#: 不 import anchors，避免循环依赖。
+GENERATED_SOURCES: frozenset[str] = frozenset(
+    {"日程", "想做的事", "未完事项", "问候时机"} | HYPOTHESIS_SOURCES
+)
 
 #: 有效期（秒）：按「这条由头多久之后说出来就已经不像话了」分档。
 #: 日程里做过的事按半天撑不住（下午的手冲，晚上再说就已经像编的）：只给两小时，
@@ -300,8 +302,8 @@ def fresh_cards(
     按采集时间倒序、截到 limit 条。
 
     `generated=True` 时给每张卡打 `generated` 标记（素材整块都是插件排的）；
-    不传时按 `source` 判：`GENERATED_SOURCES` 里的出处算生成来源，其余（刚发生 /
-    天气 / 节日 / 梦境这些真实事实）不加标记。
+    未明确要求生成时按 `source` 判定。梦境无论参数如何都标为 `generated` 和
+    `hypothesis`，不允许显式 `generated=False` 把它降格成事实。
     """
     stamp = to_epoch(now)
     alive: list[dict[str, Any]] = []
@@ -311,10 +313,13 @@ def fresh_cards(
         if is_expired(card, stamp):
             continue
         item = dict(card)
+        source = _clean(item.get("source"))
         if generated is True or (
-            generated is None and _clean(item.get("source")) in GENERATED_SOURCES
-        ):
+            generated is None and source in GENERATED_SOURCES
+        ) or source in HYPOTHESIS_SOURCES:
             item["generated"] = True
+        if source in HYPOTHESIS_SOURCES:
+            item["hypothesis"] = True
         alive.append(item)
     picked = dedupe(alive)
     picked.sort(

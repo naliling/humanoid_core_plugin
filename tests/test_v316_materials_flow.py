@@ -128,7 +128,7 @@ class UsedDedupTest(unittest.TestCase):
         used = [{"card_id": target["id"], "used_at": NOW - HOUR}]
         cards = _cards(_Core(used=used))
         self.assertNotIn(target["id"], [c["id"] for c in cards])
-        self.assertEqual(len(cards), 7)
+        self.assertEqual(len(cards), 8)
 
     def test_eight_days_old_record_is_ignored(self):
         baseline = _cards(_Core())

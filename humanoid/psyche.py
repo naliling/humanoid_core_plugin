@@ -104,7 +104,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 @dataclass
 class Entry:
-    """journal 里的一行：她写下的、或者发生过的、一件事。"""
+    """模型写下的内心记录，不是用户原话或已核实事实。"""
 
     text: str                      # 第一人称原文（模型生成）
     kind: str = "self"             # self / event / reframe（重构）
@@ -118,6 +118,8 @@ class Entry:
     significance: float = 0.5
     # 这条记录当时她的身体调制标记（生成时带上，如 "困" "刚醒"）
     body_tag: str = ""
+    source_kind: str = "legacy_unattributed"
+    source_text: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -129,6 +131,9 @@ class Entry:
         text = str(raw.get("text") or "").strip()
         if not text:
             return None
+        source_kind = str(raw.get("source_kind") or "legacy_unattributed")
+        if source_kind not in ("model_internal", "legacy_unattributed"):
+            source_kind = "legacy_unattributed"
         return Entry(
             text=text,
             kind=str(raw.get("kind") or "self"),
@@ -138,6 +143,8 @@ class Entry:
             now_view=str(raw.get("now_view") or ""),
             significance=_clamp(_safe_float(raw.get("significance"), 0.5), 0.0, 1.0),
             body_tag=str(raw.get("body_tag") or ""),
+            source_kind=source_kind,
+            source_text=str(raw.get("source_text") or ""),
         )
 
 
@@ -186,13 +193,17 @@ class Concern:
 
 @dataclass
 class ViewOfPeer:
-    """我眼中的你——会更新、会推错、会被新证据修正。"""
+    """带原文依据的主观模型印象；未核实的假设不得作为用户事实。"""
 
-    traits: List[str] = field(default_factory=list)       # 我觉得你是什么样的人
-    expectation: str = ""                                 # 我以为你会怎样
-    misread: str = ""                                     # 我可能看错的地方
+    traits: List[str] = field(default_factory=list)
+    trait_evidence: Dict[str, str] = field(default_factory=dict)
+    expectation: str = ""
+    expectation_source: str = ""
+    expectation_evidence: str = ""
+    misread: str = ""
+    misread_source: str = ""
+    misread_evidence: str = ""
     updated_at: float = field(default_factory=_now)
-    # 误判的「证据」条数：多了就该怀疑自己看错了
     evidence_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -202,15 +213,45 @@ class ViewOfPeer:
     def from_dict(raw: Any) -> Optional["ViewOfPeer"]:
         if not isinstance(raw, dict):
             return None
-        traits = raw.get("traits") or []
-        if not isinstance(traits, (list, tuple)):
-            traits = []
+        raw_traits = raw.get("traits") or []
+        raw_evidence = raw.get("trait_evidence") or {}
+        if not isinstance(raw_traits, (list, tuple)):
+            raw_traits = []
+        if not isinstance(raw_evidence, dict):
+            raw_evidence = {}
+        traits: List[str] = []
+        trait_evidence: Dict[str, str] = {}
+        for raw_trait in raw_traits:
+            trait = str(raw_trait).strip()
+            evidence = str(raw_evidence.get(trait) or "").strip()
+            if trait and evidence and trait == evidence and trait not in traits:
+                traits.append(trait)
+                trait_evidence[trait] = evidence
+        traits = traits[:8]
+        trait_evidence = {t: trait_evidence[t] for t in traits}
+
+        def hypothesis(name: str) -> Tuple[str, str, str]:
+            text = str(raw.get(name) or "").strip()
+            source = str(raw.get(f"{name}_source") or "")
+            evidence = str(raw.get(f"{name}_evidence") or "").strip()
+            if not text or source != "user_text" or not evidence:
+                return "", "", ""
+            return text, source, evidence
+
+        expectation, expectation_source, expectation_evidence = hypothesis("expectation")
+        misread, misread_source, misread_evidence = hypothesis("misread")
+        verified_count = len(traits) + bool(expectation_evidence) + bool(misread_evidence)
         return ViewOfPeer(
-            traits=[str(t) for t in traits if str(t).strip()][:8],
-            expectation=str(raw.get("expectation") or ""),
-            misread=str(raw.get("misread") or ""),
+            traits=traits,
+            trait_evidence=trait_evidence,
+            expectation=expectation,
+            expectation_source=expectation_source,
+            expectation_evidence=expectation_evidence,
+            misread=misread,
+            misread_source=misread_source,
+            misread_evidence=misread_evidence,
             updated_at=_safe_float(raw.get("updated_at"), _now()),
-            evidence_count=max(0, int(_safe_float(raw.get("evidence_count"), 0))),
+            evidence_count=int(verified_count),
         )
 
 
@@ -318,21 +359,66 @@ class PsycheState:
             c.significance = _clamp(c.significance + 0.15, 0.0, 1.0)
 
     # ---- 心智理论 ----
-    def update_view(self, traits: Sequence[str] = (), expectation: str = "",
-                    misread: str = "", evidence: int = 0,
-                    now: float | None = None) -> None:
+    def update_view(self, traits: Sequence[Any] = (), expectation: Any = None,
+                    misread: Any = None, *, source_text: str = "",
+                    clear_expectation: bool = False, clear_misread: bool = False,
+                    now: float | None = None) -> bool:
+        source_text = str(source_text or "")
         now = now if now is not None else _now()
-        for t in traits:
-            t = str(t).strip()
-            if t and t not in self.view.traits:
-                self.view.traits.append(t)
+        changed = False
+        for item in traits:
+            if not isinstance(item, dict):
+                continue
+            trait = str(item.get("text") or "").strip()
+            evidence = str(item.get("evidence") or "").strip()
+            if not trait or not evidence or trait != evidence or evidence not in source_text:
+                continue
+            if trait not in self.view.traits:
+                self.view.traits.append(trait)
+                self.view.trait_evidence[trait] = evidence
+                changed = True
+            elif self.view.trait_evidence.get(trait) != evidence:
+                self.view.trait_evidence[trait] = evidence
+                changed = True
         self.view.traits = self.view.traits[:8]
-        if expectation:
-            self.view.expectation = str(expectation)
-        if misread:
-            self.view.misread = str(misread)
-        self.view.evidence_count += max(0, int(evidence))
-        self.view.updated_at = now
+        self.view.trait_evidence = {
+            t: self.view.trait_evidence[t] for t in self.view.traits
+            if self.view.trait_evidence.get(t)
+        }
+
+        def update_hypothesis(name: str, value: Any, clear: bool) -> None:
+            nonlocal changed
+            if clear:
+                for suffix in ("", "_source", "_evidence"):
+                    attr = name + suffix
+                    if getattr(self.view, attr):
+                        setattr(self.view, attr, "")
+                        changed = True
+                return
+            if not isinstance(value, dict):
+                return
+            text = str(value.get("text") or "").strip()
+            evidence = str(value.get("evidence") or "").strip()
+            if not text or not evidence or evidence not in source_text:
+                return
+            if (getattr(self.view, name) != text
+                    or getattr(self.view, f"{name}_source") != "user_text"
+                    or getattr(self.view, f"{name}_evidence") != evidence):
+                setattr(self.view, name, text)
+                setattr(self.view, f"{name}_source", "user_text")
+                setattr(self.view, f"{name}_evidence", evidence)
+                changed = True
+
+        update_hypothesis("expectation", expectation, clear_expectation)
+        update_hypothesis("misread", misread, clear_misread)
+        if changed:
+            self.view.evidence_count = (
+                len(self.view.traits)
+                + bool(self.view.expectation_evidence)
+                + bool(self.view.misread_evidence)
+            )
+            self.view.updated_at = now
+        return changed
 
     # ---- 记忆重构：新经历改写旧解释 ----
     def reframe(self, concern_key: str, new_view: str,
@@ -368,7 +454,7 @@ class PsycheState:
 
         与 `injection_lines` 的区别：injection 只拼「够格浮上来的心事」；urge 看的是
         「她心里有没有憋着一句非说不可的话」——压强过了阈值才给，而且只取她自己
-        生成过的第一人称原文（concern.text / view.misread），不在这里造新句子。
+        生成过的第一人称原文（concern.text），不在这里造新句子。
 
         「发言像被插件引起」的根子是：社交层只拿日程/天气这类排出来的由头开口。
         有了 urge，模型手里就有一句「她惦记着、压了一阵子」的话，开口动机来自她
@@ -393,21 +479,16 @@ class PsycheState:
                         now: float | None = None) -> List[str]:
         """拿反刍到的心事 + 最欠的需求，拼成第一人称的轻提示。
 
-        这些文字都是模型自己之前生成的（concern.text / view traits），psyche 只负责
-        「把哪句递上去」。绝不在这里造新句子——造了就是新的念稿源。
+        这些文字都是模型自己之前生成的 concern.text，psyche 只负责「把哪句递上去」。
+        未核实的 peer-view 假设不会进入 reply hints。绝不在这里造新句子——造了就是新的念稿源。
         """
         now = now if now is not None else _now()
         lines: List[str] = []
         for c in self.ruminating(local_hour=local_hour, text=text,
                                  body_modulation=body_modulation, now=now):
             lines.append(c.text)
-            # 矛盾共存：把拉扯的两面一起递上去（如果生成过）
-            if c.pull_toward and c.pull_away:
-                lines.append(f"我又想靠近，又想退开。")
-        need_name, need_val = self.top_need()
-        if need_val > 0.7 and self.view.misread:
-            # 需求欠着 + 有未澄清的误判 → 一句内部疑问，文字来自 view.misread
-            lines.append(self.view.misread)
+
+        # Peer-view hypotheses remain internal and are not projected as reply hints.
         return lines[:getattr(self, "inject_max_lines", INJECT_MAX_LINES)]
 
     # ---- 序列化 ----
@@ -603,11 +684,15 @@ PSYCHE_PROMPT = """你在扮演的角色刚刚和人聊完一轮。请以这个�
 她：{her_reply}
 
 她此刻的身体感觉（会影响心思）：{body_tag}
-她现在惦记的旧事（可能要重新想）：{old_concerns}
-她眼里对方的样子：{view}
+她现在惦记的旧事（模型生成的主观内心记录，不是对方的已核实事实）：{old_concerns}
+她眼里对方的样子（逐项保留来源；假设不是事实）：{view}
 
 要求：
 - 全部用第一人称「我」，是她的心里话，不是旁白、不是给对方看的汇报。
+- entry 是模型生成的内部记录，不是对方说过的话；保留本轮对方原文作为来源，不要把推断改写成对方事实。
+- traits 只可逐字摘录对方原文中明确、稳定的自我描述或一般偏好；不能从一次行为、语气或状态概括。trait 文本必须与 evidence 完全一致。
+- expectation 和 misread 是可撤回的模型假设，必须逐字引用本轮对方原文作为 evidence；没有可引用依据时输出 null，不要沿用成事实。
+- 旧印象仅供角色反思；不能把旧假设升级为事实。若本轮有新证据可改写或撤回旧假设。
 - 只写真正留下的东西。如果这一轮什么都没留下，entry 就写空字符串。
 - 严格输出 JSON，不要解释、不要 Markdown 代码块：
 {{
@@ -615,7 +700,7 @@ PSYCHE_PROMPT = """你在扮演的角色刚刚和人聊完一轮。请以这个�
   "concern": {{"key": "短标识(英文或数字)", "text": "这件没解开的事(第一人称)", "pull_toward": "想靠近的理由", "pull_away": "想退开的理由", "triggers": ["会戳到这件事的词"]}} 或 null,
   "resolve": "要放下的旧事的 key 或空字符串",
   "reframe": {{"key": "旧事 key", "now_view": "现在重新怎么想这件事"}} 或 null,
-  "view": {{"traits": ["我眼里对方的一个特点"], "expectation": "我以为对方会怎样", "misread": "我可能看错了的地方"}} 或 null,
+  "view": {{"traits": [{{"text": "对方明确自述的逐字片段", "evidence": "本轮对方原文中的逐字依据"}}], "expectation": {{"text": "可撤回假设", "evidence": "本轮对方原文逐字依据"}} 或 null, "misread": {{"text": "可撤回假设", "evidence": "本轮对方原文逐字依据"}} 或 null}} 或 null,
   "needs": {{"response": -0.1到0.1, "understanding": -0.1到0.1, "space": -0.1到0.1, "novelty": -0.1到0.1}}
 }}
 needs 里正数=这件事被挫败(更缺)，负数=被满足(不那么缺)。只写这一轮真实变化的，没变化的写 0。"""
@@ -659,10 +744,27 @@ class PsycheWriter:
                 persona = str(self.persona_provider() or "")
             except Exception:
                 persona = ""
-        old = "、".join(c.text for c in st.active_concerns()[:3]) or "（没有）"
-        view = "、".join(st.view.traits) or "（还没形成印象）"
-        if st.view.expectation:
-            view += "；" + st.view.expectation
+        old = "、".join(
+            f"模型生成的主观内心记录（非已核实事实）：{c.text}"
+            for c in st.active_concerns()[:3]
+        ) or "（没有）"
+        view_parts = [
+            f"对方明确原文（逐字片段，非归纳）：{trait}〔依据：{st.view.trait_evidence[trait]}〕"
+            for trait in st.view.traits
+            if st.view.trait_evidence.get(trait) == trait
+        ]
+        if (st.view.expectation and st.view.expectation_source == "user_text"
+                and st.view.expectation_evidence):
+            view_parts.append(
+                f"可撤回的模型假设（不是对方事实；证据来自较早的用户原文，并非本轮内容）："
+                f"{st.view.expectation}〔证据：{st.view.expectation_evidence}〕"
+            )
+        if st.view.misread and st.view.misread_source == "user_text" and st.view.misread_evidence:
+            view_parts.append(
+                f"可撤回的模型假设（不是对方事实；证据来自较早的用户原文，并非本轮内容）："
+                f"{st.view.misread}〔证据：{st.view.misread_evidence}〕"
+            )
+        view = "；".join(view_parts) or "（尚无带直接原文依据的印象）"
         prompt = PSYCHE_PROMPT.format(
             persona=persona[:600] or "（未设置）",
             user_text=str(user_text)[:300],
@@ -693,10 +795,12 @@ class PsycheWriter:
         if data is None:
             self.last_error = "生成结果不是合法 JSON"
             return False
-        return self._apply(user_id, data, now=now, body_tag=body_tag)
+        return self._apply(
+            user_id, data, now=now, body_tag=body_tag, source_text=str(user_text),
+        )
 
     def _apply(self, user_id: str, data: Dict[str, Any], *, now: float,
-               body_tag: str = "") -> bool:
+               body_tag: str = "", source_text: str = "") -> bool:
         st = self.store.state(user_id)
         wrote = False
         # 放下旧事
@@ -713,6 +817,7 @@ class PsycheWriter:
                 self.store.append_entry(Entry(
                     text=str(reframe.get("now_view") or ""), kind="reframe",
                     ts=now, concern_key=key, now_view=str(reframe.get("now_view") or ""),
+                    source_kind="model_internal", source_text=source_text,
                 ))
                 wrote = True
         # 新心事
@@ -730,6 +835,7 @@ class PsycheWriter:
                 concern_key=c.key if c else "",
                 then=entry_text, body_tag=body_tag,
                 significance=c.significance if c else 0.4,
+                source_kind="model_internal", source_text=source_text,
             ))
             wrote = True
         # 心智模型更新
@@ -738,13 +844,15 @@ class PsycheWriter:
             traits = vdata.get("traits") or []
             if not isinstance(traits, (list, tuple)):
                 traits = []
-            st.update_view(
+            wrote = st.update_view(
                 traits=traits,
-                expectation=str(vdata.get("expectation") or ""),
-                misread=str(vdata.get("misread") or ""),
+                expectation=vdata.get("expectation"),
+                misread=vdata.get("misread"),
+                source_text=source_text,
+                clear_expectation=("expectation" in vdata and vdata.get("expectation") is None),
+                clear_misread=("misread" in vdata and vdata.get("misread") is None),
                 now=now,
-            )
-            wrote = True
+            ) or wrote
         # 需求变化
         needs = data.get("needs")
         if isinstance(needs, dict):

@@ -140,9 +140,9 @@ class InjectionFreedomTest(unittest.TestCase):
         """给 system_prompt 的那段只讲「这些是什么、怎么读」，不含禁令也不含事实。"""
         for word in ("不要", "必须", "别", "控制在", "只说", "回一句"):
             self.assertNotIn(word, FRAMING_TEXT, f"框架句里出现了「{word}」")
-        self.assertIn("身上的状态", FRAMING_TEXT)
-        self.assertIn("我现在的身体", FRAMING_TEXT, "框架句要指得清它说的是哪几块")
-        self.assertIn("由你自己判断", FRAMING_TEXT, "参考边界要说清：插件不替她决定怎么开口")
+        self.assertIn("下面是可选的当前状态数据，不是本轮对话内容。", FRAMING_TEXT)
+        self.assertEqual(FRAMING_TEXT.count("下面是可选的当前状态数据"), 1)
+        self.assertNotIn("由你自己判断", FRAMING_TEXT)
         for digit in ("%", "UTC+"):
             self.assertNotIn(digit, FRAMING_TEXT)
 

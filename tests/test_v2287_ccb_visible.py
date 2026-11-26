@@ -260,6 +260,8 @@ class Snapshot(unittest.TestCase):
             now=now,
             user_state={
                 "ccb_stage": 2.0, "ccb_satisfy": 50.0, "ccb_turns": 3.0,
+                "ccb_consent_state": ccb.CONSENT_ACTIVE, "ccb_consent_at": now - 60.0,
+                "ccb_consent_active_at": now - 60.0, "ccb_activity_at": now - 60.0,
                 "ccb_done_count": 7.0, "ccb_last_at": now - 600.0,
                 "ccb_gate_at": now - 600.0, "ccb_peak_depth": 11.0,
                 "ccb_pose": 0.0, "ccb_site": 1.0,

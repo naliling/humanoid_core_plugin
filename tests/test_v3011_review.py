@@ -1,4 +1,4 @@
-"""日程接续（v3.0.11）：空档不被节流挡住；模型自审层已在 v3.1.28 删除。"""
+"""日程接续（v3.0.11）：空档保持覆盖，普通补排仍遵守模型调用间隔。"""
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ class GateIntervalTest(unittest.TestCase):
 
 
 class GapContinuityTest(unittest.IsolatedAsyncioTestCase):
-    """空档接续：她手上那段过完之后，立刻排下一段，不被上一段留下的间隔挡住。"""
+    """空档接续：间隔内不重复问模型，用本地动态段覆盖时间线。"""
 
     def build(self, **overrides):
         conf = cfg(
@@ -116,26 +116,31 @@ class GapContinuityTest(unittest.IsolatedAsyncioTestCase):
         provider = FakeProvider("p", reply=seg_reply(event="倒杯水", minutes=5))
         ctx = FakeContext(chat_providers=[provider])
         resolver = ProviderResolver(ctx, log)
-        gateway = LLMGateway(resolver, lambda: self.conf, log, time.monotonic)
         clock = FrozenClock(FIXED_MOMENT)
+        monotonic = clock.timestamp
+        gate = CallGate(lambda: self.conf, log, wall_clock=clock.timestamp, monotonic=monotonic)
+        gate.note_interaction(now=clock.timestamp(), role_id=str(store.scope.role_id or ""))
+        gateway = LLMGateway(resolver, lambda: self.conf, log, monotonic, gate=gate)
+
         service = ScheduleService(
-            store.scope, lambda: self.conf, clock, logger=log, monotonic=time.monotonic
+            store.scope, lambda: self.conf, clock, logger=log, monotonic=monotonic
         )
         service.set_resolver_gateway(resolver, gateway)
         return service, provider, gateway
 
-    async def test_gap_is_filled_right_away_despite_the_interval(self):
+    async def test_gap_stays_covered_without_repeating_model_within_interval(self):
         service, provider, _gateway = self.build(schedule_time_granularity="15min")
-        await service.ensure_fresh()  # 09:00-09:30 倒杯水（清醒下限 30）
-        self.assertEqual(provider.calls, 1)
-        service._clock.advance(minutes=31)  # 09:31，手上没有任何一段
+        await service.ensure_fresh()  # 09:00-09:05 倒杯水（保留真实短时长）
+        self.assertEqual(
+            provider.calls, 1,
+            f"首段未到 provider；result={_gateway.last_result('日程生成')!r}; status={service.status()!r}",
+        )
+        service._clock.advance(minutes=6)  # 09:06，距离模型间隔下限仍不足 30 分钟
         self.assertTrue(service.refresh_due())
-        provider.reply = seg_reply(event="整理书架", minutes=30)
         self.assertTrue(await service.ensure_fresh())
-        self.assertEqual(provider.calls, 2, "空档接续不该被 30 分钟间隔挡住")
-        segs = service.segments()
-        self.assertEqual(segs[1]["start"], "09:30", "从上一段结束处接上，不留窟窿")
-        self.assertEqual(segs[1]["event"], "整理书架")
+        self.assertEqual(provider.calls, 1, "普通空档不能绕过 30 分钟模型调用间隔")
+        active, _prev = service._active_and_prev(9 * 60 + 6)
+        self.assertIsNotNone(active, "模型调用被限流后仍要用本地动态片段覆盖空档")
 
     async def test_idle_silence_still_blocks_even_in_a_gap(self):
         """空档不是免死金牌：没人跟她说话时，照样一次都不许调。"""
@@ -175,7 +180,7 @@ class FixedSegmentParseTest(unittest.TestCase):
         )
         self.assertIsNotNone(slot)
         self.assertEqual(slot["start"], "09:00")
-        self.assertEqual(slot["end"], "09:30", "6 分钟被抬到清醒下限 30（#311）")
+        self.assertEqual(slot["end"], "09:06", "6 分钟活动保留真实时长（#311）")
 
 
 if __name__ == "__main__":

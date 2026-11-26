@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,6 +27,7 @@ from humanoid.services.life_material import (
 )
 from humanoid.services.schedule import (
     NAP_REDUNDANT_MINUTES,
+    ROLE_MATERIALS_RULE_VERSION,
     ScheduleService,
     segment_prompt,
 )
@@ -111,6 +114,38 @@ class MaterialsPoolTest(unittest.TestCase):
         for item in duty_items:
             self.assertNotIn(str(item["event"]), without)
 
+    def test_cached_role_extras_are_revalidated(self):
+        base = dict(_items()[0])
+        valid = {
+            **base,
+            "event": "把桌上的小盒子拆了又装回去",
+            "topic": "schedule-role-cache-control",
+            "slots": ("中午",),
+            "band": "life",
+            "needs": (),
+            "interest": "",
+        }
+
+        def events_for(item, species=""):
+            return {
+                str(material["event"])
+                for material in materials_for(
+                    SEED, "", 13 * 60, (), DEFAULT_COUNT, extra=[item], species=species
+                )
+            }
+
+        self.assertIn(valid["event"], events_for(valid))
+        stale = [
+            ({**valid, "needs": ("pet",)}, ""),
+            ({**valid, "interest": "craft"}, ""),
+            ({**valid, "event": "把门口的鞋摆整齐"}, "pony"),
+            ({**valid, "event": "用手机看短视频"}, ""),
+            ({**valid, "event": "什么也不干，坐着发了会儿呆"}, ""),
+        ]
+        for item, species in stale:
+            with self.subTest(event=item["event"], species=species):
+                self.assertNotIn(item["event"], events_for(item, species))
+
     def test_recent_topic_is_deduped(self):
         """今天已经做过的事不再发——否则素材本身就成了雷同的来源。"""
         first = _items()
@@ -159,16 +194,34 @@ class PromptBlockTest(unittest.TestCase):
             **kwargs,
         )
 
-    def test_materials_block_appears(self):
+    def test_raw_materials_are_not_injected_without_a_filtered_slate(self):
         text = render_materials(_items(count=3), SEED)
         prompt = self._prompt(materials=text)
-        self.assertIn("【今天她可能做的事】", prompt)
-        self.assertIn("不是清单", prompt)
+        self.assertNotIn("【今天她可能做的事】", prompt)
+        self.assertNotIn("【可以选的事】", prompt)
         for row in text.splitlines():
-            self.assertIn(row.strip(), prompt)
+            self.assertNotIn(row.strip(), prompt)
 
     def test_no_materials_no_block(self):
         self.assertNotIn("【今天她可能做的事】", self._prompt())
+
+    def test_generated_day_frame_and_dreams_have_provenance(self):
+        prompt = self._prompt(day_frame="松散的一天", want_day_frame=True)
+        self.assertIn("模型生成的当天氛围假设，不是已发生的事实", prompt)
+        self.assertIn("dreams 是生成的梦境内容，不是清醒时发生的事实，不能证明身份或经历", prompt)
+
+    def test_schedule_preferences_are_not_identity_evidence(self):
+        from humanoid.services.schedule import _example_evidence
+
+        persona = SimpleNamespace(prompt="我是住在海边的人。")
+        conf = cfg(schedule_prompt_extra="我喜欢读书，也喜欢画画。")
+        service = _service()
+        for evidence in (
+            service._fact_evidence(persona, conf),
+            _example_evidence(persona, conf),
+        ):
+            self.assertIn("住在海边", evidence)
+            self.assertNotIn("喜欢读书", evidence)
 
     def test_sleep_block_reports_today(self):
         prompt = self._prompt(day_sleep_minutes=95)
@@ -325,7 +378,7 @@ class OverlongNapTest(unittest.TestCase):
 
 
 class NeedLessSleepGateTest(unittest.IsolatedAsyncioTestCase):
-    """生成后独立判一遍：重写一次仍然排睡，就放行但记一笔。"""
+    """生成后独立判一遍：一次重写后仍不合格就降级，不放行。"""
 
     def _build(self, reply, moment=MOMENT, sleep_pressure=40.0):
         conf = cfg(
@@ -336,7 +389,8 @@ class NeedLessSleepGateTest(unittest.IsolatedAsyncioTestCase):
         store = ScopeStore(tmp)
         store.load(moment.strftime("%Y-%m-%d"), conf.cycle_length)
         log = RecordingLogger()
-        ctx = FakeContext(chat_providers=[FakeProvider("p", reply=reply)])
+        provider = FakeProvider("p", reply=reply)
+        ctx = FakeContext(chat_providers=[provider])
         resolver = ProviderResolver(ctx, log)
         gateway = LLMGateway(resolver, lambda: conf, log, lambda: 10_000.0)
         service = ScheduleService(
@@ -348,32 +402,70 @@ class NeedLessSleepGateTest(unittest.IsolatedAsyncioTestCase):
             body_provider=lambda: {"sleep_pressure": sleep_pressure},
         )
         service.set_resolver_gateway(resolver, gateway)
-        return service
+        return service, provider
 
-    async def test_needless_sleep_is_counted_and_let_through(self):
-        service = self._build(_sleep_reply())
+    async def test_needless_sleep_is_rejected_after_one_rewrite(self):
+        service, provider = self._build(_sleep_reply())
         _seed_slots(service, [_nap("09:00", "11:00")])
         await service.ensure_fresh()
-        self.assertGreaterEqual(
-            service._quality.get("needless_sleep", 0), 1,
-            "今天已经睡够、困意也没越线，重写后仍排睡：应该记一笔",
-        )
-        self.assertEqual(len(service.segments()), 2, "记一笔但放行，不降级")
+        self.assertGreaterEqual(service._quality.get("needless_sleep", 0), 1)
+        self.assertEqual(provider.calls, 2, "只重写一次")
+        segments = service.segments()
+        self.assertEqual(len(segments), 2, "重写后仍不合格时降级")
+        self.assertNotIn("睡", segments[-1]["event"])
 
-    async def test_overlong_nap_is_counted(self):
-        service = self._build(_sleep_reply(300))
+    async def test_overlong_nap_is_rejected_after_one_rewrite(self):
+        service, provider = self._build(_sleep_reply(300))
         _seed_slots(service, [_nap("00:00", "07:00")])
         await service.ensure_fresh()
-        self.assertGreaterEqual(
-            service._quality.get("overlong_nap", 0), 1,
-            "白天睡五小时、困意也没越线：应该记一笔",
+        self.assertGreaterEqual(service._quality.get("overlong_nap", 0), 1)
+        self.assertEqual(provider.calls, 2, "只重写一次")
+        segments = service.segments()
+        self.assertEqual(len(segments), 2, "重写后仍不合格时降级")
+        self.assertNotIn("睡", segments[-1]["event"])
+
+    async def test_repeat_is_rejected_after_one_rewrite(self):
+        event = "把桌上的小盒子拆了又装回去"
+        reply = '{"continue": false, "event": "把桌上的小盒子拆了又装回去", "location": "书桌前", "emotion": "平静", "energy_rate": 0.0, "minutes": 45}'
+        service, provider = self._build(reply)
+        _seed_slots(
+            service,
+            [
+                {"start": "09:00", "end": "10:00", "event": event, "location": "书桌前", "emotion": "平静", "energy_rate": 0.0},
+                _awake("12:00", "13:00"),
+            ],
         )
+        await service.ensure_fresh()
+        self.assertGreaterEqual(service._quality.get("repeat", 0), 1)
+        self.assertEqual(provider.calls, 2, "只重写一次")
+        segments = service.segments()
+        self.assertEqual(len(segments), 3, "保留两条历史段，重写后仍不合格则追加降级段")
+        self.assertNotEqual(segments[-1]["event"], event)
 
     async def test_tired_day_is_not_flagged(self):
-        service = self._build(_sleep_reply(), sleep_pressure=92.0)
+        service, _provider = self._build(_sleep_reply(), sleep_pressure=92.0)
         _seed_slots(service, [_nap("09:00", "11:00")])
         await service.ensure_fresh()
         self.assertEqual(service._quality.get("needless_sleep", 0), 0)
+
+    async def test_role_cache_fingerprint_includes_rule_version(self):
+        service = _service(use_llm_schedule=True)
+        service.gateway = object()
+
+        async def resolve_persona():
+            return SimpleNamespace(prompt="我是住在海边的人。")
+
+        service._resolve_persona = resolve_persona
+        service._species_profile = lambda: "pony"
+        captured = []
+        with patch(
+            "humanoid.services.schedule._role_fingerprint",
+            side_effect=lambda *args: (captured.append(args) or "fingerprint"),
+        ), patch("humanoid.services.schedule._role_needs_build", return_value=False) as needs_build:
+            await service._build_role_materials(cfg(use_llm_schedule=True))
+        needs_build.assert_called_once()
+        self.assertEqual(len(captured), 1)
+        self.assertIn(f"role_rules:{ROLE_MATERIALS_RULE_VERSION}", captured[0][0])
 
 
 class QualityFixBlockTest(unittest.TestCase):

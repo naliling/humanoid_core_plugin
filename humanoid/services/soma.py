@@ -7,8 +7,8 @@
    会饿、会坐太久肩膀发僵。
 2. **轴之间耦合。** 睡眠债压低次日精力基线；不适感放大精力消耗；饥饿与久坐互相加成；
    天气的冷热并进不适感；周期阶段给的是「感受」而不只是一个系数。
-3. **产出的是体感，不是数字。** `feelings()` 返回第一人称短句与显著度，`form_policy()`
-   返回这一轮说话的形式倾向。数值只用于内部积分与 contract 导出。
+3. **产出的是体感，不是数字。** `feelings()` 返回第一人称短句与显著度。身体数值用于
+   内部状态与身体契约，不用于约束消息形式。
 
 不建模的东西：口渴、排尿、精确体温。它们只会让注入变长、让角色像在背生理书。
 """
@@ -1204,57 +1204,6 @@ class SomaService:
             return self._clock.today_str()
         except Exception:
             return ""
-
-    def form_policy(self, energy: float, social_energy: float) -> dict[str, Any]:
-        """身体这一轮够得着多大份量：只算状态，不是给她的规矩，也不碰内容。"""
-        snap = self.snapshot()
-        max_chars = 120
-        if snap["sleep_pressure"] >= 88 or snap["asleep"] >= 1.0:
-            max_chars = 20
-        elif snap["sleep_pressure"] >= 72:
-            max_chars = 40
-        elif snap["discomfort"] >= 62:
-            max_chars = 45
-        elif snap.get("chill", 0.0) >= 45:
-            max_chars = 60
-        elif energy < 25:
-            max_chars = 60
-        if snap["sleep_debt"] >= 4.0:
-            max_chars = min(max_chars, 50)
-
-        # `question_bias` 一律「取最严」：身体压制是一条条**收紧**的，社交渴望只允许在
-        # 完全没有身体压制时把它抬起来。
-        #
-        # 旧写法两种口径混用（前两条直接赋值、第三条用 min、第四条又直接赋值），
-        # 于是 740 行的 0.5 会**无条件覆盖**前面所有压制：实测「睡眠压力 90 + 社交渴望 70」
-        # → `max_chars=20` 却 `question_bias=0.5`，等于「只准写 20 字、但一半概率在反问」。
-        caps: list[float] = []
-        if snap["hunger"] >= 88 or snap["discomfort"] >= 62:
-            caps.append(0.05)
-        if snap.get("chill", 0.0) >= 45:
-            caps.append(0.15)
-        if snap["sleep_pressure"] >= 72:
-            caps.append(0.1)
-        question_bias = min([0.35] + caps)
-        if not caps and snap["social_desire"] >= 70 and energy >= 50:
-            question_bias = 0.5
-
-        return {
-            "max_chars": max_chars,
-            "question_bias": round(question_bias, 2),
-            "long_reply_ok": max_chars >= 90,
-            # 「能不能连着发」不再从 max_chars 推。旧写法是 `max_chars <= 45`，于是它
-            # **只在她最难受的时候为真**（20/40/45 三档），而精力充沛时为假——语义正好
-            # 倒过来：有余力才谈得上连着发，累到 20 字上限的人更可能发完就没电。
-            # 社交层拿它决定「主动开话题时能不能接二条」，判反了就是越难受越被连着戳。
-            "burst_ok": bool(
-                energy >= 55
-                and snap["sleep_pressure"] < 72
-                and snap["discomfort"] < 62
-                and snap.get("chill", 0.0) < 45
-                and snap["asleep"] < 1.0
-            ),
-        }
 
     def note_chat(self, now: float | None = None) -> None:
         """刚聊过：把想说话的程度泄掉，并重置独处计时。"""

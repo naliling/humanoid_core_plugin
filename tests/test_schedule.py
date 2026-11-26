@@ -16,6 +16,7 @@ from pathlib import Path
 
 from humanoid.clock import Clock
 from humanoid.config import HumanoidConfig
+from humanoid.persona import Persona
 from humanoid.jsonx import extract_json_array, extract_json_object
 from humanoid.llm import CallGate, LLMGateway, ProviderResolver
 from humanoid.llm import LLMResult, OUTCOME_GATED
@@ -46,6 +47,10 @@ from .fakes import FakeClock, FakeContext, FakeProvider, FrozenClock, RecordingL
 TZ = ZoneInfo("Asia/Shanghai")
 FIXED_TODAY = "2026-08-22"
 FIXED_MOMENT = datetime(2026, 8, 22, 9, 0, tzinfo=TZ)
+
+
+async def _test_persona():
+    return Persona(name="她", prompt="她过着普通的日常生活。", source="test")
 
 
 def cfg(**overrides) -> HumanoidConfig:
@@ -288,10 +293,10 @@ class SegmentParseTest(unittest.TestCase):
         self.assertEqual(parse_time(slot["end"]), 12 * 60 + 720)
 
     def test_min_duration_floor(self):
-        """清醒段的下限是 30 分钟（#311）：3 分钟的「倒杯水」不再单独成一段。"""
+        """清醒段下限为 5 分钟，活动时长独立于轮询粒度。"""
         slot = parse_segment({"event": "倒杯水", "minutes": 3}, now_minute=600, step=15)
         self.assertEqual(
-            parse_time(slot["end"]) - parse_time(slot["start"]), SEGMENT_AWAKE_MIN_MINUTES
+            parse_time(slot["end"]) - parse_time(slot["start"]), 5
         )
 
     def test_sleep_keeps_the_three_minute_floor(self):
@@ -391,6 +396,24 @@ class SegmentPromptTest(unittest.TestCase):
         self.assertIn("跨过半夜也没关系", prompt)
 
 
+class DynamicSegmentNeutralFallbackTest(unittest.TestCase):
+    def test_clock_fallback_does_not_assume_meals_without_hunger(self):
+        for minute in (12 * 60, 19 * 60):
+            slot = dynamic_segment(
+                cfg(), {"hunger": 0.0}, now_minute=minute, step=15,
+                seed=["bot", f"meal-{minute}"],
+            )
+            self.assertTrue(slot["status"])
+            self.assertNotIn(slot["event"], {"吃饭", "吃午饭", "吃晚饭"})
+
+        hungry = dynamic_segment(
+            cfg(), {"hunger": 100.0}, now_minute=12 * 60, step=15,
+            seed=["bot", "hungry"],
+        )
+        self.assertTrue(hungry["status"])
+        self.assertEqual(hungry["emotion"], "饿")
+
+
 class DynamicSegmentTest(unittest.TestCase):
     """模型不可用时的本地兜底：按身体与钟点现算，夜里睡到窗口结束。"""
 
@@ -454,7 +477,7 @@ class DynamicSegmentTest(unittest.TestCase):
                 slot = dynamic_segment(
                     cfg(), body, now_minute=hour * 60, step=15, seed=["bot", f"d{hour}"],
                 )
-                for banned in ("工位", "教室", "书房", "通勤"):
+                for banned in ("工位", "教室", "书房", "通勤", "扫地", "拖地", "洗碗", "洗衣服", "买菜", "做饭", "收拾房间"):
                     self.assertNotIn(
                         banned, slot.get("location", ""), f"{hour} 点给地点安了身份"
                     )
@@ -497,6 +520,7 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
             monotonic=clock_source,
             body_provider=body,
             random_source=random_source,
+            persona_provider=_test_persona,
         )
         service.set_resolver_gateway(resolver, gateway)
         return service, store, log
@@ -554,14 +578,14 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         segs = service.segments()
         self.assertEqual(len(segs), 2)
         self.assertEqual(segs[0]["start"], "09:00")
-        self.assertEqual(segs[0]["end"], "09:30", "提前结束：旧段收到新段起点（09:40 向下对齐 09:30）")
-        self.assertEqual(segs[1]["start"], "09:30")
+        self.assertEqual(segs[0]["end"], "09:40", "旧活动段在实际刷新时刻收尾")
+        self.assertEqual(segs[1]["start"], "09:40")
         self.assertEqual(segs[1]["event"], "去公司楼下取快递")
 
     async def test_expired_segment_regenerates(self):
         provider = FakeProvider("p", reply=seg_reply(minutes=25))
         service, _, _ = self.build(cfg(schedule_provider_name="p"), [provider])
-        await service.ensure_fresh()  # 09:00-09:30（25 分钟被抬到清醒下限 30）
+        await service.ensure_fresh()  # 09:00-09:25（保留 25 分钟真实活动）
         self.assertFalse(service.refresh_due())
         service._clock.advance(minutes=31)  # 09:31 已过完
         self.assertTrue(service.refresh_due())
@@ -584,17 +608,16 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
     async def test_short_gap_is_not_backfilled(self):
         """短空档也不许拿旧事件去填：填了就是编造时长。
 
-        这是「她在沙发上喝东西喝了 30 分钟」的根因：决策被节流间隔卡住，一段做完
-        之后 30 分钟没人接手，旧实现把上一段的 end 顺延到新段起点。
+        一段按实际时长结束后，等待下一次决策的空档必须保留，不能顺延旧段。
         """
         provider = FakeProvider("p", reply=seg_reply(event="倒杯水", minutes=5))
         service, _, _ = self.build(cfg(schedule_provider_name="p"), [provider])
-        await service.ensure_fresh()  # 09:00-09:30（清醒下限 30）
-        service._clock.advance(minutes=60)  # 10:00，隔了 30 分钟
+        await service.ensure_fresh()  # 09:00-09:05（清醒下限 5）
+        service._clock.advance(minutes=60)  # 10:00，隔了 55 分钟
         provider.reply = seg_reply(event="回消息", minutes=30)
         self.assertTrue(await service.ensure_fresh())
         segs = service.segments()
-        self.assertEqual(segs[0]["end"], "09:30", "旧段就是 30 分钟，不许被顺延拉长")
+        self.assertEqual(segs[0]["end"], "09:05", "旧段保持 5 分钟，不许被顺延拉长")
         self.assertEqual(segs[1]["start"], "10:00")
         self.assertEqual(len(segs), 2, "空档不补段，也不改旧段")
 
@@ -986,7 +1009,8 @@ class ThrottleTest(unittest.IsolatedAsyncioTestCase):
             resolver = ProviderResolver(ctx, log)
             clock = FrozenClock(FIXED_MOMENT)
             service = ScheduleService(
-                store.scope, lambda: conf, clock, logger=log, monotonic=gate._mono
+                store.scope, lambda: conf, clock, logger=log, monotonic=gate._mono,
+                persona_provider=_test_persona,
             )
             service.set_resolver_gateway(
                 resolver,
@@ -1138,7 +1162,8 @@ class ThrottleTest(unittest.IsolatedAsyncioTestCase):
         resolver = ProviderResolver(ctx, log)
         clock = FrozenClock(FIXED_MOMENT)
         service = ScheduleService(
-            store.scope, lambda: conf, clock, logger=log, monotonic=gate._mono
+            store.scope, lambda: conf, clock, logger=log, monotonic=gate._mono,
+            persona_provider=_test_persona,
         )
         service.set_resolver_gateway(
             resolver, LLMGateway(resolver, lambda: conf, log, gate._mono, gate=gate)
@@ -1207,6 +1232,84 @@ class TestInterruption(unittest.TestCase):
         )
         service.seed_first_segment()
         return service
+
+    def test_midsegment_replacement_starts_now_and_preserves_remaining_time(self):
+        service = self._service(granularity_minutes=15)
+        original = {
+            "start": "09:00",
+            "end": "09:30",
+            "event": "整理书架",
+            "location": "书房",
+            "emotion": "专注",
+            "energy_rate": -0.02,
+        }
+        service._scope.update_self(today_date=FIXED_TODAY, daily_schedule=[original])
+        service._clock.advance(minutes=10)
+        now_minute = 9 * 60 + 10
+
+        replacement = service._slot_from_slate(
+            service.config,
+            now_minute,
+            original,
+            [{"event": "改海报", "location": "书桌", "minutes": 30}],
+        )
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement["start"], "09:10")
+        self.assertEqual(replacement["end"], "09:40")
+        service._append_segment(replacement, FIXED_TODAY)
+
+        segments = service.segments()
+        self.assertEqual(segments[0]["end"], "09:10")
+        self.assertEqual(segments[1]["start"], "09:10")
+        self.assertEqual(segments[1]["event"], "改海报")
+        suspended = service._suspended_slot()
+        self.assertEqual(suspended["event"], "整理书架")
+        self.assertEqual(suspended["remaining_minutes"], 20)
+
+    def test_latest_starting_visible_overlap_wins_in_both_storage_orders(self):
+        rows = [
+            {"start": "08:00", "end": "12:00", "event": "整理书架", "location": "书房"},
+            {"start": "09:00", "end": "11:00", "event": "喝茶", "location": "厨房"},
+        ]
+        for stored in (rows, list(reversed(rows))):
+            with self.subTest(stored=stored):
+                service = self._service()
+                service._scope.update_self(today_date=FIXED_TODAY, daily_schedule=stored)
+                service._clock.advance(minutes=30)
+                self.assertEqual(service.active_segment()["event"], "喝茶")
+
+    def test_same_event_merges_into_selected_active_slot_not_ended_tail(self):
+        service = self._service(granularity_minutes=15)
+        service._scope.update_self(today_date=FIXED_TODAY, daily_schedule=[
+            {"start": "08:00", "end": "12:00", "event": "整理书架", "location": "书房"},
+            {"start": "09:00", "end": "10:30", "event": "读完一章书", "location": "客厅"},
+        ])
+        service._clock.advance(minutes=90)
+        service._append_segment({
+            "start": "10:30", "end": "11:30", "event": "整理书架",
+            "location": "书房", "emotion": "专注", "energy_rate": -0.02,
+        }, FIXED_TODAY)
+        active = [slot for slot in service.segments() if slot["event"] == "整理书架"]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["start"], "08:00")
+        self.assertEqual(active[0]["end"], "11:30")
+        self.assertFalse(service._suspended_slot(), "同一件事续接不应记成被打断")
+
+    def test_rolling_append_drops_future_slot_before_same_event_merge(self):
+        service = self._service(granularity_minutes=15)
+        service._scope.update_self(today_date=FIXED_TODAY, daily_schedule=[
+            {"start": "09:00", "end": "10:00", "event": "整理书架", "location": "书房"},
+            {"start": "10:00", "end": "11:00", "event": "整理书架", "location": "书房"},
+        ])
+        service._clock.advance(minutes=30)
+        service._append_segment({
+            "start": "09:30", "end": "10:30", "event": "整理书架",
+            "location": "书房", "energy_rate": -0.02,
+        }, FIXED_TODAY)
+        slots = service.segments()
+        self.assertEqual(len(slots), 1, "滚动重排应丢弃未来段并续接当前段")
+        self.assertEqual((slots[0]["start"], slots[0]["end"]), ("09:00", "10:30"))
 
     def test_interruption_makes_a_midsegment_refresh_due(self):
         """没有打断时，一段进行中有概率才重排；有人来找她则直接给一个时机。"""

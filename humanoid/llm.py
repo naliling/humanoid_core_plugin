@@ -842,7 +842,7 @@ class CallGate:
         if lo <= 0:
             return 0.0
         hi = self._max_interval_minutes()
-        if hi <= lo:
+        if hi < lo:
             # 倒置区间（只改了面板里的一项就会这样）：退回固定值，但要说出来，
             # 否则诊断页显示「120~60 随机」而实际每次都是 120，永远查不出来。
             if self._log is not None:
@@ -935,11 +935,11 @@ class CallGate:
                 )
                 return GateVerdict(False, _GATE_IDLE, detail)
 
-        # ignore_interval：只越过「距上次调用还没到间隔」这一条，空闲静默与每日预算
-        # 照旧生效。给的是「日程空档」——她手上那一段已经过完、现在没有任何一段罩着
-        # 此刻，这时候的生成不是「提前再问一次」，而是「接上断掉的地方」，不该被
-        # 上一段生成留下的间隔挡住。也用于一次决策里的后续调用（质量重写、审查），
-        # 它们属于同一次决定，不该各自再等一个间隔。
+        # ignore_interval：只越过最小间隔，空闲静默与每日预算仍照常生效。
+        # 仅供显式强制刷新和一次性追赶；普通日程空档
+        # 仍受最小间隔限制，被挡时由调度器用本地动态片段保持时间线连续。
+        #
+        #
         interval = 0.0 if ignore_interval else self._gap_seconds()
         if interval > 0 and self._last_call is not None:
             elapsed = self._mono() - self._last_call

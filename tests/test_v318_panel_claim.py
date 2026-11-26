@@ -35,7 +35,7 @@ class PanelClaimTest(unittest.TestCase):
 
     def test_schema_is_flat_and_counts_match_the_documented_numbers(self):
         schema = _schema()
-        self.assertEqual(len(schema), 154, "顶层项数变了，面板项数文案要跟着改（v3.1.53 = 154）")
+        self.assertEqual(len(schema), 150, "顶层项数变了，面板项数文案要跟着改（v3.1.54 = 150）")
         conditional = sum(
             1
             for item in schema.values()

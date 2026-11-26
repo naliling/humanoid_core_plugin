@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import tempfile
 import unittest
 from pathlib import Path
@@ -291,20 +293,27 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.star.terminate()
 
+    def test_reply_injector_and_sibling_quota_are_not_registered_as_llm_hooks(self):
+        source = inspect.getsource(main_module.HumanoidCore)
+        cls = ast.parse(source).body[0]
+        methods = {node.name: node for node in cls.body if isinstance(node, ast.AsyncFunctionDef)}
+        self.assertEqual((methods["inject_context"].decorator_list, "_guard_reply" in methods), ([], False))
+        self.assertEqual(methods["guard_sibling_chat"].decorator_list, [])
+
     async def _reply(self, text: str = "兄弟说话", event=None):
         """模拟回复钩子跑一轮：返回 (event, req)。"""
         event = event or FakeEvent(text, sender=SIBLING)
         req = FakeProviderRequest("")
-        await self.star.inject_context(event, req)
+        await self.star.guard_sibling_chat(event, req)
         return event, req
 
     async def test_sibling_bot_can_talk_three_times_then_gets_blocked(self):
-        """旧行为是第 1 次就 stop_event；现在前 3 次必须真的放行（主链路正常注入）。"""
+        """旧行为是第 1 次就 stop_event；现在前 3 次必须放行，且配额钩子不改写上下文。"""
         for index in range(3):
             event, req = await self._reply(f"兄弟第 {index + 1} 句")
             self.assertFalse(event.is_stopped(), f"第 {index + 1} 次互聊应放行")
             self.assertTrue(
-                injected_text(req), f"第 {index + 1} 次放行时应正常注入上下文"
+                injected_text(req) == "\n", f"第 {index + 1} 次配额放行不应修改上下文"
             )
         blocked, _req = await self._reply("兄弟第 4 句")
         self.assertTrue(blocked.is_stopped(), "第 4 次必须挡下本轮 LLM")
@@ -312,8 +321,8 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
     async def test_same_event_replayed_by_tool_loop_consumes_one_turn(self):
         """同一条消息被工具循环重放两次，只该消耗 1 次额度（否则一条就吃光 3 次）。"""
         event = FakeEvent("兄弟第一句", sender=SIBLING)
-        await self.star.inject_context(event, FakeProviderRequest(""))
-        await self.star.inject_context(event, FakeProviderRequest(""))
+        await self.star.guard_sibling_chat(event, FakeProviderRequest(""))
+        await self.star.guard_sibling_chat(event, FakeProviderRequest(""))
         self.assertFalse(event.is_stopped(), "重放同一条消息不该被挡，也不该多扣额度")
         for index in range(2):
             later, _req = await self._reply(f"兄弟第 {index + 2} 句")
@@ -331,11 +340,11 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
         for _index in range(3):
             event = FakeEvent("兄弟说话", sender=SIBLING, private=False)
             event.unified_msg_origin = group
-            await self.star.inject_context(event, FakeProviderRequest(""))
+            await self.star.guard_sibling_chat(event, FakeProviderRequest(""))
             self.assertFalse(event.is_stopped())
         blocked = FakeEvent("兄弟第 4 句", sender=SIBLING, private=False)
         blocked.unified_msg_origin = group
-        await self.star.inject_context(blocked, FakeProviderRequest(""))
+        await self.star.guard_sibling_chat(blocked, FakeProviderRequest(""))
         self.assertTrue(blocked.is_stopped(), "额度先要真的用完")
 
         # 同一个群里真人开口 → 机器对机器那条链结束
@@ -344,7 +353,7 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
         await self.star.on_message(human)
         fresh = FakeEvent("兄弟又来了", sender=SIBLING, private=False)
         fresh.unified_msg_origin = group
-        await self.star.inject_context(fresh, FakeProviderRequest(""))
+        await self.star.guard_sibling_chat(fresh, FakeProviderRequest(""))
         self.assertFalse(fresh.is_stopped(), "真人开口后兄弟 bot 应能重新聊")
 
     async def test_human_in_another_group_does_not_clear_this_chain(self):
@@ -354,11 +363,11 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
         for _index in range(3):
             event = FakeEvent("A 群兄弟说话", sender=SIBLING, private=False)
             event.unified_msg_origin = "aiocqhttp:group:A"
-            await self.star.inject_context(event, FakeProviderRequest(""))
+            await self.star.guard_sibling_chat(event, FakeProviderRequest(""))
             self.assertFalse(event.is_stopped())
         blocked = FakeEvent("A 群兄弟第 4 句", sender=SIBLING, private=False)
         blocked.unified_msg_origin = "aiocqhttp:group:A"
-        await self.star.inject_context(blocked, FakeProviderRequest(""))
+        await self.star.guard_sibling_chat(blocked, FakeProviderRequest(""))
         self.assertTrue(blocked.is_stopped(), "额度先要真的用完")
 
         # B 群里真人开口：只该结束 B 群那条链
@@ -368,7 +377,7 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
 
         still = FakeEvent("A 群兄弟又来了", sender=SIBLING, private=False)
         still.unified_msg_origin = "aiocqhttp:group:A"
-        await self.star.inject_context(still, FakeProviderRequest(""))
+        await self.star.guard_sibling_chat(still, FakeProviderRequest(""))
         self.assertTrue(
             still.is_stopped(),
             "A 群的额度用完了，B 群有人说话不该把它清掉",
@@ -378,7 +387,7 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
         """护栏只打在兄弟 bot 上：真人的消息一次都不该被它挡。"""
         for index in range(5):
             event = FakeEvent(f"人话{index}", sender=HUMAN)
-            await self.star.inject_context(event, FakeProviderRequest(""))
+            await self.star.guard_sibling_chat(event, FakeProviderRequest(""))
             self.assertFalse(event.is_stopped())
 
     async def test_sibling_message_is_not_recorded_as_mood_or_body(self):
@@ -403,7 +412,7 @@ class SiblingChatWiringTest(unittest.IsolatedAsyncioTestCase):
 
     async def _reply_event(self, event):
         req = FakeProviderRequest("")
-        await self.star.inject_context(event, req)
+        await self.star.guard_sibling_chat(event, req)
         return event, req
 
 

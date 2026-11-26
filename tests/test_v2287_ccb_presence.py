@@ -96,6 +96,10 @@ def _in_scene(core: HumanoidCoreInstance, stage: float = 2.0, satisfy: float = 4
     state = _state(core)
     now = core.now_epoch()
     state["ccb_stage"] = stage
+    state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+    state["ccb_consent_active_at"] = now
+    state["ccb_consent_at"] = now
+    state["ccb_activity_at"] = now - 60.0
     state["ccb_satisfy"] = satisfy
     state["ccb_pose"] = 0.0
     state["ccb_site"] = 1.0
@@ -158,7 +162,7 @@ class InsideTheScene(unittest.TestCase):
         # 已经在场景里 = 今天已经开过 1 场（F5：当日次数按场计，进场时 +1）。
         state["ccb_turns"] = 1.0
         text = core.build_injection("u1")
-        self.assertIn("正在亲密里", text)
+        self.assertIn("双方明确同意的虚构亲密模拟", text)
         self.assertIn("满足", text)
         self.assertNotRegex(text, r"\d+/\d+")
         # #62：场景块里给的是感受词（45 + 40 = 85 → 相位 3「快忍不住了」），
@@ -175,7 +179,7 @@ class InsideTheScene(unittest.TestCase):
         _mood(core)
         _in_scene(core, satisfy=45.0)  # 45 → 沉醉
         line = core.prompt_builder._ccb_presence_line("u1")
-        self.assertIn("正在亲密里", line)
+        self.assertIn("双方明确同意的虚构亲密模拟", line)
         self.assertIn("她还不太满足", line)  # 45 < 2×40：没到「挺满足」那档
         self.assertNotIn("沉醉", line, f"与场景 note 重复了阶段：{line!r}")
 
@@ -427,6 +431,10 @@ class DailyCapRegression(unittest.TestCase):
         self.assertEqual(float(state.get("ccb_stage", 0.0) or 0.0), 0.0, "当天已经封顶")
         core.clock.advance(days=1)
         state["ccb_intimacy_at"] = core.now_epoch()  # 第二天有亲密信号
+        state["ccb_consent_state"] = ccb.CONSENT_ACTIVE
+        state["ccb_consent_at"] = core.now_epoch()
+        state["ccb_consent_active_at"] = core.now_epoch()
+        state["ccb_activity_at"] = core.now_epoch()
         core.build_injection("u1")
         self.assertGreater(
             float(state.get("ccb_stage", 0.0) or 0.0), 0.0,

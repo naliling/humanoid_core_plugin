@@ -87,7 +87,9 @@ class EmotionRepeat(_Base):
         third = core.build_injection("u1")
         self.assertIn("内心：", third, "过了窗口该重新给一次，情绪不该永久消失")
 
-    def test_ccb_line_is_not_deduped(self):
+    def test_ccb_threshold_only_creates_consent_candidate(self):
+        from humanoid import ccb
+
         core = self._core({"timezone_city": "北京", "ccb": True})
         us = core._scope.user_state("u1")
         us["mood"] = {
@@ -99,9 +101,15 @@ class EmotionRepeat(_Base):
         }
         us["ccb_intimacy_at"] = core.now_epoch()
         core._scope.set_self("energy", 70.0)
-        words = ("想让你抱着我", "想离你近一点", "不想一个人")
+
         first = core.build_injection("u1")
+        self.assertEqual(ccb.consent_state(us), ccb.CONSENT_CANDIDATE)
+        self.assertEqual(float(us.get("ccb_stage", 0.0) or 0.0), 0.0)
+        self.assertIn("只是想法", first)
+        self.assertIn("明确答复", first)
+        self.assertNotIn("想让你抱着我", first)
+
         second = core.build_injection("u1")
-        self.assertTrue(any(w in first for w in words), first)
-        self.assertTrue(any(w in second for w in words),
-                        "ccb 的实时状态句不该被去重掉：" + second)
+        self.assertEqual(ccb.consent_state(us), ccb.CONSENT_CANDIDATE)
+        self.assertEqual(float(us.get("ccb_stage", 0.0) or 0.0), 0.0)
+        self.assertIn("只是想法", second)

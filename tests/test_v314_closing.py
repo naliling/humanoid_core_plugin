@@ -386,22 +386,19 @@ class ClosingWiringTest(unittest.IsolatedAsyncioTestCase):
         self.star._closing_record_out(event, reply)
         return event
 
-    async def test_her_goodnight_then_users_goodnight_is_hard_skipped(self) -> None:
+    async def test_goodnight_does_not_stop_or_add_a_closing_instruction(self) -> None:
         await self._open_and_reply()
 
         second = FakeEvent("晚安")
         req = FakeProviderRequest("")
         await self.star.inject_context(second, req)
 
-        self.assertTrue(second.is_stopped(), "对方只是重复一句晚安，这轮不该再调模型")
-        self.assertEqual(injected_text(req).strip(), "", "跳过时不该再注入任何东西")
-        top = self.diag.reason_report()["top"]
-        self.assertEqual(top[0]["code"], "closing_silence")
-        self.assertEqual(top[0]["last_detail"], "role_already_closed")
+        self.assertFalse(second.is_stopped())
+        self.assertNotIn("【对话收尾】", injected_text(req))
 
-    async def test_fail_open_when_the_host_cannot_stop_the_model(self) -> None:
+    async def test_goodnight_does_not_change_prompt_when_stop_is_unavailable(self) -> None:
         class _NoStopEvent(FakeEvent):
-            stop_event = None  # 属性在、但不可调用：模拟宿主不支持硬跳过
+            stop_event = None
 
         await self._open_and_reply()
 
@@ -410,10 +407,7 @@ class ClosingWiringTest(unittest.IsolatedAsyncioTestCase):
         await self.star.inject_context(second, req)
 
         self.assertFalse(second.is_stopped())
-        text = injected_text(req)
-        self.assertIn("【对话收尾】", text, "跳不掉时要提醒她别再追一句")
-        self.assertIn(STATE_MARK, text, "fail-open：注入照旧，绝不吞消息")
-        self.assertEqual(self.diag.reason_report()["top"][0]["code"], "closing_prompt")
+        self.assertNotIn("【对话收尾】", injected_text(req))
 
     async def test_outside_window_replies_normally(self) -> None:
         event = FakeEvent("晚安")
@@ -440,8 +434,8 @@ class ClosingWiringTest(unittest.IsolatedAsyncioTestCase):
         req = FakeProviderRequest("")
         await self.star.inject_context(second, req)
 
-        self.assertFalse(second.is_stopped(), "发图是有内容的行为，不能当成纯收尾吞掉")
-        self.assertIn("【对话收尾】", injected_text(req))
+        self.assertFalse(second.is_stopped(), "发图是有内容的行为，不能吞掉")
+        self.assertNotIn("【对话收尾】", injected_text(req))
 
     async def test_replay_does_not_record_the_input_twice(self) -> None:
         event = FakeEvent("晚安")

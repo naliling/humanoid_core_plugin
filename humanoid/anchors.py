@@ -1,7 +1,8 @@
 """由头 → 证据卡：把「她今天确实有的事」翻成社交层能直接说的卡。
 
-Core 的契约里，她今天的事实散在 `day`（doing / done / wants / dreams）、`ongoing`、
-`event`、`weather`、`holiday` 里，形状各不相同（字符串 / 列表 / 块字典）。社交层
+Core 的契约里，她今天的状态与内容散在 `day`（doing / done / wants / dreams）、
+`ongoing`、`event`、`weather`、`holiday` 里，形状各不相同（字符串 / 列表 / 块字典）；
+其中 dreams 是生成假设，不代表清醒时发生的事实。社交层
 每处都要猜一遍形状，猜错就静默少一条由头。这里把它们统一翻成
 `humanoid.opportunity` 定义的卡片，只做「翻译 + 打出处 + 定有效期」，不做判断。
 
@@ -32,6 +33,7 @@ SOURCE_EVENT = "刚发生"
 SOURCE_WEATHER = "天气"
 SOURCE_HOLIDAY = "节日"
 SOURCE_DREAM = "梦境"
+DREAM_DETAIL = "生成的梦境假设，并非清醒时发生的事实，不能证明身份或经历。"
 SOURCE_GREETING = "问候时机"
 
 
@@ -73,7 +75,7 @@ def _card(
 
 
 def cards_from_contract(contract: Any, *, now: Any) -> list[dict[str, Any]]:
-    """把契约里的既成事实翻成卡（顺序稳定，不依赖字典遍历顺序）。"""
+    """把契约里的内容翻成卡（顺序稳定，不依赖字典遍历顺序）。"""
     ts = opportunity.to_epoch(now)
     if not isinstance(contract, Mapping):
         return []
@@ -103,9 +105,9 @@ def cards_from_contract(contract: Any, *, now: Any) -> list[dict[str, Any]]:
     if phrase:
         cards.append(_card("life", phrase, SOURCE_EVENT, ts))
 
-    # 今天最近一段睡眠的梦：中午之后再说「我昨晚梦见」就开始假了。
+    # 梦境卡在 prompt 中也要清楚标明这是生成假设，而非清醒经历。
     for text in _texts(day.get("dreams"), 2):
-        cards.append(_card("journal", text, SOURCE_DREAM, ts))
+        cards.append(_card("journal", text, SOURCE_DREAM, ts, detail=DREAM_DETAIL))
 
     holiday = " ".join(str(contract.get("holiday") or "").split())
     if holiday:

@@ -124,11 +124,11 @@ class BodyFactsReachThePromptTest(unittest.TestCase):
 class StillBackgroundNotContentTest(unittest.TestCase):
     """加了身体事实，但授权口径没有放宽。"""
 
-    def test_framing_unchanged(self) -> None:
-        """框架句一个字没动：仍然是「背景，不是要拿出来讲的内容」。"""
-        self.assertIn("它们是背景，不是要拿出来讲的内容", FRAMING_TEXT)
-        self.assertIn("对方没问起", FRAMING_TEXT)
-        self.assertIn("由你自己判断", FRAMING_TEXT)
+    def test_framing_is_neutral_optional_context(self) -> None:
+        """状态框架只有一个中性标签，不规定回复内容。"""
+        self.assertIn("下面是可选的当前状态数据，不是本轮对话内容。", FRAMING_TEXT)
+        self.assertEqual(FRAMING_TEXT.count("下面是可选的当前状态数据"), 1)
+        self.assertNotIn("由你自己判断", FRAMING_TEXT)
 
     def test_framing_has_no_new_order(self) -> None:
         for word in ("不要", "必须", "别", "控制在", "只说", "回一句", "要讲"):

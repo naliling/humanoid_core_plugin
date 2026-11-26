@@ -618,15 +618,15 @@ class EmotionLineTest(unittest.TestCase):
         text = core.build_injection("42", is_group=False)
         self.assertNotIn("说话会短、会顶回去", text)
 
-    def test_framing_survives_where_it_belongs(self):
-        """许可与「怎么读」那句搬到 system_prompt 后，事实块里不该再重复它。"""
+    def test_framing_is_neutral_and_optional(self):
+        """事实标签只能标明数据性质，不替模型规定说话方式。"""
         from humanoid.prompt_builder import FRAMING_TEXT
 
         core = self.core_with_mood()
         text = core.build_injection("42", is_group=False)
         self.assertNotIn("不必逐条回应", text)
-        self.assertIn("由你自己判断", FRAMING_TEXT)
-        self.assertIn("身上的状态", FRAMING_TEXT)
+        self.assertIn("下面是可选的当前状态数据，不是本轮对话内容。", FRAMING_TEXT)
+        self.assertNotIn("由你自己判断", FRAMING_TEXT)
 
 
 
@@ -664,10 +664,10 @@ class ContractDayTest(unittest.TestCase):
         self.assertEqual(contract["persona"], "")
         self.assertIn("user_said", contract["paths"])
 
-    def test_contract_version_and_existing_keys_untouched(self):
+    def test_contract_version_excludes_removed_form_policy(self):
         core = self.build_core()
         contract = build_contract(core)
-        for key in ("v", "body", "feelings", "form", "activity", "time", "routine", "paths"):
+        for key in ("v", "body", "feelings", "activity", "time", "routine", "paths"):
             self.assertIn(key, contract)
         for key in ("sleep_pressure", "social_desire", "arousal"):
             self.assertIn(key, contract["body"])

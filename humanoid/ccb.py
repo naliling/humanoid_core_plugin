@@ -194,6 +194,16 @@ CCB_AFTERCARE_SECONDS = 2 * 3600.0
 # 场景闲置多久算结束（秒）。6 小时没人说话，那一场早就过去了；
 # 不靠它收场，`ccb_stage` 会挂着过夜，第二天她还在"场景里"。
 CCB_SCENE_IDLE_SECONDS = 6 * 3600.0
+# An active consent scene ends after a short conversational gap; aftereffects never extend consent.
+CCB_SCENE_GAP_SECONDS = 5 * 60.0
+CCB_CONSENT_TIMEOUT_SECONDS = 5 * 60.0
+CCB_CONTINUE_TIMEOUT_SECONDS = 5 * 60.0
+CCB_POUT_SECONDS = 10 * 60.0
+CONSENT_NONE = 0.0
+CONSENT_CANDIDATE = 1.0
+CONSENT_PROPOSED = 2.0
+CONSENT_ACTIVE = 3.0
+CONSENT_CONTINUE_PENDING = 4.0
 
 # 姿势与探入位置。取值是**互斥枚举**，`-1` 表示"还不知道"。
 # 判不出来时保持上一次的值；一次都判不出来就整段不出（A 的兜底）。
@@ -322,6 +332,120 @@ def detect_intimacy(text: str) -> bool:
     return any(word in s for word in _INTIMACY_WORDS)
 
 
+def _recent_stamp(value: Any, now: float, window: float) -> bool:
+    try:
+        stamp = float(value or 0.0)
+        moment = float(now)
+    except (TypeError, ValueError):
+        return False
+    return stamp > 0.0 and 0.0 <= moment - stamp <= float(window)
+
+
+def consent_state(user_state: Dict[str, Any]) -> float:
+    try:
+        value = float(user_state.get("ccb_consent_state", CONSENT_NONE) or CONSENT_NONE)
+    except (TypeError, ValueError):
+        return CONSENT_NONE
+    if value in (CONSENT_CANDIDATE, CONSENT_PROPOSED, CONSENT_ACTIVE, CONSENT_CONTINUE_PENDING):
+        return value
+    return CONSENT_NONE
+
+
+def mark_consent_candidate(
+    user_state: Dict[str, Any], now: float, score: float = 0.0, stage: int = 1, line: str = ""
+) -> None:
+    user_state["ccb_consent_state"] = CONSENT_CANDIDATE
+    user_state["ccb_consent_at"] = float(now)
+    user_state["ccb_consent_score"] = float(score)
+    user_state["ccb_consent_stage"] = float(stage)
+    user_state["ccb_consent_line"] = str(line or "")
+
+
+def mark_consent_proposal(user_state: Dict[str, Any], now: float) -> None:
+    user_state["ccb_consent_state"] = CONSENT_PROPOSED
+    user_state["ccb_consent_at"] = float(now)
+
+
+def clear_consent(user_state: Dict[str, Any]) -> None:
+    user_state["ccb_consent_state"] = CONSENT_NONE
+    user_state["ccb_consent_at"] = 0.0
+    user_state["ccb_consent_active_at"] = 0.0
+    user_state["ccb_consent_score"] = 0.0
+    user_state["ccb_consent_stage"] = 0.0
+    user_state["ccb_candidate_at"] = 0.0
+    user_state.pop("ccb_consent_line", None)
+
+
+def accept_consent(user_state: Dict[str, Any], now: float) -> bool:
+    state = consent_state(user_state)
+    timeout = CCB_CONTINUE_TIMEOUT_SECONDS if state == CONSENT_CONTINUE_PENDING else CCB_CONSENT_TIMEOUT_SECONDS
+    if state not in (CONSENT_PROPOSED, CONSENT_CONTINUE_PENDING):
+        return False
+    if not _recent_stamp(user_state.get("ccb_consent_at"), now, timeout):
+        clear_consent(user_state)
+        return False
+    user_state["ccb_consent_state"] = CONSENT_ACTIVE
+    user_state["ccb_consent_active_at"] = float(now)
+    user_state["ccb_consent_at"] = float(now)
+    user_state["ccb_intimacy_at"] = float(now)
+    user_state["ccb_activity_at"] = float(now)
+    return True
+
+
+def request_continuation(user_state: Dict[str, Any], now: float) -> None:
+    reset_scene(user_state)
+    user_state["ccb_consent_state"] = CONSENT_CONTINUE_PENDING
+    user_state["ccb_consent_at"] = float(now)
+    user_state["ccb_aftercare_until"] = max(float(user_state.get("ccb_aftercare_until", 0.0) or 0.0), float(now) + CCB_CONTINUE_TIMEOUT_SECONDS)
+
+
+def detect_consent(text: str) -> bool:
+    s = "".join(str(text or "").strip().split()).strip("。.!！?？,，、~～")
+    if not s or detect_refusal_hard(s):
+        return False
+    return s in ("好", "好呀", "好的", "可以", "可以的", "愿意", "我愿意", "同意", "我同意", "继续", "继续吧", "想要", "来吧", "嗯", "嗯嗯")
+
+
+def detect_consent_proposal(text: str) -> bool:
+    s = str(text or "")
+    question = s.rstrip().endswith(("?", "？", "吗"))
+    if not question and "要不要" not in s:
+        return False
+    return any(token in s for token in ("要不要继续", "要不要再", "要继续吗", "继续吗", "再来吗", "想继续吗", "想不想继续", "你愿意吗", "愿意和我继续", "愿意和我亲密", "可以继续吗"))
+
+
+def mark_feedback_discomfort(user_state: Dict[str, Any], now: float) -> None:
+    user_state["ccb_discomfort_at"] = float(now)
+
+
+def feedback_effects(user_state: Dict[str, Any], profile: Dict[str, Any], now: float) -> Dict[str, float]:
+    """Apply simulated pleasure/discomfort to bounded internal axes only."""
+    if consent_state(user_state) != CONSENT_ACTIVE or float(user_state.get("ccb_stage", 0.0) or 0.0) <= 0:
+        return {}
+    try:
+        current = max(0.0, min(CCB_SATISFY_FULL, float(user_state.get("ccb_satisfy", 0.0) or 0.0)))
+        previous = max(0.0, min(CCB_SATISFY_FULL, float(user_state.get("ccb_feedback_satisfy", 0.0) or 0.0)))
+        libido = max(0.0, min(LIBIDO_MAX, float(profile.get("libido", 0.0) or 0.0)))
+        aggression = max(0.0, min(AGGRESSION_MAX, float(profile.get("aggression", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        return {}
+    if current <= previous:
+        return {}
+    user_state["ccb_feedback_satisfy"] = current
+    if _recent_stamp(user_state.get("ccb_discomfort_at"), now, CCB_CONTINUE_TIMEOUT_SECONDS):
+        return {"libido": max(0.0, libido - 0.75), "aggression": min(AGGRESSION_MAX, aggression + 1.0)}
+    return {"libido": min(LIBIDO_MAX, libido + 0.75), "aggression": max(0.0, aggression - 0.25)}
+
+
+def scene_gap_expired(*, last_at: float, now: float) -> bool:
+    try:
+        last = float(last_at or 0.0)
+        moment = float(now)
+    except (TypeError, ValueError):
+        return False
+    return last > 0.0 and (moment - last) > CCB_SCENE_GAP_SECONDS
+
+
 def scene_score_fresh(score_at: float, now: float) -> bool:
     """这个 scene 分还新不新鲜。过期一律当"不知道"。"""
     try:
@@ -423,6 +547,10 @@ STATE_KEYS = (
     "ccb_activity_at",
     # P1：她明确拒绝的时刻（与她被强迫的 `ccb_coerced_at` 分开记）。
     "ccb_refused_at",
+    # Explicit consent handshake: candidate, sent proposal, active scene, and continuation prompt.
+    "ccb_consent_state", "ccb_consent_at", "ccb_consent_active_at",
+    "ccb_consent_score", "ccb_consent_stage", "ccb_candidate_at",
+    "ccb_feedback_satisfy", "ccb_discomfort_at", "ccb_pout_until",
     # (B 表现层）：场景内三根动态键。`-1` = 还不知道，由关键词检测填；
     # 判不出就一直保持原值（`-1` 时那一段整行不出，退回单行注入）。
     "ccb_pose", "ccb_site",
@@ -1373,6 +1501,13 @@ def scene_note(
     return "·".join(b for b in bits if b)
 
 
+def detect_discomfort(text: str) -> bool:
+    """Recognize explicit discomfort wording for an active simulated scene only."""
+    body = str(text or "")
+    return any(token in body for token in ("疼", "痛", "不舒服", "难受", "轻一点", "慢一点"))
+
+
+
 def scene_idle_expired(*, last_at: float, now: float) -> bool:
     """这一场是不是早就过去了（长时间没人说话）。
 
@@ -1550,7 +1685,7 @@ def scene_status(
 
     # 场景闲置过期：`ccb_stage` 会因为「没人说话」而挂在那里过夜，
     # 照实显示"进行中"就是骗人——6 小时没人碰过的那一场早就过去了。
-    expired = stage > 0 and scene_idle_expired(last_at=activity_at, now=moment)
+    expired = stage > 0 and scene_gap_expired(last_at=activity_at, now=moment)
     in_scene = stage > 0 and not expired
     phase = phase_of(
         satisfy=satisfy,
@@ -1921,7 +2056,7 @@ def scene_active(user_state: Dict[str, Any], now: float) -> bool:
     moment = _fs(now, 0.0)
     last_at = _fs(user_state.get("ccb_last_at"), 0.0)
     activity_at = _fs(user_state.get("ccb_activity_at"), 0.0) or last_at
-    return not scene_idle_expired(last_at=activity_at, now=moment)
+    return not scene_gap_expired(last_at=activity_at, now=moment)
 
 
 def note_occurrence_in_scene(user_state: Dict[str, Any], moment: float) -> bool:

@@ -444,6 +444,13 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         await self.star.inject_context(FakeEvent("在吗", sender="7120"), req2)
         self.assertIn("对TA的称呼是「阿名」", injected_text(req2))
 
+    async def test_goodbye_message_does_not_suppress_core_reply(self):
+        event = FakeEvent("晚安")
+        self.star._closing_decision = lambda *_: self.fail("closing guard must not run")
+        req = FakeProviderRequest("")
+        await self.star.inject_context(event, req)
+        self.assertFalse(event.is_stopped())
+
     # ---------- 钩子 ----------
 
     async def test_injection_appends_to_existing_prompt(self):

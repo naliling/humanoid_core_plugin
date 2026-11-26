@@ -745,7 +745,7 @@ class EmotionLayer:
         # 原来只有只读面板（`scene_status`）判「已过期」，状态机照旧拿
         # `ccb_stage > 0` 当「还在场景里」——于是隔夜再聊，她还在上一场的姿势、
         # 满足度与「临界」里续着。判据走 `scene_active()`，与面板同源，不另算。
-        in_scene = _ccb.scene_active(user_state, moment)
+        in_scene = (_ccb.consent_state(user_state) == _ccb.CONSENT_ACTIVE and _ccb.scene_active(user_state, moment))
         if not in_scene and float(user_state.get("ccb_stage", 0.0) or 0.0) > 0:
             _ccb.reset_scene(user_state)
             self._core._scope.mark_dirty()
@@ -806,6 +806,25 @@ class EmotionLayer:
             turns_today=float(user_state.get("ccb_turns", 0.0) or 0.0),
             index=idx,
         )
+        consent = _ccb.consent_state(user_state)
+        if consent == _ccb.CONSENT_CANDIDATE and not _ccb._recent_stamp(user_state.get("ccb_candidate_at"), moment, _ccb.CCB_CONSENT_TIMEOUT_SECONDS):
+            _ccb.clear_consent(user_state)
+            self._core._scope.mark_dirty()
+            consent = _ccb.CONSENT_NONE
+        active_consent = consent == _ccb.CONSENT_ACTIVE
+        if active_consent and float(user_state.get("ccb_stage", 0.0) or 0.0) <= 0 and _ccb._recent_stamp(user_state.get("ccb_candidate_at"), moment, _ccb.CCB_CONSENT_TIMEOUT_SECONDS):
+            try:
+                res = (float(user_state.get("ccb_consent_score", 0.0) or 0.0), str(user_state.get("ccb_consent_line", "") or ""), int(float(user_state.get("ccb_consent_stage", 1.0) or 1.0)))
+            except (TypeError, ValueError):
+                res = None
+        if res is not None and not in_scene and not active_consent:
+            score, text, stage = res
+            if consent in (_ccb.CONSENT_PROPOSED, _ccb.CONSENT_CONTINUE_PENDING):
+                return None
+            _ccb.mark_consent_candidate(user_state, moment, score=score, stage=stage, line=text)
+            user_state["ccb_candidate_at"] = float(moment)
+            self._core._scope.mark_dirty()
+            return score, "她有亲近你的念头；这只是想法，还没有开始。先自然地问对方是否愿意，等到明确答复后再决定；不要把沉默或含糊当作同意。"
         if res is None:
             # 只有「该不该进入」的门槛**真的掉下去了**，才算场景结束、清掉场景状态。
             # 冷却期内 / 当日已达上限 / 群里 / 精力见底 都是**暂时的**——原来一律
@@ -826,6 +845,7 @@ class EmotionLayer:
                 coerced=coerced,
             ):
                 _ccb.reset_scene(user_state)
+                _ccb.clear_consent(user_state)
             return None
         score, text, stage = res
         # 同一条用户消息可能触发多次 LLM 请求，而这里是**读路径**：每次都推进的话，
@@ -875,6 +895,11 @@ class EmotionLayer:
         if was_in_scene and _ccb.advance_satisfy(
             user_state, float(moment), tz=self._tz()
         ):
+            effects = _ccb.feedback_effects(user_state, state, float(moment))
+            for axis, value in effects.items():
+                state[axis] = value
+            if effects:
+                self._core.mood.mark_dirty() if hasattr(self._core.mood, "mark_dirty") else None
             # 刚到顶：这一次是收场，扣一次体力。
             self._core._scope.set_self(
                 "energy", max(0.0, float(self._core.energy.energy) - _ccb.CCB_ENERGY_COST)

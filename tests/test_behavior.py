@@ -13,7 +13,7 @@ class FakeMood:
 
 class FakeCore:
     role_id = "role-a"
-    config = SimpleNamespace(last_interaction_threshold_minutes=5, last_interaction_mode="simple")
+    config = SimpleNamespace(last_interaction_threshold_minutes=1, last_interaction_mode="simple")
     mood = FakeMood()
 
 
@@ -21,8 +21,21 @@ class BehaviorServiceTest(unittest.TestCase):
     def setUp(self):
         self.service = BehaviorService(FakeCore())
 
-    def test_no_event_before_five_minutes(self):
-        self.assertIsNone(self.service.process_interval("u", 1299, 1000))
+    def test_no_event_before_one_minute(self):
+        self.assertIsNone(self.service.process_interval("u", 1059, 1000))
+
+    def test_one_minute_return_is_recognized(self):
+        event = self.service.process_interval("u", 1060, 1000)
+        self.assertEqual(event["type"], "conversation_resumed")
+        self.assertEqual(event["data"]["gap_bucket"], "short_return")
+
+    def test_configured_longer_threshold_is_preserved(self):
+        original = self.service._core.config.last_interaction_threshold_minutes
+        self.service._core.config.last_interaction_threshold_minutes = 5
+        try:
+            self.assertIsNone(self.service.process_interval("u", 1000 + 4 * 60, 1000))
+        finally:
+            self.service._core.config.last_interaction_threshold_minutes = original
 
     def test_gap_event_keeps_old_timestamp(self):
         event = self.service.process_interval("u", 1000 + 10800, 1000)

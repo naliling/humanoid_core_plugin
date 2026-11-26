@@ -27,7 +27,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from ..opportunity import MATERIAL_TTL_SECONDS, anchor_key_for, make_card
 from ..species import BODY_HUMAN, body_kind, profile_body
 from ..wording import pick
-from .schedule_content import species_issues
+from .schedule_content import content_issues, low_info_issues, species_issues
 
 # ----------------------------------------------------------------------
 # 生活条件：人设正文里出现这些词，才认为她确实有工作/宠物/要照护的人/社交
@@ -436,11 +436,17 @@ def _segment_allows(item: Mapping[str, Any], kind: str) -> bool:
 
 
 def _used_item(item: Mapping[str, Any], used: set[str]) -> bool:
-    """这条素材的题眼是不是近 7 天已经用过（按 anchor_key 比）。"""
+    """这条素材近 7 天是否用过（按 anchor_key 或 card_id 比）。"""
     if not used:
         return False
     topic = str(item.get("topic") or "").strip() or str(item.get("event") or "")
-    return anchor_key_for("life", topic) in used
+    if anchor_key_for("life", topic) in used:
+        return True
+    try:
+        card = material_card(item, captured_at=1.0)
+    except (TypeError, ValueError):
+        return False
+    return str(card.get("id") or "") in used
 
 
 def _topic_used(topic: str, recent: Iterable[str]) -> bool:
@@ -477,9 +483,8 @@ def materials_for(
     recent_events 是今天已经过完的段 + 昨天的收尾：题眼出现过的事不再发——否则
     模型每天看到的都是同一批素材，「她的一天高度雷同」这条老毛病就换了个来源。
 
-    extra 是这个角色专属的素材（role_materials 按人设生成的）：它们已经按人设筛过
-    身份条件，进池后优先于内置条目——不然「她是谁」写进去的那些具体的事永远排在
-    通用条目后面，等于没加。
+    extra 是角色专属素材缓存；每次进入池前都会按当前人设、物种和内容规则复验，
+    再优先于内置条目——过期或低质缓存不能绕过当前的准入条件。
 
     used 是近 7 天已经用过的键（card_id / anchor_key，见 used_keys）：命中就跳过，
     别每天把同一件事再推一遍。拿不到记录就传空——空集合等于不过滤（fail-open）。
@@ -512,7 +517,15 @@ def materials_for(
         )
 
     role_pool = _ordered(
-        (item for item in extra if isinstance(item, Mapping) and usable(item)),
+        (
+            item
+            for item in extra
+            if isinstance(item, Mapping)
+            and usable(item)
+            and _allowed(dict(item), caps, interests)
+            and not content_issues(str(item.get("event") or ""))
+            and not low_info_issues(str(item.get("event") or ""))
+        ),
         seed_text,
         "role",
     )

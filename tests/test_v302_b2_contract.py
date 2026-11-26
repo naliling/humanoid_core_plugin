@@ -63,9 +63,9 @@ class ContractVersionTest(unittest.TestCase):
     def test_version_and_schema_are_bumped(self):
         contract = build_contract(self.core)
         self.assertEqual(contract["v"], CONTRACT_VERSION)
-        self.assertEqual(CONTRACT_VERSION, 3, "body 里出现 null 是破坏性变更，v 必须 >2")
+        self.assertEqual(CONTRACT_VERSION, 4, "contract.form 移除是破坏性变更，schema 必须升级")
         self.assertEqual(contract["schema"], CONTRACT_SCHEMA)
-        self.assertEqual(CONTRACT_SCHEMA, "humanoid.contract/3")
+        self.assertEqual(CONTRACT_SCHEMA, "humanoid.contract/4")
 
     def test_capabilities_did_not_grow_a_fake_block(self):
         """三态是**读法**，不是新块：capabilities 里每多一个名字，消费方就会去找那个块。"""

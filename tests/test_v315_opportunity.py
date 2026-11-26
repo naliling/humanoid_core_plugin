@@ -12,7 +12,7 @@
 4. **两个键永远都在**：没有卡就是空列表。社交层按「键在不在」判新旧版本，缺键与
    空列表是两件事。
 5. **绝不让契约生成失败**：卡是锦上添花，任何一处翻车都只让这两个键变空列表。
-6. **只加不改**：schema 仍是 humanoid.contract/3，旧键一个不动。
+6. **明确破坏性变更**：schema 升到 humanoid.contract/4，移除跨插件发言形式约束。
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from humanoid.link import CONTRACT_SCHEMA, build_contract
 from humanoid.services import life_material
 
 from .test_link import FROZEN, Harness, freeze
+from .test_main_integration import SKIP_REASON, main_module
 
 HOUR = 3600.0
 NOW = 1_790_000_000.0  # 2026-09-22 前后的某个整点附近，用固定值让断言可复现
@@ -105,6 +106,22 @@ class CardTest(unittest.TestCase):
         cards = [card(title="第 " + str(i) + " 件事", at=NOW + i) for i in range(9)]
         self.assertEqual(len(opportunity.fresh_cards(cards, NOW + 100)), opportunity.OPP_LIMIT)
 
+    def test_dreams_are_always_generated_hypotheses(self):
+        dream = anchors.cards_from_contract(
+            {"day": {"dreams": ["梦见一只很大的猫"]}}, now=NOW
+        )[0]
+        projections = (
+            opportunity.fresh_cards([dream], NOW),
+            opportunity.fresh_cards([dream], NOW, generated=True),
+            opportunity.fresh_cards([dream], NOW, generated=False),
+        )
+
+        for projected in projections:
+            with self.subTest(generated=projected[0].get("generated")):
+                self.assertIs(projected[0]["generated"], True)
+                self.assertIs(projected[0]["hypothesis"], True)
+                self.assertEqual(opportunity.validate_card(projected[0]), [])
+
     def test_contract_blocks_always_returns_both_keys(self):
         blocks = opportunity.contract_blocks([], [], NOW)
         self.assertEqual(set(blocks), {"opportunities", "materials"})
@@ -153,6 +170,14 @@ class AnchorsTest(unittest.TestCase):
         self.assertIn(anchors.SOURCE_WEATHER, sources)
         self.assertIn(anchors.SOURCE_HOLIDAY, sources)
 
+    def test_dream_card_keeps_readable_title_and_nonfactual_detail(self):
+        dream = next(item for item in self.cards if item["source"] == anchors.SOURCE_DREAM)
+
+        self.assertEqual(dream["title"], "梦见一只很大的猫")
+        self.assertEqual(dream["source"], anchors.SOURCE_DREAM)
+        self.assertEqual(dream["detail"], anchors.DREAM_DETAIL)
+        self.assertIn("不能证明身份或经历", dream["detail"])
+
     def test_kinds_are_fixed_not_guessed(self):
         by_title = {item["title"]: item["kind"] for item in self.cards}
         self.assertEqual(by_title["在厨房煮面"], "activity")
@@ -193,6 +218,21 @@ class AnchorsTest(unittest.TestCase):
         blocks = anchors.contract_blocks(_FakeCore(broken=True), self.CONTRACT, now=NOW)
         self.assertEqual(set(blocks), {"opportunities", "materials"})
         self.assertTrue(blocks["opportunities"])
+
+
+@unittest.skipIf(main_module is None, SKIP_REASON)
+class DreamPromptProjectionTest(unittest.TestCase):
+    def test_nonfactual_boundary_survives_evidence_rendering(self):
+        dream = anchors.cards_from_contract(
+            {"day": {"dreams": ["梦见一只很大的猫"]}}, now=NOW
+        )[0]
+        projected = opportunity.fresh_cards([dream], NOW, generated=True)
+        result = main_module._evidence_note(projected, [], now=NOW)
+
+        self.assertIn("- 梦见一只很大的猫：", result["text"])
+        self.assertIn(anchors.DREAM_DETAIL, result["text"])
+        self.assertIs(result["shown"][0]["generated"], True)
+        self.assertIs(result["shown"][0]["hypothesis"], True)
 
 
 class MaterialCardTest(unittest.TestCase):
@@ -263,11 +303,11 @@ class ContractMountTest(unittest.TestCase):
         for item in contract["opportunities"] + contract["materials"]:
             self.assertEqual(opportunity.validate_card(item), [])
 
-    def test_schema_and_capabilities_are_untouched(self):
-        """只加键：schema 仍是 3，旧能力一个不少。"""
+    def test_schema_and_capabilities_match_exported_blocks(self):
+        """能力清单只列实际导出的块；发言形式策略不再跨插件传递。"""
         contract = build_contract(self.core)
-        self.assertEqual(contract["schema"], CONTRACT_SCHEMA)
-        for name in ("body", "feelings", "form", "activity", "day", "event", "identity", "outfit"):
+        self.assertEqual((contract["schema"], "form" in contract["capabilities"]), (CONTRACT_SCHEMA, False))
+        for name in ("body", "feelings", "activity", "day", "event", "identity", "outfit"):
             self.assertIn(name, contract["capabilities"])
 
     def test_same_hour_contract_is_stable(self):

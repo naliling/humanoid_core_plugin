@@ -12,7 +12,7 @@
 * 相邻同场景的两段先并成一句，再筛：别把「下饺子」「捞饺子」「吃饺子」拆成三条。
 * 日程段没标 wants 时用 today_plans 兜底（最多 3 条）；两边都没有就是空列表，
   **键必须还在**——社交侧按 day.get("wants") 取。
-* 清醒段最短 30 分钟（睡段仍是 3 分钟）：17 分钟一段的日程本身就是碎片之源。
+* 清醒段保留 5 分钟以上的真实活动（睡段仍是 3 分钟）；不为拼整齐而虚增时长。
 """
 
 from __future__ import annotations
@@ -184,15 +184,15 @@ class WantsFallbackTest(unittest.TestCase):
 
 
 class AwakeDurationFloorTest(unittest.TestCase):
-    """清醒段最短 30 分钟，睡段仍是 3 分钟。"""
+    """清醒段下限 5 分钟，睡段仍是 3 分钟。"""
 
-    def test_awake_segment_has_a_thirty_minute_floor(self):
-        self.assertEqual(SEGMENT_AWAKE_MIN_MINUTES, 30)
+    def test_awake_segment_has_a_five_minute_floor(self):
+        self.assertEqual(SEGMENT_AWAKE_MIN_MINUTES, 5)
         self.assertGreater(SEGMENT_AWAKE_MIN_MINUTES, SEGMENT_MIN_MINUTES)
 
     def test_a_five_minute_awake_segment_climbs_to_the_floor(self):
         parsed = parse_segment({"event": "倒杯水", "minutes": 5}, now_minute=9 * 60, step=15)
-        self.assertEqual((parsed["start"], parsed["end"]), ("09:00", "09:30"))
+        self.assertEqual((parsed["start"], parsed["end"]), ("09:00", "09:05"))
 
     def test_sleep_segment_keeps_the_three_minute_floor(self):
         parsed = parse_segment({"event": "睡觉", "minutes": 1}, now_minute=9 * 60, step=15)

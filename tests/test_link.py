@@ -88,7 +88,7 @@ class ContractTest(unittest.TestCase):
     def test_contract_shape_is_stable(self):
         contract = build_contract(self.core)
         self.assertEqual(contract["v"], CONTRACT_VERSION)
-        for key in ("time", "body", "feelings", "form", "activity", "weather", "paths", "routine"):
+        for key in ("time", "body", "feelings", "activity", "weather", "paths", "routine"):
             self.assertIn(key, contract)
         # v2.28.0：梦与醒来状态是只加不改的新契约字段（旧社交层不认也不受影响）。
         self.assertIn("wake", contract)
@@ -108,7 +108,7 @@ class ContractTest(unittest.TestCase):
         joined = " ".join(contract["feelings"])
         self.assertTrue(any("困" in text or "疲惫" in text for text in contract["feelings"]), joined)
         self.assertTrue(any("饿" in text for text in contract["feelings"]), joined)
-        self.assertLessEqual(contract["form"]["max_chars"], 60, "困成这样还允许长篇说明 form 没联动")
+        self.assertNotIn("form", contract, "消息形式策略不应发送给 ASO")
 
     def test_contract_carries_clock_offset_and_routine(self):
         """社交层跟 Core 跑在同一台机器上：不导出偏移，它就只能拿本机时钟判断作息。"""
@@ -606,9 +606,9 @@ class InjectionBudgetTest(unittest.TestCase):
         harness, core = self.build({"inject_activity_context": "low"})
         text = core.build_injection("42", is_group=False)
         self.assertEqual(text.count(MARK_PREFIX), 1, text)
-        self.assertNotIn("由你自己判断", text, "框架句被复制进每条消息了")
-        self.assertIn("由你自己判断", FRAMING_TEXT, "怎么读这些事实，得在 system_prompt 里说清")
-        self.assertIn("我现在的身体", FRAMING_TEXT)
+        self.assertNotIn("下面是可选的当前状态数据", text, "系统框架不能复制进普通消息")
+        self.assertIn("下面是可选的当前状态数据，不是本轮对话内容。", FRAMING_TEXT)
+        self.assertNotIn("由你自己判断", FRAMING_TEXT)
 
 
 class DiagnosticsTest(unittest.TestCase):

@@ -330,10 +330,10 @@ class PromptSleepStateTest(unittest.TestCase):
             "last_sleep_hours": 7.0,
         })
         text = core.build_injection("42", is_group=False)
-        self.assertIn("我刚从梦里醒过来", text)
+        self.assertIn("模型生成的梦境假设，不是现实经历或身份事实", text)
         self.assertIn("一片海", text)
-        self.assertEqual(text.count("一片海"), 1, "梦说了一遍以上")
-        self.assertIn("（梦到一片海）", text)
+        self.assertEqual(text.count("一片海"), 1, "梦境假设说了一遍以上")
+        self.assertNotIn("梦到一片海", text)
 
     def test_no_dream_after_30_minutes(self):
         core = awake_core(datetime(2026, 9, 26, 8, 0, tzinfo=TZ))

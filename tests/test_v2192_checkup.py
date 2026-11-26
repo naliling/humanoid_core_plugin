@@ -422,15 +422,12 @@ class SwitchEffectsTest(unittest.TestCase):
     # 开/关两档由 tests/test_expression.NightFactsTest 覆盖。
 
     def test_last_interaction_threshold_below_the_segment_floor_is_honest(self):
-        """「隔了多久」的句子来自分段表，表从 5 分钟起：阈值配得更小也只能按 5 分钟生效。"""
+        """Return wording begins at one minute, matching the default recognition threshold."""
 
         from humanoid.services.behavior import GAP_SEGMENTS
 
         floor = min(low for low, _high, *_rest in GAP_SEGMENTS)
-        self.assertEqual(
-            floor, 300.0,
-            "间隔分段表的下限变了：schema 里「低于 5 分钟按 5 分钟算」的说明要同步",
-        )
+        self.assertEqual(floor, 60.0)
 
     def test_custom_holiday_reaches_the_clock(self):
         """holidays 里写她自己的日子，她的钟就得认得这天（/时间 不报节日，节日进的是上下文）。"""

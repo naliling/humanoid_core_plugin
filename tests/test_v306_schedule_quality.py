@@ -48,11 +48,10 @@ def _service(moment, persona_text=None, **overrides):
     conf = cfg(**overrides)
     store = ScopeStore(Path(tempfile.mkdtemp()) / "state.json")
     store.load(moment.strftime("%Y-%m-%d"), conf.cycle_length)
-    persona = (
-        (lambda: Persona(name="她", prompt=persona_text, source="test"))
-        if persona_text is not None
-        else None
-    )
+    async def persona_provider():
+        return Persona(name="她", prompt=persona_text, source="test")
+
+    persona = persona_provider if persona_text is not None else None
     service = ScheduleService(
         store.scope,
         lambda: conf,
@@ -78,26 +77,23 @@ class ScriptedGateway:
 
 
 class AwakeSegmentFloorTest(unittest.TestCase):
-    """P0（#311 起）：清醒段下限 30 分钟，睡段仍是 3 分钟。
+    """清醒段下限 5 分钟，睡段仍是 3 分钟。
 
-    v3.0.6 把下限压到 3 分钟，是因为当时 prompt 把微动作写成 15~30 分钟的段，两处
-    叠加把「倒杯水」撑成半小时。代价是线上日程碎成 17~18 分钟一段的过渡小动作
-    （实测 22 段/中位 17 分钟），day.done 交出去的素材全是「把碗推到水池泡着」。
-    现在反过来收：prompt 要求一段是「一件有头有尾、说得出口的事」，下限也抬到 30；
-    睡段保持 3 分钟（一小觉合法，且睡段由 end 时刻算，不该被抬）。
+    清醒段保留短而完整的真实活动，不为对齐刻度而延长时长；睡段仍按结束时刻计算，
+    一小觉合法，且不应被清醒段下限抬高。
     """
 
-    def test_awake_floor_is_thirty_minutes(self):
-        self.assertEqual(SEGMENT_AWAKE_MIN_MINUTES, 30)
+    def test_awake_floor_is_five_minutes(self):
+        self.assertEqual(SEGMENT_AWAKE_MIN_MINUTES, 5)
         self.assertGreater(SEGMENT_AWAKE_MIN_MINUTES, SEGMENT_MIN_MINUTES)
 
-    def test_five_minutes_climbs_to_the_awake_floor(self):
+    def test_five_minutes_keeps_the_awake_floor(self):
         slot = parse_segment({"event": "倒杯水", "minutes": 5}, now_minute=9 * 60, step=15)
-        self.assertEqual((slot["start"], slot["end"]), ("09:00", "09:30"), "5 分钟的动作被抬到 30")
+        self.assertEqual((slot["start"], slot["end"]), ("09:00", "09:05"))
 
     def test_below_the_floor_climbs_to_the_floor(self):
         slot = parse_segment({"event": "洗把脸", "minutes": 1}, now_minute=9 * 60, step=15)
-        self.assertEqual(slot["end"], "09:30", f"下限应是 {SEGMENT_AWAKE_MIN_MINUTES} 分钟")
+        self.assertEqual(slot["end"], "09:05", f"下限应是 {SEGMENT_AWAKE_MIN_MINUTES} 分钟")
 
     def test_sleep_segment_keeps_the_three_minute_floor(self):
         slot = parse_segment({"event": "睡觉", "minutes": 1}, now_minute=9 * 60, step=15)
@@ -188,7 +184,7 @@ class PromptRulesTest(unittest.TestCase):
             is_night=False,
         )
 
-    def test_minutes_rule_says_awake_segments_start_at_thirty_minutes(self):
+    def test_minutes_rule_uses_the_awake_floor_constant(self):
         text = self._prompt()
         self.assertIn(f"清醒时最短 {SEGMENT_AWAKE_MIN_MINUTES} 分钟", text)
         self.assertIn("上下限，不是目标值", text)
@@ -208,6 +204,17 @@ class QualityGateTest(unittest.TestCase):
         service.set_resolver_gateway(FakeContext(), gateway)
         asyncio.run(service.ensure_fresh(force=True))
         return service.status()
+
+    def test_no_persona_keeps_a_concrete_model_activity_without_rewrite(self):
+        service, _ = _service(datetime(2026, 8, 22, 9, 0, tzinfo=TZ))
+        gateway = ScriptedGateway([seg_reply(event="把碗洗了")])
+
+        status = self._run(service, gateway)
+
+        self.assertEqual(status["source"], "llm")
+        self.assertIn("把碗洗了", str(status.get("active") or ""))
+        self.assertEqual(len(gateway.prompts), 1, "无证据不能把普通活动误判后再重写")
+        self.assertEqual(status["quality"]["invented"], 0)
 
     def test_invented_fact_survives_the_rewrite_then_degrades(self):
         service, _ = _service(
@@ -284,6 +291,17 @@ class QualityGateTest(unittest.TestCase):
         status = self._run(service, gateway)
         self.assertEqual(len(gateway.prompts), 2, "编造要重写一次")
         self.assertEqual(status["quality"]["rewrite"], 1)
+
+    def test_missing_persona_does_not_create_an_invented_verdict(self):
+        service, _ = _service(datetime(2026, 8, 22, 9, 0, tzinfo=TZ))
+        gateway = ScriptedGateway([seg_reply(event="去买咖啡")])
+
+        status = self._run(service, gateway)
+
+        self.assertEqual(len(gateway.prompts), 1, "缺少依据不能等同于已证伪")
+        self.assertEqual(service.segments()[-1]["event"], "去买咖啡")
+        self.assertEqual(status["quality"]["invented"], 0)
+        self.assertEqual(status["source"], "llm")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -127,7 +127,7 @@ class ContextShapeTest(unittest.TestCase):
         contract = core.refresh_contract()
         self.assertTrue(contract, "契约还得照常导出，主动社交靠它")
         self.assertIn("body", contract)
-        self.assertIsNotNone(contract["form"].get("max_chars"), "形式倾向仍给社交层")
+        self.assertNotIn("form", contract, "消息形式策略不应发送给社交层")
 
     def test_default_tier_carries_time_gap_and_nickname(self):
         core = core_with()
@@ -426,7 +426,7 @@ class ContractTimeTest(unittest.TestCase):
         wrecked_body(core)
         contract = build_contract(core)
         self.assertTrue(contract["body"]["asleep"])
-        self.assertLess(contract["form"]["max_chars"], 60)
+        self.assertNotIn("form", contract)
         self.assertTrue(contract["feelings"], "体感短句仍导出给社交层，只是不塞进聊天")
         asyncio.run(harness.roles.stop())
 
