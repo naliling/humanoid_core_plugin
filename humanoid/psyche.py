@@ -40,6 +40,7 @@ psyche 管的是**心理的日子**：她惦记什么、她怎么看对方、她
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -107,6 +108,8 @@ class Entry:
     """模型写下的内心记录，不是用户原话或已核实事实。"""
 
     text: str                      # 第一人称原文（模型生成）
+    role_id: str = ""             # bot account owner
+    user_id: str = ""             # peer owner
     kind: str = "self"             # self / event / reframe（重构）
     ts: float = field(default_factory=_now)
     # 关联的心事 key（这条属于哪件惦记的事）
@@ -136,6 +139,8 @@ class Entry:
             source_kind = "legacy_unattributed"
         return Entry(
             text=text,
+            role_id=str(raw.get("role_id") or "").strip(),
+            user_id=str(raw.get("user_id") or "").strip(),
             kind=str(raw.get("kind") or "self"),
             ts=_safe_float(raw.get("ts"), _now()),
             concern_key=str(raw.get("concern_key") or ""),
@@ -562,21 +567,25 @@ class PsycheStore:
             self._cfg("psyche_inject_max_lines", INJECT_MAX_LINES))
         return st
 
+    def _owner_tag(self) -> str:
+        return hashlib.sha256(self.role_id.encode("utf-8")).hexdigest()[:24]
+
     def _state_path(self) -> Path:
-        return self.dir / STATE_FILE
+        return self.dir / f"psyche_state.{self._owner_tag()}.json"
 
     def _journal_path(self) -> Path:
-        return self.dir / JOURNAL_FILE
+        return self.dir / f"psyche_journal.{self._owner_tag()}.jsonl"
 
     def _load(self) -> None:
         try:
             raw = json.loads(self._state_path().read_text(encoding="utf-8"))
-            people = raw.get("people") or {}
-            if isinstance(people, dict):
-                for uid, p in people.items():
-                    st = PsycheState.from_dict(p)
-                    if st:
-                        self.states[str(uid)] = st
+            if isinstance(raw, dict) and str(raw.get("role_id") or "") == self.role_id:
+                people = raw.get("people") or {}
+                if isinstance(people, dict):
+                    for uid, p in people.items():
+                        st = PsycheState.from_dict(p)
+                        if st:
+                            self.states[str(uid)] = st
         except (OSError, ValueError, TypeError):
             pass
         try:
@@ -590,7 +599,7 @@ class PsycheStore:
                     except (ValueError, TypeError):
                         continue  # 坏行跳过，不影响其余记录
                     e = Entry.from_dict(raw)
-                    if e:
+                    if e and e.role_id == self.role_id and e.user_id:
                         self.journal.append(e)
             self.journal = self.journal[-JOURNAL_MAX:]
         except (OSError, ValueError):
@@ -631,6 +640,11 @@ class PsycheStore:
                                   json.dumps(payload, ensure_ascii=False, indent=2))
 
     def append_entry(self, entry: Entry) -> bool:
+        if entry.role_id and entry.role_id != self.role_id:
+            return False
+        if not str(entry.user_id or "").strip():
+            return False
+        entry.role_id = self.role_id
         self.journal.append(entry)
         self.journal = self.journal[-JOURNAL_MAX:]
         # append：把新行直接追加（比整本重写便宜；坏行下次 _load 会跳过）
@@ -654,7 +668,9 @@ class PsycheStore:
         st = self.state(user_id)
         if now - st.last_entry_at < min_interval:
             return False
-        today = sum(1 for e in self.journal if now - e.ts < 86400)
+        today = sum(1 for e in self.journal
+                    if e.role_id == self.role_id and e.user_id == str(user_id)
+                    and 0 <= now - e.ts < 86400)
         return today < daily_cap
 
 
@@ -816,6 +832,7 @@ class PsycheWriter:
                 st.reframe(key, str(reframe.get("now_view") or ""), now=now)
                 self.store.append_entry(Entry(
                     text=str(reframe.get("now_view") or ""), kind="reframe",
+                    role_id=self.store.role_id, user_id=str(user_id),
                     ts=now, concern_key=key, now_view=str(reframe.get("now_view") or ""),
                     source_kind="model_internal", source_text=source_text,
                 ))
@@ -832,6 +849,7 @@ class PsycheWriter:
         if entry_text:
             self.store.append_entry(Entry(
                 text=entry_text, kind="self", ts=now,
+                role_id=self.store.role_id, user_id=str(user_id),
                 concern_key=c.key if c else "",
                 then=entry_text, body_tag=body_tag,
                 significance=c.significance if c else 0.4,

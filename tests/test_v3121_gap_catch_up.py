@@ -18,13 +18,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from humanoid.llm import LLMGateway, LLMResult, OUTCOME_OK, ProviderResolver
-from humanoid.services.schedule import (
-    HEAL_CATCHUP_SECONDS,
-    HEAL_CATCHUP_WINDOW_SECONDS,
-    SOURCE_LLM,
-    SOURCE_TEMPLATE,
-    ScheduleService,
-)
+from humanoid.services.schedule import SOURCE_TEMPLATE, ScheduleService
 
 from .fakes import FakeContext, FakeProvider, FrozenClock, RecordingLogger, ScopeStore
 from .test_schedule import cfg, seg_reply
@@ -147,112 +141,20 @@ class GapCatchUpTest(unittest.TestCase):
         self.assertTrue(service.heal_gap())
         return service._covering(service.segments(), 9 * 60 + 30)
 
-    # ------------------------------------------------------------------
-    # 资格判定
-    # ------------------------------------------------------------------
-
-    def test_healed_segment_earns_one_catch_up(self):
-        service, _provider = self.build()
-        active = self.heal(service)
-        self.assertFalse(active.get("status"), "v3.1.23 起自愈补的是具体事")
-        self.assertEqual(service.source, SOURCE_TEMPLATE)
-        self.assertTrue(service.refresh_due(), "补位之后应该把模型请回来一次")
-        self.assertTrue(service._catch_up_armed, "放行只是「待办」，等真去调模型才落时间戳")
-        self.assertEqual(service._heal_gen_at, 0.0, "决策层不许提前写限频标记")
-
-    def test_catch_up_is_used_once_then_rate_limited(self):
+    # Stable segments are not rewritten until their planned boundary.
+    def test_healed_segment_is_stable_until_natural_boundary(self):
         service, provider = self.build()
-        self.heal(service)
+        active = self.heal(service)
+        self.assertIsNotNone(active)
+        self.assertEqual(service.source, SOURCE_TEMPLATE)
+        original = dict(active)
+        self.assertFalse(service.refresh_due())
+        self.assertFalse(asyncio.run(service.ensure_fresh()))
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(service._covering(service.segments(), 9 * 60 + 30), original)
+        end_hour, end_minute = (int(part) for part in str(active["end"]).split(":"))
+        service._clock = FrozenClock(datetime(2026, 8, 22, end_hour, end_minute, tzinfo=TZ))
         self.assertTrue(service.refresh_due())
-        self.assertTrue(asyncio.run(service.ensure_fresh()), "接班这一次真的调到模型")
-        self.assertEqual(provider.calls, 1)
-        self.assertGreater(service._heal_gen_at, 0.0, "真走到模型那一步才算接班过")
-        self.assertFalse(service.refresh_due(), "一小时最多接班一次")
-
-    def test_plain_event_from_llm_does_not_earn_catch_up(self):
-        """模型自己写的段不该再问一遍：只有本地兜底段才需要接班（v3.1.28）。"""
-        service, _provider = self.build()
-        service._set_source(SOURCE_LLM)
-        self.seed(service, [slot("08:00", "10:30", "在窗边坐着")])
-        self.assertFalse(service.refresh_due(), "模型写过的段不再越过空闲静默")
-
-    def test_inherited_status_segment_still_earns_one_catch_up(self):
-        """重启后内存里没有补位时刻：处境段照样该被请一次模型，别僵到段尾。"""
-        service, _provider = self.build()
-        self.seed(service, [slot("08:00", "10:30", "在窗边坐着", status=True)])
-        self.assertEqual(service._healed_at, 0.0, "新进程里没有补位时刻")
-        self.assertTrue(service.refresh_due(), "继承来的处境段也算补出来的")
-        service._heal_gen_at = float(service._monotonic())
-        self.assertFalse(service.refresh_due(), "但一小时仍然只接班一次")
-
-    def test_catch_up_window_expires(self):
-        service, _provider = self.build()
-        self.heal(service)
-        service._healed_at = time.monotonic() - HEAL_CATCHUP_WINDOW_SECONDS - 1
-        self.assertFalse(service.refresh_due(), "补位太久了，那一段已经是「旧安排」")
-
-    def test_budget_refusal_does_not_earn_catch_up(self):
-        service, _provider = self.build()
-        self.heal(service)
-        service.gateway._gate = _Gate("budget")
-        self.assertFalse(service.refresh_due(), "每日预算用完不能绕")
-
-    def test_interval_refusal_does_not_earn_catch_up(self):
-        service, _provider = self.build()
-        self.heal(service)
-        service.gateway._gate = _Gate("interval")
-        self.assertFalse(service.refresh_due(), "最小间隔那条本来就该由 ignore_interval 处理")
-
-    def test_peek_never_consumes_the_catch_up(self):
-        service, _provider = self.build()
-        self.heal(service)
-        self.assertFalse(service._due_peek(), "只读路径不改状态")
-        self.assertEqual(service._heal_gen_at, 0.0)
-
-    # ------------------------------------------------------------------
-    # 真跑一遍：接班之后模型段落地，欠账清零
-    # ------------------------------------------------------------------
-
-    def test_model_takes_over_after_a_heal(self):
-        service, provider = self.build(gate_reason=None)  # 没有闸门，接班这次真的放行
-        self.heal(service)
-        self.assertGreater(service._healed_at, 0.0)
-        self.assertTrue(asyncio.run(service.ensure_fresh()))
-        self.assertEqual(provider.calls, 1)
-        self.assertEqual(service.source, "llm")
-        self.assertEqual(service._healed_at, 0.0, "模型接上了，欠账清零")
-
-    def test_catch_up_really_reaches_the_model_under_idle(self):
-        """v3.1.22 的回归：空闲静默挡着时，接班必须真的调到模型一次。
-
-        初版在 `_due()` 里就写了 `_heal_gen_at`，`ensure_fresh` 内部的第二次
-        `refresh_due()` 于是判 False，模型一次都没被叫过——线上表现就是「只有自愈、
-        没有一件真事」。
-        """
-        service, _provider = self.build()
-        recorder = _RecordingGateway(seg_reply(event="去超市买菜", minutes=85))
-        service.set_resolver_gateway(service.resolver, recorder)
-        self.heal(service)
-        self.assertTrue(asyncio.run(service.ensure_fresh()), "接班这一次要真的走到模型")
-        self.assertGreaterEqual(recorder.calls, 1, "至少一次生成调用")
-        self.assertIn("【可以选的事】", recorder.prompts[0], "走的是日程生成那条路")
-        events = [seg.get("event") for seg in service.segments()]
-        self.assertIn("去超市买菜", events, "模型回的段要真的落地")
-        self.assertEqual(service.source, "llm")
-        self.assertEqual(service._healed_at, 0.0, "模型接上了，欠账清零")
-
-    def test_idle_gate_does_not_freeze_the_healed_segment(self):
-        service, provider = self.build()  # 空闲静默一直挡着：接班是唯一的出口
-        self.heal(service)
-        self.assertTrue(asyncio.run(service.ensure_fresh()), "接班要把模型请回来")
-        self.assertEqual(provider.calls, 1)
-        tail = service.segments()[-1]
-        self.assertNotIn("status", tail, "接班之后落地的是真事，不是处境词")
-        self.assertIsNotNone(
-            service._covering(service.segments(), 9 * 60 + 30),
-            "换段也不能留空档",
-        )
-
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

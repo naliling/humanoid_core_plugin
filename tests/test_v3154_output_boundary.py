@@ -53,7 +53,18 @@ class StaticSpeechBoundaryTest(unittest.TestCase):
 
         method = self.methods["show_input_state"]
         body_nodes = [node for stmt in method.body for node in ast.walk(stmt)]
-        self.assertFalse(any(isinstance(node, ast.Name) and node.id == "req" for node in body_nodes))
+        request_helpers = {"_request_holds_blocks", "_append_injected_parts"}
+        request_calls = {
+            node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+            for node in body_nodes
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id in request_helpers)
+                or (isinstance(node.func, ast.Attribute) and node.func.attr in request_helpers)
+            )
+            and any(isinstance(arg, ast.Name) and arg.id == "req" for arg in node.args)
+        }
+        self.assertEqual(request_calls, request_helpers, "request may only be read/injected through guarded helpers")
         self.assertFalse(
             any(
                 isinstance(node, ast.Call)

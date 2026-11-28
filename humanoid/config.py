@@ -248,11 +248,9 @@ class HumanoidConfig:
     schedule_llm_timeout_seconds: int = 60
     schedule_generation_max_attempts: int = 2
     schedule_max_slots: int = 96
-    # 决策窗间隔（分钟）：动态日程每隔这么久掷一次骰子决定「生成或不生成」。
-    # 15 分钟与默认粒度对齐；调大可省模型额度。
+    # 兼容旧配置：字段与解析保留，当前版本不使用此间隔。
     schedule_refresh_minutes: int = 15
-    # 每个决策窗在「这一段还没做完、身体也没报警」时仍然重新排一段的概率（%）：
-    # 她临时改主意的频率。0 = 只在到期/身体报警时才排；100 = 每个窗都重排。
+    # 兼容旧配置：字段与解析保留；当前版本不按此概率提前重排。
     schedule_change_chance: int = 30
     schedule_provider_cooldown_minutes: int = 30
     # 日程两次调模型之间的间隔（分钟）：每次生成后在这个区间里**随机**抽一个

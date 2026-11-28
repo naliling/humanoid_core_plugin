@@ -7,7 +7,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import aiohttp
 
@@ -48,7 +48,7 @@ from .humanoid.diagnostics import config_error_banner, note_reason
 from .humanoid import closing as _closing
 from .humanoid.engine import HumanoidEngine
 from .humanoid.llm import CallGate, LLMGateway, ProviderResolver
-from .humanoid.persona import PersonaSource
+from .humanoid.persona import EMPTY, PersonaSource, persona_relation_identity
 from .humanoid.role_manager import RoleManager
 from .humanoid.state import StateStore
 from .humanoid.clock import Clock
@@ -1791,6 +1791,17 @@ class HumanoidCore(Star):
             self._known_roles.add(str(core.role_id))
         except Exception:
             pass
+        try:
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            source = getattr(core, "persona_source", None)
+            persona = source.cached_persona_for_umo(umo) if source is not None and umo else None
+            if persona is None and source is not None and umo and source.umo_for(role_id) == umo:
+                persona = source.cached_persona(role_id)
+            core.bind_persona_relation(
+                persona_relation_identity(persona), getattr(persona, "name", "") or ""
+            )
+        except Exception as exc:
+            logger.debug(f"{LOG_PREFIX} 人格关系作用域绑定失败，保持本角色档案: {exc}")
         return core
 
     def _refresh_known_roles(self) -> None:
@@ -1863,7 +1874,7 @@ class HumanoidCore(Star):
         yield event.plain_result(core.intimacy_text(self._sender(event)))
 
     @filter.command("好感度")
-    async def cmd_mood(self, event: AstrMessageEvent, argument: str = ""):
+    async def cmd_mood(self, event: AstrMessageEvent, argument: str = "") -> AsyncGenerator[object, None]:
         """用法：/好感度（你的情绪档案）；/好感度 排行榜 看所有人的排名（管理员）"""
         if not self._config.mood_enabled:
             yield event.plain_result("情绪系统未开启。")
@@ -1877,16 +1888,24 @@ class HumanoidCore(Star):
             yield event.plain_result(_clip_text(self.engine.affection_ranking_text(core)))
             return
         core = self._core(event)
-        yield event.plain_result(core.mood.profile_text(self._sender(event)))
+        yield event.plain_result(
+            core.mood.profile_text(
+                self._sender(event), include_intimacy=_is_private_chat(event)
+            )
+        )
 
     @filter.command("情绪详情")
-    async def cmd_mood_detail(self, event: AstrMessageEvent):
+    async def cmd_mood_detail(self, event: AstrMessageEvent) -> AsyncGenerator[object, None]:
         """用法：/情绪详情（含基线值与交互轮次）"""
         if not self._config.mood_enabled:
             yield event.plain_result("情绪系统未开启。")
             return
         core = self._core(event)
-        yield event.plain_result(core.mood.profile_text(self._sender(event), detailed=True))
+        yield event.plain_result(
+            core.mood.profile_text(
+                self._sender(event), detailed=True, include_intimacy=_is_private_chat(event)
+            )
+        )
 
     @filter.command("情绪日志")
     async def cmd_mood_log(self, event: AstrMessageEvent):
@@ -2286,7 +2305,7 @@ class HumanoidCore(Star):
         else:
             lines.append(f"- 城市（全局默认）：{cfg.timezone_city or '（未定）'}　→ /拟人 时间 大阪")
         lines.append(f"- 日程用人设：{'开' if cfg.schedule_use_persona else '关'}　→ /拟人 设置 人设 开")
-        lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（每 {cfg.schedule_refresh_minutes} 分钟决定一次要不要排下一段，变动概率 {cfg.schedule_change_chance}%）")
+        lines.append(f"- 大模型日程：{'开' if cfg.use_llm_schedule else '关'}（当前片段通常保持至自然结束；饥饿优先下一清醒槽，睡眠压力或明确打断除外；旧随机重排参数不生效）")
         _lo = cfg.schedule_min_interval_minutes
         _hi = cfg.schedule_max_interval_minutes
         _gap = f"{_lo}~{_hi} 分钟随机" if _hi > _lo else f"{_lo} 分钟"
@@ -2562,6 +2581,26 @@ class HumanoidCore(Star):
         priority=1 是为了比其它插件的 on_llm_request 先跑，不然得等它们做完准备工作
         才开始显示（参考插件也是这么标的）。
         """
+        try:
+            clock = self._core(event).clock
+            now = clock.now()
+            offset = now.strftime("%z")
+            if len(offset) == 5:
+                offset = f"{offset[:3]}:{offset[3:]}"
+            city = getattr(clock, "display_city", "")
+            place = f"（{city}）" if city else ""
+            zone = f"UTC{offset}" if offset else "时区偏移不可确认"
+            block = (
+                "【Core本地时钟】"
+                f"本角色本地日期与时间为 {now:%Y-%m-%d %H:%M:%S}{place}，{zone}。"
+                "这是当前请求中可信的时间依据；回答今天、现在的日期或时间时优先使用，"
+                "不要调用 shell、PowerShell 或其他系统工具查询当前时间。"
+            )
+            if not _request_holds_blocks(req, ["【Core本地时钟】"]):
+                _append_injected_parts(req, [block])
+        except Exception as e:
+            logger.debug(f"{LOG_PREFIX} 注入本地时间失败: {e}")
+
         try:
             if not self._config.input_state_enabled:
                 return
@@ -3435,6 +3474,33 @@ class HumanoidCore(Star):
             # 来的消息不算「有人跟她说话」，否则这道闸被它自己重置。
             self.call_gate.note_interaction(role_id=role_id)
             core = self._core(event)
+            step = "人格关系归属"
+            try:
+                umo = str(getattr(event, "unified_msg_origin", "") or "")
+            except Exception:
+                umo = ""
+            source = getattr(core, "persona_source", None)
+            persona = None
+            legacy_owners = {}
+            if source is not None:
+                persona = await source.persona_for_event(core.role_id, umo)
+                for old_role, old_umo in core.persona_legacy_sources().items():
+                    if not old_umo:
+                        legacy_owners[old_role] = ("", "")
+                        continue
+                    old_persona = await source.persona_for_umo(old_umo, refresh=True)
+                    if old_persona == EMPTY:
+                        continue
+                    legacy_owners[old_role] = (
+                        persona_relation_identity(old_persona), old_persona.name or ""
+                    )
+            else:
+                legacy_owners = {rid: ("", "") for rid in core.persona_legacy_sources()}
+            core.bind_persona_relation(
+                persona_relation_identity(persona),
+                getattr(persona, "name", "") or "",
+                legacy_owners,
+            )
             # 自动认定称呼：只在这个人还没有任何称呼时填一次，之后换名片也不会改口；
             # 用户 /叫我 设过的更碰不到。纯图片消息也带名字，所以放在正文判空之前。
             #

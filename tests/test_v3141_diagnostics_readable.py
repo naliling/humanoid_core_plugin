@@ -46,8 +46,27 @@ class _Resolver:
         return "p1"
 
 
+class _Verdict:
+    allowed = True
+
+    def describe(self) -> str:
+        return "允许"
+
+
+class _Gate:
+    def snapshot(self, role_id="") -> dict:
+        return {
+            "idle_limit_minutes": 0,
+            "interval_minutes": 0,
+            "budget": 0,
+            "used_today": 0,
+            "used_by_purpose": {},
+            "verdict": _Verdict(),
+        }
+
+
 class _Gateway:
-    gate = None
+    gate = _Gate()
 
     def cooldown_remaining(self, provider_id, purpose) -> float:
         return 0.0

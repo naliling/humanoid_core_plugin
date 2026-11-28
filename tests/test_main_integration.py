@@ -250,11 +250,38 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/拟人 参照名称", out[0])
         self.assertIn(main_module.__version__, out[0])
 
-    async def test_mood_commands(self):
-        self.assertIn("情绪档案", (await collect(self.star.cmd_mood(FakeEvent("/好感度"))))[0])
-        self.assertIn(
-            "情绪详细档案", (await collect(self.star.cmd_mood_detail(FakeEvent("/情绪详情"))))[0]
-        )
+    async def test_mood_commands(self) -> None:
+        self.raw["ccb"] = True
+        self.star._config_box.reload(self.raw)
+        group_event = FakeEvent("/好感度", private=False)
+        private_event = FakeEvent("/好感度", private=True)
+        core = self.star._core(private_event)
+        summary = core.mood.intimacy_summary("10001")
+        self.assertTrue(summary)
+
+        group = (await collect(self.star.cmd_mood(group_event)))[0]
+        private = (await collect(self.star.cmd_mood(private_event)))[0]
+        self.assertIn("情绪档案", group)
+        self.assertNotIn("亲近欲", group)
+        self.assertNotIn("门槛", group)
+        self.assertNotIn(summary, group)
+        self.assertIn("亲近欲", private)
+        self.assertIn("门槛", private)
+        self.assertIn(summary, private)
+
+        group_detail = (await collect(
+            self.star.cmd_mood_detail(FakeEvent("/情绪详情", private=False))
+        ))[0]
+        private_detail = (await collect(
+            self.star.cmd_mood_detail(FakeEvent("/情绪详情", private=True))
+        ))[0]
+        self.assertIn("情绪详细档案", group_detail)
+        self.assertNotIn("亲近欲", group_detail)
+        self.assertNotIn("门槛", group_detail)
+        self.assertNotIn(summary, group_detail)
+        self.assertIn("亲近欲", private_detail)
+        self.assertIn("门槛", private_detail)
+        self.assertIn(summary, private_detail)
         self.assertIn("暂无情绪", (await collect(self.star.cmd_mood_log(FakeEvent("/情绪日志"))))[0])
 
     async def test_time_command(self):
@@ -452,6 +479,32 @@ class MainIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.is_stopped())
 
     # ---------- 钩子 ----------
+
+    async def test_registered_hook_injects_local_time_even_when_input_state_is_disabled(self):
+        self.raw["input_state_enabled"] = False
+        self.star.engine.reload_config(self.raw)
+        event = FakeEvent("现在几点？")
+        req = FakeProviderRequest("")
+        await self.star.show_input_state(event, req)
+        content = injected_text(req)
+        self.assertIn("【Core本地时钟】", content)
+        self.assertIn(self.star._core(event).clock.now().strftime("%Y-%m-%d"), content)
+        self.assertIn("UTC+08:00", content)
+        self.assertIn("不要调用 shell", content)
+        await self.star.show_input_state(event, req)
+        self.assertEqual(injected_text(req), content)
+
+    async def test_registered_hook_time_uses_context_and_prompt_fallbacks(self):
+        self.raw["input_state_enabled"] = False
+        self.star.engine.reload_config(self.raw)
+        event = FakeEvent("今天几号？")
+        context_req = types.SimpleNamespace(contexts=[], system_prompt="")
+        await self.star.show_input_state(event, context_req)
+        self.assertTrue(main_module._request_holds_blocks(context_req, ["【Core本地时钟】"]))
+
+        prompt_req = types.SimpleNamespace(system_prompt="")
+        await self.star.show_input_state(event, prompt_req)
+        self.assertTrue(main_module._request_holds_blocks(prompt_req, ["【Core本地时钟】"]))
 
     async def test_injection_appends_to_existing_prompt(self):
         req = FakeProviderRequest("你是一个助手。")

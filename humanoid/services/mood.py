@@ -1010,10 +1010,12 @@ class MoodService:
         if int(_num_or(record.get("turn_count_peak"), 0.0)) != peak:
             record["turn_count_peak"] = peak
             changed = True
-        # 关系时长靠 first_met：老档案没有时用 last_interaction 补（不丢历史，只是少算一段）。
+        # 关系时长只从可靠的 user 级迁移值恢复；最近互动不是相识日期。
         if "first_met" not in record:
-            record["first_met"] = record.get("last_interaction", self._time())
-            changed = True
+            first_met = _num_or(user_state.get("first_met"), 0.0)
+            if 0 < first_met < float("inf"):
+                record["first_met"] = first_met
+                changed = True
         if changed and persist:
             user_state["mood"] = record
             self._scope.mark_dirty()
@@ -1972,7 +1974,7 @@ class MoodService:
             # 折进来之后封顶/递减/日封顶对它们一律生效，记账也自动落进当日额度。
             # `severe` 是「强迫」标记：它要当场扣好感，不能被「连续才扣」的门槛归零。
             delta = self._apply_recovery(delta, record, text)
-            delta, severe = self._apply_intimacy_request(delta, record, text)
+            delta, severe = self._apply_intimacy_request(delta, record, text, is_group=is_group)
             delta = self._apply_modifiers(delta, user_id, warm_key, _neg_key_for(text), severe)
             self._commit(user_id, record, user_state, delta)
             return delta
@@ -2507,7 +2509,7 @@ class MoodService:
         return Delta(aff, delta.libido, aggr)
 
     def _apply_intimacy_request(
-        self, delta: Delta, record: dict, text: str
+        self, delta: Delta, record: dict, text: str, is_group: bool = False
     ) -> Tuple[Delta, bool]:
         """E3/E4：用户主动求亲密 / 强迫。
 
@@ -2522,6 +2524,8 @@ class MoodService:
         `ccb_affection_min`、从不读 `ccb` 开关 —— 默认配置（`ccb=false`）下
         一句「我们上床吧」照样白拿 2.0 亲近欲，而且完全不计入当日额度。
         """
+        if is_group:
+            return delta, False
         cfg = self.config
         if not bool(getattr(cfg, "ccb", False)):
             return delta, False
@@ -3397,7 +3401,9 @@ class MoodService:
             lines.append(f"{entry.get('time', '')} | {entry.get('event', '')}")
         return "\n".join(lines)
 
-    def profile_text(self, user_id: str, detailed: bool = False) -> str:
+    def profile_text(
+        self, user_id: str, detailed: bool = False, include_intimacy: bool = True
+    ) -> str:
         # 只读展示：没档案就用配置里的初始值渲染一份，不因为 `/好感度` 建档。
         data = self._scope.peek_user(user_id, "mood")
         if not isinstance(data, dict):
@@ -3428,25 +3434,25 @@ class MoodService:
             lines.append(f"好感度：{data['affection']:.1f}/100（基线 {data['base_affection']:.1f}）")
         else:
             lines.append(f"好感度：{data['affection']:.1f}/100")
-        # 亲近欲不能只给一个裸数字：她「比平常高多少」才是这个人能不能进亲密场景的
-        # 主门槛，而用户原来看到 41/50 根本不知道自己离 38/Δ4 还差哪一条。
-        libido = _num_or(data.get("libido"), _num_or(getattr(self.config, "mood_initial_libido", 34.0), 34.0))
-        base_libido = _num_or(data.get("base_libido"), libido)
-        libido_note = f"基线 {base_libido:.1f}，{_ccb.delta_text(libido - base_libido)}"
-        try:
-            if bool(getattr(self.config, "ccb", False)):
-                lo = _num_or(getattr(self.config, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN),
-                             _ccb.CCB_LIBIDO_MIN)
-                need = _num_or(getattr(self.config, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE),
-                               _ccb.CCB_LIBIDO_RISE)
-                libido_note += (
-                    f" · 门槛 {lo:.0f}/Δ{need:.0f}"
-                    f" → {_ccb.threshold_text(libido, base_libido, lo, need)}"
-                )
-        except Exception:
-            pass
+        if include_intimacy:
+            # 亲近欲与成人档门槛只在私聊展示。
+            libido = _num_or(data.get("libido"), _num_or(getattr(self.config, "mood_initial_libido", 34.0), 34.0))
+            base_libido = _num_or(data.get("base_libido"), libido)
+            libido_note = f"基线 {base_libido:.1f}，{_ccb.delta_text(libido - base_libido)}"
+            try:
+                if bool(getattr(self.config, "ccb", False)):
+                    lo = _num_or(getattr(self.config, "ccb_libido_min", _ccb.CCB_LIBIDO_MIN),
+                                 _ccb.CCB_LIBIDO_MIN)
+                    need = _num_or(getattr(self.config, "ccb_libido_rise", _ccb.CCB_LIBIDO_RISE),
+                                   _ccb.CCB_LIBIDO_RISE)
+                    libido_note += (
+                        f" · 门槛 {lo:.0f}/Δ{need:.0f}"
+                        f" → {_ccb.threshold_text(libido, base_libido, lo, need)}"
+                    )
+            except Exception:
+                pass
+            lines.append(f"亲近欲：{libido:.1f}/50（{libido_note}）")
         lines += [
-            f"亲近欲：{libido:.1f}/50（{libido_note}）",
             f"攻击性：{data['aggression']:.1f}/50（基线 {data['base_aggression']:.1f}）",
             f"当前标签：{self.label(user_id)}",
         ]
@@ -3455,14 +3461,15 @@ class MoodService:
         tag = self.tag(user_id)
         if tag:
             lines.append(f"心情标签：{tag}")
-        # 亲密档案：只在成人档开着时显示（它是隐藏开关，平时不露）。
-        try:
-            if bool(getattr(self.config, "ccb", False)):
-                extra = self.intimacy_summary(user_id)
-                if extra:
-                    lines.append(extra)
-        except Exception:
-            pass
+        if include_intimacy:
+            # 亲密档案：只在成人档开着时显示（它是隐藏开关，平时不露）。
+            try:
+                if bool(getattr(self.config, "ccb", False)):
+                    extra = self.intimacy_summary(user_id)
+                    if extra:
+                        lines.append(extra)
+            except Exception:
+                pass
         return "\n".join(lines)
 
     def intimacy_summary(self, user_id: str) -> str:

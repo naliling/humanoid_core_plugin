@@ -323,8 +323,8 @@ class PsycheStoreTest(unittest.TestCase):
         )
         self.assertTrue(store.save_state())
         self.assertTrue(store.append_entry(Entry(
-            text="我记下了", concern_key="k", source_kind="model_internal",
-            source_text="那件事",
+            text="我记下了", role_id="bot1", user_id="u1", concern_key="k",
+            source_kind="model_internal", source_text="那件事",
         )))
 
         reopened = PsycheStore(d, "bot1")
@@ -338,11 +338,51 @@ class PsycheStoreTest(unittest.TestCase):
 
     def test_corrupt_files_do_not_crash(self):
         d = Path(tempfile.mkdtemp())
-        (d / "psyche_state.json").write_text("{broken", encoding="utf-8")
-        (d / "psyche_journal.jsonl").write_text("not json\n\n{garbage}\n", encoding="utf-8")
+        store = PsycheStore(d, "bot1")
+        store._state_path().write_text("{broken", encoding="utf-8")
+        store._journal_path().write_text("not json\n\n{garbage}\n", encoding="utf-8")
         store = PsycheStore(d, "bot1")
         self.assertEqual(store.states, {})
         self.assertEqual(store.journal, [])
+
+    def test_bot_and_peer_psyche_files_are_isolated_and_legacy_shared_files_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            old_state = d / "psyche_state.json"
+            old_journal = d / "psyche_journal.jsonl"
+            old_state.write_text("legacy-state", encoding="utf-8")
+            old_journal.write_text("legacy-journal\n", encoding="utf-8")
+            bot1 = PsycheStore(d, "bot1")
+            bot2 = PsycheStore(d, "bot2")
+            bot1.state("peer1").frustrate_need("space", 0.5)
+            bot2.state("peer1").frustrate_need("space", 0.2)
+            self.assertTrue(bot1.save_state())
+            self.assertTrue(bot2.save_state())
+            self.assertTrue(bot1.append_entry(Entry(
+                text="bot1-peer1", role_id="bot1", user_id="peer1")))
+            self.assertTrue(bot1.append_entry(Entry(
+                text="bot1-peer2", role_id="bot1", user_id="peer2")))
+            self.assertTrue(bot2.append_entry(Entry(
+                text="bot2-peer1", role_id="bot2", user_id="peer1")))
+            self.assertNotEqual(bot1._state_path(), bot2._state_path())
+            self.assertNotEqual(bot1._journal_path(), bot2._journal_path())
+            reopened1 = PsycheStore(d, "bot1")
+            reopened2 = PsycheStore(d, "bot2")
+            self.assertIn("peer1", reopened1.states)
+            self.assertNotIn("peer2", reopened1.states)
+            self.assertEqual([e.text for e in reopened1.journal], ["bot1-peer1", "bot1-peer2"])
+            self.assertEqual([e.text for e in reopened2.journal], ["bot2-peer1"])
+            self.assertEqual(old_state.read_text(encoding="utf-8"), "legacy-state")
+            self.assertEqual(old_journal.read_text(encoding="utf-8"), "legacy-journal\n")
+
+    def test_daily_write_cap_is_per_peer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = PsycheStore(Path(tmp), "bot1")
+            now = 1_000_000.0
+            self.assertTrue(store.append_entry(Entry(
+                text="peer1 entry", role_id="bot1", user_id="peer1", ts=now - 10)))
+            self.assertFalse(store.should_write("peer1", now=now, min_interval=0, daily_cap=1))
+            self.assertTrue(store.should_write("peer2", now=now, min_interval=0, daily_cap=1))
 
     def test_write_throttle(self):
         now = 1_000_000.0
