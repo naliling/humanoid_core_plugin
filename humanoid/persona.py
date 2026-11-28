@@ -17,6 +17,7 @@ persona_id）按 ``platform_id::`` 路由到具体角色（core/umop_config_rout
 from __future__ import annotations
 
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -58,6 +59,16 @@ class Persona:
 
 
 EMPTY = Persona()
+
+
+def persona_relation_identity(persona: Any) -> str:
+    """Stable explicit persona-name key; nameless and [%None] personas stay local."""
+    if not isinstance(persona, Persona) or persona.source == NO_PERSONA:
+        return ""
+    name = unicodedata.normalize("NFKC", str(persona.name or "").strip())
+    if not name or name.startswith(("（未命名", "(未命名")):
+        return ""
+    return " ".join(name.split()).casefold()
 
 
 def truncate(text: str, limit: int = PERSONA_PROMPT_MAX) -> str:
@@ -195,6 +206,7 @@ class PersonaSource:
         self._ttl = ttl
         self._umos: dict[str, str] = {}
         self._cache: dict[str, _Entry] = {}
+        self._umo_cache: dict[str, _Entry] = {}
 
     def restore(self, role_id: str, umo: Any) -> None:
         """从持久状态里恢复代表会话（重启后第一条消息之前也能用人格生成日程）。"""
@@ -215,6 +227,41 @@ class PersonaSource:
     def umo_for(self, role_id: str) -> str:
         return self._umos.get(str(role_id), "")
 
+    async def persona_for_umo(self, umo: Any, *, refresh: bool = False) -> Persona:
+        """Resolve an exact UMO independently of the role's latest session."""
+        text = str(umo or "").strip()
+        entry = self._umo_cache.get(text)
+        if not refresh and entry and self._time() - entry.at < self._ttl:
+            return entry.persona
+        try:
+            persona = await resolve_persona(self._context, text)
+        except Exception as exc:
+            if self._log is not None:
+                self._log.warning(f"[humanoid_core] 人格设定读取失败，按无设 persona 排: {exc}")
+            return EMPTY
+        if persona != EMPTY:
+            self._umo_cache[text] = _Entry(persona=persona, at=self._time(), umo=text)
+        return persona
+
+    async def persona_for_event(self, role_id: str, umo: Any) -> Persona:
+        """Resolve this event's exact UMO and cache it only if still current."""
+        key = str(role_id)
+        text = str(umo or "").strip()
+        if not text:
+            return EMPTY
+        self.note_umo(key, text)
+        persona = await self.persona_for_umo(text)
+        if self._umos.get(key, "") == text and persona != EMPTY:
+            self._cache[key] = _Entry(persona=persona, at=self._time(), umo=text)
+        return persona
+
+    def cached_persona_for_umo(self, umo: Any) -> "Persona | None":
+        text = str(umo or "").strip()
+        entry = self._umo_cache.get(text)
+        if entry is None or self._time() - entry.at >= self._ttl:
+            return None
+        return entry.persona
+
     async def persona(self, role_id: str) -> Persona:
         key = str(role_id)
         umo = self._umos.get(key, "")
@@ -222,7 +269,7 @@ class PersonaSource:
         if entry and entry.umo == umo and self._time() - entry.at < self._ttl:
             return entry.persona
         try:
-            persona = await resolve_persona(self._context, umo)
+            persona = await self.persona_for_umo(umo)
         except Exception as exc:  # 解析失败不影响生成日程，按「没有人设」排
             if self._log is not None:
                 self._log.warning(f"[humanoid_core] 人格设定读取失败，日程按无设 persona 排: {exc}")
@@ -234,7 +281,8 @@ class PersonaSource:
             # `Persona()`）都不该被缓存 600 秒，否则一次瞬时故障会变成 10 分钟的
             # 通用模板日程。显式「不用人格」有自己的 source，是成功结果，照常缓存。
             return EMPTY
-        self._cache[key] = _Entry(persona=persona, at=self._time(), umo=umo)
+        if self._umos.get(key, "") == umo:
+            self._cache[key] = _Entry(persona=persona, at=self._time(), umo=umo)
         return persona
 
     def cached_persona(self, role_id: str) -> "Persona | None":
@@ -267,3 +315,4 @@ class PersonaSource:
             self._cache.pop(str(role_id), None)
         else:
             self._cache.clear()
+            self._umo_cache.clear()

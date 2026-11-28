@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from humanoid.llm import LLMGateway, LLMResult, OUTCOME_OK, ProviderResolver
 from humanoid.services.schedule import (
-    HEAL_GEN_KEY,
+
     PURGE_KEY,
     PURGE_VERSION,
     SOURCE_TEMPLATE,
@@ -168,7 +168,7 @@ class StatePurgeTest(unittest.TestCase):
         )
 
 
-class IdleTakeoverTest(unittest.TestCase):
+class StableSegmentTest(unittest.TestCase):
     def build(self, segments):
         conf = cfg(
             schedule_provider_name="p",
@@ -192,40 +192,14 @@ class IdleTakeoverTest(unittest.TestCase):
         service._set_source(SOURCE_TEMPLATE)
         return service, gateway
 
-    def test_concrete_local_segment_earns_a_takeover(self):
-        """重载后 `_healed_at` 丢了，具体事也还是本地兜底——要给一次接班。"""
+    def test_concrete_local_segment_is_unchanged_until_its_original_end(self):
         service, _gateway = self.build([slot("08:40", "10:10", "翻出以前的照片看了一会儿")])
-        active = service._covering(service.segments(), 9 * 60 + 30)
-        self.assertIsNotNone(active)
-        self.assertEqual(service.source, SOURCE_TEMPLATE)
-        self.assertTrue(service._has_real_activity())
-        self.assertTrue(service.refresh_due(), "整段是本地兜底时也该把模型请回来")
-
-    def test_takeover_really_reaches_the_model(self):
-        service, _gateway = self.build([slot("08:40", "10:10", "翻出以前的照片看了一会儿")])
-        recorder = _Recorder(seg_reply(event="去菜市场买了把青菜", minutes=50))
-        service.set_resolver_gateway(service.resolver, recorder)
-        self.assertTrue(asyncio.run(service.ensure_fresh()))
-        self.assertGreaterEqual(recorder.calls, 1)
-        events = [item.get("event") for item in service.segments()]
-        self.assertIn("去菜市场买了把青菜", events)
-        self.assertEqual(service.source, "llm")
-
-    def test_takeover_limit_is_restored_from_disk(self):
-        """限频落盘：重载后不能因为内存清零又白送一次模型调用。"""
-        service, _gateway = self.build([slot("08:40", "10:10", "翻出以前的照片看了一会儿")])
-        service._scope.set_self(HEAL_GEN_KEY, float(service._clock.timestamp()))
-        fresh = ScheduleService(
-            service._scope,
-            lambda: cfg(schedule_provider_name="p"),
-            FrozenClock(MOMENT),
-            logger=RecordingLogger(),
-            monotonic=time.monotonic,
-        )
-        fresh.set_resolver_gateway(service.resolver, service.gateway)
-        self.assertGreater(fresh._heal_gen_at, 0.0, "落盘的限频要换算回单调钟")
-        self.assertFalse(fresh.refresh_due(), "刚接班过，四小时内不再打扰")
-
+        before = service.segments()
+        self.assertFalse(service.refresh_due())
+        self.assertFalse(asyncio.run(service.ensure_fresh()))
+        self.assertEqual(service.segments(), before)
+        service._clock = FrozenClock(MOMENT.replace(hour=10, minute=10))
+        self.assertTrue(service.refresh_due())
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

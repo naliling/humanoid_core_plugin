@@ -1,9 +1,8 @@
 """日程服务 - 滚动分段：一次只决定「从现在起的这一段」。
 
-与旧版整表日程的区别：未来不预排。她的下一段做什么、做多久，到了时候看着她
-当时的身体与人设现决定；每天每 15 分钟一个决策窗，生成或不生成都可能——这一段
-过完了、身体跟手上的事明显打架、或掷中了变动概率，才会重新问一次模型，其余
-时候她接着做手上的事，一次模型都不调。
+与旧版整表日程的区别：未来不预排。新的一段只在当前段结束或没有有效段时生成；
+清醒时也可因睡眠压力越线或明确打断提前评估。当前段不因普通消息、饥饿或旧版随机
+参数中途重排；高饥饿只影响下一个可行的非睡眠、非餐食槽，优先安排泛化进食尝试。
 """
 
 from __future__ import annotations
@@ -99,19 +98,7 @@ _MATERIAL_ANCHOR_KEY = "_material_anchor_key"
 #: 实测就是「角色明明在跑，日程停在几小时前」。超时后强制复位/取消，下一轮重来。
 GENERATION_STALL_SECONDS = 600.0
 
-#: 空档自愈补的是 `dynamic_segment` 的处境词（「安静待着」「忙自己的事」）。没人说话时
-#: 闸门按「空闲静默」一直挡着模型，自愈就会一段接一段地补下去，一整天全是处境词——
-#: 时间线是连续的，但里面没有一件真事。这里给补位后的那一段留一次「让模型真正接班」
-#: 的机会：只要当前这段是自愈补出来的处境段，就允许越过空闲静默一次，一小时最多一次
-#: （每日预算照旧，预算用完就等明天）。只越过空闲静默，不越过预算与卡住保护。
-HEAL_CATCHUP_SECONDS = 3600.0
-HEAL_CATCHUP_WINDOW_SECONDS = 900.0
-# 整段都还是本地兜底（重载后 `_healed_at` 丢了）时，给模型接手一次的限频。
-# 一小时太紧：这类角色没人说话，一小时内根本轮不到它；四小时够把一整天的
-# 处境段换成真事，又不至于每轮都去砸模型。
-HEAL_IDLE_CATCHUP_SECONDS = 4 * 3600.0
-# 接班限频的落盘键：只在内存里的话，每次重载都会多送一次模型调用。
-HEAL_GEN_KEY = "schedule_heal_gen_wall"
+
 # 旧状态清理（v3.1.28）：设备词/含糊词曾经写进日程，读的时候过滤不够，
 # 得在 state 里真的删掉。跑过一次就记版本，别每次启动都扫。
 # v3.1.35 升到 8：再清两处漏网的——`materials_done` 里带设备/物种词的台账，
@@ -2361,17 +2348,13 @@ def dynamic_segment(
 
 
 class ScheduleService:
-    """滚动分段日程：未来不预排，每 15 分钟一个「生成或不生成」的决策窗。
+    """滚动分段日程：未来不预排，当前段到自然边界前保持稳定。
 
-    - 到期（这一段过完了 / 今天还没有段）必须生成；
-    - 身体跟手上的事明显打架（饿到发慌还在做事、困到不行还醒着）当场生成；
-    - 有人打破一段安静来找她（私聊，见 `note_interruption`）：给一次「要不要
-      停下手上的事」的时机，整天消息不断的部署里这条自然很少触发；
-    - 其余时候按 `schedule_change_chance` 的概率掷骰子：掷中才生成（她临时改
-      主意），没掷中就接着做手上的事，一次模型都不调；
-    - 睡着的那一段不重掷：一觉睡到这段结束为止，夜里不会被打扰（消息也不算，
-      多用户部署里夜里总有人发消息）；跨午夜的一觉由结转（carry）原样接到明天，
-      零点不需要再问一次模型。
+    - 没有有效段或当前段结束时生成下一段；
+    - 清醒段的睡眠压力越线或已记录的明确打断可以提前评估；
+    - 高饥饿只影响下一个可行的非睡眠、非餐食槽，改为泛化进食尝试；
+    - 普通消息、普通事件和旧版随机参数不会截断当前段；
+    - 睡眠段不被消息打断；跨午夜的一觉由结转（carry）原样接到明天。
     """
 
     def __init__(
@@ -2428,12 +2411,7 @@ class ScheduleService:
         # 卡住看门狗（v3.1.20）：`_generating` 与 `_task` 的开始时刻。0 表示没在跑。
         self._generating_since = 0.0
         self._task_since = 0.0
-        # 空档接班（v3.1.21）：上一次自愈补位的时刻、上一次「越过空闲静默让模型接班」的时刻。
-        self._healed_at = 0.0
-        self._heal_gen_at = 0.0
-        # 决策层已经放行、等 `ensure_fresh` 真的去调模型时再落「接班过」的时间戳。
-        self._catch_up_armed = False
-        self._restore_heal_marks()
+
         # 日程得按她是谁来排：递一个 async () -> Persona 进来，不递就不读人设。
         self._persona = persona_provider
         # 身体参考数值的来源：递一个 () -> dict 进来，每次决策现取活值。
@@ -2441,10 +2419,7 @@ class ScheduleService:
         # 外界（天气/节日）的来源：同样是 () -> dict，每次决策现取，别用开机那一刻的。
         self._world = world_provider
         self.last_persona = ""
-        # 概率重估的骰子：每个决策窗只掷一次，掷完的结果本窗内保持不变。
-        self._random = random_source or random.random
-        self._roll_window = -1
-        self._roll_hit = False
+        # random_source 参数保留旧构造兼容；稳定分段不再使用改主意概率。
         # 待处理的「来访」（有人打破安静来找她）：一次性，refresh_due 消费掉。
         self._interrupt_at = 0.0
         # 上一条私聊消息的时刻 / 上一次「算作来访」的时刻。用于安静间隔与冷却；
@@ -3159,7 +3134,7 @@ class ScheduleService:
         """节流闸门：没人看着 / 间隔没到 / 今日预算用完时，都算「不需要决定」。
 
         问在「本来该生成」之后而不是之前：正常无事可做的那几百个 tick 不该去
-        反复查闸门，更不该把 _roll_change 的骰子白白掷掉。
+        反复查闸门；自然边界之外不应仅因后台轮询增加模型调用。
 
         `ignore_interval=True` 只用于明确的强制刷新或一次性追赶；普通日程
         空档仍遵守最小间隔。被节流时用本地动态片段保持时间线连续，不额外调用模型。
@@ -3481,7 +3456,7 @@ class ScheduleService:
     def _interrupt_status(self) -> dict[str, Any]:
         """打断闸门的只读快照（给 `status()` 用）：还剩多少保鲜期/冷却/安静。
 
-        全部只读：不改标记、不掷骰子。任何异常都退化成「什么都不剩」——
+        全部只读：不改变状态、不消费待处理事件。任何异常都退化成「什么都不剩」——
         状态页不能因为一个坏配置把 /查看日程 整条带崩。
         """
         try:
@@ -3526,19 +3501,18 @@ class ScheduleService:
             }
 
     def refresh_due(self) -> bool:
-        """该不该决定下一段：没段/这一段过完了/身体打架/刚被打断/还没排上大模型/掷中骰子。
+        """判断是否需要决定下一段：无有效段/当前段自然结束/清醒段睡眠压力越线/明确打断。
 
-        **会写状态**（掷骰子、清过期的「来访」）。只读查询请用 `_due_peek()`。
+        饥饿只在自然边界影响下一个候选；普通消息、普通事件与旧版概率参数不触发中途
+        重排。此方法可能捕获睡眠期间消息或清理过期打断标记；只读查询请用 `_due_peek()`。
         """
         return self._due(roll=True)
 
     def _due_peek(self) -> bool:
-        """`refresh_due()` 的**只读**版本，给 `status()` 这类查询用。
+        """`refresh_due()` 的只读版本，供 `status()` 等查询使用。
 
-        `refresh_due()` 经 `_roll_change()` 会写 `_roll_window`/`_roll_hit`，而
-        `status()` 在每条消息组 prompt 的路径上都会被调到 —— 用户在 15 分钟决策窗里
-        说一句话就把本窗的「临时改主意」骰子吃掉，且结果缓存到窗口结束。这里只**读**
-        本窗已经掷出的结果（还没掷过就是 False），也不清过期的「来访」标记。
+        只评估自然到期、清醒段睡眠压力及已记录的打断；不捕获睡眠期间消息，也不清理
+        过期打断标记。
         """
         return self._due(roll=False)
 
@@ -3568,10 +3542,7 @@ class ScheduleService:
             return False
         body = self._body_snapshot()
         if body:
-            hunger = float(body.get("hunger", 0.0) or 0.0)
             pressure = float(body.get("sleep_pressure", 0.0) or 0.0)
-            if hunger >= CHANGE_TRIGGER_HUNGER and not is_meal_event(event):
-                return True
             if pressure >= CHANGE_TRIGGER_SLEEP_PRESSURE:
                 return True
         # 刚有人打破安静来找过她：给她一个「要不要停下手上这件事」的时机。
@@ -3581,117 +3552,8 @@ class ScheduleService:
         # 放它进来只会白白重排一次模板。
         if cfg.use_llm_schedule and self._fresh_interruption(clear=roll) and self._gate_allows():
             return True
-        # 刚发生的事够重（被夸/被骂/被敷衍）：给她一次因此停下、改主意、
-        # 或反过来被激励的时机。这是用户的话唯一能进日程的路。
-        # 睡着的那段已经在上面 return 了——消息不掀被子，被夸也一样。
-        if cfg.use_llm_schedule and self._fresh_event(clear=roll) and self._gate_allows():
-            return True
-        if cfg.use_llm_schedule and self.source != SOURCE_LLM:
-            # 本地兜底段还占着位：尽快让大模型接手（退避会挡住砸模型的频率）。
-            due = True
-        elif roll:
-            due = self._roll_change()
-        else:
-            due = self._roll_peek()
-        if not due:
-            return False
-        return self._due_gate_or_catch_up(active, roll=roll)
-
-    def _due_gate_or_catch_up(self, active: Slot | None, *, roll: bool) -> bool:
-        """本来该决定、但闸门不让：只有「自愈补出来的处境段」可以越过空闲静默一次。"""
-        if self._gate_allows():
-            return True
-        if roll and self._gap_catch_up(active):
-            # 只**记一个待办**，不在这里记「已经接班过」：`ensure_fresh` 拿锁后还会再问
-            # 一次 `refresh_due()`，这里要是先把 `_heal_gen_at` 写掉，那一次就会判 False，
-            # 接班永远走不到模型（v3.1.21 的初版就栽在这一步）。
-            self._catch_up_armed = True
-            return True
         return False
 
-    def _gap_catch_up(self, active: Slot | None) -> bool:
-        """自愈补出来的处境段，够不够资格让模型越过空闲静默接手一次。
-
-        只看四件事：这段确实是刚补出来的（`_healed_at` 在窗口内，或没有补位时刻但
-        是处境段）、距离补位没过 `HEAL_CATCHUP_WINDOW_SECONDS`、距上一次接班已过
-        `HEAL_CATCHUP_SECONDS`、闸门拒绝的原因**只是**空闲静默。预算用完不算
-        （额度绕不得），还没到最小间隔也不算（那条本来就是补位该绕的）。
-
-        v3.1.23 起补位给的是具体事而不是处境词，所以「是不是处境段」不再是前提：
-        刚补出来的那段不管长什么样，都该被模型接手一次。
-        """
-        if not getattr(self.config, "use_llm_schedule", False):
-            return False
-        if not isinstance(active, dict):
-            return False
-        now = float(self._monotonic())
-        if self._healed_at:
-            # 刚补出来的那一段（具体事或处境词都算）：给模型一次接手的机会。
-            # `_healed_at` 为 0 说明这段是进程重启前补的（内存里没有补位时刻），
-            # 那就只有处境段算——具体事多半是模型自己写的，不该再问一遍。
-            if now - self._healed_at > HEAL_CATCHUP_WINDOW_SECONDS:
-                # 补位太久了，那一段已经是「旧安排」。
-                return False
-        elif not active.get("status") and self.source == SOURCE_LLM:
-            # 来源是本地兜底时，具体事也是自愈补的（重载后 `_healed_at` 丢了），
-            # 不能因为「它看起来像模型写的」就把接班资格取消掉。
-            return False
-        limit = HEAL_CATCHUP_SECONDS
-        if not self._healed_at and self.source != SOURCE_LLM:
-            limit = HEAL_IDLE_CATCHUP_SECONDS
-        if self._heal_gen_at and now - self._heal_gen_at < limit:
-            return False
-        gate = getattr(self.gateway, "gate", None) if self.gateway is not None else None
-        if gate is None:
-            return False
-        role_id = str(getattr(self._scope, "role_id", "") or "")
-        try:
-            verdict = gate.check(PURPOSE, role_id=role_id, ignore_interval=True)
-        except Exception:  # noqa: BLE001 - 闸门自己出错时按「不让」处理，别把日程卡死
-            return False
-        if getattr(verdict, "allowed", False) or str(getattr(verdict, "reason", "")) != "idle":
-            return False
-        # 「还没人跟她说过话」不算：全新部署里一次都别调（老契约：闲置不花钱）。
-        # 判断依据是「她有没有过真事」——今天或昨天收尾里出现过非 status/sleep 的干净段，
-        # 就说明这是个在用的角色，只是这会儿安静太久，给这一小时一次接班机会。
-        try:
-            return self._has_real_activity() or gate.interaction_at(role_id) is not None
-        except Exception:  # noqa: BLE001
-            return False
-
-    def _has_real_activity(self) -> bool:
-        """她今天（或昨天收尾）有没有过一段真事：有，就说明这不是全新部署。"""
-        slots = list(self.segments()) + list(self._prev_day_slots())
-        for slot in slots:
-            if not isinstance(slot, dict) or slot.get("status") or slot.get("sleep"):
-                continue
-            if _content_ok(str(slot.get("event") or "")):
-                return True
-        return False
-
-    def _roll_peek(self) -> bool:
-        """本窗已经掷出的骰子；本窗还没掷过就是 False（只读路径不替它掷）。"""
-        interval = max(60, int(self.config.schedule_refresh_minutes) * 60)
-        window = int(self._clock.now().timestamp() // interval)
-        if window != self._roll_window:
-            return False
-        return self._roll_hit
-
-    def _roll_change(self) -> bool:
-        """概率重估：每个决策窗掷一次骰子，本窗内结果保持不变。"""
-        interval = max(60, int(self.config.schedule_refresh_minutes) * 60)
-        window = int(self._clock.now().timestamp() // interval)
-        if window < self._roll_window:
-            # 时钟回拨/重装：重置后重新掷
-            self._roll_window = window
-            self._roll_hit = False
-            return self._roll_hit
-        if window == self._roll_window:
-            return self._roll_hit
-        self._roll_window = window
-        chance = min(100.0, max(0.0, float(self.config.schedule_change_chance))) / 100.0
-        self._roll_hit = self._random() < chance
-        return self._roll_hit
 
     def seed_first_segment(self) -> bool:
         """开机时按身体当场种下第一段，不等模型。
@@ -3770,8 +3632,7 @@ class ScheduleService:
             if not replaced:
                 return False
             self._scope.update_self(daily_schedule=updated)
-            # 本窗的骰子不该因为这次延长立刻把刚延长的段又截掉。
-            self._roll_hit = False
+
             if self._log and cfg.debug_mode:
                 self._log.info(
                     f"[humanoid_core] 日程继续：{active.get('event')} "
@@ -3818,23 +3679,6 @@ class ScheduleService:
     # 生成
     # ------------------------------------------------------------------
 
-    def _restore_heal_marks(self) -> None:
-        """把落盘的「上一次接班」换算回内存里的单调钟。
-
-        落盘用墙钟（`_clock.timestamp()`）：单调钟每次进程重启都从零开始，存下来
-        没法跨重载比较。这里换算成「单调钟 - 已经过去多久」，让
-        `now - self._heal_gen_at` 的老写法继续成立。
-        """
-        try:
-            wall = float(self._clock.timestamp())
-            stored = float(self._scope.get_self(HEAL_GEN_KEY, 0.0) or 0.0)
-        except Exception:  # noqa: BLE001 - 读不到就当没记过，别让服务起不来
-            return
-        if stored <= 0:
-            return
-        delta = wall - stored
-        if 0 <= delta <= HEAL_IDLE_CATCHUP_SECONDS:
-            self._heal_gen_at = float(self._monotonic()) - delta
 
     def _purge_dirty_history(self) -> int:
         """把旧版本写进 state 的设备词/含糊词条目真删掉（只删不改写）。
@@ -4211,9 +4055,7 @@ class ScheduleService:
                 return False
             self._append_segment(slot, today)
             self._set_source(SOURCE_TEMPLATE)
-            # 记下「这段是补出来的」：`_gap_catch_up()` 靠它判断要不要越过空闲静默，
-            # 让模型接手把处境词换成一件真事（v3.1.21）。
-            self._healed_at = float(self._monotonic())
+
             if self._log:
                 self._log.info(
                     f"[humanoid_core] 日程空档自愈（{self._scope.role_id}）："
@@ -4266,7 +4108,7 @@ class ScheduleService:
         return False
 
     def request_refresh(self, force: bool = False, ignore_cooldown: bool = False) -> bool:
-        """投递一次后台决定。到点（到期/越线/掷中）才真的投。"""
+        """投递后台决定；自动路径只在无有效段、自然到期、清醒段越线或明确打断时触发。"""
         # 先自愈空档：它不花模型调用、不受闸门影响，也不该被「有一轮在跑」挡住——
         # 那一轮可能正卡着，等它等不到（v3.1.20 把这一步提到所有判断之前）。
         self.heal_gap()
@@ -4325,16 +4167,7 @@ class ScheduleService:
             # 拿锁期间可能已被别的路径决定过：再确认一次。
             if not force and not self.refresh_due():
                 return False
-            catch_up = False
-            if self._catch_up_armed:
-                # 真走到这一步才算「接班过」：一小时最多一次，被挡回的尝试也不会每 30 秒重来。
-                self._catch_up_armed = False
-                catch_up = True
-                self._heal_gen_at = float(self._monotonic())
-                try:
-                    self._scope.set_self(HEAL_GEN_KEY, float(self._clock.timestamp()))
-                except Exception:  # noqa: BLE001 - 落盘失败只影响限频，别打断生成
-                    pass
+
             # 「现在这一段」和「它前面那段」与写路径同一份口径：存档乱序时盲取
             # `segs[-1]` 会把更早的一段当成她正在做的事递给 prompt（时间跨度、
             # 「上一段是不是睡眠」、continue 判定全跟着错）。
@@ -4370,10 +4203,10 @@ class ScheduleService:
         try:
             if attempt_llm:
                 slot = await self._generate_segment(
-                    cfg, now, minutes, prev, elapsed, ignore_cooldown or catch_up,
+                    cfg, now, minutes, prev, elapsed, ignore_cooldown,
                     interrupted_ts=interrupted_ts, event_phrase=event_phrase,
                     event_ts=event_ts, force_switch=force_switch,
-                    ignore_interval=force or ignore_cooldown or catch_up,
+                    ignore_interval=force or ignore_cooldown,
                 )
                 # 生成真的失败了（超时/异常/解析失败/换事失败），把刚取走的事件与
                 # 「来访」**原样还回去**（#75）：它们一次提示词都没进过，就这么丢掉
@@ -4410,6 +4243,15 @@ class ScheduleService:
                     self._set_source(SOURCE_TEMPLATE)
                 if slot is None:
                     return False
+                body = self._body_snapshot() or {}
+                try:
+                    hunger = float(body.get("hunger", 0.0) or 0.0)
+                except (TypeError, ValueError, OverflowError):
+                    hunger = 0.0
+                event = str(slot.get("event") or "")
+                if hunger >= CHANGE_TRIGGER_HUNGER and not slot_sleeps(slot) and not is_meal_event(event):
+                    slot = dict(slot)
+                    slot["event"] = "尝试找时间吃点东西"
                 self._append_segment(slot, today)
                 return True
         finally:
@@ -4951,8 +4793,7 @@ class ScheduleService:
         self._last_outcome = OUTCOME_OK
         if not degraded:
             self._set_source(SOURCE_LLM)
-            # 模型真的接上了一次：之前那段自愈补位不用再当「欠一次接班」了（v3.1.21）。
-            self._healed_at = 0.0
+
         if self._log:
             # 带上是哪个 bot：多开时日志里分不清谁生成了谁没生成。
             self._log.info(
@@ -5591,8 +5432,7 @@ class ScheduleService:
         # 一次 resume 只影响刚装上的这一段。
         self._resumed_event = ""
 
-        # 本窗的骰子已经用掉了：刚装上的这一段，本窗内不再重掷。
-        self._roll_hit = False
+
 
         if self.on_install is not None:
             try:

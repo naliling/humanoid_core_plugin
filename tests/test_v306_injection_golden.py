@@ -73,10 +73,10 @@ GOLDEN = {
         "〔我现在的身体〕\n"
         "在跟TA私聊。我这几天人挺有精神，皮肤也顺眼，我现在很闲。身上有点黏。今天只睡了4小时。我对TA还不算熟，你们刚认识不久。我内心：有点想说话。这会儿手上是空的。"
     ),
-    # 情绪冷静期：只出现一次，且不出现「为你刚才说的话的事」这种二次拼装。
+    # 情绪冷静期：只出现一次；缺少 first_met 的旧档案不伪造「刚认识不久」。
     "s5_cooling": (
         "〔我现在的身体〕\n"
-        "在跟TA私聊。我这几天人挺有精神，皮肤也顺眼，我现在很闲。身上有点黏。我对TA还不算熟，你们刚认识不久。我内心：还在气头上（你刚才说的话），这会儿不想好好说话，过一会儿再讲。这会儿手上是空的。"
+        "在跟TA私聊。我这几天人挺有精神，皮肤也顺眼，我现在很闲。身上有点黏。我对TA还不算熟。我内心：还在气头上（你刚才说的话），这会儿不想好好说话，过一会儿再讲。这会儿手上是空的。"
     ),
     # 群聊：另一个 user_id 的未完事项不许出现，自己的那条要在。
     "s7_group": (
@@ -296,10 +296,11 @@ class GoldenSnapshotTest(unittest.TestCase):
         self.assertEqual(body.count("只睡了"), 1, "睡眠时长这件事被说了不止一遍")
         self.assertNotIn("刚睡醒", body, "同一轮里「只睡了 N 小时」与「刚睡醒」不该并存")
 
-    def test_5_cooling_is_said_once(self):
+    def test_5_cooling_is_said_once(self) -> None:
         body = _cooling_body()
         self.assertEqual(body, GOLDEN["s5_cooling"])
         self.assertEqual(body.count("气头上"), 1, "冷静期从两条通道各说了一遍")
+        self.assertNotIn("你们刚认识不久", body, "缺少 first_met 时不应伪造相识日期")
         self.assertNotIn("说的话的事", body, "reason 被二次拼装成「…的事」")
 
     def test_6_schedule_event_stays_out_until_she_is_asked(self):

@@ -54,7 +54,7 @@ async def _test_persona():
 
 
 def cfg(**overrides) -> HumanoidConfig:
-    # chance 默认压到 0：概率重估单独测，不让它污染「不该生成」的断言
+    # 保留旧配置默认值；当前稳定段行为不再由该概率控制。
     # 质量闸在 3.1.0 起默认关（实测误判多于拦下的真编造）；本文件的用例大多是在测
     # 「生成 + 审查」这条链路本身，所以显式打开，别让默认值变化把被测对象改掉。
     return HumanoidConfig.from_raw(
@@ -621,7 +621,7 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(segs[1]["start"], "10:00")
         self.assertEqual(len(segs), 2, "空档不补段，也不改旧段")
 
-    async def test_sleep_segment_is_never_rerolled(self):
+    async def test_sleep_segment_is_not_interrupted_or_rerolled(self):
         provider = FakeProvider("p", reply=seg_reply(event="睡觉", minutes=480))
         service, _, _ = self.build(
             cfg(schedule_provider_name="p", schedule_change_chance=100), [provider]
@@ -629,63 +629,91 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         await service.ensure_fresh()  # 09:00-17:00 睡觉
         for _ in range(8):
             service._clock.advance(minutes=15)
-            self.assertFalse(service.refresh_due(), "睡着的那一段不重掷、不越线打断")
+            self.assertFalse(service.refresh_due(), "睡眠段不重排或越线打断")
         self.assertEqual(provider.calls, 1)
 
-    async def test_roll_chance_zero_keeps_current_segment(self):
+    async def test_legacy_roll_chance_zero_keeps_current_segment(self):
         provider = FakeProvider("p", reply=seg_reply(minutes=180))
         service, _, _ = self.build(cfg(schedule_provider_name="p"), [provider])
         await service.ensure_fresh()
         for _ in range(4):
             service._clock.advance(minutes=15)
-            self.assertFalse(service.refresh_due(), "没到期、没报警、骰子掷不中：接着做手上的事")
+            self.assertFalse(service.refresh_due(), "当前段未结束且无清醒段触发条件：继续手头的事")
         self.assertEqual(provider.calls, 1)
 
-    async def test_roll_chance_hundred_regenerates_each_window(self):
+    async def test_legacy_roll_probability_keeps_active_segment_until_boundary(self):
         provider = FakeProvider("p", reply=seg_reply(minutes=180))
         service, _, _ = self.build(
             cfg(schedule_provider_name="p", schedule_change_chance=100), [provider]
         )
         await service.ensure_fresh()
         service._clock.advance(minutes=15)
-        self.assertTrue(service.refresh_due())
+        self.assertFalse(service.refresh_due())
+        self.assertEqual(len(service.segments()), 1)
+        self.assertEqual(provider.calls, 1)
+        service._clock.advance(minutes=165)
+        self.assertTrue(service.refresh_due(), "只在当前段自然结束后生成下一段")
         provider.reply = continue_reply(minutes=60)
         self.assertTrue(await service.ensure_fresh())
         self.assertEqual(provider.calls, 2)
 
-    async def test_roll_result_is_stable_within_window(self):
-        """同一个决策窗里掷一次就定：30 秒一查的后台循环不能反复掷。"""
-        rolls = iter([0.99, 0.05, 0.05, 0.05])
+    async def test_random_source_and_event_do_not_replace_active_segment(self):
         provider = FakeProvider("p", reply=seg_reply(minutes=180))
+
+        def unexpected_roll():
+            raise AssertionError("active segment must not trigger a random roll")
+
         service, _, _ = self.build(
             cfg(schedule_provider_name="p", schedule_change_chance=30),
             [provider],
-            random_source=lambda: next(rolls),
+            random_source=unexpected_roll,
         )
         await service.ensure_fresh()
-        service._clock.advance(minutes=5)
-        self.assertFalse(service.refresh_due(), "第一掷没中（0.99），本窗内不再掷")
+        service._event_phrase = "刚有人来找她"
+        service._event_at = service._clock.now().timestamp()
         service._clock.advance(minutes=5)
         self.assertFalse(service.refresh_due())
-        service._clock.advance(minutes=6)  # 进入下一个窗
-        self.assertTrue(service.refresh_due(), "新窗重掷，这次掷中（0.05）")
+        service._clock.advance(minutes=5)
+        self.assertFalse(service.refresh_due())
+        service._clock.advance(minutes=6)
+        self.assertFalse(service.refresh_due(), "普通来访留到下一段生成时参考")
+        self.assertEqual(provider.calls, 1)
 
-    async def test_hunger_override_breaks_current_segment(self):
+    async def test_hunger_waits_for_boundary_then_promotes_next_slot_to_meal_attempt(self):
         provider = FakeProvider("p", reply=seg_reply(event="改报表", minutes=180))
         readings = {"hunger": 40.0}
-
         service, _, _ = self.build(
-            cfg(schedule_provider_name="p"),
-            [provider],
-            body=lambda: dict(readings),
+            cfg(schedule_provider_name="p"), [provider], body=lambda: dict(readings)
         )
         await service.ensure_fresh()
-        self.assertFalse(service.refresh_due())
+        original = service.segments()[0].copy()
         readings["hunger"] = 90.0
-        self.assertTrue(service.refresh_due(), "饿到发慌还在改报表：当场重新决定")
-        provider.reply = seg_reply(event="下楼买饭", minutes=40)
+        service._clock.advance(minutes=15)
+        self.assertFalse(service.refresh_due(), "饥饿不截断正在进行的活动段")
+        self.assertEqual(service.segments()[0], original)
+        self.assertEqual(provider.calls, 1)
+        service._clock.advance(minutes=165)
+        self.assertTrue(service.refresh_due(), "当前段结束后再安排下一段")
+        provider.reply = seg_reply(event="去图书馆", minutes=60)
         self.assertTrue(await service.ensure_fresh())
-        self.assertEqual(service.segments()[-1]["event"], "下楼买饭")
+        segments = service.segments()
+        self.assertEqual(segments[0]["end"], "12:00")
+        self.assertEqual(segments[-1]["start"], "12:00")
+        self.assertEqual(segments[-1]["event"], "尝试找时间吃点东西")
+        self.assertNotIn("图书馆", segments[-1]["event"])
+
+    async def test_hunger_does_not_turn_a_new_sleep_slot_into_a_meal(self):
+        provider = FakeProvider(
+            "p",
+            reply=seg_reply(event="睡觉", minutes=180, location="卧室", energy_rate=0.1),
+        )
+        service, _, _ = self.build(
+            cfg(schedule_provider_name="p"), [provider], body=lambda: {"hunger": 95.0}
+        )
+        await service.ensure_fresh()
+        self.assertEqual(service.segments()[-1]["event"], "睡觉")
+        self.assertEqual(service.segments()[-1]["start"], "09:00")
+        self.assertEqual(provider.calls, 1)
 
     async def test_body_values_travel_into_the_prompt(self):
         provider = FakeProvider("p", reply=seg_reply())
@@ -762,7 +790,7 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
 
         provider.error = RuntimeError("down")
         service._clock.advance(minutes=31)  # 段过完
-        self.assertTrue(service.request_refresh())
+        self.assertTrue(service.request_refresh(force=True), "显式手动刷新仍可强制投递")
         await service._task
         self.assertGreater(service.retry_after, 0, "失败后应进入退避窗口")
         self.assertTrue(service.segments(), "模型挂了也要按身体现算一段，不留白")
@@ -777,7 +805,7 @@ class ScheduleServiceTest(unittest.IsolatedAsyncioTestCase):
         clock.advance(30 * 60 + 1)
         provider.error = None
         provider.reply = seg_reply(event="回过神来干活", minutes=60)
-        self.assertTrue(service.request_refresh())
+        self.assertTrue(service.request_refresh(force=True))
         await service._task
         self.assertEqual(service.source, SOURCE_LLM, "退避一过就让模型接手")
         self.assertGreater(provider.calls, calls)
@@ -1316,7 +1344,7 @@ class TestInterruption(unittest.TestCase):
         service = self._service(schedule_min_interval_minutes=0,
                                 llm_idle_silence_minutes=0,
                                 llm_daily_call_budget=0,
-                                schedule_change_chance=0)  # 骰子永不中
+                                schedule_change_chance=0)  # 旧版兼容值
         self.assertFalse(service._consume_interruption())
         service.note_interruption()
         self.assertTrue(service.refresh_due(), "有人来找她时应该给一个可重排的时机")

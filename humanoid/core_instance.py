@@ -928,6 +928,30 @@ class HumanoidCoreInstance:
         self._log.info(f"{LOG_PREFIX} 角色 {self.role_id} 认出了人设「{persona.label}」，重排今日日程")
         self.schedule.request_refresh(force=True, ignore_cooldown=True)
 
+    def bind_persona_relation(self, persona_id: str, display_name: str = "", legacy_owners=None) -> bool:
+        return self._scope.bind_persona(persona_id, display_name, legacy_owners)
+
+    def persona_legacy_sources(self) -> dict[str, str]:
+        """Return unmigrated role archives and their persisted last UMO, if any."""
+        data = self._state_store.data or {}
+        roles = data.get("roles") if isinstance(data, dict) else None
+        migrated = data.get("persona_legacy_migrations") if isinstance(data, dict) else None
+        if not isinstance(roles, dict):
+            return {}
+        migrated = migrated if isinstance(migrated, dict) else {}
+        result = {}
+        for role_id, role_data in roles.items():
+            role_id = str(role_id)
+            if role_id in migrated or not isinstance(role_data, dict):
+                continue
+            users = role_data.get("users")
+            if not isinstance(users, dict) or not users:
+                continue
+            self_data = role_data.get("self")
+            last_umo = self_data.get("last_umo") if isinstance(self_data, dict) else ""
+            result[role_id] = str(last_umo or "").strip()
+        return result
+
     def persona_label(self) -> str:
         """今天这份日程是按哪个人设排的（展示用，不触发解析）。"""
         stored = str(self._scope.get_self("schedule_persona", "") or "")
@@ -1498,7 +1522,9 @@ class HumanoidCoreInstance:
                 lines.append("我眼里的你：" + "、".join(st.view.traits))
             if st.view.misread:
                 lines.append("可能在看错：" + st.view.misread)
-            recent = [e for e in store.journal if e.kind == "self"][-3:]
+            recent = [e for e in store.journal
+                      if e.kind == "self" and e.role_id == self.role_id
+                      and e.user_id == str(user_id)][-3:]
             if recent:
                 lines.append("最近写下的：")
                 for e in recent:
@@ -3434,11 +3460,10 @@ class HumanoidCoreInstance:
                 pass
 
     async def _schedule_loop(self) -> None:
-        """动态日程：每 30 秒问一句「该不该决定下一段」。
+        """动态日程：每 30 秒检查「是否该决定下一段」。
 
-        该不该由日程服务自己判断：这一段过完了、身体跟手上的事打架、或掷中了
-        变动概率才生成，其余时候她接着做手上的事，一次模型都不调。跨天与跨夜
-        结转也在服务里处理——睡着的那一段会原样接到明天，零点不需要再问模型。
+        无有效段或当前段自然结束时生成下一段；清醒段睡眠压力越线或已记录的明确打断
+        可以提前评估。跨天与跨夜结转仍由服务处理，睡眠段会原样接到明天。
         """
         while not self._stop_event.is_set():
             try:

@@ -51,7 +51,7 @@ def _new_store(tmp: str, log: RecordingLogger | None = None, interval: float = 6
 
 def _big_state(per_role: int = 2000, role_count: int = 6) -> dict:
     """合成一份 2 MB 级别的真实形状状态（6 角色 / 12000 用户 / 含契约）。"""
-    state: dict = {"_state_version": STATE_VERSION, "roles": {}}
+    state: dict = {"_state_version": STATE_VERSION, "persona_relations": {}, "persona_legacy_migrations": {}, "roles": {}}
     for r in range(role_count):
         role: dict = {
             "self": {
@@ -258,9 +258,9 @@ class EventLoopStallTest(unittest.IsolatedAsyncioTestCase):
                 f"（原始 wall 最大间隔 {raw_gap * 1000:.1f} ms，flush 总耗时"
                 f" {elapsed * 1000:.0f} ms；宿主抢占已按 CPU 占比过滤）",
             )
-            # 落盘结果仍是标准 state.json：顶层只有两键，social 读的 contract 路径还在。
+            # 落盘结果仍是标准 state.json：新增人格关系容器，social 读的 contract 路径还在。
             saved = _read_json(Path(tmp) / "state.json")
-            self.assertEqual(set(saved), {"_state_version", "roles"})
+            self.assertEqual(set(saved), {"_state_version", "persona_legacy_migrations", "persona_relations", "roles"})
             self.assertEqual(saved["_state_version"], STATE_VERSION)
             self.assertEqual(saved["roles"]["bot0"]["self"]["contract"]["schema"], "v2")
             self.assertEqual(len(saved["roles"]["bot0"]["users"]), 2000)
@@ -462,7 +462,7 @@ class BadUserEntriesAreRepairedTest(unittest.TestCase):
 
 
 class UnknownTopLevelKeysTest(unittest.TestCase):
-    """P2-05：迁移后顶层只允许 `_state_version` / `roles`。"""
+    """P2-05：迁移后顶层只允许 schema 明确列出的 state 容器。"""
 
     def test_unknown_keys_are_dropped_and_persisted(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -476,13 +476,13 @@ class UnknownTopLevelKeysTest(unittest.TestCase):
             log = RecordingLogger()
             store = StateStore(path, lambda: 60.0, log)
             store.load("2026-01-01")
-            self.assertEqual(sorted(store.data), ["_state_version", "roles"])
+            self.assertEqual(sorted(store.data), ["_state_version", "persona_legacy_migrations", "persona_relations", "roles"] )
             self.assertIn("current_process", log.text("warning"))
             self.assertEqual(store.data["roles"]["default"]["self"]["energy"], 88.0)
             self.assertEqual(store.data["roles"]["default"]["users"]["42"]["nickname"], "阿")
             self.assertTrue(store.flush_sync())
             saved = _read_json(path)
-            self.assertEqual(sorted(saved), ["_state_version", "roles"])
+            self.assertEqual(sorted(saved), ["_state_version", "persona_legacy_migrations", "persona_relations", "roles"] )
             self.assertNotIn("current_process", saved)
             self.assertNotIn("备注", saved)
 

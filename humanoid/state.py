@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-STATE_VERSION = 3
+STATE_VERSION = 4
 
 # ── 落盘体积 / 节奏（P1-4）──────────────────────────────────────────────
 # 状态是**全量重写**的：体积越大，每次序列化 + 写盘越贵。默认 60 秒一次时，
@@ -68,6 +68,8 @@ MAX_FAILURE_BACKOFF = 300.0
 # 迁移前必须保证类型的容器字段（仅用于读入旧文件时的类型兼容）。
 _CONTAINER_FIELDS: dict[str, type] = {
     "roles": dict,
+    "persona_relations": dict,
+    "persona_legacy_migrations": dict,
 }
 
 # 旧版单角色结构里属于“角色自身”的字段。
@@ -90,7 +92,7 @@ _LEGACY_USER_FIELDS = {
 
 _DROPPED_FIELDS = ("_energy_noise_date",)
 
-# 顶层**只允许**有 `_state_version` 与 `roles`。这份集合把所有历史顶层键集中起来，
+# 顶层只允许版本号、角色表与按人格归属的用户关系档案。
 # 迁移时无条件 pop：以前只有 `_DROPPED_FIELDS` 是无条件删的，其余旧键仅在
 # `_absorb_legacy` 真的搬成功时才被删——roles 里已有一份同名数据时，顶层那份
 # 拷贝就永远留在文件里，既读不到又一直占体积。
@@ -100,12 +102,16 @@ _LEGACY_TOP_LEVEL = (
 
 
 def default_state(today: str = "", cycle_day: int = 1) -> dict[str, Any]:
-    """v3 只存两样东西：版本号与角色表。
+    """v4 存角色自身状态，以及按人格名归属的跨 bot 用户关系档案。
 
-    v2 时代把角色字段同时写一份到顶层“保兼容”，多角色后那份拷贝只属于恰好排在第一个的
-    角色，既读不到也会把文件撑大，因此不再保留。
+    bot 的 self 设置仍留在 roles；persona_relations 只保存用户关系数据。
     """
-    return {"_state_version": STATE_VERSION, "roles": {}}
+    return {
+        "_state_version": STATE_VERSION,
+        "roles": {},
+        "persona_relations": {},
+        "persona_legacy_migrations": {},
+    }
 
 
 def seed_cycle_day(today: str, cycle_length: int = 28) -> int:
@@ -423,7 +429,7 @@ class StateStore:
         self._dirty_event.set()
 
     def _migrate(self, raw: dict[str, Any], fresh: dict[str, Any], cycle_length: int) -> dict[str, Any]:
-        """把任意旧版结构收敛成 v3：顶层只留版本号与角色表。
+        """把任意旧版结构收敛成 v4：角色 self 独立，用户关系可按 persona 归属。
 
         v2.12 之前的 `_migrate` 有两个坑：一是把角色字段再复制一份到顶层「保兼容」，
         多角色下那份拷贝只属于恰好排在第一个的角色；二是 `roles` 为空时按 set 顺序逐个
@@ -449,11 +455,13 @@ class StateStore:
         for key in _LEGACY_TOP_LEVEL:
             state.pop(key, None)
 
+        repaired = legacy_repaired
         for key, expected in _CONTAINER_FIELDS.items():
             if not isinstance(state.get(key), expected):
                 state[key] = expected()
+                if key != "roles":
+                    repaired = True
 
-        repaired = legacy_repaired
         for role_id, role_data in list(roles.items()):
             if not isinstance(role_data, dict):
                 # 静默重置会把「谁的档案被吞了」这件事藏起来：带上原类型记一条。
@@ -485,16 +493,17 @@ class StateStore:
             # 修过的坏值必须落盘，否则下次启动又读到同一份坏数据。
             self.mark_dirty()
 
-        # P2-05：顶层只允许 `_state_version` 与 `roles`。历史遗留键（生产快照里实测
-        # 残留 `current_process`）既没有读取路径、也不会被后续版本认领，留着只会让每次
-        # 全量重写都继续携带。清理动作要留日志：删的可能是某个旧版本的数据。
-        allowed_top = {"_state_version", "roles"}
+        # 顶层严格限制为角色 self、persona 关系档案及其迁移标记。
+        allowed_top = {
+            "_state_version", "roles", "persona_relations",
+            "persona_legacy_migrations",
+        }
         unknown = [key for key in state if key not in allowed_top]
         for key in unknown:
             state.pop(key, None)
         if unknown:
             self._warn(
-                "状态文件顶层有未知键，已删除（顶层只允许 _state_version/roles）："
+                "状态文件顶层有未知键，已删除（只允许版本、roles、persona_relations 与迁移标记）："
                 + "、".join(repr(key) for key in unknown)
             )
             self.mark_dirty()

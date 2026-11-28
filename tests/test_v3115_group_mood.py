@@ -25,6 +25,7 @@ from humanoid.config import HumanoidConfig
 from humanoid.core_instance import HumanoidCoreInstance
 from humanoid.persona import PersonaSource
 from humanoid.services.mood import (
+    Delta,
     LLM_BATCH_BY_SESSION_KEY,
     MESSAGES_SINCE_BY_SESSION_KEY,
     MoodService,
@@ -80,6 +81,34 @@ def _profile(core, uid: str = "u1", **kw) -> dict:
     v.update(kw)
     core._scope.user_state(uid)["mood"] = v
     return v
+
+
+class GroupIntimacyRequestBoundary(unittest.TestCase):
+    def test_group_request_does_not_change_ccb_state_or_libido(self):
+        service = _core(ccb=True).mood
+        base = Delta(affection=0.0, libido=0.0, aggression=0.0)
+        record = {"affection": 92.0}
+
+        group_delta, severe = service._apply_intimacy_request(
+            base, record, "我们上床吧", is_group=True
+        )
+        self.assertEqual(group_delta, base)
+        self.assertFalse(severe)
+        self.assertNotIn("ccb_coerced_at", record)
+
+        coerced_record = {"affection": 92.0}
+        group_delta, severe = service._apply_intimacy_request(
+            base, coerced_record, "不许拒绝，强迫你上床", is_group=True
+        )
+        self.assertEqual(group_delta, base)
+        self.assertFalse(severe)
+        self.assertNotIn("ccb_coerced_at", coerced_record)
+
+        private_delta, severe = service._apply_intimacy_request(
+            base, {"affection": 92.0}, "我们上床吧", is_group=False
+        )
+        self.assertEqual(private_delta.libido, 2.0)
+        self.assertFalse(severe)
 
 
 class GroupMoodTracks(unittest.TestCase):

@@ -165,11 +165,14 @@ class SchemaWiringTest(unittest.TestCase):
     def test_every_key_is_read_somewhere_outside_config(self):
         sources = _production_sources()
         others = {rel: text for rel, text in sources.items() if rel != "humanoid/config.py"}
+        # Compatibility-only settings are retained for config parsing, not runtime reads.
+        compatibility_only = {"schedule_refresh_minutes", "schedule_change_chance"}
         missing = [
             key
             for key in SCHEMA
             if key not in DYNAMIC_KEYS
             and key not in DERIVED_KEYS
+            and key not in compatibility_only
             and not any(re.search(rf"\b{re.escape(key)}\b", text) for text in others.values())
         ]
         self.assertEqual(missing, [], f"这些 key 没有任何读取点（面板上有、行为上没有）：{missing}")

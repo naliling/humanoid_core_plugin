@@ -855,5 +855,31 @@ class StaleRetentionZeroTest(unittest.TestCase):
         self.assertNotIn("empty", store.scope.all_user_ids(), "纯空壳是 0 语义的明确例外")
 
 
+class MissingFirstMetRepairTest(unittest.TestCase):
+    NOW = 1_780_000_000.0
+
+    def test_missing_first_met_does_not_use_last_interaction(self) -> None:
+        service, store, _state, _clock = build_mood(now=self.NOW)
+        user = store.user("u1")
+        user.pop("first_met", None)
+        user["mood"] = {"affection": 20.0, "last_interaction": self.NOW - 3600.0}
+
+        record = service.profile("u1")
+
+        self.assertNotIn("first_met", record)
+        self.assertEqual(record["last_interaction"], self.NOW - 3600.0)
+
+    def test_migrates_valid_user_first_met(self) -> None:
+        service, store, _state, _clock = build_mood(now=self.NOW)
+        first_met = self.NOW - 12 * 86400.0
+        user = store.user("u1")
+        user["first_met"] = first_met
+        user["mood"] = {"affection": 20.0, "last_interaction": self.NOW - 3600.0}
+
+        record = service.profile("u1")
+
+        self.assertEqual(record["first_met"], first_met)
+
+
 if __name__ == "__main__":
     unittest.main()

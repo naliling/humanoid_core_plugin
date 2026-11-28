@@ -9,7 +9,7 @@ desc: |
   可独立使用；与「自主拟人社交」联动后，主动消息能参考角色的身体、日程、情绪和关系背景。长期记忆由单独的记忆插件负责读写。
 
   群聊也可参与情绪更新，但只对已有档案的人生效，互动间隔更宽。亲密场景模拟默认关闭，可按需单独开启。
-version: 3.1.56
+version: 3.1.58
 author: 娜莉灵
 repo: https://github.com/naliling/humanoid_core_plugin
 astrbot_version: ">=4.24.0"

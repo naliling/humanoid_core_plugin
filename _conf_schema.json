@@ -99,8 +99,8 @@
     }
   },
   "schedule_refresh_minutes": {
-    "description": "【进阶】决策窗间隔(分)",
-    "hint": "每隔多久重看一遍要不要换事",
+    "description": "【兼容旧配置】旧版决策窗间隔(分)",
+    "hint": "保留旧值供配置读取；当前版本不生效",
     "type": "int",
     "default": 15,
     "minimum": 1,
@@ -112,8 +112,8 @@
     }
   },
   "schedule_change_chance": {
-    "description": "【进阶】改主意概率(%)",
-    "hint": "每次决定换事的概率（百分数）",
+    "description": "【兼容旧配置】旧版改主意概率(%)",
+    "hint": "保留旧值供配置读取；当前版本不生效",
     "type": "int",
     "default": 30,
     "minimum": 0,

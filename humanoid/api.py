@@ -912,10 +912,9 @@ class CoreFacade:
         except (TypeError, ValueError):
             first_met = 0.0
         if first_met <= 0 and record:
-            # 老档案没有 user 级 first_met 时，`mood._repair` 也是拿 last_interaction 补的。
+            # 未知的相识日期保持未知，不从最近互动推断。
             first_met = _num(record.get("first_met", 0.0))
-            if first_met <= 0:
-                first_met = _num(record.get("last_interaction", 0.0))
+
         known_days = int((now - first_met) // 86400.0) if first_met > 0 and now > first_met else 0
 
         last_interaction = _num(peek("last_interaction", 0.0))

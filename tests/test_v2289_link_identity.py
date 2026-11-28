@@ -519,6 +519,21 @@ class FacadeUserBlockTest(unittest.TestCase):
         self.assertAlmostEqual(user["last_interaction"], self.now - 3600.0, places=1)
         self.assertIsInstance(user["intimacy"], dict)
 
+    def test_missing_first_met_does_not_fall_back_to_last_interaction(self) -> None:
+        state = self.core.scope.user_state("10001")
+        state.pop("first_met", None)
+        state["last_interaction"] = self.now - 3600.0
+        mood = state.get("mood")
+        if isinstance(mood, dict):
+            mood.pop("first_met", None)
+            mood["last_interaction"] = self.now - 3600.0
+
+        user = self._user()
+
+        self.assertEqual(user["first_met"], 0.0)
+        self.assertEqual(user["known_days"], 0)
+        self.assertEqual(user["last_interaction"], self.now - 3600.0)
+
     def test_user_block_present_for_every_task(self):
         for task in ("chat", "proactive", "status"):
             brief = self.facade.brief("bot1", "10001", task=task)

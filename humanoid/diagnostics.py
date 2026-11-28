@@ -900,13 +900,12 @@ def _build_report_body(
         for note in state_size_lines:
             lines.append(f"- {note}")
     lines.append(
-        f"- 日程生成：滚动分段，一次只决定下一段（输入约 240 + 输出一个小 JSON）；"
-        f"决策窗 {cfg.schedule_refresh_minutes} 分钟，变动概率 {cfg.schedule_change_chance}%，"
-        "没到期没报警没掷中就不调模型"
+        f"- 日程生成：滚动分段，当前段保持到自然边界；清醒段睡眠压力越线或明确打断可提前评估；"
+        "高饥饿时，下一个可行的非睡眠、非餐食槽优先尝试进食。"
     )
     lines.append(
-        "- 上面这条的频率只由「到期/掷中」决定，硬上限看下面的【调用节流】："
-        "没有节流时，全天无人也能烧掉一百多次"
+        "- 普通消息、普通事件与旧版决策窗/概率选项不会提前截断当前段；"
+        "模型调用频率仍受下方独立节流与预算限制。"
     )
     lines.append(
         "- 情绪分析："
@@ -949,7 +948,7 @@ def _build_report_body(
         elif interval > 0:
             lines.append(f"- 调用间隔：{int(interval)} 分钟")
         else:
-            lines.append("- 调用间隔：未限制（改主意概率仍可能连着触发）")
+            lines.append("- 调用间隔：未限制（自然边界或明确打断可能造成相邻决定）")
         budget = snap["budget"]
         used = snap["used_today"]
         lines.append(
